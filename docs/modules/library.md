@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0 已实现的契约；导入、查询与编辑命令在后续阶段追加。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0/S1 已实现的契约；查询与编辑命令在后续阶段追加。
 
 ## 图库清单
 
@@ -106,7 +106,7 @@ ui                 { theme, gridThumbPx }
 
 ## 命令契约
 
-前端统一经 `src/app/api.ts` 调用；参数使用 camelCase。
+前端统一经 `src/app/api.ts` 调用图库生命周期命令；导入命令经 `src/modules/import/api.ts` 调用，契约见 [导入与缩略图](import.md)。参数使用 camelCase。
 
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
@@ -142,12 +142,13 @@ ui                 { theme, gridThumbPx }
 - `close_library`：释放连接并清空 `lastLibraryId`，不动文件。
 - `remove_library`：只从设置移除；若正打开则先关闭。不删除磁盘内容。
 - `rename_library`：更新设置名称与清单名称；不改目录名。
+- 导入任务运行时，关闭、切换、创建与移除图库都会被拒绝；需要先取消或等待导入结束。
 
 ## 已实现与未实现
 
-已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI。
+已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行。
 
-未实现（后续阶段）：图片导入、查询/筛选/排序、元数据编辑、集合、回收站操作、缩略图包读写、feature pack、AI 任务。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
+未实现（后续阶段）：查询/筛选/排序、元数据编辑、集合、回收站操作、feature pack、AI 任务。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
 ## 测试
 
@@ -156,6 +157,8 @@ ui                 { theme, gridThumbPx }
 - 设置往返、重复路径拒绝、后端维护 `lastLibraryId`；
 - schema 初始化、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验；
-- 图库创建/重开/重复创建拒绝/普通目录拒绝打开。
+- 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
+- 导入仓储插入、内容哈希冲突与合并元数据；
+- 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）。
 
 性能基准（默认忽略）见 [性能基准](../guides/performance.md)。

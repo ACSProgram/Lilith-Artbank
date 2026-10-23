@@ -6,9 +6,11 @@
 
 ## 当前状态
 
-**Stage 0 已完成**：项目骨架、设置持久化、图库创建/打开/关闭、SQLite schema v1、应用外壳与图库入口。
+**S0 已完成**：项目骨架、设置持久化、图库创建/打开/关闭、SQLite schema v1、应用外壳与图库入口。
 
-尚未实现：图片导入、缩略图、网格浏览、元数据编辑、筛选排序、查看器、图像处理、AI 服务调用。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
+**S1 已完成（自动验收通过）**：512px WebP 缩略图编码（libwebp 静态链接）、追加式缩略图包、`thumb://` 自定义协议、应用内 150 张加载基准；导入管线（文件/目录/拖放、BLAKE3、EXIF 方向、pHash、主色、重复策略、进度/取消/失败清单）与导入界面。
+
+真实 WebView2 的 150 张门槛已由用户确认；真实窗口中的导入界面与拖放待手工验收。尚未实现：网格浏览、元数据编辑、筛选排序、查看器、图像处理、AI 服务调用。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
 
 ## 功能边界
 
@@ -30,7 +32,7 @@ AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应�
 | 桌面壳 | Tauri 2（Windows，WebView2 系统运行时，不随包附带 DLL） |
 | 前端 | React 19 + TypeScript + Vite 6，手写 CSS，无 UI 框架 |
 | 元数据 | SQLite（`rusqlite` bundled，静态编译），WAL + FTS5 |
-| 图像 | `image` crate；缩略图为追加式 `.pack`，浏览器负责解码 |
+| 图像 | `image` crate + 静态 libwebp；缩略图为追加式 `.pack`，浏览器负责解码 |
 | 并发 | 单写连接 + 多读连接；`rayon` 处理导入与图像计算 |
 | AI | 本地 HTTP `/v1` 接口；应用托管进程，接口见 [docs/modules/ai-service.md](docs/modules/ai-service.md) |
 
@@ -43,7 +45,7 @@ AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应�
     library.db           SQLite 元数据（WAL）
     thumbs/0001.pack     追加式缩略图包
     features/            embedding / pose 包（Stage 6）
-    temp/
+    temp/                原子写入与导入临时目录；启动时清理
   <folder>/<content-hash>.<ext>
   recycle/
   output/
@@ -64,10 +66,13 @@ AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应�
 | FTS 三字中文查询 | p50 0.48 ms |
 | 200k 元数据 + 600k 标签关系写入 | 7.01 s |
 | 150×20KB 随机读：缩略图包 vs 逐文件 | 0.60 ms vs 9.69 ms |
+| 150 张 512px WebP 生成 + 写入 pack | 3.97 s，9.00 MB（开发档） |
+| 同一 pack 内 150 张（约 9 MB）定位读 | p50 2.27 ms / p95 2.80 ms |
 | 150 张 512px JPEG：冷加载 / 热缓存 | 456 ms / 236 ms |
 | 150 张 512px WebP：冷加载 | 437 ms，体积约为 JPEG 一半 |
+| 1000 张 768×512 混合格式导入（开发档，4 线程） | 约 20 s，50.0 张/秒 |
 
-结论：SQLite 不是瓶颈；缩略图包明显优于逐文件；浏览器解码满足 1/3 效率门槛。完整方法与结论见 [docs/guides/performance.md](docs/guides/performance.md)。
+结论：SQLite 不是瓶颈；缩略图包明显优于逐文件；浏览器解码满足 1/3 效率门槛；导入吞吐高于 20 张/秒下限。完整方法与结论见 [docs/guides/performance.md](docs/guides/performance.md)。
 
 ## 开发
 
@@ -86,7 +91,11 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
 ```
+
+真实 WebView2 的缩略图基准在开发构建中打开任意图库，点击工作区右上角“缩略图基准”。
 
 `G:\Lilith Image Library` 下的真实仓库只允许只读查看；任何测试、基准与开发流程都不得修改它。
 

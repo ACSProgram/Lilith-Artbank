@@ -59,3 +59,17 @@ export interface AppInfo {
   version: string;
   settingsPath: string;
 }
+
+export interface ThumbBenchInfo {
+  count: number;
+  thumbBytes: number;
+  buildMs: number;
+  readP50Ms: number;
+  readP95Ms: number;
+}
+
+export interface ThumbReadStats {
+  p50Ms: number;
+  p95Ms: number;
+  totalBytes: number;
+}

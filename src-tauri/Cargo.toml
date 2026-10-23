@@ -29,6 +29,7 @@ tauri-plugin-log = "2"
 tauri-plugin-single-instance = "2"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+webp = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

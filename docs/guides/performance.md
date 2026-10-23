@@ -60,6 +60,44 @@ node tools/perf/thumb_bench/server.mjs
 # 浏览器打开 http://127.0.0.1:18767/?format=jpg 和 ?format=webp
 ```
 
+### 应用内缩略图基准（S1 前半）
+
+开发构建的工作区工具栏有“缩略图基准”。它用 Rust 生成 150 张 512px 确定性图片，经正式管线编码为 WebP q80、写入临时追加式 pack，然后让 WebView2 通过 `thumb://` 加载：
+
+- 冷加载：每次使用新的 `?run=<n>`，浏览器缓存必然未命中；
+- 热加载：复用同一 URL，测浏览器缓存路径；
+- 计时从创建 `<img>` 到 150 张全部 `decode()` 完成后再等两帧 rAF；
+- 同时显示 Rust 侧 pack 读取 p50/p95 与包体积。
+
+```bash
+npm run tauri dev
+# 打开任意图库 → 工作区右上角“缩略图基准” → 生成样本 → 冷加载 / 热加载
+```
+
+真实 WebView2 的数字由用户在本机手工验收；用户已确认冷/热加载满足 ≤1s 门槛，具体数字尚未记录。浏览器预览不支持该基准。
+
+### 导入吞吐（S1 后半）
+
+`perf_import_1000`：
+
+- 临时目录生成 1000 张 768×512 确定性图片，JPEG/PNG/BMP/WebP 各 25%；
+- 建立临时图库，4 个工作线程；
+- 计时覆盖扫描、BLAKE3、解码、EXIF、缩略图、pHash、主色、原子发布、pack 写入与批量入库，不含样本生成；
+- 断言新增 1000、失败 0、吞吐 ≥20 张/秒。
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
+```
+
+### 发布产物依赖
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml
+python tools/perf/pe_imports.py src-tauri/target/debug/lilith-artbank.exe
+```
+
+脚本列出 PE 的 import 与 delay-import DLL。当前结果只包含系统 DLL，没有 `WebView2Loader.dll`、`vcruntime140.dll` 或 `webp.dll`。release 产物的最终核对仍留在 S9。
+
 ## 实测记录（2026-10-23）
 
 环境：Windows 11，Rust 1.97.1，开发档（依赖 opt-level 2），本机 SSD；浏览器为 Qoder 内置 Chromium 150（Electron 43）。这是 Chromium 代理，不是 WebView2；Stage 1 会在真实 Tauri 窗口复测。
@@ -95,20 +133,52 @@ node tools/perf/thumb_bench/server.mjs
 
 单张平均：JPEG 19.6 KB，WebP 9.6 KB（合成图；真实美术图会更大，但相对关系一致）。
 
+### 应用内 pack 与 WebP（S1 前半，2026-10-23）
+
+同一台机器、Rust 1.97.1、开发档（本 crate opt-level 1，依赖 opt-level 2）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 150 张 512px 确定性样本：生成 + WebP q80 + 追加 pack | 3.97 s |
+| 样本包体积 | 9.00 MB（平均 60 KB/张） |
+| 同一 pack 内 150 张定位读，20 轮 | p50 2.27 ms / p95 2.80 ms（约 4 GB/s，OS 缓存命中） |
+| debug exe 导入 DLL | 仅系统 DLL；无 libwebp / vcruntime / WebView2Loader |
+
+前三项由 `perf_thumb_bench_build` 输出：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
+```
+
+WebView2 中的 150 张冷/热加载已由用户手工确认满足 ≤1s 门槛，具体耗时未记录。
+
+### 导入（S1 后半，2026-10-23）
+
+同一台机器、Rust 1.97.1、开发档（本 crate opt-level 1，依赖 opt-level 2），4 个工作线程：
+
+| 项目 | 结果 |
+| --- | --- |
+| 1000 张 768×512 混合格式导入（含特征与缩略图） | 19.99–20.97 s，47.7–50.0 张/秒（两次） |
+| 失败 / 重复 | 0 / 0 |
+| 门槛 | ≥20 张/秒，达标 |
+
+样本是合成图，真实美术图的解码与主色耗时会更高；S9 用复制出来的真实小样本复测。
+
 ## 结论与决策
 
 1. **SQLite 不是瓶颈**。首屏、深分页、文件夹、FTS 都在毫秒级；不需要自研元数据索引。
 2. **缩略图包优于逐文件**。随机读快约 16 倍，且避免 20 万小文件对备份、扫描和冷启动的压力。
 3. **浏览器解码满足门槛**。150 张 512px 缩略图冷加载约 0.44-0.46s，远低于 3s 底线，也低于 1s 目标。
-4. **优先 WebP**。体积约 JPEG 一半，解码同级或更快。Stage 1 需要确认 Rust 侧 WebP 编码方式：优先静态链接 libwebp（不产生 DLL）；若构建不可接受，回退 JPEG/PNG。
+4. **WebP 已定稿**。`webp` 0.3 + `libwebp-sys` 0.9.6 静态编译，构建可接受，debug exe 无额外 DLL；缩略图统一 WebP q80。
 5. **不需要 DDS/WebGPU 缩略图管线**。浏览器解码已达标，自绘网格的复杂度与风险不值得。
+6. **导入吞吐达标**。1000 张合成图 47.7–50.0 张/秒，高于 20 张/秒的阶段下限；瓶颈仍在解码、WebP 编码与 k-means，而不是 SQLite 写入。
 
 ## 仍需复测
 
-- 真实 Tauri WebView2 + 自定义协议（不是本地 HTTP）下的 150 张加载；
+- 真实 Tauri WebView2 的缩略图冷/热具体耗时与 WebView2 缓存行为；
 - 冷磁盘缓存（清空系统缓存后的首次读取）；
 - 真实美术缩略图（平均 30-80KB）与 512px 下 20 万张的包分段；
-- 导入吞吐（解码 + pHash + 主色 + 缩略图 + DB 写入）；
+- 真实美术图导入（大图、透明图、EXIF 方向、不同压缩率）与吞吐；
 - CLIP/pose 全库扫描耗时与内存；
 - 前端在 20 万行下的滚动帧率与内存。
 

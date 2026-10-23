@@ -1,10 +1,16 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{State, WebviewWindow};
+use tauri::{AppHandle, State, WebviewWindow};
 
 use crate::{
-    app::{error::AppError, settings::Settings, state::AppState},
+    app::{
+        bench::{self, ThumbBenchInfo, ThumbReadStats},
+        error::AppError,
+        settings::Settings,
+        state::AppState,
+    },
+    import::{ImportRequest, job::ImportSnapshot},
     library::{manifest::LibraryInspection, service::LibraryInfo},
 };
 
@@ -127,6 +133,60 @@ pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
     }
 }
 
+#[tauri::command]
+pub async fn thumb_bench_prepare(state: State<'_, AppState>) -> Result<ThumbBenchInfo, String> {
+    if !cfg!(debug_assertions) {
+        return Err("缩略图基准只在开发构建中可用".to_owned());
+    }
+    let (bench, info) = tauri::async_runtime::spawn_blocking(bench::prepare)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    state.set_thumb_bench(Some(bench));
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn thumb_bench_measure_read(
+    state: State<'_, AppState>,
+) -> Result<ThumbReadStats, String> {
+    let bench = state
+        .thumb_bench()
+        .ok_or_else(|| "请先生成基准样本".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || bench.measure_read(bench::READ_ROUNDS))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn thumb_bench_cleanup(state: State<'_, AppState>) -> Result<(), String> {
+    state.set_thumb_bench(None);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_import(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ImportRequest,
+) -> Result<ImportSnapshot, String> {
+    AppError::command(state.start_import(app, request))
+}
+
+#[tauri::command]
+pub fn cancel_import(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
+    AppError::command(state.cancel_import(&job_id))
+}
+
+#[tauri::command]
+pub fn get_import_status(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Option<ImportSnapshot>, String> {
+    Ok(state.import_status(&job_id))
+}
+
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         get_settings,
@@ -144,6 +204,12 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         window_toggle_maximize,
         window_is_maximized,
         window_close,
-        get_app_info
+        get_app_info,
+        thumb_bench_prepare,
+        thumb_bench_measure_read,
+        thumb_bench_cleanup,
+        start_import,
+        cancel_import,
+        get_import_status
     ]
 }

@@ -9,6 +9,7 @@ use crate::{
         manifest::{LibraryInspection, LibraryManifest, inspect},
         paths::LibraryPaths,
         schema::{self, SCHEMA_VERSION},
+        thumbs::ThumbPack,
     },
 };
 
@@ -27,6 +28,7 @@ pub struct LibraryInfo {
 pub struct LibrarySession {
     pub info: LibraryInfo,
     pub db: Arc<LibraryDb>,
+    pub thumbs: Arc<ThumbPack>,
 }
 
 pub fn create(
@@ -54,6 +56,7 @@ pub fn create(
     std::fs::create_dir_all(path)?;
     let paths = LibraryPaths::new(path);
     paths.ensure_runtime_dirs()?;
+    let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
     let manifest = LibraryManifest::new(name, now_ms());
     LibraryManifest::write_atomic(&paths.manifest, &manifest)?;
 
@@ -83,6 +86,7 @@ pub fn create(
         LibrarySession {
             info,
             db: Arc::new(database),
+            thumbs,
         },
         manifest,
     ))
@@ -104,6 +108,7 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
     let paths = LibraryPaths::new(path);
     paths.ensure_runtime_dirs()?;
     clean_temporary_directory(path)?;
+    let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
     let database = LibraryDb::open(&paths.database, read_connections)?;
     database.with_writer(|connection| schema::ensure(connection, &manifest))?;
     let (image_count, trash_count) = database.counts()?;
@@ -119,6 +124,7 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
             opened_at: now_ms(),
         },
         db: Arc::new(database),
+        thumbs,
     })
 }
 

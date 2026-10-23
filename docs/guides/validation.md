@@ -32,6 +32,7 @@ git diff --check
 
 - 前端改动至少跑 typecheck；涉及构建配置时跑 build。
 - Rust 改动至少跑 cargo check 与 cargo test。
+- 导入改动跑 `cargo test`：包含混合格式入库、精确重复、合并策略、取消一致性与 pack 缺失；性能门槛单独跑 `perf_import_1000`。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 
 ## 数据库与文件
@@ -48,6 +49,8 @@ git diff --check
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
 ```
 
 浏览器缩略图基准：
@@ -56,6 +59,29 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 python tools/perf/thumb_bench/generate.py
 node tools/perf/thumb_bench/server.mjs
 # 打开 http://127.0.0.1:18767/?format=jpg 与 ?format=webp，看页面右下角结果
+```
+
+真实 WebView2 的缩略图基准通过开发构建的应用内入口执行，由用户手工点击：
+
+```bash
+npm run tauri dev
+# 打开图库 → 工作区右上角“缩略图基准” → 生成样本 → 冷加载 / 热加载
+```
+
+导入界面与拖放同样只在真实 Tauri 窗口中验收：
+
+```bash
+npm run tauri dev
+# 打开图库 → “导入图片”或拖入图片/目录 → 选择选项 → 观察进度、取消与结果
+```
+
+代理不得用输入注入驱动该窗口；界面最终由用户手工确认。
+
+发布产物依赖检查：
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml
+python tools/perf/pe_imports.py src-tauri/target/debug/lilith-artbank.exe
 ```
 
 - 同一台机器、同一构建档、同一浏览器才有可比性；不要用跨机器墙钟下结论。

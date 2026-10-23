@@ -93,7 +93,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "dark".into(),
+            theme: "light".into(),
             grid_thumb_px: 220,
         }
     }
@@ -142,10 +142,10 @@ impl Settings {
         if !(1..=16).contains(&self.performance.reader_connections) {
             return Err(AppError::message("读取连接数必须在 1-16 之间"));
         }
-        if let Some(threads) = self.performance.worker_threads {
-            if !(1..=128).contains(&threads) {
-                return Err(AppError::message("工作线程数必须在 1-128 之间"));
-            }
+        if let Some(threads) = self.performance.worker_threads
+            && !(1..=128).contains(&threads)
+        {
+            return Err(AppError::message("工作线程数必须在 1-128 之间"));
         }
         if self.performance.thumbnail_cache_mb < 64 {
             return Err(AppError::message("缩略图缓存不能小于 64 MB"));
@@ -330,7 +330,7 @@ mod tests {
         let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
         assert_eq!(loaded.libraries.len(), 1);
         assert_eq!(loaded.libraries[0].name, "素材");
-        assert_eq!(loaded.ui.theme, "dark");
+        assert_eq!(loaded.ui.theme, "light");
     }
 
     #[test]

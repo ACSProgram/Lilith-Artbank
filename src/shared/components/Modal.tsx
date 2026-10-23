@@ -10,6 +10,7 @@ interface ModalProps {
   footer?: ReactNode;
   width?: number;
   dismissible?: boolean;
+  tone?: "default" | "danger";
 }
 
 export function Modal({
@@ -21,6 +22,7 @@ export function Modal({
   footer,
   width = 560,
   dismissible = true,
+  tone = "default",
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
 
@@ -48,7 +50,7 @@ export function Modal({
     >
       <div
         ref={panelRef}
-        className="modal-panel"
+        className={`modal-panel${tone === "danger" ? " modal-panel-danger" : ""}`}
         style={{ width }}
         role="dialog"
         aria-modal="true"

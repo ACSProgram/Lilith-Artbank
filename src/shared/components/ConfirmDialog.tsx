@@ -14,6 +14,7 @@ export function ConfirmDialog({ options, onResolve }: ConfirmDialogProps) {
       title={options.title}
       onClose={() => onResolve(false)}
       width={440}
+      tone={options.danger ? "danger" : "default"}
       footer={
         <>
           <Button variant="ghost" onClick={() => onResolve(false)} autoFocus>

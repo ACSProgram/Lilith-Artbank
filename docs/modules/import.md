@@ -1,94 +1,149 @@
 # 导入与缩略图
 
-导入把外部图片变成图库中的“原图 + 元数据 + 缩略图指针”。本文件定义 Stage 1 要实现的行为；当前只完成了表结构与路径布局。
+导入把外部图片变成图库中的“原图 + 元数据 + 缩略图指针”。S1 前半完成缩略图编码、追加式 pack 与 `thumb://` 协议；S1 后半完成导入管线、pHash、主色、重复策略、后台任务与导入界面。
 
-## 输入
+## 当前实现
 
-- 文件选择器：多选图片，或选择目录后递归扫描。
-- 拖放：Tauri 原生 `drag-drop` 事件给出的路径列表。
-- 剪贴板：图片位图或文件路径（后续接入）。
-- 支持格式：JPEG、PNG、BMP、WebP、TIFF、TGA、GIF（首帧）。HEIC/AVIF 暂不支持；需要时再评估纯 Rust 解码器。
-- 导入选项：目标文件夹、初始标签、初始评分、重复策略。默认**复制**，不移动用户原文件。
+### 输入与校验
 
-## 单张图片管线
+- 文件选择器：多选图片；目录选择器：递归扫描。
+- 拖放：Tauri 原生 `drag-drop` 事件；窗口任意位置可放下图片或目录。
+- 支持格式：JPEG、PNG、BMP、WebP、TIFF、TGA、GIF（首帧）。HEIC/AVIF 暂不支持。
+- 扫描跳过 `.artbank`；若扫描范围在图库内，同时跳过 `recycle` 与 `output`；不跟随符号链接。
+- 单次最多 10000 个输入路径、最多收集 100000 个文件；超出时停止扫描并在失败清单记录。
+- 导入选项：目标文件夹（图库内相对路径）、初始标签（最多 32 个，单个 ≤64 字符）、初始评分 0-5、重复策略（跳过 / 合并元数据）。
+- 路径必须是绝对路径；目标文件夹经 `normalize_folder` 校验，拒绝 `..`、盘符与绝对路径。
+- 浏览器预览不执行导入；界面会提示需要 Tauri 桌面窗口。
+
+### 单张图片管线
 
 ```text
-读取文件
-  → 流式 BLAKE3（同时写 temp 副本）
-  → 查 content_hash 是否已存在
-  → 解码（应用 EXIF 方向）
-  → 记录宽高/格式/alpha
-  → 生成 512px 缩略图
-  → 计算 256 位 pHash
-  → 计算 4 色 / 8 色主色
+读取文件 → 流式 BLAKE3 + 临时副本（1 MiB 缓冲，sync_all）
+  → 查 content_hash / 批内集合（精确重复）
+  → 解码（EXIF 方向、尺寸与分配上限）
+  → 记录宽高 / 格式 / alpha
+  → 512px WebP 缩略图
+  → 256 位 pHash
+  → 4 色 / 8 色主色
   → 原子发布原图 <folder>/<hash>.<ext>
-  → 追加缩略图到 pack，写 DB 指针
-  → 写 tags / score / imported_at
+  → 结果送入单写通道，批量入库
 ```
 
-关键约定：
-
-- **BLAKE3 内容哈希**是精确身份；同一内容只存一份。不同文件夹导入相同内容不会产生第二行。
-- 原图文件名是 `<content_hash>.<ext>`；扩展名小写、无点。
-- 文件写入先落到 `.artbank/temp/`，`sync_all` 后 rename 到目标路径；跨卷或失败时清理临时文件。
-- EXIF 方向只影响派生数据（缩略图、pHash、主色）与查看器显示；原图字节不改。
-- 解码设置最大分配上限（例如 1 GiB）与最大像素数，防止异常大图拖垮进程；失败进入失败清单。
-- 单张图片只解码一次；缩略图、pHash、主色共用解码结果或低成本降采样结果。
-
-## 哈希与特征
+- 临时文件位于 `.artbank/temp/import-<jobId>/`，保留源扩展名：格式先按魔数判断，魔数不认识的格式（TGA）再用扩展名兜底；成功发布后目录整体清理。
+- 原图按 `<content_hash>.<ext>` 命名；扩展名取自解码后的格式（`jpeg → jpg`，其余与格式名一致），不跟源文件名，避免改名文件的扩展名与 `format` 列矛盾。
+- 目标文件已存在（通常是上次崩溃留下的同内容文件）时复用，不覆盖；发布用 `rename`，不跨卷。
+- 解码上限：单边 65535、总像素 1 亿、解码分配 512 MiB。超限进入失败清单。
+- EXIF 方向由 `image` crate 的 `ImageDecoder::orientation()` 读取并 `apply_orientation`，只影响缩略图、pHash、主色与后续显示，不改原图字节。
 
 ### pHash（256 位）
 
-1. 缩略图转灰度并缩放到 32×32。
+1. 转灰度并缩放到 32×32。
 2. 做二维 DCT-II，取左上 16×16 低频系数。
-3. 按这些系数的中位数二值化，得到 256 bit，存为 32 字节 BLOB。
+3. DC 分量不参与中位数；绝对值小于 0.5 的系数归零，避免纯色图的浮点噪声随机点亮一半的位。
+4. 按其余系数中位数二值化，得到 256 bit，存 32 字节 BLOB。
 
-用途：找相似、排序、疑似重复提示。汉明距离越小越相似。它是派生特征，不参与主键；编辑后可重算。
+用途是相似度与疑似重复提示，不参与主键。相似度扫描用 4 个 `u64` 做异或+popcount。
 
 ### 主色 4 / 8
 
-1. 缩略图缩到约 64px。
-2. 转 OKLab（或 Lab）做 k-means，4/8 个簇，固定迭代上限。
-3. 每簇存 `(r, g, b, weight)` 各 1 字节；weight 归一化到 0-255。
+1. 缩略到 64×64（Triangle）。
+2. 转 OKLab，使用固定种子的 k-means++ 初始化，最多 12 次迭代。
+3. 每簇存 `(r, g, b, weight)` 各 1 字节；权重按最大余数法合计 255。
+4. 4 色 16 字节、8 色 32 字节；按权重降序。
 
-存 16 字节 / 32 字节 BLOB。相似度用加权颜色距离，不追求与原 OpenCV EMD 逐值一致；目标是稳定、可解释、够快。
+不追求与旧 OpenCV EMD 逐值一致；目标是稳定、可解释、支持加权颜色距离。透明图的主色与 pHash 都按解码后的 RGB 计算，不额外合成背景；缩略图保留 alpha。
 
-## 缩略图
+### 重复策略
 
-- 最长边 512px，保持宽高比；不存多档尺寸，网格由浏览器缩放。
-- 文件名不独立存在，写入追加式包：
-  ```text
-  .artbank/thumbs/0001.pack   默认每段 1 GiB，超过后开新段
-  DB: thumb_segment, thumb_offset, thumb_length, thumb_format,
-      thumb_width, thumb_height, thumb_version
-  ```
-- 包只追加，不改写旧字节；编辑重算缩略图时追加新 blobs 并更新指针，旧 blobs 成为垃圾，由维护任务压缩。
-- 写入由一个缩略图写线程串行执行，按批 flush；数据库指针在同一批事务中提交。崩溃最多留下未引用的 blob，不破坏已提交行。
-- `thumb_version` 每次重算 +1；前端 URL 带 `?v=`，避免浏览器缓存旧图。
-- 读取由 Tauri 自定义协议 `thumb://`（Windows 上表现为 `http://thumb.localhost`）完成：按 segment/offset/length 读字节，返回正确 `Content-Type` 与长缓存头。
-- 格式首选 **WebP quality 80**（透明图同样支持），备选 JPEG q82（不透明）/ PNG（透明）。编码器选型在 Stage 1 实测：优先静态链接 libwebp，不产生 DLL；若构建不可接受则回退纯 Rust JPEG/PNG。
+- **精确重复**：`content_hash` 已存在。默认跳过并计入“重复跳过”；选择“合并元数据”时标签取并集、评分取较高值、更新 `modified_at`。
+- **批内重复**：HashSet 在发布前占位，同一批内相同内容只保留一份。批内重复即使选择合并也按跳过处理，避免写入顺序不确定。
+- **感知重复**：导入时把新 pHash 与库内 pHash 线性比较（默认汉明距离阈值 6/256），只记录提示，不自动跳过。任务开始时一次性载入库内 pHash 的 4×`u64` 紧凑数组；新入库图片在提交后追加。20 万规模约 6.4 MB 原始数据，S7 再加分桶/索引。
+- 感知提示最多保留 100 条；结果里显示 `imageId / similarTo / distance`。
+- 回收站中的同内容图片仍视为已存在；导入不会自动恢复，回收站语义在 S3 接入。
 
-实测依据见 [性能基准](../guides/performance.md)：150 张 512px WebP 冷加载 437ms，体积约为 JPEG 的一半；缩略图包 15 万次随机读比逐文件快约 16 倍。
+### 缩略图包与指针
 
-## 重复策略
+- 缩略图最长边 512px、WebP quality 80；透明图走 RGBA。
+- 追加式 `.pack`：`0001.pack` 起、16 字节段头（`ARTBTHM1` + u32 版本 + 4 字节保留）、默认 1 GiB/段。
+- 写入由单写通道串行执行，每个 blob 后 flush；读取按 segment 缓存句柄并定位读，单 blob 上限 32 MiB。
+- pack 不做逐 blob fsync。进程崩溃只会留下未引用 blob；断电后指针可能失效，按缓存缺失处理，由维护任务重建。
+- 每批事务内写入 `thumb_segment / thumb_offset / thumb_length / thumb_format / thumb_width / thumb_height / thumb_version = 1`，同时维护 `thumb_segments` 行与段文件尺寸。
+- 崩溃最多留下未引用的 blob；已提交行不受影响。pack 丢失或指针失效时协议返回 404，由前端显示占位，不会崩溃。
 
-- **精确重复**：`content_hash` 已存在 → 默认跳过并计入报告；可选“合并元数据”把新标签并入、评分取较高值。
-- **感知重复**：pHash 汉明距离低于阈值（默认建议 6/256，可调）→ 不自动跳过，只在导入结果里标记“疑似重复”，由用户决定。原实现直接按 pHash 去重，会误伤近似但不同的图。
-- 同一批内用一个内存 `HashSet` 去重，避免同批并发重复写入。
-- 编辑后若新内容哈希与另一张图冲突，拒绝保存并提示，不自动合并。
+### `thumb://` 协议
 
-## 并发与进度
+- URL：`thumb://<imageId>?v=<thumbVersion>`。Windows 的 WebView2 只接受 `http://thumb.localhost/<imageId>?v=<thumbVersion>`；前端统一经 `src/shared/thumbUrl.ts` 的 `thumbnailUrl()` 生成，不自己拼字符串。
+- 查询串只作为浏览器缓存键，服务端只解析路径里的 id，不校验 `v`。
+- 响应头：`Content-Type` 取自 `thumb_format`（当前只有 `image/webp`）、`Content-Length`、`Cache-Control: public, max-age=31536000, immutable`、`ETag: "v<thumb_version>"`、`X-Content-Type-Options: nosniff`。
+- 状态码：id 不是整数 → 400；图库未打开、图片无缩略图、pack 缺失或指针越界 → 404；数据库与文件读取异常 → 500。错误响应带 `Cache-Control: no-store`，不会被长缓存钉住。
+- 开发构建另有 `thumb://bench/<index>?run=<n>`：读取应用内基准样本，`run` 变化即强制冷加载；`bench/` 前缀与图片 id 互不冲突。
 
-- 像素工作走 `rayon` 工作池，线程数默认 CPU 并行度 - 1，可在设置覆盖。
-- 数据库只有一个写者：工作线程把结果发到写通道，按 100-500 条批量写入。
-- 每张图有阶段：`读取`、`解码`、`缩略图`、`入库`。进度事件按 100ms 或阶段变化节流。
-- 取消：在任务边界检查取消标记；已经入库的图片保留，未完成的清理临时文件。
-- 失败清单：路径 + 原因（无法读取、格式不支持、哈希冲突、缩略图失败等），可复制。
+### 并发、进度与取消
 
-## 验收
+- 像素工作走 rayon 工作池；线程数取设置里的 `workerThreads`，为空时使用 CPU 并行度 - 1。
+- 结果通过有界通道送入唯一写线程；每 64 张或 250ms 批量提交；重复项最多攒 128 条。
+- 每张图的阶段：读取/哈希 → 解码/特征 → 发布 → 入库。界面显示当前文件名与总进度。
+- `import-progress` 事件每 150ms 推送一次；`import-finished` 在结束时推送完整快照。
+- 取消：工作线程在文件边界检查标记；已入库图片保留，未完成临时文件清理；写线程继续把已准备好的批次落库。
+- 同一时间只允许一个导入任务；导入期间禁止关闭、切换或移除图库。
+- 失败清单最多保留 200 条；每条包含路径与原因。
+- 结果快照保留最近 24 个新增图片 id，用于导入完成后的缩略图预览。
+- 内存峰值约为工作线程数 × 单图解码内存；默认 CPU 并行度 - 1，超大图多张并发时可在设置里降低 `workerThreads`。
 
-- 导入 1,000 张混合格式，UI 不冻结；进度与取消可用。
-- 同一批与跨批的精确重复都只保留一行；感知重复只提示。
-- 缩略图包写入后 DB 指针完整；删掉 pack 后能识别为“无缩略图”而不是崩溃。
-- 导入期间关闭应用：已提交的图片可用，临时文件在下次打开时清理。
-- 性能：至少 20 张/秒（本机开发档，含缩略图与特征）作为 Stage 1 的下限，实测后写入性能文档。
+## 前端契约
+
+- 命令入口：`src/modules/import/api.ts`。
+- 类型：`src/modules/import/types.ts`。
+- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `start_import` | `{ request }` | `ImportSnapshot`（立即返回，任务在后台执行） |
+| `cancel_import` | `{ jobId }` | `null` |
+| `get_import_status` | `{ jobId }` | `ImportSnapshot \| null` |
+
+`ImportRequest`：
+
+```text
+paths: string[]            绝对路径，文件或目录
+folder: string             图库内相对路径，根目录为 ""
+tags: string[]             初始标签
+score: number              0-5
+duplicatePolicy: "skip" | "merge"
+perceptualThreshold: number 默认 6，后端限制在 0-64
+```
+
+`workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
+
+`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
+
+事件名：`import-progress`、`import-finished`。
+
+## 验收结果（2026-10-23）
+
+自动测试覆盖并通过：
+
+- 混合 JPEG/PNG/BMP/WebP 导入：8 张全部入库，缩略图指针、pHash 与主色长度完整，原图文件存在；
+- EXIF 方向 6 的 JPEG 解码后宽高交换，方向 1 保持原尺寸；
+- 再次导入同一目录：8 张全部计为重复，新增 0；
+- TGA 通过扩展名兜底解码（魔数表里没有 TGA），得到正确格式与尺寸；
+- 合并策略：标签并集、评分取较高值；
+- 取消：已提交行数与数据库一致，临时目录为空；
+- 删除 pack：指针仍可读取，读取返回错误而不是 panic；
+- 1000 张 768×512 混合格式（4 线程）：`imported=1000, failed=0, elapsed=19.99s, 50.0 张/秒`（复跑 20.97s / 47.7 张/秒），高于 20 张/秒门槛。
+
+运行吞吐基准：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
+```
+
+## 尚未实现
+
+- 剪贴板图片/路径输入。
+- HEIC/AVIF 解码。
+- “保留源目录层级”选项；当前所有图片进入指定目标文件夹。
+- 移动模式；默认只复制，不改用户原文件。源目录若在图库内，原文件也不会被移动或删除；请优先从图库外导入。
+- 感知重复的分桶索引与阈值标定（S7 用真实样本做）。
+- 导入完成后的网格浏览（S2）；当前只显示最近 24 张缩略图预览。
+- 删除 pack 后的网格占位组件（S2）；协议层已返回 404。

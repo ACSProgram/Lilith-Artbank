@@ -1,10 +1,12 @@
 mod app;
+mod imageops;
+mod import;
 mod library;
 
 use tauri::Manager;
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |application, _args, _cwd| {
                 if let Some(window) = application.get_webview_window("main") {
@@ -29,7 +31,10 @@ pub fn run() {
                 .max_file_size(4_000_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                 .build(),
-        )
+        );
+    let builder = app::thumb_protocol::register(builder);
+
+    builder
         .setup(|application| {
             let config_dir = application.path().app_config_dir()?;
             std::fs::create_dir_all(&config_dir)?;

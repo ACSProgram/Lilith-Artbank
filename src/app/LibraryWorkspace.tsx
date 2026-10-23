@@ -1,8 +1,20 @@
-import { Database, FolderOpen, Images, RefreshCw, Trash2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Activity,
+  Database,
+  FolderOpen,
+  Images,
+  RefreshCw,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
 import { Button, IconButton } from "../shared/components/Button";
+import { ImportDialog } from "../modules/import/ImportDialog";
 import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
+import { ThumbBenchOverlay } from "./ThumbBenchOverlay";
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -11,14 +23,48 @@ function errorMessage(error: unknown): string {
 }
 
 const upcoming = [
-  ["Stage 1", "导入、内容哈希、pHash、主色与缩略图包"],
   ["Stage 2", "虚拟化网格、列表视图、选择与键盘操作"],
   ["Stage 3", "标签/评分/描述、筛选、排序、集合与回收站"],
+  ["Stage 4", "查看器、旋转/翻转/裁剪/调尺寸"],
 ];
 
 export function LibraryWorkspace() {
   const { current, refreshStatus, closeLibrary } = useAppRuntime();
   const { notify, confirm } = useNotices();
+  const [benchOpen, setBenchOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [pendingPaths, setPendingPaths] = useState<string[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const importOpenRef = useRef(false);
+  importOpenRef.current = importOpen;
+
+  useEffect(() => {
+    if (browserPreview) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+      if (disposed) return;
+      unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+        const type = event.payload.type;
+        if (type === "enter" || type === "over") {
+          setDragging(true);
+        } else if (type === "leave") {
+          setDragging(false);
+        } else if (type === "drop") {
+          setDragging(false);
+          if (!importOpenRef.current && event.payload.paths.length > 0) {
+            setPendingPaths(event.payload.paths);
+            setImportOpen(true);
+          }
+        }
+      });
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   if (!current) return null;
 
@@ -45,6 +91,20 @@ export function LibraryWorkspace() {
     }
   };
 
+  const openImport = (paths: string[] = []) => {
+    if (browserPreview) {
+      notify("导入需要 Tauri 桌面窗口", "info", "浏览器预览不会读写真实图库。");
+      return;
+    }
+    setPendingPaths(paths);
+    setImportOpen(true);
+  };
+
+  const closeImport = () => {
+    setImportOpen(false);
+    setPendingPaths([]);
+  };
+
   return (
     <div className="workspace">
       <header className="workspace-toolbar">
@@ -58,6 +118,24 @@ export function LibraryWorkspace() {
           </div>
         </div>
         <div className="workspace-actions">
+          {import.meta.env.DEV && !browserPreview ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Activity size={14} />}
+              onClick={() => setBenchOpen(true)}
+            >
+              缩略图基准
+            </Button>
+          ) : null}
+          <Button
+            size="sm"
+            variant="primary"
+            icon={<Upload size={14} />}
+            onClick={() => openImport()}
+          >
+            导入图片
+          </Button>
           <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} onClick={() => void handleRefresh()}>
             刷新状态
           </Button>
@@ -89,7 +167,7 @@ export function LibraryWorkspace() {
             <span className="stat-label">Schema</span>
           </div>
         </div>
-        <div className="stat-card stat-card-path">
+        <div className="stat-card">
           <span className="stat-icon"><FolderOpen size={18} /></span>
           <div>
             <span className="stat-value stat-value-small" title={current.path}>{current.path}</span>
@@ -102,10 +180,17 @@ export function LibraryWorkspace() {
         <div className="workspace-empty-icon">
           <Images size={34} />
         </div>
-        <h2>图库已就绪</h2>
+        <h2>{current.imageCount > 0 ? "图库已有内容" : "把图片拖进来"}</h2>
         <p>
-          数据库、清单与目录结构已经建立。下一阶段接入导入管线与缩略图包后，这里会出现虚拟化网格。
+          {current.imageCount > 0
+            ? `已经收进 ${current.imageCount.toLocaleString()} 张图片。导入会继续追加，重复内容按内容哈希跳过或合并。`
+            : "把图片或文件夹拖进窗口，或者从本地选择。原图复制入库，缩略图、pHash 与主色同步生成。"}
         </p>
+        <div className="workspace-empty-actions">
+          <Button variant="primary" icon={<Upload size={15} />} onClick={() => openImport()}>
+            {current.imageCount > 0 ? "继续导入" : "导入图片"}
+          </Button>
+        </div>
         <div className="stage-list">
           {upcoming.map(([stage, text]) => (
             <div key={stage} className="stage-item">
@@ -116,10 +201,28 @@ export function LibraryWorkspace() {
         </div>
         {browserPreview ? (
           <p className="workspace-note">
-            浏览器预览模式不会创建真实数据库；请用 <code>npm run tauri dev</code> 验证图库读写。
+            浏览器预览模式不会创建真实数据库；请用 <code>npm run tauri dev</code> 验证导入与图库读写。
           </p>
         ) : null}
       </div>
+
+      <ThumbBenchOverlay open={benchOpen} onClose={() => setBenchOpen(false)} />
+      <ImportDialog
+        open={importOpen}
+        initialPaths={pendingPaths}
+        onClose={closeImport}
+        onFinished={() => void refreshStatus()}
+      />
+
+      {dragging && !importOpen ? (
+        <div className="drop-overlay">
+          <div className="drop-overlay-card">
+            <Upload size={30} />
+            <strong>松开即可导入</strong>
+            <span>图片会被复制到当前图库</span>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

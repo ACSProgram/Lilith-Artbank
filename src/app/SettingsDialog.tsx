@@ -333,12 +333,12 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
             </div>
           </Section>
 
-          <Section title="界面" description="当前只提供深色工作台；浅色主题在后续阶段接入。">
+          <Section title="界面" description="当前使用 Lilith Artworks 风格的浅色工作台。">
             <div className="theme-row">
               <span className="theme-swatch" />
               <div>
-                <strong>深色</strong>
-                <small>中性灰底，避免干扰素材本身的颜色判断。</small>
+                <strong>浅色</strong>
+                <small>暖白底、深绿强调色，减少界面对素材颜色的干扰。</small>
               </div>
             </div>
           </Section>

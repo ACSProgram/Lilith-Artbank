@@ -5,6 +5,8 @@ import type {
   LibraryInfo,
   LibraryInspection,
   Settings,
+  ThumbBenchInfo,
+  ThumbReadStats,
 } from "./types";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -25,7 +27,7 @@ const defaultSettings: Settings = {
     thumbnailCacheMb: 1024,
   },
   ui: {
-    theme: "dark",
+    theme: "light",
     gridThumbPx: 220,
   },
 };
@@ -160,6 +162,21 @@ export const appApi = {
       return { version: "0.1.0", settingsPath: "(浏览器预览模式)" };
     }
     return invoke<AppInfo>("get_app_info");
+  },
+
+  async thumbBenchPrepare(): Promise<ThumbBenchInfo> {
+    if (!isTauri()) throw new Error("缩略图基准只在 Tauri 开发构建中可用");
+    return invoke<ThumbBenchInfo>("thumb_bench_prepare");
+  },
+
+  async thumbBenchMeasureRead(): Promise<ThumbReadStats> {
+    if (!isTauri()) throw new Error("缩略图基准只在 Tauri 开发构建中可用");
+    return invoke<ThumbReadStats>("thumb_bench_measure_read");
+  },
+
+  async thumbBenchCleanup(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("thumb_bench_cleanup");
   },
 
   async windowMinimize(): Promise<void> {
