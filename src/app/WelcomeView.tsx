@@ -3,12 +3,7 @@ import { Button } from "../shared/components/Button";
 import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
-}
+import { errorMessage } from "../shared/errors";
 
 export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
   const { settings, openLibrary } = useAppRuntime();

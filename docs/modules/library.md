@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0/S1/S2 已实现的契约；元数据编辑、集合与回收站操作在后续阶段追加。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0–S3 已实现的契约；AI 任务、feature pack、查看器与图像编辑在后续阶段追加。
 
 ## 图库清单
 
@@ -72,10 +72,11 @@ thumb_segment / thumb_offset / thumb_length / thumb_format
 thumb_width / thumb_height / thumb_version
 ```
 
-- `deleted_at IS NULL` 表示正常；非空表示回收站。原图在永久删除前不移动。
-- `thumb_segment = 0` 表示还没有缩略图；`thumb_version` 用于 URL 缓存失效。
+- `deleted_at IS NULL` 表示正常；非空表示回收站。软删除不移动原图；永久删除先删数据库行，再删原图文件。
+- `thumb_segment = 0` 表示还没有缩略图；`thumb_version` 用于 URL 缓存失效。缩略图包追加写入，永久删除图片不会回收包内字节。
 - `feature_blobs` 只存位置与模型/维度，不存向量本体；避免主库膨胀。
-- FTS5 使用 `trigram` tokenizer，支持中文子串；查询少于 3 个字符时回退 `LIKE`（Stage 3 实现）。
+- FTS5 使用 `trigram` tokenizer，支持中文子串；查询少于 3 个字符时回退 `LIKE`（S3 实现）。
+- 描述、标签、回收站、集合关系与 FTS 索引由 schema 触发器/外键维护；应用不手工写 FTS 表。
 - 不保存原始文件名；原图文件名就是 `<content_hash>.<ext>`。列表显示尺寸、格式、大小、评分、标签与时间，不以文件名作为标识。
 
 ### 索引
@@ -127,6 +128,27 @@ ui                 { theme, gridThumbPx }
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
 | `get_folders` | — | `FolderInfo[]` |
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
+| `search_tags` | `{ query, limit? }` | `TagInfo[]` |
+| `get_image_detail` | `{ imageId }` | `ImageDetails` |
+| `update_image_score` | `{ imageId, score }` | `null` |
+| `set_images_score` | `{ imageIds, score }` | 更新行数 |
+| `update_image_description` | `{ imageId, description }` | `null` |
+| `set_image_tags` | `{ imageId, tagNames }` | `TagRef[]` |
+| `add_tags_to_images` | `{ imageIds, tagNames }` | 新增关系数 |
+| `remove_tags_from_images` | `{ imageIds, tagNames }` | 删除关系数 |
+| `rename_tag` | `{ tagId, name }` | `null` |
+| `delete_tag` | `{ tagId }` | 删除关系数 |
+| `move_images_to_folder` | `{ imageIds, folderPath }` | `MoveReport` |
+| `trash_images` / `restore_images` | `{ imageIds }` | 更新行数 |
+| `delete_images_permanently` | `{ imageIds }` | `DeleteReport` |
+| `empty_trash` | — | `DeleteReport` |
+| `get_collections` | — | `CollectionInfo[]` |
+| `create_collection` | `{ name }` | `CollectionInfo` |
+| `rename_collection` | `{ collectionId, name }` | `null` |
+| `delete_collection` | `{ collectionId }` | 删除条目数 |
+| `reorder_collections` | `{ collectionIds }` | `null` |
+| `add_images_to_collection` / `remove_images_from_collection` | `{ collectionId, imageIds }` | 变更条目数 |
+| `combine_collections` | `{ mode, collectionIds, name }` | `CollectionInfo` |
 | `copy_text` | `{ text }` | `null` |
 | `window_minimize` / `window_toggle_maximize` / `window_is_maximized` / `window_close` | — | 窗口控制 |
 | `get_app_info` | — | `{ version, settingsPath }` |
@@ -141,6 +163,13 @@ ui                 { theme, gridThumbPx }
 
 `LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`schemaVersion`、`openedAt`。
 
+S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
+
+- 元数据写入都走单写连接；批量操作按 400 个 id 分块。
+- 文件夹移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除先删行再删文件。
+- 文件操作（移动、永久删除、清空回收站）与导入、图库切换共用 `maintenance` 守卫；长任务当前没有进度事件与取消。
+- 集合只引用图片 id；集合运算新建集合，不修改源集合。
+
 ## 生命周期
 
 - `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 加入设置 → 打开。
@@ -153,9 +182,9 @@ ui                 { theme, gridThumbPx }
 
 ## 已实现与未实现
 
-已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表（见 [浏览与检索](browse-and-query.md)）。
+已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空。详见 [浏览与检索](browse-and-query.md)。
 
-未实现（后续阶段）：元数据编辑、搜索、集合、回收站操作、feature pack、AI 任务、原图查看器与编辑。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
+未实现（后续阶段）：feature pack 与 AI 任务、原图查看器与图像编辑、颜色/pHash/CLIP/pose 相似度、长任务进度/取消。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
 ## 测试
 
@@ -167,6 +196,9 @@ ui                 { theme, gridThumbPx }
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 导入仓储插入、内容哈希冲突与合并元数据；
 - 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）；
-- S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id、拒绝集合/搜索参数。
+- S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；
+- S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
+- S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复/永久删除/清空回收站；
+- S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集。
 
 性能基准（默认忽略）见 [性能基准](../guides/performance.md)。

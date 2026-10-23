@@ -4,6 +4,7 @@ import { Button } from "../shared/components/Button";
 import { appApi } from "./api";
 import { benchThumbnailUrl } from "../shared/thumbUrl";
 import type { ThumbBenchInfo, ThumbReadStats } from "./types";
+import { errorMessage } from "../shared/errors";
 
 interface LoadResult {
   id: number;
@@ -18,12 +19,6 @@ interface LoadResult {
 interface ThumbBenchOverlayProps {
   open: boolean;
   onClose: () => void;
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
 }
 
 function formatBytes(bytes: number): string {

@@ -1,0 +1,554 @@
+use std::collections::HashSet;
+
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    app::error::{AppError, AppResult},
+    library::{db::LibraryDb, placeholders, service::now_ms},
+};
+
+const SQL_CHUNK: usize = 400;
+const MAX_IMAGES: usize = 1_000_000;
+const MAX_COMBINE_COLLECTIONS: usize = 32;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionInfo {
+    pub id: i64,
+    pub name: String,
+    pub sort_order: i64,
+    pub image_count: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CombineMode {
+    Union,
+    Intersection,
+    Difference,
+}
+
+pub fn list(database: &LibraryDb) -> AppResult<Vec<CollectionInfo>> {
+    database.with_reader(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT collections.id, collections.name, collections.sort_order,
+                    collections.created_at, collections.updated_at,
+                    (SELECT count(*) FROM collection_items
+                     JOIN images ON images.id = collection_items.image_id
+                     WHERE collection_items.collection_id = collections.id
+                       AND images.deleted_at IS NULL)
+             FROM collections
+             ORDER BY collections.sort_order, collections.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CollectionInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                sort_order: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                image_count: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+}
+
+pub fn create(database: &LibraryDb, name: &str) -> AppResult<CollectionInfo> {
+    let name = validate_name(name)?;
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        ensure_unique_name(&transaction, &name, None)?;
+        let sort_order: i64 = transaction.query_row(
+            "SELECT coalesce(max(sort_order), -1) + 1 FROM collections",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO collections(name, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![name, sort_order, now],
+        )?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(CollectionInfo {
+            id,
+            name,
+            sort_order,
+            image_count: 0,
+            created_at: now,
+            updated_at: now,
+        })
+    })
+}
+
+pub fn rename(database: &LibraryDb, collection_id: i64, name: &str) -> AppResult<()> {
+    validate_id(collection_id)?;
+    let name = validate_name(name)?;
+    database.with_writer(|connection| {
+        ensure_unique_name(connection, &name, Some(collection_id))?;
+        let changed = connection.execute(
+            "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, now_ms(), collection_id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::message("集合不存在"));
+        }
+        Ok(())
+    })
+}
+
+pub fn delete(database: &LibraryDb, collection_id: i64) -> AppResult<u64> {
+    validate_id(collection_id)?;
+    database.with_writer(|connection| {
+        let items: i64 = connection.query_row(
+            "SELECT count(*) FROM collection_items WHERE collection_id = ?1",
+            [collection_id],
+            |row| row.get(0),
+        )?;
+        let changed =
+            connection.execute("DELETE FROM collections WHERE id = ?1", [collection_id])?;
+        if changed == 0 {
+            return Err(AppError::message("集合不存在"));
+        }
+        Ok(items as u64)
+    })
+}
+
+pub fn reorder(database: &LibraryDb, collection_ids: &[i64]) -> AppResult<()> {
+    let ids = validate_ids(collection_ids, 10_000)?;
+    database.with_writer(|connection| {
+        let existing: HashSet<i64> = connection
+            .prepare("SELECT id FROM collections")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        if existing.len() != ids.len() || !ids.iter().all(|id| existing.contains(id)) {
+            return Err(AppError::message("排序必须包含全部集合"));
+        }
+        let transaction = connection.transaction()?;
+        let now = now_ms();
+        for (index, id) in ids.iter().enumerate() {
+            transaction.execute(
+                "UPDATE collections SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                params![index as i64, now, id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+pub fn add_images(database: &LibraryDb, collection_id: i64, image_ids: &[i64]) -> AppResult<u64> {
+    validate_id(collection_id)?;
+    let ids = validate_ids(image_ids, MAX_IMAGES)?;
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        ensure_collection(&transaction, collection_id)?;
+        let mut position: i64 = transaction.query_row(
+            "SELECT coalesce(max(position), -1) + 1 FROM collection_items WHERE collection_id = ?1",
+            [collection_id],
+            |row| row.get(0),
+        )?;
+        let mut added = 0_u64;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO collection_items(collection_id, image_id, position)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                 ON CONFLICT(collection_id, image_id) DO NOTHING",
+            )?;
+            for image_id in ids {
+                let changed = statement.execute(params![collection_id, image_id, position])?;
+                position += 1;
+                added += changed as u64;
+            }
+        }
+        if added > 0 {
+            transaction.execute(
+                "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                params![now_ms(), collection_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(added)
+    })
+}
+
+pub fn remove_images(
+    database: &LibraryDb,
+    collection_id: i64,
+    image_ids: &[i64],
+) -> AppResult<u64> {
+    validate_id(collection_id)?;
+    let ids = validate_ids(image_ids, MAX_IMAGES)?;
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        ensure_collection(&transaction, collection_id)?;
+        let mut removed = 0_u64;
+        for chunk in ids.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            removed += transaction.execute(
+                &format!(
+                    "DELETE FROM collection_items
+                     WHERE collection_id = ?1 AND image_id IN ({marks})"
+                ),
+                params_from_iter(
+                    std::iter::once(Value::Integer(collection_id))
+                        .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                ),
+            )? as u64;
+        }
+        if removed > 0 {
+            transaction.execute(
+                "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                params![now_ms(), collection_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed)
+    })
+}
+
+pub fn combine(
+    database: &LibraryDb,
+    mode: CombineMode,
+    collection_ids: &[i64],
+    name: &str,
+) -> AppResult<CollectionInfo> {
+    let ids = validate_ids(collection_ids, MAX_COMBINE_COLLECTIONS)?;
+    if ids.len() < 2 {
+        return Err(AppError::message("集合运算至少需要两个集合"));
+    }
+    let name = validate_name(name)?;
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        ensure_unique_name(&transaction, &name, None)?;
+
+        let mut lists = Vec::with_capacity(ids.len());
+        for collection_id in &ids {
+            ensure_collection(&transaction, *collection_id)?;
+            let mut statement = transaction.prepare(
+                "SELECT image_id FROM collection_items
+                 WHERE collection_id = ?1 ORDER BY position, image_id",
+            )?;
+            lists.push(
+                statement
+                    .query_map([collection_id], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+
+        let combined = combine_ids(mode, &lists);
+        let sort_order: i64 = transaction.query_row(
+            "SELECT coalesce(max(sort_order), -1) + 1 FROM collections",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO collections(name, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![name, sort_order, now],
+        )?;
+        let collection_id = transaction.last_insert_rowid();
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO collection_items(collection_id, image_id, position)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (position, image_id) in combined.iter().enumerate() {
+                statement.execute(params![collection_id, image_id, position as i64])?;
+            }
+        }
+        // imageCount 与 list() 保持同一口径：只统计未删除图片。
+        let image_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM collection_items
+             JOIN images ON images.id = collection_items.image_id
+             WHERE collection_items.collection_id = ?1 AND images.deleted_at IS NULL",
+            [collection_id],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(CollectionInfo {
+            id: collection_id,
+            name,
+            sort_order,
+            image_count: image_count.max(0) as u64,
+            created_at: now,
+            updated_at: now,
+        })
+    })
+}
+
+fn combine_ids(mode: CombineMode, lists: &[Vec<i64>]) -> Vec<i64> {
+    let first = &lists[0];
+    match mode {
+        CombineMode::Union => {
+            let mut seen = HashSet::new();
+            let mut result = Vec::new();
+            for list in lists {
+                for id in list {
+                    if seen.insert(*id) {
+                        result.push(*id);
+                    }
+                }
+            }
+            result
+        }
+        CombineMode::Intersection => {
+            let others: Vec<HashSet<i64>> = lists[1..]
+                .iter()
+                .map(|list| list.iter().copied().collect())
+                .collect();
+            let mut seen = HashSet::new();
+            first
+                .iter()
+                .copied()
+                .filter(|id| seen.insert(*id) && others.iter().all(|set| set.contains(id)))
+                .collect()
+        }
+        CombineMode::Difference => {
+            let others: HashSet<i64> = lists[1..]
+                .iter()
+                .flat_map(|list| list.iter().copied())
+                .collect();
+            let mut seen = HashSet::new();
+            first
+                .iter()
+                .copied()
+                .filter(|id| seen.insert(*id) && !others.contains(id))
+                .collect()
+        }
+    }
+}
+
+fn ensure_collection(connection: &Connection, collection_id: i64) -> AppResult<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+        [collection_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(AppError::message("集合不存在"));
+    }
+    Ok(())
+}
+
+fn ensure_unique_name(
+    connection: &Connection,
+    name: &str,
+    exclude_id: Option<i64>,
+) -> AppResult<()> {
+    let duplicate: Option<i64> = connection
+        .query_row(
+            "SELECT id FROM collections
+             WHERE name = ?1 COLLATE NOCASE AND id <> coalesce(?2, -1)",
+            params![name, exclude_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        return Err(AppError::message("已经有同名集合"));
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str) -> AppResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::message("集合名称不能为空"));
+    }
+    if name.chars().count() > 120 {
+        return Err(AppError::message("集合名称不能超过 120 个字符"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(AppError::message("集合名称包含控制字符"));
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_id(id: i64) -> AppResult<()> {
+    if id <= 0 {
+        return Err(AppError::message("集合 id 无效"));
+    }
+    Ok(())
+}
+
+fn validate_ids(values: &[i64], max: usize) -> AppResult<Vec<i64>> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        if *value <= 0 {
+            return Err(AppError::message("id 无效"));
+        }
+        if seen.insert(*value) {
+            result.push(*value);
+        }
+    }
+    if result.is_empty() {
+        return Err(AppError::message("没有提供 id"));
+    }
+    if result.len() > max {
+        return Err(AppError::message(format!("一次最多处理 {max} 项")));
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::library::{import::ensure_folder, service};
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        session: service::LibrarySession,
+        images: Vec<i64>,
+    }
+
+    fn fixture() -> Fixture {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = service::create(&root, "集合测试", 1).unwrap();
+        let images = session
+            .db
+            .with_writer(|connection| {
+                let folder = ensure_folder(connection, "", 1)?;
+                let mut ids = Vec::new();
+                for index in 0..6 {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description,
+                            imported_at, modified_at
+                         ) VALUES (?1, 'jpg', ?2, 1, 1, 1, 'jpeg', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        params![format!("{index:064x}"), folder],
+                    )?;
+                    ids.push(connection.last_insert_rowid());
+                }
+                Ok(ids)
+            })
+            .unwrap();
+        Fixture {
+            _temp: temp,
+            session,
+            images,
+        }
+    }
+
+    fn collection_ids(database: &LibraryDb, collection_id: i64) -> Vec<i64> {
+        database
+            .with_reader(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT image_id FROM collection_items
+                     WHERE collection_id = ?1 ORDER BY position, image_id",
+                )?;
+                Ok(statement
+                    .query_map([collection_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn creates_renames_reorders_and_deletes() {
+        let fixture = fixture();
+        let first = create(&fixture.session.db, "参考").unwrap();
+        let second = create(&fixture.session.db, "练习").unwrap();
+        assert!(create(&fixture.session.db, "参考").is_err());
+        rename(&fixture.session.db, first.id, "精选").unwrap();
+        reorder(&fixture.session.db, &[second.id, first.id]).unwrap();
+        let collections = list(&fixture.session.db).unwrap();
+        assert_eq!(collections[0].id, second.id);
+        assert_eq!(collections[1].name, "精选");
+        assert_eq!(delete(&fixture.session.db, first.id).unwrap(), 0);
+        assert_eq!(list(&fixture.session.db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn adds_and_removes_images_without_duplicates() {
+        let fixture = fixture();
+        let collection = create(&fixture.session.db, "参考").unwrap();
+        let ids = &fixture.images;
+        assert_eq!(
+            add_images(
+                &fixture.session.db,
+                collection.id,
+                &[ids[0], ids[2], ids[1]]
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            add_images(&fixture.session.db, collection.id, &[ids[0], ids[3]]).unwrap(),
+            1
+        );
+        assert_eq!(
+            collection_ids(&fixture.session.db, collection.id),
+            vec![ids[0], ids[2], ids[1], ids[3]]
+        );
+        assert_eq!(
+            remove_images(&fixture.session.db, collection.id, &[ids[2], ids[5]]).unwrap(),
+            1
+        );
+        assert_eq!(
+            collection_ids(&fixture.session.db, collection.id),
+            vec![ids[0], ids[1], ids[3]]
+        );
+        assert!(add_images(&fixture.session.db, 999, &[ids[0]]).is_err());
+    }
+
+    #[test]
+    fn combines_collections_with_set_operations() {
+        let fixture = fixture();
+        let ids = &fixture.images;
+        let first = create(&fixture.session.db, "A").unwrap();
+        let second = create(&fixture.session.db, "B").unwrap();
+        let third = create(&fixture.session.db, "C").unwrap();
+        add_images(&fixture.session.db, first.id, &[ids[0], ids[1], ids[2]]).unwrap();
+        add_images(&fixture.session.db, second.id, &[ids[1], ids[2], ids[3]]).unwrap();
+        add_images(&fixture.session.db, third.id, &[ids[2], ids[4]]).unwrap();
+
+        let union = combine(
+            &fixture.session.db,
+            CombineMode::Union,
+            &[first.id, second.id, third.id],
+            "并集",
+        )
+        .unwrap();
+        assert_eq!(
+            collection_ids(&fixture.session.db, union.id),
+            vec![ids[0], ids[1], ids[2], ids[3], ids[4]]
+        );
+
+        let intersection = combine(
+            &fixture.session.db,
+            CombineMode::Intersection,
+            &[first.id, second.id],
+            "交集",
+        )
+        .unwrap();
+        assert_eq!(
+            collection_ids(&fixture.session.db, intersection.id),
+            vec![ids[1], ids[2]]
+        );
+
+        let difference = combine(
+            &fixture.session.db,
+            CombineMode::Difference,
+            &[first.id, second.id, third.id],
+            "差集",
+        )
+        .unwrap();
+        assert_eq!(
+            collection_ids(&fixture.session.db, difference.id),
+            vec![ids[0]]
+        );
+    }
+}

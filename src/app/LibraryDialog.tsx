@@ -9,12 +9,7 @@ import { appApi, browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import type { LibraryInspection } from "./types";
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
-}
+import { errorMessage } from "../shared/errors";
 
 function basename(path: string): string {
   const trimmed = path.trim().replace(/[\\/]+$/, "");

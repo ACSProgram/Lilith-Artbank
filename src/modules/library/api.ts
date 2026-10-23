@@ -1,17 +1,46 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
+  mockAddTags,
+  mockAddToCollection,
+  mockCollections,
+  mockCombineCollections,
+  mockCreateCollection,
+  mockDeleteCollection,
+  mockDeleteImages,
+  mockDeleteTag,
+  mockEmptyTrash,
   mockFilterCounts,
   mockFolders,
+  mockImageDetail,
+  mockMoveImages,
   mockQueryIds,
   mockQueryPage,
+  mockRemoveFromCollection,
+  mockRemoveTags,
+  mockRenameCollection,
+  mockRenameTag,
+  mockReorderCollections,
+  mockRestoreImages,
+  mockSearchTags,
+  mockSetImageTags,
+  mockSetScores,
   mockTags,
+  mockTrashImages,
+  mockUpdateDescription,
+  mockUpdateScore,
 } from "./mock";
 import type {
+  CollectionInfo,
+  CombineMode,
+  DeleteReport,
   FilterCounts,
   FolderInfo,
+  ImageDetails,
   ImagePage,
   LibraryQuery,
+  MoveReport,
   TagInfo,
+  TagRef,
 } from "./types";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -33,12 +62,146 @@ export const libraryApi = {
   },
 
   async getFolders(): Promise<FolderInfo[]> {
-    if (!isTauri()) return mockFolders;
+    if (!isTauri()) return mockFolders();
     return invoke<FolderInfo[]>("get_folders");
   },
 
   async getTags(limit = 500): Promise<TagInfo[]> {
-    if (!isTauri()) return mockTags.slice(0, limit);
+    if (!isTauri()) return mockTags().slice(0, limit);
     return invoke<TagInfo[]>("get_tags", { limit });
+  },
+
+  async searchTags(query: string, limit = 50): Promise<TagInfo[]> {
+    if (!isTauri()) return mockSearchTags(query, limit);
+    return invoke<TagInfo[]>("search_tags", { query, limit });
+  },
+
+  async getImageDetail(imageId: number): Promise<ImageDetails> {
+    if (!isTauri()) return mockImageDetail(imageId);
+    return invoke<ImageDetails>("get_image_detail", { imageId });
+  },
+
+  async updateImageScore(imageId: number, score: number): Promise<void> {
+    if (!isTauri()) {
+      mockUpdateScore(imageId, score);
+      return;
+    }
+    return invoke("update_image_score", { imageId, score });
+  },
+
+  async setImagesScore(imageIds: number[], score: number): Promise<number> {
+    if (!isTauri()) return mockSetScores(imageIds, score);
+    return invoke<number>("set_images_score", { imageIds, score });
+  },
+
+  async updateImageDescription(imageId: number, description: string): Promise<void> {
+    if (!isTauri()) {
+      mockUpdateDescription(imageId, description);
+      return;
+    }
+    return invoke("update_image_description", { imageId, description });
+  },
+
+  async setImageTags(imageId: number, tagNames: string[]): Promise<TagRef[]> {
+    if (!isTauri()) return mockSetImageTags(imageId, tagNames);
+    return invoke<TagRef[]>("set_image_tags", { imageId, tagNames });
+  },
+
+  async addTagsToImages(imageIds: number[], tagNames: string[]): Promise<number> {
+    if (!isTauri()) return mockAddTags(imageIds, tagNames);
+    return invoke<number>("add_tags_to_images", { imageIds, tagNames });
+  },
+
+  async removeTagsFromImages(imageIds: number[], tagNames: string[]): Promise<number> {
+    if (!isTauri()) return mockRemoveTags(imageIds, tagNames);
+    return invoke<number>("remove_tags_from_images", { imageIds, tagNames });
+  },
+
+  async renameTag(tagId: number, name: string): Promise<void> {
+    if (!isTauri()) {
+      mockRenameTag(tagId, name);
+      return;
+    }
+    return invoke("rename_tag", { tagId, name });
+  },
+
+  async deleteTag(tagId: number): Promise<number> {
+    if (!isTauri()) return mockDeleteTag(tagId);
+    return invoke<number>("delete_tag", { tagId });
+  },
+
+  async moveImagesToFolder(imageIds: number[], folderPath: string): Promise<MoveReport> {
+    if (!isTauri()) return mockMoveImages(imageIds, folderPath);
+    return invoke<MoveReport>("move_images_to_folder", { imageIds, folderPath });
+  },
+
+  async trashImages(imageIds: number[]): Promise<number> {
+    if (!isTauri()) return mockTrashImages(imageIds);
+    return invoke<number>("trash_images", { imageIds });
+  },
+
+  async restoreImages(imageIds: number[]): Promise<number> {
+    if (!isTauri()) return mockRestoreImages(imageIds);
+    return invoke<number>("restore_images", { imageIds });
+  },
+
+  async deleteImagesPermanently(imageIds: number[]): Promise<DeleteReport> {
+    if (!isTauri()) return mockDeleteImages(imageIds);
+    return invoke<DeleteReport>("delete_images_permanently", { imageIds });
+  },
+
+  async emptyTrash(): Promise<DeleteReport> {
+    if (!isTauri()) return mockEmptyTrash();
+    return invoke<DeleteReport>("empty_trash");
+  },
+
+  async getCollections(): Promise<CollectionInfo[]> {
+    if (!isTauri()) return mockCollections();
+    return invoke<CollectionInfo[]>("get_collections");
+  },
+
+  async createCollection(name: string): Promise<CollectionInfo> {
+    if (!isTauri()) return mockCreateCollection(name);
+    return invoke<CollectionInfo>("create_collection", { name });
+  },
+
+  async renameCollection(collectionId: number, name: string): Promise<void> {
+    if (!isTauri()) {
+      mockRenameCollection(collectionId, name);
+      return;
+    }
+    return invoke("rename_collection", { collectionId, name });
+  },
+
+  async deleteCollection(collectionId: number): Promise<number> {
+    if (!isTauri()) return mockDeleteCollection(collectionId);
+    return invoke<number>("delete_collection", { collectionId });
+  },
+
+  async reorderCollections(collectionIds: number[]): Promise<void> {
+    if (!isTauri()) {
+      mockReorderCollections(collectionIds);
+      return;
+    }
+    return invoke("reorder_collections", { collectionIds });
+  },
+
+  async addImagesToCollection(collectionId: number, imageIds: number[]): Promise<number> {
+    if (!isTauri()) return mockAddToCollection(collectionId, imageIds);
+    return invoke<number>("add_images_to_collection", { collectionId, imageIds });
+  },
+
+  async removeImagesFromCollection(collectionId: number, imageIds: number[]): Promise<number> {
+    if (!isTauri()) return mockRemoveFromCollection(collectionId, imageIds);
+    return invoke<number>("remove_images_from_collection", { collectionId, imageIds });
+  },
+
+  async combineCollections(
+    mode: CombineMode,
+    collectionIds: number[],
+    name: string,
+  ): Promise<CollectionInfo> {
+    if (!isTauri()) return mockCombineCollections(mode, collectionIds, name);
+    return invoke<CollectionInfo>("combine_collections", { mode, collectionIds, name });
   },
 };

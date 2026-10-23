@@ -12,6 +12,7 @@ import type {
   ImportProgress,
   ImportSnapshot,
 } from "./types";
+import { errorMessage } from "../../shared/errors";
 
 const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff", "tga", "gif"];
 
@@ -22,12 +23,6 @@ interface ImportDialogProps {
   initialPaths: string[];
   onClose: () => void;
   onFinished: () => void;
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
 }
 
 function basename(path: string): string {

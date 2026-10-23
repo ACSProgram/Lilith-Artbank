@@ -12,7 +12,9 @@ use crate::{
     },
     import::{ImportRequest, job::ImportSnapshot},
     library::{
+        collections::{CollectionInfo, CombineMode},
         manifest::LibraryInspection,
+        metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::LibraryInfo,
     },
@@ -227,6 +229,179 @@ pub fn get_tags(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<Ta
     AppError::command(state.tags(limit))
 }
 
+#[tauri::command]
+pub fn search_tags(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<TagInfo>, String> {
+    AppError::command(state.search_tags(&query, limit))
+}
+
+#[tauri::command]
+pub fn get_image_detail(state: State<'_, AppState>, image_id: i64) -> Result<ImageDetails, String> {
+    AppError::command(state.image_detail(image_id))
+}
+
+#[tauri::command]
+pub fn update_image_score(
+    state: State<'_, AppState>,
+    image_id: i64,
+    score: i64,
+) -> Result<(), String> {
+    AppError::command(state.update_image_score(image_id, score))
+}
+
+#[tauri::command]
+pub fn set_images_score(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+    score: i64,
+) -> Result<u64, String> {
+    AppError::command(state.set_images_score(&image_ids, score))
+}
+
+#[tauri::command]
+pub fn update_image_description(
+    state: State<'_, AppState>,
+    image_id: i64,
+    description: String,
+) -> Result<(), String> {
+    AppError::command(state.update_image_description(image_id, &description))
+}
+
+#[tauri::command]
+pub fn set_image_tags(
+    state: State<'_, AppState>,
+    image_id: i64,
+    tag_names: Vec<String>,
+) -> Result<Vec<TagRef>, String> {
+    AppError::command(state.set_image_tags(image_id, &tag_names))
+}
+
+#[tauri::command]
+pub fn add_tags_to_images(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+    tag_names: Vec<String>,
+) -> Result<u64, String> {
+    AppError::command(state.add_tags(&image_ids, &tag_names))
+}
+
+#[tauri::command]
+pub fn remove_tags_from_images(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+    tag_names: Vec<String>,
+) -> Result<u64, String> {
+    AppError::command(state.remove_tags(&image_ids, &tag_names))
+}
+
+#[tauri::command]
+pub fn rename_tag(state: State<'_, AppState>, tag_id: i64, name: String) -> Result<(), String> {
+    AppError::command(state.rename_tag(tag_id, &name))
+}
+
+#[tauri::command]
+pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<u64, String> {
+    AppError::command(state.delete_tag(tag_id))
+}
+
+#[tauri::command]
+pub fn move_images_to_folder(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+    folder_path: String,
+) -> Result<MoveReport, String> {
+    AppError::command(state.move_images(&image_ids, &folder_path))
+}
+
+#[tauri::command]
+pub fn trash_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result<u64, String> {
+    AppError::command(state.trash_images(&image_ids))
+}
+
+#[tauri::command]
+pub fn restore_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result<u64, String> {
+    AppError::command(state.restore_images(&image_ids))
+}
+
+#[tauri::command]
+pub fn delete_images_permanently(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+) -> Result<DeleteReport, String> {
+    AppError::command(state.delete_images(&image_ids))
+}
+
+#[tauri::command]
+pub fn empty_trash(state: State<'_, AppState>) -> Result<DeleteReport, String> {
+    AppError::command(state.empty_trash())
+}
+
+#[tauri::command]
+pub fn get_collections(state: State<'_, AppState>) -> Result<Vec<CollectionInfo>, String> {
+    AppError::command(state.collections())
+}
+
+#[tauri::command]
+pub fn create_collection(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<CollectionInfo, String> {
+    AppError::command(state.create_collection(&name))
+}
+
+#[tauri::command]
+pub fn rename_collection(
+    state: State<'_, AppState>,
+    collection_id: i64,
+    name: String,
+) -> Result<(), String> {
+    AppError::command(state.rename_collection(collection_id, &name))
+}
+
+#[tauri::command]
+pub fn delete_collection(state: State<'_, AppState>, collection_id: i64) -> Result<u64, String> {
+    AppError::command(state.delete_collection(collection_id))
+}
+
+#[tauri::command]
+pub fn reorder_collections(
+    state: State<'_, AppState>,
+    collection_ids: Vec<i64>,
+) -> Result<(), String> {
+    AppError::command(state.reorder_collections(&collection_ids))
+}
+
+#[tauri::command]
+pub fn add_images_to_collection(
+    state: State<'_, AppState>,
+    collection_id: i64,
+    image_ids: Vec<i64>,
+) -> Result<u64, String> {
+    AppError::command(state.add_images_to_collection(collection_id, &image_ids))
+}
+
+#[tauri::command]
+pub fn remove_images_from_collection(
+    state: State<'_, AppState>,
+    collection_id: i64,
+    image_ids: Vec<i64>,
+) -> Result<u64, String> {
+    AppError::command(state.remove_images_from_collection(collection_id, &image_ids))
+}
+
+#[tauri::command]
+pub fn combine_collections(
+    state: State<'_, AppState>,
+    mode: CombineMode,
+    collection_ids: Vec<i64>,
+    name: String,
+) -> Result<CollectionInfo, String> {
+    AppError::command(state.combine_collections(mode, &collection_ids, &name))
+}
+
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         get_settings,
@@ -256,6 +431,29 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         query_image_ids,
         get_filter_counts,
         get_folders,
-        get_tags
+        get_tags,
+        search_tags,
+        get_image_detail,
+        update_image_score,
+        set_images_score,
+        update_image_description,
+        set_image_tags,
+        add_tags_to_images,
+        remove_tags_from_images,
+        rename_tag,
+        delete_tag,
+        move_images_to_folder,
+        trash_images,
+        restore_images,
+        delete_images_permanently,
+        empty_trash,
+        get_collections,
+        create_collection,
+        rename_collection,
+        delete_collection,
+        reorder_collections,
+        add_images_to_collection,
+        remove_images_from_collection,
+        combine_collections
     ]
 }

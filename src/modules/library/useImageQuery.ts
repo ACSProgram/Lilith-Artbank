@@ -2,17 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { libraryApi } from "./api";
 import { queryKey } from "./model";
 import type { ImageRow, LibraryQuery, QueryCursor } from "./types";
+import { errorMessage } from "../../shared/errors";
 
 /** 首屏状态：`error` 时整页显示错误与重试，`ready` 且无条目时显示空结果。 */
 export type QueryStatus = "loading" | "ready" | "error";
 /** 下一页状态；虚拟网格/列表底部据此显示载入中、失败重试或已到底。 */
 export type MoreStatus = "idle" | "loading" | "error";
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
-}
 
 export interface ImageQueryState {
   items: ImageRow[];

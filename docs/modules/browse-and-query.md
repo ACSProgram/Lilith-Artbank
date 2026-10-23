@@ -1,47 +1,80 @@
 # 浏览与检索
 
-S2 已实现“20-50 万条元数据 + 当前页 150 张缩略图”的基础浏览路径：Rust 键集查询、前端虚拟网格/列表、基础筛选、选择与键盘。前端不持有全库数组，每次只请求一页。
+S3 在 S2 的键集查询与虚拟网格之上补齐了搜索、扩展筛选、集合、回收站和详情/批量编辑。前端仍不持有全库数组，每次只请求一页；筛选计数只在筛选面板打开时计算。
 
-## 已实现范围
+## 查询 DTO
 
-统一查询 DTO（`src-tauri/src/library/query.rs` 与 `src/modules/library/types.ts`）：
+统一查询 DTO 位于 `src-tauri/src/library/query.rs` 与 `src/modules/library/types.ts`：
 
 ```text
 LibraryQuery {
-  view: "all" | "trash",          // "collection" 保留给 S3，当前会拒绝
-  collectionId?: number | null,   // 当前会拒绝
-  search: string,                 // S2 只接受空串，搜索在 S3
+  view: "all" | "trash" | "collection",
+  collectionId?: number | null,     // view=collection 时必填
+  search: string,
+  searchScope: "view" | "library",  // 默认只搜当前视图
   filters: {
     folderIds: number[],
     extensions: string[],
-    scores: number[],             // 0-5
+    scores: number[],               // 0-5
     tagIds: number[],
-    tagMode: "any" | "all"
+    tagMode: "any" | "all",
+    importedFrom?: number | null,   // 毫秒时间戳
+    importedTo?: number | null,
+    sizeMin?: number | null,        // 字节
+    sizeMax?: number | null,
+    description: "any" | "has" | "missing",
+    embedding: "any" | "has" | "missing",
+    pose: "any" | "has" | "missing"
   },
-  sort: { key: "importedAt" | "score" | "size", descending: boolean },
+  sort: {
+    key: "importedAt" | "score" | "size" | "collectionPosition",
+    descending: boolean
+  },
   cursor?: { sortKey: string, id: number } | null,
-  limit?: number | null           // 默认 150，限制 1-300
+  limit?: number | null             // 默认 150，限制 1-300
 }
 ```
 
 - 筛选去重并校验：文件夹最多 256、扩展名最多 32、评分只允许 0-5、标签最多 64。
-- 当前视图是 `all`；`trash` 查询已可用但还没有界面入口（S3）。
+- `collectionPosition` 只在集合视图有效；集合视图默认按手工顺序升序。
 - 排序键都是整数列，游标 `sortKey` 用十进制字符串传递。
-- 返回 `ImageRow` 只含列表需要的字段，不含 embedding/pose 本体：
+- `ImageRow` 新增 `deletedAt`；回收站行在网格/列表中带“回收站”前缀。
+- 返回行只含列表需要的字段，不含 embedding/pose 本体：
 
 ```text
 id, contentHash, fileExt, folderId, folderPath, filePath,
 fileSize, width, height, format, hasAlpha, score,
-importedAt, modifiedAt, thumbVersion, thumbWidth, thumbHeight,
+importedAt, modifiedAt, deletedAt, thumbVersion, thumbWidth, thumbHeight,
 tags: string[]
 ```
 
 - `filePath` 是原图的绝对路径（`<folder>/<content_hash>.<ext>`），用于“复制文件路径”。
-- 当前不保存原始文件名；网格显示尺寸、格式、大小与评分，列表额外显示标签、导入时间与文件夹。
+
+## 搜索
+
+搜索覆盖三类字段：描述、标签名、文件夹路径。前端在输入停止 260 ms 后提交查询。
+
+- 描述：3 个字符及以上走 FTS5 trigram（`image_search MATCH`），1-2 个字符回退 `LIKE` 子串匹配；标签名与文件夹路径始终用参数化 `LIKE`。
+- `searchScope=view`：在 `all`、`trash` 或当前集合内搜索；`searchScope=library`：忽略当前视图与集合，搜索整个图库（包含回收站），界面临时按“全部”展示，并禁用“集合内顺序”排序。
+- 命中条件是描述、标签、文件夹三者的并集，再与筛选条件取交集；不改变标签/文件夹筛选的语义。
+- 翻页与计数采用不同策略：
+  - 翻页（`SearchMode::Page`）：OR + `EXISTS`，让 `LIMIT 150` 尽早停止；
+  - 计数/全选（`SearchMode::Count`）：先一次性 `UNION` 出命中 id 的并集，避免每个候选行重复跑相关子查询。
+- 搜索框支持 `Ctrl/Cmd+F` 聚焦、`Esc` 清空并退出输入；工具栏有独立的“当前视图 / 全库”切换。
+
+## 筛选与计数
+
+- 筛选面板覆盖文件夹、扩展名、评分、标签（任一/全部）、导入时间范围、文件大小范围、有描述/有 embedding/有 pose。
+- 每个分面计数排除该分面自身的筛选条件。例如选中文件夹后，文件夹计数仍显示其他文件夹在其余筛选下的数量。
+- 搜索或集合视图下，计数用单条 `WITH matched AS MATERIALIZED (...)` 语句一次求出命中集，再在五个 `UNION ALL` 分支里分别统计总数/文件夹/扩展名/评分/标签；普通视图直接按分面查询。
+- 计数只在筛选面板打开时请求，面板内有 160 ms 防抖与加载态；搜索/集合很大时可能超过 100 ms（见[性能](../guides/performance.md)），不会阻塞网格翻页。
+- 标签管理器提供标签搜索、计数、重命名与删除；删除前在确认框显示影响数量。管理器一次只载入图片最多的 500 个标签，搜索在该列表内过滤。
 
 ## 命令契约
 
 前端入口：`src/modules/library/api.ts`（`copy_text` 经 `src/shared/clipboard.ts`）。参数使用 camelCase。
+
+### 查询与列表
 
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
@@ -50,6 +83,7 @@ tags: string[]
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
 | `get_folders` | — | `FolderInfo[]` |
 | `get_tags` | `{ limit? }` | `TagInfo[]`（默认/最多 500，按活跃图片数降序） |
+| `search_tags` | `{ query, limit? }` | `TagInfo[]`（按名称子串，最多 200） |
 | `copy_text` | `{ text }` | `null`（Rust `arboard` 写系统剪贴板） |
 
 `FilterCounts`：
@@ -64,9 +98,59 @@ tags: string[]
 }
 ```
 
-- 每个分面计数会排除该分面自身的筛选条件。例如选中文件夹后，文件夹计数仍显示其他文件夹在其余筛选下的数量。
-- `get_folders` 返回所有文件夹（含根目录）及其活跃图片总数；`get_tags` 只返回至少有一张活跃图片的标签。
-- 计数在打开筛选面板或筛选变化后计算一次，不在滚动时计算。
+### 详情与元数据
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `get_image_detail` | `{ imageId }` | `ImageDetails` |
+| `update_image_score` | `{ imageId, score }` | `null` |
+| `set_images_score` | `{ imageIds, score }` | 更新行数 |
+| `update_image_description` | `{ imageId, description }` | `null` |
+| `set_image_tags` | `{ imageId, tagNames }` | `TagRef[]` |
+| `add_tags_to_images` | `{ imageIds, tagNames }` | 新增关系数 |
+| `remove_tags_from_images` | `{ imageIds, tagNames }` | 删除关系数 |
+| `rename_tag` | `{ tagId, name }` | `null` |
+| `delete_tag` | `{ tagId }` | 删除关系数 |
+| `move_images_to_folder` | `{ imageIds, folderPath }` | `MoveReport` |
+
+- 描述保存时 `description_source` 固定为 `user`、清空 `description_model`，并由 schema 触发器同步 FTS。
+- 标签名忽略大小写去重；每张图最多 64 个标签，标签名最多 64 字符。
+- 文件夹移动先 `create_dir_all` 目标目录，再逐张 `rename` 原图并更新 `folder_id`；数据库更新失败时把文件移回原路径并记入失败清单。目标文件夹已存在时直接复用；同一文件夹的图片计入 `skipped`。
+- `MoveReport`：`{ moved, skipped, failures: [{ imageId?, path, reason }] }`。
+- 文件操作前校验内容哈希为 64 位十六进制、扩展名已规范化、目标目录 canonicalize 后仍位于图库根目录内。
+
+### 回收站
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `trash_images` | `{ imageIds }` | 更新行数 |
+| `restore_images` | `{ imageIds }` | 更新行数 |
+| `delete_images_permanently` | `{ imageIds }` | `DeleteReport` |
+| `empty_trash` | — | `DeleteReport` |
+
+- 软删除只写 `deleted_at`，原图不移动；恢复把 `deleted_at` 置空。
+- 永久删除在单个写事务里删除数据库行（标签、集合关系、FTS 由外键/触发器级联），提交后再删除原图文件；文件删除失败写入 `DeleteReport.failures`，数据库删除不回滚。
+- 缩略图包是追加式的，永久删除不会回收 pack 内的字节；`thumb://` 在行不存在时返回 404。
+- `DeleteReport`：`{ deleted, filesRemoved, failures }`。
+- 移入/恢复/永久删除/清空与导入、图库切换共用 `maintenance` 守卫：文件操作期间拒绝导入与生命周期切换。
+
+### 集合
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `get_collections` | — | `CollectionInfo[]` |
+| `create_collection` | `{ name }` | `CollectionInfo` |
+| `rename_collection` | `{ collectionId, name }` | `null` |
+| `delete_collection` | `{ collectionId }` | 删除条目数 |
+| `reorder_collections` | `{ collectionIds }` | `null` |
+| `add_images_to_collection` | `{ collectionId, imageIds }` | 新增条目数 |
+| `remove_images_from_collection` | `{ collectionId, imageIds }` | 移除条目数 |
+| `combine_collections` | `{ mode, collectionIds, name }` | `CollectionInfo` |
+
+- `CollectionInfo`：`{ id, name, imageCount, sortOrder, createdAt, updatedAt }`；`imageCount` 只统计未删除图片。
+- 加入集合自动追加到末尾；重复加入不改变顺序；集合名唯一（忽略大小写）。
+- `combine` 的 `mode` 为 `union` / `intersection` / `difference`，至少两个、最多 32 个集合；结果新建集合，顺序沿用第一个集合的手工顺序，再追加其余集合中新出现的 id。
+- 集合引用图片 id，不复制文件；图片内容哈希变化（S4 编辑）不影响集合关系。
 
 ## 查询与索引
 
@@ -80,84 +164,103 @@ WHERE (images.score, images.id) < (?, ?)
 WHERE (images.score, images.id) > (?, ?)
 ```
 
-- 视图条件：`deleted_at IS NULL`（all）或 `deleted_at IS NOT NULL`（trash）。
-- 文件夹筛选使用 `folder_id IN (...)`，当前是精确匹配，不自动包含子文件夹。
+- 视图条件：`deleted_at IS NULL`（all）、`deleted_at IS NOT NULL`（trash）、集合 `JOIN collection_items`（collection）。
+- 文件夹筛选使用 `folder_id IN (...)`，只做精确匹配，不自动包含子文件夹。
 - 扩展名、评分、标签筛选都用参数化 `IN`；标签 `all` 为每个标签一个 `EXISTS`。
-- 首屏、深分页、文件夹、标签都命中现有索引；20 万行实测见 [性能基准](../guides/performance.md)。
-- 标签摘要在一页返回后按页内 id 批量查询，避免 N+1。
+- 时间/大小范围是半开区间之外的闭区间（`>=` / `<=`）；描述/embedding/pose 用 `description <> ''` 或 `EXISTS feature_blobs`。
+- 首屏、深分页、文件夹、标签、集合都命中现有索引；20 万行实测见[性能基准](../guides/performance.md)。
+- 标签摘要在一页返回后按页内 id 批量查询，避免 N+1；详情侧栏单独读取 4/8 主色。
 
-## 前端虚拟化
-
-模块：
+## 前端模块
 
 ```text
 src/modules/library/
-  types.ts          边界 DTO
-  api.ts            Tauri 命令入口 + 浏览器预览 mock
-  mock.ts           浏览器预览用的确定性数据集与查询实现
-  model.ts          查询构造、分页常量、格式化、选择范围、筛选键
-  useImageQuery.ts  首屏/下一页、代次、查询与翻页状态类型、错误重试
-  LibraryView.tsx   控制器：筛选、排序、视图、选择、键盘、右键菜单
-  VirtualGrid.tsx   自适应列数虚拟网格
-  VirtualList.tsx   固定行高虚拟列表
-  virtual.ts        两个虚拟视图共用的滚动句柄类型
-  FilterPanel.tsx   基础筛选面板
-  LibraryThumbnail.tsx 占位、失败与重试
+  types.ts                  边界 DTO
+  api.ts                    Tauri 命令入口 + 浏览器预览 mock
+  mock.ts                   浏览器预览用的可变数据集与查询/编辑实现
+  model.ts                  BrowseState、查询构造、排序选项、格式化、筛选键
+  useImageQuery.ts          首屏/下一页、代次、查询与翻页状态类型、错误重试
+  LibraryView.tsx           控制器：视图/搜索/筛选/排序/选择/键盘/右键菜单
+  LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
+  ViewBar.tsx               全部/回收站标签、集合胶囊、集合管理入口、清空回收站
+  VirtualGrid.tsx           自适应列数虚拟网格
+  VirtualList.tsx           固定行高虚拟列表
+  virtual.ts                两个虚拟视图共用的滚动句柄类型
+  FilterPanel.tsx           完整筛选面板（含范围与存在性筛选）
+  Inspector.tsx             单张详情与批量编辑侧栏
+  CollectionManagerDialog.tsx 集合新建/重命名/删除/排序/运算
+  CollectionPickerDialog.tsx  把选中图片加入现有或新集合
+  TagManagerDialog.tsx      标签搜索、重命名、删除
+  LibraryThumbnail.tsx      占位、失败与重试
 ```
 
 - 网格列数由容器宽度和设置里的 `ui.gridThumbPx` 决定；只挂载视口前后各一屏的行。
 - 列表固定 44px 行高，32px 粘性表头；窄窗口隐藏“导入时间/文件夹”列。
-- 缩略图只挂载当前可见 + 前后一屏的单元格；`<img decoding="async">` 指向 `thumb://`。失败显示占位，点击重试会给 URL 加 `retry` 参数绕过失败缓存。
-- 浏览器预览（无 Tauri）用 4,000 行确定性 mock 数据与 SVG data URL 缩略图；只用于 UI/布局检查，不代表真实性能。
+- 缩略图只挂载当前可见 + 前后一屏的单元格；`<img decoding="async">` 指向 `thumb://`。失败显示占位，点击重试会给 URL 加 `retry` 参数绕过失败缓存；缓存命中时挂载后补查 `img.complete`。
+- 浏览器预览（无 Tauri）用 4,000 行可变 mock 数据与 SVG data URL 缩略图；可编辑评分/标签/描述/文件夹、操作集合与回收站、执行集合运算；只用于 UI/布局检查，不代表真实性能。
 - 滚动接近已加载末尾时请求下一页；一页返回后追加，不整库载入。**限制**：已加载的页不会被回收，用户一直滚到全库末尾时前端会持有全部行；分页窗口回收留给 S9。
 
-## 选择、键盘与菜单
+## 视图、选择与键盘
 
+- 视图栏：全部 / 回收站两个标签、集合胶囊、集合管理、清空回收站。切回标签时搜索范围重置为“当前视图”。
+- 浏览历史保存完整的视图/搜索/筛选/排序快照；只有视图、搜索或筛选变化才新增记录（切换排序不单独入栈）。`Ctrl/Cmd+Z` 或工具栏后退按钮回到上一状态。
 - 单击选中；Ctrl/Cmd 单击切换；Shift 单击按当前已加载顺序区间选择。
 - `Ctrl+A` 调 `query_image_ids` 取当前筛选的全部 id，包含尚未滚动加载的图片；状态栏显示总数。
 - 方向键移动活动项（网格按列数上下移动），Shift+方向键扩展区间；PageUp/PageDown、Home/End 滚动。
 - Enter 或双击调用查看器入口；查看器本身在 S4，当前只提示占位。
-- Delete 在 S3 接入回收站，当前提示。
-- 右键菜单：打开查看器（占位）、复制文件路径、选择全部匹配项。
+- Delete/Backspace：普通视图移入回收站，回收站视图永久删除选中项。
+- 右键菜单：打开查看器（占位）、复制文件路径、选择全部匹配项、移入回收站/恢复、加入集合、从当前集合移出。
+- 详情侧栏在 980px 以下变为覆盖层；选中单张显示详情，多选显示批量编辑。
 - 复制路径走 Rust `copy_text`（`arboard`），浏览器预览回退到 clipboard API / `execCommand`。
-- 拖出到资源管理器（Windows OLE）本轮评估后未在 S2 实现；复制图片也留到 S4。当前可用的回退是复制文件路径。
+- 拖出到资源管理器（Windows OLE）仍未实现；复制图片留到 S4。
 
-## 筛选面板
+## 详情与批量编辑
 
-- 文件夹（复选）、扩展名、评分、标签（任一/全部），显示条件计数。
-- 标签过多时面板内可搜索标签名；列表最多 500 个。
-- “清除筛选”与筛选摘要行；“完成”只关闭面板，不撤销已应用的筛选。
-- 搜索、时间/大小范围、描述/embedding/pose/颜色/pHash 筛选在 S3/S7。
+- 详情：缩略图、评分星级、标签（自动补全）、描述编辑、文件夹移动、4/8 主色、尺寸/格式/大小/导入时间、复制哈希/路径、移入回收站/恢复/永久删除、加入/移出集合。
+- 批量：统一评分、批量加/删标签、移动文件夹或根目录、回收站操作、加入/移出集合。
+- 编辑成功后刷新当前页与分面选项；批量结果会提示失败清单。文件夹移动成功不再重复弹出二次提示。
+- 长任务（文件夹移动、永久删除、清空回收站）不提供进度事件或取消按钮；当前按批次串行执行，见[待办](../planning/todo.md)。
 
 ## 请求竞态与刷新
 
 - `useImageQuery` 为每次首屏请求递增代次；过期结果直接丢弃，不覆盖新视图。
 - 翻页请求与首屏共享代次；筛选/排序/刷新变化后旧页不会追加到新结果。
 - 首屏失败显示整页错误与重试；翻页失败保留已加载页，在列表底部提供重试。
-- 排序变化会重新从第一页加载并清空滚动位置，但保留图片选择；筛选变化会清空选择。
-- 导入结束会递增 `refreshToken`，重新查询第一页并刷新图库计数。
+- 排序变化会重新从第一页加载并清空滚动位置，但保留图片选择；搜索/筛选变化会清空选择。
+- 导入结束会递增 `refreshToken`，重新查询第一页并刷新图库计数；详情编辑递增本地 `dataVersion`。
 - 切换图库时 `LibraryView` 以图库 id 为 key 重新挂载，避免复用上一库的筛选与选择。
 
 ## 性能
 
-20 万行合成库、4 个读连接、开发档的查询引擎实测：
+20 万行合成库、4 个读连接、开发档实测（同一台机器；不同轮次受系统负载影响约 2 倍）：
 
 | 路径 | p50 | p95 | 预算 |
 | --- | --- | --- | --- |
-| 首屏 150（导入时间降序） | 0.62 ms | 0.79 ms | ≤50 ms |
-| 深分页 150（score/id 游标） | 1.08 ms | 1.24 ms | ≤50 ms |
-| 文件夹 150 | 0.58 ms | 0.83 ms | ≤50 ms |
-| 标签 150 | 2.91 ms | 3.16 ms | ≤50 ms |
-| 筛选分面计数 | 27.36 ms | 40.32 ms | ≤100 ms |
-| Ctrl+A 取 20 万 id | 17.61 ms | — | 未设硬门槛 |
+| 首屏 150（导入时间降序） | 0.70 ms | 1.31 ms | ≤50 ms |
+| 深分页 150（score/id 游标） | 2.59 ms | 5.36 ms | ≤50 ms |
+| 文件夹 150 | 1.55 ms | 3.74 ms | ≤50 ms |
+| 标签 150 | 5.65 ms | 7.87 ms | ≤50 ms |
+| 集合 150（手工顺序） | 1.65 ms | 2.53 ms | ≤50 ms |
+| 搜索 150（FTS trigram） | 8.78 ms | 14.15 ms | ≤50 ms |
+| 搜索 150（2 字 LIKE） | 1.40 ms | 4.93 ms | ≤50 ms |
+| 搜索 150（标签名） | 5.78 ms | 11.46 ms | ≤50 ms |
+| 搜索 150（文件夹路径） | 7.12 ms | 9.32 ms | ≤50 ms |
+| 筛选分面计数（普通视图） | 69.54 ms | 96.66 ms | ≤100 ms |
+| 筛选分面计数（FTS 搜索） | 132.56 ms | 144.38 ms | 超预算，面板显示加载态 |
+| 筛选分面计数（标签/文件夹搜索） | 99.86 / 79.85 ms | 107.71 / 109.96 ms | 约在预算边缘 |
+| 筛选分面计数（2 字搜索） | 825.88 ms | 878.44 ms | 超预算，面板显示加载态 |
+| 筛选分面计数（20 万条集合） | 778.83 ms | 819.69 ms | 超预算，面板显示加载态 |
+| Ctrl+A 取 20 万个 id | 41.36 ms | — | 未设硬门槛 |
 
-浏览器预览（724×712 CSS，4,000 行 mock）验证了 DOM 有界：加载 150 行时同时挂载 12-24 个单元格，加载 300 行后约 18 个；滚动到底会继续加载下一页；筛选/排序切换后回到第一页且无旧行残留。真实 WebView2 的 20 万行滚动帧率、150 张缩略图加载与真实美术样本仍需手工验收。
+- 2 字搜索必须全表扫描 `description`，无法使用 trigram 索引；20 万条集合的计数需要扫描集合命中集并聚合标签关系。两者都只在筛选面板打开时计算，并有加载态。
+- 搜索/集合分面计数使用单条 `MATERIALIZED` CTE，比逐分面重复求命中集快数倍；但 20 万级命中仍会超过 100 ms。普通视图计数仍在预算内。
+- 浏览器预览（724×712 CSS，4,000 行 mock）验证了 DOM 有界与全部 S3 交互；真实 WebView2 的 20 万行滚动帧率、150 张缩略图加载与真实美术样本仍需手工验收。
 
 ## 尚未实现
 
-- 文本搜索（FTS5 trigram）与搜索框；时间/大小、有描述/embedding/pose、颜色/pHash 筛选。
-- 集合视图与集合运算；回收站界面、移入/恢复/清空。
 - 列表列头点击排序、列隐藏；当前用工具栏排序。
 - 拖出到资源管理器（Windows OLE）、复制图片到剪贴板（S4）。
+- 颜色 / pHash / CLIP / pose 相似度筛选与排序（S7）。
 - 原始文件名：当前不入库；如需按文件名识别，需要 schema 变更与导入记录。
 - 已加载页的窗口回收；长时间滚动到 20 万末尾时前端内存会随已加载行增长。
+- 长任务进度/取消、已移出当前筛选的图片仍可能保持选中。

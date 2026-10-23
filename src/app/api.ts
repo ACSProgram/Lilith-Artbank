@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { MOCK_IMAGE_COUNT } from "../modules/library/mockConfig";
+import { mockLibraryCounts } from "../modules/library/mock";
 import type {
   AppInfo,
   LibraryEntry,
@@ -37,12 +37,13 @@ let mockSettings: Settings = structuredClone(defaultSettings);
 let mockCurrent: LibraryInfo | null = null;
 
 function mockLibrary(name: string, path: string): LibraryInfo {
+  const counts = mockLibraryCounts();
   return {
     id: crypto.randomUUID(),
     name,
     path,
-    imageCount: MOCK_IMAGE_COUNT,
-    trashCount: 0,
+    imageCount: counts.imageCount,
+    trashCount: counts.trashCount,
     schemaVersion: 1,
     openedAt: Date.now(),
   };
@@ -112,10 +113,11 @@ export const appApi = {
     if (!isTauri()) {
       const entry = mockSettings.libraries.find((library) => library.id === libraryId);
       if (!entry) throw new Error("图库不在列表中");
+      const counts = mockLibraryCounts();
       mockCurrent = {
         ...entry,
-        imageCount: MOCK_IMAGE_COUNT,
-        trashCount: 0,
+        imageCount: counts.imageCount,
+        trashCount: counts.trashCount,
         schemaVersion: 1,
         openedAt: Date.now(),
       };
@@ -133,7 +135,17 @@ export const appApi = {
   },
 
   async getLibraryStatus(): Promise<LibraryInfo | null> {
-    if (!isTauri()) return mockCurrent;
+    if (!isTauri()) {
+      if (mockCurrent) {
+        const counts = mockLibraryCounts();
+        mockCurrent = {
+          ...mockCurrent,
+          imageCount: counts.imageCount,
+          trashCount: counts.trashCount,
+        };
+      }
+      return mockCurrent;
+    }
     return invoke<LibraryInfo | null>("get_library_status");
   },
 

@@ -15,17 +15,12 @@ import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { ThumbBenchOverlay } from "./ThumbBenchOverlay";
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
-}
+import { errorMessage } from "../shared/errors";
 
 const upcoming = [
-  ["Stage 3", "标签/评分/描述、搜索、筛选、集合与回收站"],
   ["Stage 4", "查看器、旋转/翻转/裁剪/调尺寸"],
   ["Stage 5", "色彩/LUT/DFT/卷积与操作链撤销"],
+  ["Stage 6", "AI 描述、Embedding、Pose 与批量任务"],
 ];
 
 export function LibraryWorkspace() {
@@ -69,7 +64,7 @@ export function LibraryWorkspace() {
 
   if (!current) return null;
 
-  const hasImages = current.imageCount > 0;
+  const hasImages = current.imageCount > 0 || current.trashCount > 0;
 
   const handleImportFinished = () => {
     setRefreshToken((value) => value + 1);

@@ -3,12 +3,7 @@ import { appApi } from "./api";
 import { useNotices } from "./noticeContext";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
-}
+import { errorMessage } from "../shared/errors";
 
 export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const { notify } = useNotices();

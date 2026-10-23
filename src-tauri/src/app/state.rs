@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use parking_lot::Mutex;
 
@@ -13,19 +16,30 @@ use crate::{
         job::{ImportJob, ImportSnapshot},
     },
     library::{
+        collections::{self, CollectionInfo, CombineMode},
         db::LibraryDb,
         manifest::{LibraryInspection, inspect},
+        metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
         thumbs::ThumbPack,
     },
 };
 
+struct MaintenanceGuard<'a>(&'a AtomicBool);
+
+impl Drop for MaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub struct AppState {
     pub settings: SettingsStore,
     library: Mutex<Option<LibrarySession>>,
     thumb_bench: Mutex<Option<std::sync::Arc<ThumbBench>>>,
     import_job: Mutex<Option<std::sync::Arc<ImportJob>>>,
+    maintenance: AtomicBool,
 }
 
 impl AppState {
@@ -35,6 +49,7 @@ impl AppState {
             library: Mutex::new(None),
             thumb_bench: Mutex::new(None),
             import_job: Mutex::new(None),
+            maintenance: AtomicBool::new(false),
         }
     }
 
@@ -89,6 +104,7 @@ impl AppState {
         app: tauri::AppHandle,
         request: ImportRequest,
     ) -> AppResult<ImportSnapshot> {
+        self.ensure_no_activity()?;
         let mut request = request.normalized()?;
         request.worker_threads = self.settings.snapshot().performance.worker_threads;
 
@@ -143,15 +159,26 @@ impl AppState {
             .map(|job| job.snapshot())
     }
 
-    fn ensure_no_import(&self) -> AppResult<()> {
+    fn ensure_no_activity(&self) -> AppResult<()> {
+        if self.maintenance.load(Ordering::Acquire) {
+            return Err(AppError::message("文件操作进行中，请等待完成"));
+        }
         if self.import_running() {
             return Err(AppError::message("导入进行中，请等待完成或取消导入"));
         }
         Ok(())
     }
 
+    fn begin_maintenance(&self) -> AppResult<MaintenanceGuard<'_>> {
+        self.ensure_no_activity()?;
+        if self.maintenance.swap(true, Ordering::AcqRel) {
+            return Err(AppError::message("已有文件操作在运行"));
+        }
+        Ok(MaintenanceGuard(&self.maintenance))
+    }
+
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
-        self.ensure_no_import()?;
+        self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let (session, manifest) = service::create(path, name, read_connections)?;
         let info = session.info.clone();
@@ -167,7 +194,7 @@ impl AppState {
     }
 
     pub fn open_library(&self, path: &Path) -> AppResult<LibraryInfo> {
-        self.ensure_no_import()?;
+        self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let session = service::open(path, read_connections)?;
         let info = session.info.clone();
@@ -183,14 +210,14 @@ impl AppState {
     }
 
     pub fn close_library(&self) -> AppResult<()> {
-        self.ensure_no_import()?;
+        self.ensure_no_activity()?;
         *self.library.lock() = None;
         self.settings.set_last_library(None)?;
         Ok(())
     }
 
     pub fn remove_library(&self, library_id: &str) -> AppResult<Settings> {
-        self.ensure_no_import()?;
+        self.ensure_no_activity()?;
         let is_current = self
             .current()
             .map(|info| info.id == library_id)
@@ -252,5 +279,136 @@ impl AppState {
     pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
         let (database, _) = self.query_source()?;
         query::list_tags(&database, limit)
+    }
+
+    pub fn search_tags(&self, query_text: &str, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
+        let (database, _) = self.query_source()?;
+        query::search_tags(&database, query_text, limit)
+    }
+
+    pub fn image_detail(&self, image_id: i64) -> AppResult<ImageDetails> {
+        let (database, root) = self.query_source()?;
+        metadata::image_details(&database, &root, image_id)
+    }
+
+    pub fn update_image_score(&self, image_id: i64, score: i64) -> AppResult<()> {
+        let (database, _) = self.query_source()?;
+        metadata::update_score(&database, image_id, score)
+    }
+
+    pub fn set_images_score(&self, image_ids: &[i64], score: i64) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::set_scores(&database, image_ids, score)
+    }
+
+    pub fn update_image_description(&self, image_id: i64, description: &str) -> AppResult<()> {
+        let (database, _) = self.query_source()?;
+        metadata::update_description(&database, image_id, description)
+    }
+
+    pub fn set_image_tags(&self, image_id: i64, tag_names: &[String]) -> AppResult<Vec<TagRef>> {
+        let (database, _) = self.query_source()?;
+        metadata::set_image_tags(&database, image_id, tag_names)
+    }
+
+    pub fn add_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::add_tags(&database, image_ids, tag_names)
+    }
+
+    pub fn remove_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::remove_tags(&database, image_ids, tag_names)
+    }
+
+    pub fn rename_tag(&self, tag_id: i64, name: &str) -> AppResult<()> {
+        let (database, _) = self.query_source()?;
+        metadata::rename_tag(&database, tag_id, name)
+    }
+
+    pub fn delete_tag(&self, tag_id: i64) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::delete_tag(&database, tag_id)
+    }
+
+    pub fn move_images(&self, image_ids: &[i64], folder_path: &str) -> AppResult<MoveReport> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        metadata::move_images(&database, &root, image_ids, folder_path)
+    }
+
+    pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::set_trashed(&database, image_ids, true)
+    }
+
+    pub fn restore_images(&self, image_ids: &[i64]) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        metadata::set_trashed(&database, image_ids, false)
+    }
+
+    pub fn delete_images(&self, image_ids: &[i64]) -> AppResult<DeleteReport> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        metadata::delete_images(&database, &root, image_ids)
+    }
+
+    pub fn empty_trash(&self) -> AppResult<DeleteReport> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        metadata::empty_trash(&database, &root)
+    }
+
+    pub fn collections(&self) -> AppResult<Vec<CollectionInfo>> {
+        let (database, _) = self.query_source()?;
+        collections::list(&database)
+    }
+
+    pub fn create_collection(&self, name: &str) -> AppResult<CollectionInfo> {
+        let (database, _) = self.query_source()?;
+        collections::create(&database, name)
+    }
+
+    pub fn rename_collection(&self, collection_id: i64, name: &str) -> AppResult<()> {
+        let (database, _) = self.query_source()?;
+        collections::rename(&database, collection_id, name)
+    }
+
+    pub fn delete_collection(&self, collection_id: i64) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        collections::delete(&database, collection_id)
+    }
+
+    pub fn reorder_collections(&self, collection_ids: &[i64]) -> AppResult<()> {
+        let (database, _) = self.query_source()?;
+        collections::reorder(&database, collection_ids)
+    }
+
+    pub fn add_images_to_collection(
+        &self,
+        collection_id: i64,
+        image_ids: &[i64],
+    ) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        collections::add_images(&database, collection_id, image_ids)
+    }
+
+    pub fn remove_images_from_collection(
+        &self,
+        collection_id: i64,
+        image_ids: &[i64],
+    ) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        collections::remove_images(&database, collection_id, image_ids)
+    }
+
+    pub fn combine_collections(
+        &self,
+        mode: CombineMode,
+        collection_ids: &[i64],
+        name: &str,
+    ) -> AppResult<CollectionInfo> {
+        let (database, _) = self.query_source()?;
+        collections::combine(&database, mode, collection_ids, name)
     }
 }

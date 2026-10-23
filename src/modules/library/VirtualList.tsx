@@ -203,6 +203,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
             <span className="list-tags">{item.tags.length > 0 ? item.tags.join(", ") : "—"}</span>
             <span className="list-numeric">{formatDate(item.importedAt)}</span>
             <span className="list-folder" title={item.folderPath}>
+              {item.deletedAt != null ? "回收站 · " : ""}
               {folderLabel(item.folderPath)}
             </span>
           </div>

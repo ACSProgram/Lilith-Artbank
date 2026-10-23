@@ -310,6 +310,23 @@ fn perf_metadata_200k() {
     );
 
     let database = &reopened.db;
+    let collection_id = database
+        .with_writer(|connection| {
+            connection.execute(
+                "INSERT INTO collections(name, sort_order, created_at, updated_at)
+                 VALUES ('性能集合', 0, 1, 1)",
+                [],
+            )?;
+            let collection_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO collection_items(collection_id, image_id, position)
+                 SELECT ?1, id, id FROM images",
+                [collection_id],
+            )?;
+            Ok(collection_id)
+        })
+        .expect("seed collection");
+
     let page_query = LibraryQuery {
         limit: Some(PAGE_SIZE as u32),
         ..Default::default()
@@ -398,6 +415,92 @@ fn perf_metadata_200k() {
         all_ids.len(),
         ms(start.elapsed())
     );
+
+    let search_query = LibraryQuery {
+        search: "人物速".into(),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, search_query.clone(), 30);
+    println!(
+        "[perf] query engine search 150 (FTS trigram): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let short_search_query = LibraryQuery {
+        search: "编号".into(),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, short_search_query.clone(), 30);
+    println!(
+        "[perf] query engine search 150 (2-char LIKE): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let tag_search_query = LibraryQuery {
+        search: "标签17".into(),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, tag_search_query.clone(), 20);
+    println!(
+        "[perf] query engine search 150 via tag name: p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let folder_search_query = LibraryQuery {
+        search: "folder7".into(),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, folder_search_query.clone(), 20);
+    println!(
+        "[perf] query engine search 150 via folder path: p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let collection_query = LibraryQuery {
+        view: crate::library::query::LibraryView::Collection,
+        collection_id: Some(collection_id),
+        sort: SortSpec {
+            key: SortKey::CollectionPosition,
+            descending: false,
+        },
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, collection_query.clone(), 30);
+    println!(
+        "[perf] query engine collection 150 (manual order): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    for (label, query) in [
+        ("search FTS", search_query),
+        ("search 2-char", short_search_query),
+        ("search tag", tag_search_query),
+        ("search folder", folder_search_query),
+        ("collection", collection_query),
+    ] {
+        let mut samples = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let start = Instant::now();
+            let counts = query::filter_counts(database, query.clone()).expect("counts");
+            samples.push(start.elapsed());
+            assert!(counts.total > 0);
+        }
+        println!(
+            "[perf] filter counts ({label}): p50={:.2}ms p95={:.2}ms",
+            ms(percentile(&samples, 0.5)),
+            ms(percentile(&samples, 0.95))
+        );
+    }
 }
 
 fn time_query(

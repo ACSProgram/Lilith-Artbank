@@ -1,7 +1,7 @@
 # 当前阶段状态
 
 日期：2026-10-23
-阶段：**S2 已实现，自动验收通过；真实窗口的 S1 导入与 S2 浏览界面待用户手工验收**
+阶段：**S3 已实现，自动验收通过；真实 Tauri 窗口的 S1–S3 界面待用户手工验收**
 
 ## 已完成
 
@@ -27,22 +27,54 @@
 Rust：
 
 - `library/query.rs`：`LibraryQuery`、键集游标、视图（all/trash）、文件夹/扩展名/评分/标签（any/all）筛选、导入时间/评分/大小排序、分页（默认 150，最多 300）。
-- 命令：`query_images`、`query_image_ids`（当前筛选全部 id）、`get_filter_counts`（四个分面，排除自身筛选）、`get_folders`、`get_tags`。
+- 命令：`query_images`、`query_image_ids`（当前筛选全部 id）、`get_filter_counts`、`get_folders`、`get_tags`。
 - 返回行含缩略图版本与尺寸、标签摘要、原图绝对路径；不含 embedding/pose。
-- 标签摘要在页内批量查询；游标用 `(sort_col, id) < (?)` 行值比较，不使用深 `OFFSET`。
-- `platform/clipboard.rs` + `copy_text` 命令：`arboard` 写系统剪贴板，供右键“复制文件路径”使用。
-- 查询单测覆盖分页无重复、重复排序键、筛选、升降序、回收站视图、计数、列表、全部 id、非法参数。
+- 标签摘要在页内批量查询；游标用 `(sort_col, id)` 行值比较，不使用深 `OFFSET`。
 
 前端：
 
 - `src/modules/library/`：types、api、model、`useImageQuery`、`LibraryView`、`VirtualGrid`、`VirtualList`、`FilterPanel`、`LibraryThumbnail`。
 - 自适应列数虚拟网格与固定行高虚拟列表：只挂载视口 + 前后一屏；缩略图失败显示占位并可重试。
-- 基础筛选面板：文件夹、扩展名、评分、标签（任一/全部）、条件计数、清除；工具栏排序与网格/列表切换。
-- 选择：单击、Ctrl/Cmd、Shift 区间、`Ctrl+A`（Rust 返回全部匹配 id）；方向键/PageUp/PageDown/Home/End；Enter/双击提示查看器占位；Delete 提示 S3。
-- 右键菜单：打开查看器（占位）、复制文件路径、选择全部匹配项。
-- 请求代次丢弃过期页；首屏/翻页错误可重试；筛选变化清空选择，排序变化保留选择；导入完成刷新第一页。
-- 切换图库时以图库 id 重新挂载视图；浏览器预览使用 4,000 行 mock 与 data URL 缩略图。
-- 未改 schema；不保存原始文件名，列表只显示尺寸、格式、大小、评分、标签、时间与文件夹。
+- 选择、键盘导航、右键菜单、请求代次丢弃过期页、筛选/排序刷新语义。
+
+### S3 元数据、搜索、集合与回收站
+
+查询：
+
+- `LibraryQuery` 增加 `view=collection`、`collectionId`、`search`、`searchScope`（view/library）与扩展筛选：导入时间范围、文件大小范围、描述/embedding/pose 存在性。
+- 搜索覆盖描述、标签名、文件夹路径：≥3 字符走 FTS5 trigram，1-2 字符回退 `LIKE`；全库范围忽略当前视图/集合并包含回收站。
+- 翻页使用 OR-EXISTS 让 `LIMIT` 尽早停止；计数/全选使用 UNION 求出命中集。
+- 筛选分面计数在搜索/集合视图下用单条 `WITH matched AS MATERIALIZED` 语句一次求命中集，再分别统计总数/文件夹/扩展名/评分/标签。
+- 新增 `search_tags` 命令与 `SortKey::collectionPosition`；`ImageRow` 返回 `deletedAt`。
+
+元数据（`library/metadata.rs`）：
+
+- 详情：文件事实、评分、描述与来源、标签、4/8 主色、缩略图版本、原图绝对路径。
+- 编辑：单图评分/描述、批量评分、标签集合覆盖/批量增删、标签重命名/删除。
+- 文件夹移动：创建目标目录、逐张 `rename` + 更新 `folder_id`，数据库失败回滚文件；目标已存在时复用，同文件夹计入 `skipped`。
+- 安全校验：内容哈希 64 位十六进制、扩展名规范化、目标目录 canonicalize 后仍在图库根内。
+- 回收站：软删除/恢复；永久删除先删数据库行（级联标签、集合、FTS），提交后删原图；清空回收站只处理已删除项。
+
+集合（`library/collections.rs`）：
+
+- 新建/重命名/删除/排序、加入/移出、并集/交集/差集。
+- 集合只引用图片 id；加入去重并追加到末尾；运算结果新建集合，顺序沿用第一个集合。
+- `imageCount` 只统计未删除图片。
+
+状态与命令：
+
+- `AppState` 增加 `maintenance` 守卫：文件夹移动、永久删除、清空回收站期间拒绝导入与图库生命周期切换。
+- 新增 23 个命令，覆盖搜索标签、详情、评分/描述/标签、文件夹移动、回收站与集合；注册表同步更新。
+
+前端：
+
+- 新增 `ViewBar`、`Inspector`、`LibraryContextMenu`、`CollectionManagerDialog`、`CollectionPickerDialog`、`TagManagerDialog`；重写 `LibraryView` 的浏览状态、搜索、历史与视图控制；`errorMessage` 收敛到 `src/shared/errors.ts`。
+- 搜索框（260 ms 防抖）、当前视图/全库切换、`Ctrl/Cmd+F` 聚焦、`Esc` 清空；`Ctrl/Cmd+Z` 回退视图/搜索/筛选（排序切换不入历史）。
+- 详情侧栏支持评分、标签自动补全、描述编辑、文件夹移动、主色、复制哈希/路径、回收站与集合操作；多选显示批量编辑。
+- 筛选面板增加时间/大小范围与存在性筛选、标签管理器入口；计数按需加载并显示加载态。
+- 视图栏支持全部/回收站、集合胶囊、集合管理、清空回收站；回收站行带前缀，Delete 在回收站中执行永久删除。
+- 右键菜单与批量操作接入回收站/集合；窄窗口（<980px）详情侧栏变为覆盖层。
+- 浏览器预览 mock 改为可变数据集，支持全部 S3 编辑、集合、回收站与搜索路径。
 
 ## 验证结果
 
@@ -53,51 +85,59 @@ npm run typecheck
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets   # 额外检查：无警告
-cargo test --manifest-path src-tauri/Cargo.toml --lib   # 49 passed, 4 ignored
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets   # 无警告
+cargo test --manifest-path src-tauri/Cargo.toml --lib   # 63 passed, 4 ignored
 git diff --check                                        # 无空白问题
 ```
 
-20 万行查询引擎（`perf_metadata_200k`，开发档，4 读连接）：
+20 万行查询引擎（`perf_metadata_200k`，开发档，4 读连接；最近一轮，系统处于日常负载）：
 
 ```text
-first page 150 (imported desc)   p50 0.62ms / p95 0.79ms
-deep keyset 150 (score/id)       p50 1.08ms / p95 1.24ms
-folder 150                       p50 0.58ms / p95 0.83ms
-tag 150                          p50 2.91ms / p95 3.16ms
-filter counts                    p50 27.36ms / p95 40.32ms
-select-all 200k ids             17.61ms
+first page 150 (imported desc)   p50 0.70ms  / p95 1.31ms
+deep keyset 150 (score/id)       p50 2.59ms  / p95 5.36ms
+folder 150                       p50 1.55ms  / p95 3.74ms
+tag 150                          p50 5.65ms  / p95 7.87ms
+collection 150 (manual order)    p50 1.65ms  / p95 2.53ms
+search 150 (FTS trigram)         p50 8.78ms  / p95 14.15ms
+search 150 (2-char LIKE)         p50 1.40ms  / p95 4.93ms
+search 150 (tag / folder)        p50 5.78 / 7.12ms
+filter counts (plain)            p50 69.54ms / p95 96.66ms
+filter counts (FTS search)       p50 132.56ms
+filter counts (2-char search)    p50 825.88ms
+filter counts (200k collection)  p50 778.83ms
+select-all 200k ids              41.36ms
 ```
 
-全部低于预算（首屏/深分页/文件夹/标签 ≤50ms，计数 ≤100ms）。
+普通视图计数在预算内；搜索结果/超大集合的计数超 100 ms，筛选面板显示加载态。2 字搜索的 `LIKE` 全表扫描与 20 万条集合的标签聚合是主要成本，已在 [浏览与检索](../modules/browse-and-query.md) 与 [性能基准](../guides/performance.md) 记录。
 
 浏览器预览（Chromium 代理，724×712 CSS，4,000 行 mock）：
 
-- 150 行时同时挂载 12–24 个网格单元格；300 行时约 18 个；列表约 24 行。
-- 滚动到底继续加载下一页；筛选/排序后回到第一页，无旧行残留。
-- 文件夹/评分筛选、空结果、清除筛选、选择、Ctrl+A、右键菜单、缩略图失败重试均通过。
-- 控制台无 error/warn。
+- 搜索、当前视图/全库切换、扩展筛选、集合新建/加入/查看/排序/运算/移出、回收站移入/恢复/清空、详情与批量编辑、标签重命名、右键菜单、Ctrl+A 与窄窗口布局均走通。
+- 网格/列表仍只挂载视口附近的行；滚动继续加载下一页，筛选/排序后无旧行残留。
 - 该检查不代表 WebView2 性能；真实窗口仍需手工验收。
 
-debug exe 的 PE import 仍只有系统 DLL（新增剪贴板依赖未引入额外 DLL）。
+debug exe 的 PE import 仍只有系统 DLL（S1 已确认，S3 未新增本地依赖）。
 
 ## 未验证
 
 - 真实 Tauri 窗口的 S1 导入界面、拖放、进度/取消与结果预览。
-- 真实 Tauri 窗口的 S2 网格/列表：20 万行滚动帧率、内存、150 张缩略图从请求到可见、1440 宽度下的列布局。
-- 真实窗口的筛选面板、键盘导航、Shift/Ctrl 选择、右键“复制文件路径”（arboard）、缩略图 404 重试。
+- 真实 Tauri 窗口的 S2/S3 网格与列表：20 万行滚动帧率、内存、150 张缩略图从请求到可见、1440 宽度下的列布局。
+- 真实窗口的搜索、全库范围、扩展筛选、详情/批量编辑、文件夹移动、标签管理、集合与回收站全流程。
+- 文件夹移动在真实 Windows 文件锁/权限/跨卷场景下的失败与回滚表现。
+- 永久删除/清空回收站后原图文件确实消失、缩略图请求返回 404。
 - 20 万 id 全选经 Tauri IPC/JSON 到前端的耗时与内存。
 - 真实 WebView2 的缩略图冷/热耗时与缓存行为。
-- 真实美术图样本（大图、透明图、EXIF 方向、不同压缩率）的导入与显示。
+- 真实美术图样本（大图、透明图、EXIF 方向、不同压缩率）的导入、显示与主色。
 - 长时间滚动到全库末尾时前端已加载页的内存增长（当前不回收旧页）。
+- 长任务（文件夹移动、永久删除、清空回收站）的进度事件与取消尚未实现。
 - release 构建的 exe 与 DLL 清单（S9）。
 - 真实 Tauri 窗口的启动、窗口拖动/最小化/最大化/关闭、设置持久化（S0 遗留）。
 
 ## 下一步
 
-1. 用户手工验收：`npm run tauri dev` → 打开图库 → 导入混合格式样本 → 关闭导入弹窗 → 在网格/列表中滚动、筛选、选择、右键复制路径；再用 20 万级库观察滚动与首屏。
-2. 验收通过后进入 S3：元数据编辑、搜索/完整筛选、标签/文件夹管理、集合与回收站。
-3. S3 开始时补上搜索框、时间/大小范围、列表列头排序与回收站入口；S4 接入查看器与复制图片。
+1. 用户手工验收：`npm run tauri dev` → 打开图库 → 导入混合格式样本 → 浏览/搜索/筛选 → 编辑详情与批量元数据 → 管理标签/集合 → 回收站移入/恢复/清空。
+2. S3 验收通过后进入 S4：查看器、旋转/翻转/裁剪/调尺寸、保存事务、姿势叠加。
+3. S3 的相似度筛选/排序（颜色/pHash）按计划留到 S7；列表列头排序与长任务进度/取消按需补。
 
 ## 约束
 

@@ -218,6 +218,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             <span className="grid-cell-label">
               <span>{formatDimensions(item.width, item.height)}</span>
               <span>
+                {item.deletedAt != null ? "回收站 · " : ""}
                 {extensionLabel(item.fileExt)} · {formatBytes(item.fileSize)}
               </span>
             </span>

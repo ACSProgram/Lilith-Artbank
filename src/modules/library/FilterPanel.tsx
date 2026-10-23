@@ -1,39 +1,49 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Tags, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import { libraryApi } from "./api";
-import { activeFilterCount, folderLabel, queryKey, toggleValue } from "./model";
+import {
+  activeFilterCount,
+  bytesToMbInput,
+  dateInputValue,
+  folderLabel,
+  localDayEnd,
+  localDayStart,
+  mbToBytes,
+  queryKey,
+  toggleValue,
+} from "./model";
 import type {
   FilterCounts,
   FolderInfo,
   LibraryFilters,
   LibraryQuery,
+  PresenceFilter,
   TagInfo,
 } from "./types";
+import { errorMessage } from "../../shared/errors";
 
 interface FilterPanelProps {
   open: boolean;
   filters: LibraryFilters;
   query: LibraryQuery;
+  dataVersion: number;
   onFiltersChange: (filters: LibraryFilters) => void;
   onClose: () => void;
   onReset: () => void;
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  return "未知错误";
+  onManageTags: () => void;
 }
 
 export function FilterPanel({
   open,
   filters,
   query,
+  dataVersion,
   onFiltersChange,
   onClose,
   onReset,
+  onManageTags,
 }: FilterPanelProps) {
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [tags, setTags] = useState<TagInfo[]>([]);
@@ -43,6 +53,8 @@ export function FilterPanel({
   const [countsLoading, setCountsLoading] = useState(false);
   const [countsError, setCountsError] = useState<string | null>(null);
   const [tagQuery, setTagQuery] = useState("");
+  const [sizeMinDraft, setSizeMinDraft] = useState(bytesToMbInput(filters.sizeMin));
+  const [sizeMaxDraft, setSizeMaxDraft] = useState(bytesToMbInput(filters.sizeMax));
   const countsGeneration = useRef(0);
 
   const loadOptions = useCallback(async () => {
@@ -65,8 +77,14 @@ export function FilterPanel({
   useEffect(() => {
     if (!open) return;
     void loadOptions();
-  }, [open, loadOptions]);
+  }, [open, loadOptions, dataVersion]);
 
+  useEffect(() => {
+    setSizeMinDraft(bytesToMbInput(filters.sizeMin));
+    setSizeMaxDraft(bytesToMbInput(filters.sizeMax));
+  }, [filters.sizeMin, filters.sizeMax]);
+
+  // 计数只随筛选条件（countsKey）与数据版本变化重算；排序、翻页不触发。
   const countsKey = queryKey(query);
 
   useEffect(() => {
@@ -90,7 +108,7 @@ export function FilterPanel({
       })();
     }, 160);
     return () => window.clearTimeout(timer);
-  }, [open, countsKey]);
+  }, [open, countsKey, dataVersion]);
 
   useEffect(() => {
     if (!open) setTagQuery("");
@@ -126,6 +144,45 @@ export function FilterPanel({
   const patch = (update: Partial<LibraryFilters>) => {
     onFiltersChange({ ...filters, ...update });
   };
+
+  const setImportedFrom = (value: string) => {
+    const from = localDayStart(value);
+    if (from == null) {
+      patch({ importedFrom: null });
+      return;
+    }
+    const to =
+      filters.importedTo != null && filters.importedTo < from
+        ? localDayEnd(value)
+        : filters.importedTo;
+    patch({ importedFrom: from, importedTo: to });
+  };
+
+  const setImportedTo = (value: string) => {
+    const to = localDayEnd(value);
+    if (to == null) {
+      patch({ importedTo: null });
+      return;
+    }
+    const from =
+      filters.importedFrom != null && filters.importedFrom > to
+        ? localDayStart(value)
+        : filters.importedFrom;
+    patch({ importedTo: to, importedFrom: from });
+  };
+
+  const applySize = () => {
+    patch({
+      sizeMin: mbToBytes(sizeMinDraft),
+      sizeMax: mbToBytes(sizeMaxDraft),
+    });
+  };
+
+  const presenceOptions: { value: PresenceFilter; label: string }[] = [
+    { value: "any", label: "任意" },
+    { value: "has", label: "有" },
+    { value: "missing", label: "无" },
+  ];
 
   return (
     <div className="filter-panel" role="dialog" aria-label="筛选图片">
@@ -234,22 +291,113 @@ export function FilterPanel({
         </section>
 
         <section className="filter-section">
+          <h4>导入时间</h4>
+          <div className="filter-range">
+            <input
+              type="date"
+              className="input filter-date"
+              value={dateInputValue(filters.importedFrom)}
+              onChange={(event) => setImportedFrom(event.target.value)}
+            />
+            <span>至</span>
+            <input
+              type="date"
+              className="input filter-date"
+              value={dateInputValue(filters.importedTo)}
+              onChange={(event) => setImportedTo(event.target.value)}
+            />
+          </div>
+        </section>
+
+        <section className="filter-section">
+          <h4>文件大小（MB）</h4>
+          <div className="filter-range">
+            <input
+              type="number"
+              min={0}
+              step={1}
+              className="input filter-size"
+              placeholder="最小"
+              value={sizeMinDraft}
+              onChange={(event) => setSizeMinDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  applySize();
+                }
+              }}
+            />
+            <span>至</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              className="input filter-size"
+              placeholder="最大"
+              value={sizeMaxDraft}
+              onChange={(event) => setSizeMaxDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  applySize();
+                }
+              }}
+            />
+            <Button size="sm" variant="ghost" onClick={applySize}>
+              应用
+            </Button>
+          </div>
+        </section>
+
+        <section className="filter-section">
+          <h4>内容状态</h4>
+          <div className="filter-presence">
+            {[
+              { key: "description" as const, label: "描述" },
+              { key: "embedding" as const, label: "Embedding" },
+              { key: "pose" as const, label: "Pose" },
+            ].map((field) => (
+              <div key={field.key} className="filter-presence-row">
+                <span>{field.label}</span>
+                <div className="filter-mode">
+                  {presenceOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={filters[field.key] === option.value ? "is-active" : ""}
+                      onClick={() => patch({ [field.key]: option.value })}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="filter-section">
           <div className="filter-section-heading">
             <h4>标签</h4>
-            <div className="filter-mode">
-              <button
-                type="button"
-                className={filters.tagMode === "any" ? "is-active" : ""}
-                onClick={() => patch({ tagMode: "any" })}
-              >
-                任一
-              </button>
-              <button
-                type="button"
-                className={filters.tagMode === "all" ? "is-active" : ""}
-                onClick={() => patch({ tagMode: "all" })}
-              >
-                全部
+            <div className="filter-section-tools">
+              <div className="filter-mode">
+                <button
+                  type="button"
+                  className={filters.tagMode === "any" ? "is-active" : ""}
+                  onClick={() => patch({ tagMode: "any" })}
+                >
+                  任一
+                </button>
+                <button
+                  type="button"
+                  className={filters.tagMode === "all" ? "is-active" : ""}
+                  onClick={() => patch({ tagMode: "all" })}
+                >
+                  全部
+                </button>
+              </div>
+              <button type="button" className="text-button" onClick={onManageTags}>
+                <Tags size={11} /> 管理
               </button>
             </div>
           </div>
