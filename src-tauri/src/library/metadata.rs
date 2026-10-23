@@ -629,7 +629,7 @@ fn delete_internal(
     Ok(report)
 }
 
-fn content_path(
+pub(crate) fn content_path(
     paths: &LibraryPaths,
     folder_path: &str,
     content_hash: &str,
@@ -671,7 +671,7 @@ fn ensure_dir_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn remove_content_file(root: &Path, path: &Path) -> AppResult<()> {
+pub(crate) fn remove_content_file(root: &Path, path: &Path) -> AppResult<()> {
     ensure_inside_root(root, path)?;
     let canonical_root = root.canonicalize()?;
     let canonical = path.canonicalize()?;

@@ -16,16 +16,16 @@ AI 能力（description、image/text embedding、pose）统一走本机 HTTP 服
 src/app/                     应用外壳、设置、图库入口、全局通知、跨模块编排
 src/modules/library/         图库视图、虚拟网格/列表、筛选、选择、查询控制器
 src/modules/import/          导入弹窗、进度、结果与失败清单
-src/modules/viewer/          查看器（后续）
+src/modules/viewer/          查看器、几何编辑工具、姿势叠加
 src/modules/editor/          图像处理（后续）
 src/modules/ai/              AI 任务与设置页（后续）
-src/shared/                  无领域语义的控件、API 调用、缩略图 URL、剪贴板与格式化
+src/shared/                  无领域语义的控件、错误文案、缩略图/原图 URL、剪贴板与查看器会话契约
 
-src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 协议
-src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、缩略图 pack、导入仓储、键集查询
+src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 与 img:// 协议
+src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、缩略图 pack、导入仓储、键集查询、查看器源与编辑保存
 src-tauri/src/import/        BLAKE3、解码/EXIF、扫描、pHash/主色调度、导入后台任务
-src-tauri/src/imageops/      缩略图编码、pHash、主色；裁剪/旋转/调尺寸/色彩/LUT/DFT/卷积（后续）
-src-tauri/src/platform/      剪贴板等平台差异（当前为文本写入）
+src-tauri/src/imageops/      缩略图编码、pHash、主色、几何编辑；色彩/LUT/DFT/卷积（后续）
+src-tauri/src/platform/      剪贴板等平台差异（文本与图片写入）
 src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管（后续）
 src-tauri/src/features/      pHash/颜色/向量/姿势相似度（后续）
 ```
@@ -51,7 +51,8 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
     library.db             SQLite 元数据（WAL，FTS5）
     thumbs/0001.pack       追加式缩略图包（段头 16 字节，默认 1 GiB/段）
     features/              embedding / pose 包（后续）
-    temp/                  原子写入与编辑中间文件；启动时清理
+    temp/                  原子写入与编辑中间文件；打开图库时清理
+    temp/viewer/           大图降采样预览缓存（`<id>-<hash>.webp`，按内容哈希失效）
   <folder>/<content-hash>.<ext>
   recycle/
   output/                  描述导出/回填流水线
@@ -81,8 +82,9 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 列表数据使用键集游标（`(sort_key, id)`），不用深 `OFFSET`；一页默认 150，最多 300。
 - 浏览命令只经 `src/modules/library/api.ts`；返回行只含列表字段与缩略图版本，不含 embedding/pose。
 - 缩略图通过本地协议按需加载（`thumb://` / `http://thumb.localhost`），浏览器负责解码与缓存；网格只挂载视口附近项目。
+- 原图与降采样预览通过 `img://`（`http://img.localhost`）按图片 id 提供，URL 带内容哈希做缓存失效；大图预览由 Rust 生成并缓存。
 - 选择集只存图片 id；`Ctrl+A` 通过 `query_image_ids` 取当前筛选的全部 id，而不是只选已加载行。
-- 复制文件路径在 Rust 侧写系统剪贴板；前端不直接读图库目录。
+- 复制文件路径与复制图片都在 Rust 侧写系统剪贴板；前端不直接读图库目录。
 
 ## 性能原则
 
@@ -115,6 +117,8 @@ S1 后半已实现：文件/目录/拖放导入、流式 BLAKE3、原子发布�
 
 S2 已实现：键集查询引擎、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本、虚拟网格/列表、缩略图占位与重试、选择/键盘/右键菜单、基础筛选面板、导入后刷新。20 万行查询预算全部达标；真实窗口滚动与复制路径待手工验收。拖出到资源管理器与复制图片未在 S2 实现。
 
-S3 已实现：描述/标签/文件夹搜索（当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签重命名/删除、文件夹移动（失败回滚）、集合 CRUD/排序/运算、回收站软删除/恢复/永久删除/清空。普通视图分面计数在预算内；搜索与超大集合计数超 100ms 时筛选面板显示加载态。真实 Tauri 窗口的 S1–S3 交互待用户手工验收。
+S3 已实现：描述/标签/文件夹搜索（当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签重命名/删除、文件夹移动（失败回滚）、集合 CRUD/排序/运算、回收站软删除/恢复/永久删除/清空。普通视图分面计数在预算内；搜索与超大集合计数超 100ms 时筛选面板显示加载态。
 
-尚未实现：颜色/pHash/CLIP/pose 相似度、查看器、图像处理、AI。具体见 [路线图](../planning/roadmap.md)。
+S4 已实现：查看器（缩放/平移/全屏/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、复制图片与新命令、可编辑详情侧栏。`img://` 协议按内容哈希提供原图与预览；姿势叠加 UI 就绪但数据待 S6。OLE 拖出暂缓。真实 Tauri 窗口的 S1–S4 交互待用户手工验收。
+
+尚未实现：颜色/pHash/CLIP/pose 相似度、图像处理、AI。具体见 [路线图](../planning/roadmap.md)。

@@ -34,6 +34,7 @@ pub fn run() {
                 .build(),
         );
     let builder = app::thumb_protocol::register(builder);
+    let builder = app::img_protocol::register(builder);
 
     builder
         .setup(|application| {

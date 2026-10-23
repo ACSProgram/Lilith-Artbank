@@ -13,10 +13,12 @@ use crate::{
     import::{ImportRequest, job::ImportSnapshot},
     library::{
         collections::{CollectionInfo, CombineMode},
+        edit::{self, EditRequest, EditResult},
         manifest::LibraryInspection,
         metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::LibraryInfo,
+        viewer::{self, PoseData, ViewerSource},
     },
 };
 
@@ -122,6 +124,15 @@ pub fn window_is_maximized(window: WebviewWindow) -> Result<bool, String> {
 #[tauri::command]
 pub fn window_close(window: WebviewWindow) -> Result<(), String> {
     window.close().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn window_toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
+    let fullscreen = window.is_fullscreen().map_err(|error| error.to_string())?;
+    window
+        .set_fullscreen(!fullscreen)
+        .map_err(|error| error.to_string())?;
+    Ok(!fullscreen)
 }
 
 #[derive(Serialize)]
@@ -402,6 +413,55 @@ pub fn combine_collections(
     AppError::command(state.combine_collections(mode, &collection_ids, &name))
 }
 
+#[tauri::command]
+pub async fn get_viewer_source(
+    state: State<'_, AppState>,
+    image_id: i64,
+) -> Result<ViewerSource, String> {
+    let (database, root) = state
+        .current_library()
+        .ok_or_else(|| "尚未打开图库".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || viewer::source(&database, &root, image_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn save_image_edit(
+    state: State<'_, AppState>,
+    request: EditRequest,
+) -> Result<EditResult, String> {
+    let guard = state.begin_edit().map_err(|error| error.to_string())?;
+    let (database, thumbs, root) = state.edit_handles().map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        edit::save(&database, &root, &thumbs, &request).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn get_image_pose(
+    state: State<'_, AppState>,
+    image_id: i64,
+) -> Result<Option<PoseData>, String> {
+    AppError::command(state.image_pose(image_id))
+}
+
+#[tauri::command]
+pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(), String> {
+    let path = state
+        .copy_source(image_id)
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::platform::clipboard::copy_image(&path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         get_settings,
@@ -419,6 +479,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         window_toggle_maximize,
         window_is_maximized,
         window_close,
+        window_toggle_fullscreen,
         get_app_info,
         thumb_bench_prepare,
         thumb_bench_measure_read,
@@ -454,6 +515,10 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         reorder_collections,
         add_images_to_collection,
         remove_images_from_collection,
-        combine_collections
+        combine_collections,
+        get_viewer_source,
+        save_image_edit,
+        get_image_pose,
+        copy_image
     ]
 }

@@ -1,80 +1,30 @@
 # 当前阶段状态
 
 日期：2026-10-23
-阶段：**S3 已实现，自动验收通过；真实 Tauri 窗口的 S1–S3 界面待用户手工验收**
+阶段：**S4 已实现，自动验收通过；S1–S4 的真实 Tauri 窗口界面待用户手工验收**
 
-## 已完成
+历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
 
-### S0 工程骨架
-
-- Tauri 2 + React 19 + TypeScript + Vite 6 工程。
-- 无边框自绘标题栏、Lilith Artworks 风格浅色应用外壳、侧栏、欢迎页、设置弹窗、新建/打开图库弹窗、通知与确认弹窗。
-- 设置持久化（图库列表、AI 参数、性能参数、界面参数），原子写入与损坏备份。
-- 图库清单 `.artbank/library.json`、SQLite schema v1、单写 + 多读连接池、WAL/FTS5。
-- 图库创建/打开/关闭/移除/重命名、状态查询、窗口控制命令。
-- 浏览器预览 mock：无 Tauri 时可用界面创建/打开演示图库，不写磁盘。
-
-### S1 性能原型 + 导入管线
-
-- WebP 缩略图编码（最长边 512、quality 80），`webp` 0.3 + `libwebp-sys` 0.9.6 静态编译。
-- 追加式缩略图包 `0001.pack`、16 字节段头、1 GiB/段、串行追加、句柄缓存与定位读。
-- `thumb://` 自定义协议（Windows 为 `http://thumb.localhost`），长缓存、ETag、404/500 语义。
-- 文件/目录/拖放导入、流式 BLAKE3、临时副本 + 原子发布、EXIF 方向、解码上限、pHash、4/8 主色、精确/批内/感知重复、rayon 工作池、单写批量入库、进度/取消/失败清单。
-- 导入界面、拖放覆盖层、结果预览。1000 张合成图实测 47.7–50.0 张/秒。
-
-### S2 虚拟化网格、查询与选择
+## 本批次完成：S4 查看器与几何编辑
 
 Rust：
 
-- `library/query.rs`：`LibraryQuery`、键集游标、视图（all/trash）、文件夹/扩展名/评分/标签（any/all）筛选、导入时间/评分/大小排序、分页（默认 150，最多 300）。
-- 命令：`query_images`、`query_image_ids`（当前筛选全部 id）、`get_filter_counts`、`get_folders`、`get_tags`。
-- 返回行含缩略图版本与尺寸、标签摘要、原图绝对路径；不含 embedding/pose。
-- 标签摘要在页内批量查询；游标用 `(sort_col, id)` 行值比较，不使用深 `OFFSET`。
+- `imageops/edit.rs`：翻转 → 顺时针旋转 → 裁剪 → Lanczos3 缩放的几何算子；JPEG/PNG/WebP 编码，JPEG 透明合成白底，编辑上限 5000 万像素/单边 65535。
+- `library/viewer.rs`：`get_viewer_source`。小图直接由浏览器解码；>2400 万像素、TIFF/TGA 或带 EXIF 方向的图片生成最长边 4096 的 WebP 预览，缓存于 `.artbank/temp/viewer/`。
+- `library/edit.rs`：保存采用“新内容发布”事务——临时编码 + BLAKE3 + `sync_all`、冲突检查、原子发布、追加缩略图、更新 `images` 行并清空 `feature_blobs`，提交后删除旧原图与旧预览；标签/评分/描述/集合保留。
+- `library/content.rs`：原图行加载与路径解析。
+- `app/img_protocol.rs`：`img://`（Windows 为 `http://img.localhost`）提供原图与预览，带 immutable 缓存与内容哈希 ETag。
+- `platform/clipboard.rs`：`copy_image` 解码、应用 EXIF 方向后写入系统剪贴板。
+- 新增命令：`get_viewer_source`、`save_image_edit`、`get_image_pose`（S6 前返回 null）、`copy_image`、`window_toggle_fullscreen`。保存与导入/图库切换共用维护守卫，并在阻塞线程池执行。
 
 前端：
 
-- `src/modules/library/`：types、api、model、`useImageQuery`、`LibraryView`、`VirtualGrid`、`VirtualList`、`FilterPanel`、`LibraryThumbnail`。
-- 自适应列数虚拟网格与固定行高虚拟列表：只挂载视口 + 前后一屏；缩略图失败显示占位并可重试。
-- 选择、键盘导航、右键菜单、请求代次丢弃过期页、筛选/排序刷新语义。
-
-### S3 元数据、搜索、集合与回收站
-
-查询：
-
-- `LibraryQuery` 增加 `view=collection`、`collectionId`、`search`、`searchScope`（view/library）与扩展筛选：导入时间范围、文件大小范围、描述/embedding/pose 存在性。
-- 搜索覆盖描述、标签名、文件夹路径：≥3 字符走 FTS5 trigram，1-2 字符回退 `LIKE`；全库范围忽略当前视图/集合并包含回收站。
-- 翻页使用 OR-EXISTS 让 `LIMIT` 尽早停止；计数/全选使用 UNION 求出命中集。
-- 筛选分面计数在搜索/集合视图下用单条 `WITH matched AS MATERIALIZED` 语句一次求命中集，再分别统计总数/文件夹/扩展名/评分/标签。
-- 新增 `search_tags` 命令与 `SortKey::collectionPosition`；`ImageRow` 返回 `deletedAt`。
-
-元数据（`library/metadata.rs`）：
-
-- 详情：文件事实、评分、描述与来源、标签、4/8 主色、缩略图版本、原图绝对路径。
-- 编辑：单图评分/描述、批量评分、标签集合覆盖/批量增删、标签重命名/删除。
-- 文件夹移动：创建目标目录、逐张 `rename` + 更新 `folder_id`，数据库失败回滚文件；目标已存在时复用，同文件夹计入 `skipped`。
-- 安全校验：内容哈希 64 位十六进制、扩展名规范化、目标目录 canonicalize 后仍在图库根内。
-- 回收站：软删除/恢复；永久删除先删数据库行（级联标签、集合、FTS），提交后删原图；清空回收站只处理已删除项。
-
-集合（`library/collections.rs`）：
-
-- 新建/重命名/删除/排序、加入/移出、并集/交集/差集。
-- 集合只引用图片 id；加入去重并追加到末尾；运算结果新建集合，顺序沿用第一个集合。
-- `imageCount` 只统计未删除图片。
-
-状态与命令：
-
-- `AppState` 增加 `maintenance` 守卫：文件夹移动、永久删除、清空回收站期间拒绝导入与图库生命周期切换。
-- 新增 23 个命令，覆盖搜索标签、详情、评分/描述/标签、文件夹移动、回收站与集合；注册表同步更新。
-
-前端：
-
-- 新增 `ViewBar`、`Inspector`、`LibraryContextMenu`、`CollectionManagerDialog`、`CollectionPickerDialog`、`TagManagerDialog`；重写 `LibraryView` 的浏览状态、搜索、历史与视图控制；`errorMessage` 收敛到 `src/shared/errors.ts`。
-- 搜索框（260 ms 防抖）、当前视图/全库切换、`Ctrl/Cmd+F` 聚焦、`Esc` 清空；`Ctrl/Cmd+Z` 回退视图/搜索/筛选（排序切换不入历史）。
-- 详情侧栏支持评分、标签自动补全、描述编辑、文件夹移动、主色、复制哈希/路径、回收站与集合操作；多选显示批量编辑。
-- 筛选面板增加时间/大小范围与存在性筛选、标签管理器入口；计数按需加载并显示加载态。
-- 视图栏支持全部/回收站、集合胶囊、集合管理、清空回收站；回收站行带前缀，Delete 在回收站中执行永久删除。
-- 右键菜单与批量操作接入回收站/集合；窄窗口（<980px）详情侧栏变为覆盖层。
-- 浏览器预览 mock 改为可变数据集，支持全部 S3 编辑、集合、回收站与搜索路径。
+- `src/modules/viewer/`：types、api、model、`ImageViewer`、`ViewerTools`、`PoseOverlay`。适应窗口/1:1/滚轮缩放、拖拽平移、双击切换、上下张与翻页加载、全屏、键盘快捷键、裁剪选区、输出格式与质量。
+- `src/app/ViewerHost.tsx`：查看器与可编辑详情侧栏的编排；评分/标签/描述/文件夹直接复用 Inspector，回收站/恢复/永久删除成功后关闭查看器。
+- `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步与元数据操作的桥接契约。
+- `src/shared/imgUrl.ts`：`img://` URL 生成。
+- 入口：双击网格/列表、Enter、右键“打开查看器”；网格右键新增“复制图片”。
+- 拖出到资源管理器（Windows OLE）按用户确认暂缓，保留“复制图片”与“复制文件路径”。
 
 ## 验证结果
 
@@ -86,58 +36,48 @@ npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets   # 无警告
-cargo test --manifest-path src-tauri/Cargo.toml --lib   # 63 passed, 4 ignored
+cargo test --manifest-path src-tauri/Cargo.toml --lib   # 83 passed, 4 ignored
 git diff --check                                        # 无空白问题
 ```
 
-20 万行查询引擎（`perf_metadata_200k`，开发档，4 读连接；最近一轮，系统处于日常负载）：
+S4 新增测试覆盖：
 
-```text
-first page 150 (imported desc)   p50 0.70ms  / p95 1.31ms
-deep keyset 150 (score/id)       p50 2.59ms  / p95 5.36ms
-folder 150                       p50 1.55ms  / p95 3.74ms
-tag 150                          p50 5.65ms  / p95 7.87ms
-collection 150 (manual order)    p50 1.65ms  / p95 2.53ms
-search 150 (FTS trigram)         p50 8.78ms  / p95 14.15ms
-search 150 (2-char LIKE)         p50 1.40ms  / p95 4.93ms
-search 150 (tag / folder)        p50 5.78 / 7.12ms
-filter counts (plain)            p50 69.54ms / p95 96.66ms
-filter counts (FTS search)       p50 132.56ms
-filter counts (2-char search)    p50 825.88ms
-filter counts (200k collection)  p50 778.83ms
-select-all 200k ids              41.36ms
-```
+- 几何算子：翻转先于旋转、旋转后裁剪坐标、裁剪后缩放、非法参数拒绝；三种输出格式可解码，PNG 保留 alpha，JPEG 透明合成白底。
+- 保存事务：宽高交换、旧原图删除、新文件存在、缩略图指针可读、`thumb_version` 递增；标签/评分/描述/集合保留、`feature_blobs` 清空；哈希冲突、无修改与回收站图片被拒绝。
+- 查看器源：小图直接服务、预览生成与复用、4096 长边上限、EXIF 方向 6 生成转正预览、原图缺失报错、回收站只读。
 
-普通视图计数在预算内；搜索结果/超大集合的计数超 100 ms，筛选面板显示加载态。2 字搜索的 `LIKE` 全表扫描与 20 万条集合的标签聚合是主要成本，已在 [浏览与检索](../modules/browse-and-query.md) 与 [性能基准](../guides/performance.md) 记录。
+本轮收尾整理（不改行为契约）：
 
-浏览器预览（Chromium 代理，724×712 CSS，4,000 行 mock）：
+- 修复 `img://` 预览响应的 `Content-Type`（`webp` → `image/webp`）；图片行缺失改为 404，与前端失败态一致。
+- 查看器打开时把焦点移进覆盖层，避免网格容器级键盘处理与查看器同时响应 ←/→、Esc；覆盖层补 `aria-modal`。
+- 去掉重复的 URL 重试参数、未使用的 `zoomPercent`/`activeItem`、`has_changes` 的冗余参数；姿势可见性阈值收敛到 `hasVisiblePose`。
+- `AppState` 的图库句柄统一走一次取锁；`TempFile` 改为 `Option<PathBuf>`；剪贴板打开逻辑收敛为一个 helper。
+- 文档同步：架构分层与存储布局补 `img://`、`temp/viewer/`；修正 `img://` 状态码说明与 `temp` 缓存无上限的待决策项。
 
-- 搜索、当前视图/全库切换、扩展筛选、集合新建/加入/查看/排序/运算/移出、回收站移入/恢复/清空、详情与批量编辑、标签重命名、右键菜单、Ctrl+A 与窄窗口布局均走通。
-- 网格/列表仍只挂载视口附近的行；滚动继续加载下一页，筛选/排序后无旧行残留。
-- 该检查不代表 WebView2 性能；真实窗口仍需手工验收。
+浏览器预览（Chromium 代理，724×712 CSS，mock 数据）：
 
-debug exe 的 PE import 仍只有系统 DLL（S1 已确认，S3 未新增本地依赖）。
+- 查看器覆盖工作区，工具面板 262px、画布与 320px 侧栏无溢出；适应缩放 30%，滚轮 30%→40%，双击回到适应。
+- 旋转点亮“未保存”；裁剪拖拽 306px 屏幕距离映射为 1,024×1,024 原图像素；调尺寸 512、重置、上下张与 Inspector/网格选择联动、侧栏开关、关闭均正常；无控制台错误。
+- 该检查不代表 WebView2 的图片解码、剪贴板、全屏或保存性能。
 
 ## 未验证
 
-- 真实 Tauri 窗口的 S1 导入界面、拖放、进度/取消与结果预览。
-- 真实 Tauri 窗口的 S2/S3 网格与列表：20 万行滚动帧率、内存、150 张缩略图从请求到可见、1440 宽度下的列布局。
-- 真实窗口的搜索、全库范围、扩展筛选、详情/批量编辑、文件夹移动、标签管理、集合与回收站全流程。
-- 文件夹移动在真实 Windows 文件锁/权限/跨卷场景下的失败与回滚表现。
-- 永久删除/清空回收站后原图文件确实消失、缩略图请求返回 404。
-- 20 万 id 全选经 Tauri IPC/JSON 到前端的耗时与内存。
-- 真实 WebView2 的缩略图冷/热耗时与缓存行为。
-- 真实美术图样本（大图、透明图、EXIF 方向、不同压缩率）的导入、显示与主色。
-- 长时间滚动到全库末尾时前端已加载页的内存增长（当前不回收旧页）。
-- 长任务（文件夹移动、永久删除、清空回收站）的进度事件与取消尚未实现。
+- 真实 Tauri 窗口的 S1 导入、S2/S3 浏览与 S4 查看器全流程（含全屏、键盘、侧栏编辑）。
+- 真实 WebView2 的原图/大图预览加载、EXIF 方向图显示与裁剪一致性、缩放平移帧率。
+- 真实图库的保存 round-trip：旧原图删除、`img://` 与缩略图立即刷新、pHash/主色更新、embedding/pose 清除。
+- 4K/8K 保存耗时与内存峰值；超过 5000 万像素的只读限制与拒绝提示。
+- 真实 Windows 程序粘贴剪贴板图片；透明图与 EXIF 方向。
+- 深分页中打开查看器后保存会刷新回第一页，上下张上下文会重置（已知限制）。
+- 姿势叠加 UI 已就绪，但 `get_image_pose` 要到 S6 的 feature pack 才能返回真实 landmark。
+- 文件夹移动、永久删除、清空回收站仍无进度事件与取消（S8/S9 前补齐）。
+- 20 万行滚动、150 张缩略图从请求到可见、冷/热缓存与 WebView2 内存行为。
 - release 构建的 exe 与 DLL 清单（S9）。
-- 真实 Tauri 窗口的启动、窗口拖动/最小化/最大化/关闭、设置持久化（S0 遗留）。
 
 ## 下一步
 
-1. 用户手工验收：`npm run tauri dev` → 打开图库 → 导入混合格式样本 → 浏览/搜索/筛选 → 编辑详情与批量元数据 → 管理标签/集合 → 回收站移入/恢复/清空。
-2. S3 验收通过后进入 S4：查看器、旋转/翻转/裁剪/调尺寸、保存事务、姿势叠加。
-3. S3 的相似度筛选/排序（颜色/pHash）按计划留到 S7；列表列头排序与长任务进度/取消按需补。
+1. 用户手工验收：`npm run tauri dev` → 打开图库 → 在网格/列表打开查看器 → 缩放/平移/全屏 → 旋转、翻转、裁剪、调尺寸 → 保存并确认缩略图与原图更新、标签/评分/集合保留 → 复制图片并粘贴到其他程序。
+2. S4 验收通过后进入 S5：色彩/LUT/DFT/卷积处理链与 Rust 降采样预览。
+3. 待决策项见 [待办与待决策](todo.md)，尤其是 OLE 拖出、深分页保存刷新与编辑上限的进度/取消。
 
 ## 约束
 

@@ -42,7 +42,6 @@ import {
   buildQuery,
   defaultBrowseState,
   filterKey,
-  formatDimensions,
   hasActiveFilters,
   hasActiveQuery,
   isFormTarget,
@@ -64,9 +63,12 @@ import { useImageQuery } from "./useImageQuery";
 import { VirtualGrid } from "./VirtualGrid";
 import { VirtualList } from "./VirtualList";
 import type { VirtualViewHandle } from "./virtual";
+import type { ViewerSession } from "../../shared/viewerSession";
 
 interface LibraryViewProps {
   refreshToken: number;
+  onOpenViewer: (session: ViewerSession) => void;
+  onCopyImage: (imageId: number) => void;
 }
 
 /** 涉及文件（文件夹移动、永久删除）的批量上限，与 Rust `MAX_FILE_BATCH_IDS` 保持一致。 */
@@ -87,7 +89,7 @@ function sortForView(view: LibraryViewType, sort: SortSpec): SortSpec {
   return sort.key === "collectionPosition" ? DEFAULT_SORT : sort;
 }
 
-export function LibraryView({ refreshToken }: LibraryViewProps) {
+export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: LibraryViewProps) {
   const { settings, current, refreshStatus } = useAppRuntime();
   const { notify, confirm } = useNotices();
 
@@ -147,6 +149,16 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
     [query, refreshToken],
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
+
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const hasMoreRef = useRef(hasMore);
+  hasMoreRef.current = hasMore;
+  const viewerListeners = useRef(new Set<() => void>());
+
+  useEffect(() => {
+    for (const listener of viewerListeners.current) listener();
+  }, [items]);
 
   const clearSelection = useCallback(() => {
     setSelected(new Set());
@@ -323,21 +335,6 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
     });
   };
 
-  const activateItem = useCallback(
-    (item: ImageRow) => {
-      setActiveId(item.id);
-      setSelected(new Set([item.id]));
-      setAnchorId(item.id);
-      setInspectorOpen(true);
-      notify(
-        "查看器将在 Stage 4 提供",
-        "info",
-        `图片 #${item.id} · ${formatDimensions(item.width, item.height)}`,
-      );
-    },
-    [notify],
-  );
-
   const handleItemClick = useCallback(
     (item: ImageRow, event: ReactMouseEvent) => {
       setContextMenu(null);
@@ -449,15 +446,17 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
   }, [contextMenu, notify]);
 
   const trashSelected = useCallback(
-    async (ids: number[]) => {
-      if (ids.length === 0 || viewBusy) return;
+    async (ids: number[]): Promise<boolean> => {
+      if (ids.length === 0 || viewBusy) return false;
       setViewBusy(true);
       try {
         const changed = await libraryApi.trashImages(ids);
         notify(`已移入回收站 ${changed.toLocaleString()} 张`, "success");
         refreshData({ clearSelection: true });
+        return changed > 0;
       } catch (cause) {
         notify("移入回收站失败", "error", errorMessage(cause));
+        return false;
       } finally {
         setViewBusy(false);
       }
@@ -466,15 +465,17 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
   );
 
   const restoreSelected = useCallback(
-    async (ids: number[]) => {
-      if (ids.length === 0 || viewBusy) return;
+    async (ids: number[]): Promise<boolean> => {
+      if (ids.length === 0 || viewBusy) return false;
       setViewBusy(true);
       try {
         const changed = await libraryApi.restoreImages(ids);
         notify(`已恢复 ${changed.toLocaleString()} 张`, "success");
         refreshData({ clearSelection: true });
+        return changed > 0;
       } catch (cause) {
         notify("恢复失败", "error", errorMessage(cause));
+        return false;
       } finally {
         setViewBusy(false);
       }
@@ -483,15 +484,15 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
   );
 
   const deleteSelected = useCallback(
-    async (ids: number[]) => {
-      if (ids.length === 0 || viewBusy) return;
+    async (ids: number[]): Promise<boolean> => {
+      if (ids.length === 0 || viewBusy) return false;
       if (ids.length > MAX_FILE_BATCH) {
         notify(
           "一次永久删除的图片过多",
           "error",
           `一次最多 ${MAX_FILE_BATCH.toLocaleString()} 张，请分批处理。`,
         );
-        return;
+        return false;
       }
       const accepted = await confirm({
         title: `永久删除 ${ids.length.toLocaleString()} 张图片？`,
@@ -500,7 +501,7 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
         confirmLabel: "永久删除",
         danger: true,
       });
-      if (!accepted) return;
+      if (!accepted) return false;
       setViewBusy(true);
       try {
         const report = await libraryApi.deleteImagesPermanently(ids);
@@ -511,8 +512,10 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
           failed > 0 ? `${failed} 个文件删除失败：${report.failures[0].reason}` : undefined,
         );
         refreshData({ clearSelection: true });
+        return report.deleted > 0;
       } catch (cause) {
         notify("永久删除失败", "error", errorMessage(cause));
+        return false;
       } finally {
         setViewBusy(false);
       }
@@ -551,11 +554,11 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
   }, [confirm, current?.trashCount, notify, refreshData, viewBusy]);
 
   const removeFromCurrentCollection = useCallback(
-    async (ids: number[]) => {
+    async (ids: number[]): Promise<boolean> => {
       if (effectiveView !== "collection" || effectiveCollectionId == null || ids.length === 0) {
-        return;
+        return false;
       }
-      if (viewBusy) return;
+      if (viewBusy) return false;
       setViewBusy(true);
       try {
         const removed = await libraryApi.removeImagesFromCollection(
@@ -565,13 +568,67 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
         notify(`已从当前集合移出 ${removed.toLocaleString()} 张`, "success");
         void reloadCollections();
         refreshData({ clearSelection: true });
+        return removed > 0;
       } catch (cause) {
         notify("移出集合失败", "error", errorMessage(cause));
+        return false;
       } finally {
         setViewBusy(false);
       }
     },
     [effectiveCollectionId, effectiveView, notify, refreshData, reloadCollections, viewBusy],
+  );
+
+  const activateItem = useCallback(
+    (item: ImageRow) => {
+      setActiveId(item.id);
+      setSelected(new Set([item.id]));
+      setAnchorId(item.id);
+      setContextMenu(null);
+      const session: ViewerSession = {
+        initialId: item.id,
+        folders,
+        currentCollectionId: effectiveCollectionId,
+        getItems: () => itemsRef.current,
+        hasMore: () => hasMoreRef.current,
+        subscribe: (listener) => {
+          viewerListeners.current.add(listener);
+          return () => {
+            viewerListeners.current.delete(listener);
+          };
+        },
+        loadMore,
+        onActiveChange: (imageId) => {
+          setActiveId(imageId);
+          setSelected(new Set([imageId]));
+          setAnchorId(imageId);
+          const position = itemsRef.current.findIndex((candidate) => candidate.id === imageId);
+          if (position >= 0) viewRef.current?.ensureIndex(position);
+        },
+        onSaved: () => refreshData(),
+        refresh: () => refreshData(),
+        addToCollection: (ids) => {
+          setSelected(new Set(ids));
+          setCollectionPickerOpen(true);
+        },
+        removeFromCollection: (ids) => removeFromCurrentCollection(ids),
+        trash: trashSelected,
+        restore: restoreSelected,
+        delete: deleteSelected,
+      };
+      onOpenViewer(session);
+    },
+    [
+      deleteSelected,
+      effectiveCollectionId,
+      folders,
+      loadMore,
+      onOpenViewer,
+      refreshData,
+      removeFromCurrentCollection,
+      restoreSelected,
+      trashSelected,
+    ],
   );
 
   const handleCollectionAdded = useCallback(() => {
@@ -1070,6 +1127,11 @@ export function LibraryView({ refreshToken }: LibraryViewProps) {
           }}
           onCopyPaths={() => void copyPaths()}
           onCopyHashes={() => void copyHashes()}
+          onCopyImage={() => {
+            const item = contextMenu.items[0];
+            setContextMenu(null);
+            if (item) onCopyImage(item.id);
+          }}
           onAddToCollection={() => {
             setContextMenu(null);
             setCollectionPickerOpen(true);

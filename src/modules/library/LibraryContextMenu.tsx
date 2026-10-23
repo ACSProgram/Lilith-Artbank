@@ -4,6 +4,7 @@ import {
   Copy,
   Eye,
   Hash,
+  Image as ImageIcon,
   Layers,
   PanelRight,
   RotateCcw,
@@ -30,6 +31,7 @@ interface LibraryContextMenuProps {
   onShowDetails: () => void;
   onCopyPaths: () => void;
   onCopyHashes: () => void;
+  onCopyImage: () => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
   onTrash: () => void;
@@ -52,6 +54,7 @@ export function LibraryContextMenu({
   onShowDetails,
   onCopyPaths,
   onCopyHashes,
+  onCopyImage,
   onAddToCollection,
   onRemoveFromCollection,
   onTrash,
@@ -88,7 +91,6 @@ export function LibraryContextMenu({
       <button type="button" className="context-menu-item" onClick={onOpenViewer}>
         <Eye size={14} />
         <span>打开查看器</span>
-        <em>Stage 4</em>
       </button>
       <button type="button" className="context-menu-item" onClick={onShowDetails}>
         <PanelRight size={14} />
@@ -103,6 +105,11 @@ export function LibraryContextMenu({
         <Hash size={14} />
         <span>复制内容哈希</span>
         {multiple ? <em>{multiple}</em> : null}
+      </button>
+      <button type="button" className="context-menu-item" onClick={onCopyImage}>
+        <ImageIcon size={14} />
+        <span>复制图片</span>
+        {multiple ? <em>首张</em> : null}
       </button>
       <button type="button" className="context-menu-item" onClick={onAddToCollection}>
         <Layers size={14} />

@@ -1,6 +1,9 @@
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use parking_lot::Mutex;
@@ -17,18 +20,20 @@ use crate::{
     },
     library::{
         collections::{self, CollectionInfo, CombineMode},
+        content,
         db::LibraryDb,
         manifest::{LibraryInspection, inspect},
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
         thumbs::ThumbPack,
+        viewer::{self, PoseData},
     },
 };
 
-struct MaintenanceGuard<'a>(&'a AtomicBool);
+pub(crate) struct MaintenanceGuard(Arc<AtomicBool>);
 
-impl Drop for MaintenanceGuard<'_> {
+impl Drop for MaintenanceGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
@@ -37,9 +42,9 @@ impl Drop for MaintenanceGuard<'_> {
 pub struct AppState {
     pub settings: SettingsStore,
     library: Mutex<Option<LibrarySession>>,
-    thumb_bench: Mutex<Option<std::sync::Arc<ThumbBench>>>,
-    import_job: Mutex<Option<std::sync::Arc<ImportJob>>>,
-    maintenance: AtomicBool,
+    thumb_bench: Mutex<Option<Arc<ThumbBench>>>,
+    import_job: Mutex<Option<Arc<ImportJob>>>,
+    maintenance: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -49,7 +54,7 @@ impl AppState {
             library: Mutex::new(None),
             thumb_bench: Mutex::new(None),
             import_job: Mutex::new(None),
-            maintenance: AtomicBool::new(false),
+            maintenance: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -60,13 +65,25 @@ impl AppState {
             .map(|session| session.info.clone())
     }
 
-    pub fn current_thumb_source(
-        &self,
-    ) -> Option<(std::sync::Arc<LibraryDb>, std::sync::Arc<ThumbPack>)> {
-        self.library
-            .lock()
-            .as_ref()
-            .map(|session| (session.db.clone(), session.thumbs.clone()))
+    pub fn current_thumb_source(&self) -> Option<(Arc<LibraryDb>, Arc<ThumbPack>)> {
+        self.library_handles()
+            .map(|(database, thumbs, _)| (database, thumbs))
+    }
+
+    pub fn current_library(&self) -> Option<(Arc<LibraryDb>, PathBuf)> {
+        self.library_handles()
+            .map(|(database, _, root)| (database, root))
+    }
+
+    /// 一次取锁拿全当前图库的三件句柄，避免同一操作里重复加锁。
+    fn library_handles(&self) -> Option<(Arc<LibraryDb>, Arc<ThumbPack>, PathBuf)> {
+        self.library.lock().as_ref().map(|session| {
+            (
+                session.db.clone(),
+                session.thumbs.clone(),
+                PathBuf::from(&session.info.path),
+            )
+        })
     }
 
     pub fn thumb_bench(&self) -> Option<std::sync::Arc<ThumbBench>> {
@@ -169,12 +186,12 @@ impl AppState {
         Ok(())
     }
 
-    fn begin_maintenance(&self) -> AppResult<MaintenanceGuard<'_>> {
+    fn begin_maintenance(&self) -> AppResult<MaintenanceGuard> {
         self.ensure_no_activity()?;
         if self.maintenance.swap(true, Ordering::AcqRel) {
             return Err(AppError::message("已有文件操作在运行"));
         }
-        Ok(MaintenanceGuard(&self.maintenance))
+        Ok(MaintenanceGuard(self.maintenance.clone()))
     }
 
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
@@ -248,12 +265,10 @@ impl AppState {
         inspect(path)
     }
 
-    fn query_source(&self) -> AppResult<(std::sync::Arc<LibraryDb>, PathBuf)> {
-        let library = self.library.lock();
-        let session = library
-            .as_ref()
-            .ok_or_else(|| AppError::message("尚未打开图库"))?;
-        Ok((session.db.clone(), PathBuf::from(&session.info.path)))
+    fn query_source(&self) -> AppResult<(Arc<LibraryDb>, PathBuf)> {
+        self.library_handles()
+            .map(|(database, _, root)| (database, root))
+            .ok_or_else(|| AppError::message("尚未打开图库"))
     }
 
     pub fn query_images(&self, query: LibraryQuery) -> AppResult<ImagePage> {
@@ -410,5 +425,24 @@ impl AppState {
     ) -> AppResult<CollectionInfo> {
         let (database, _) = self.query_source()?;
         collections::combine(&database, mode, collection_ids, name)
+    }
+
+    pub fn image_pose(&self, image_id: i64) -> AppResult<Option<PoseData>> {
+        let (database, _) = self.query_source()?;
+        viewer::pose(&database, image_id)
+    }
+
+    pub(crate) fn begin_edit(&self) -> AppResult<MaintenanceGuard> {
+        self.begin_maintenance()
+    }
+
+    pub(crate) fn edit_handles(&self) -> AppResult<(Arc<LibraryDb>, Arc<ThumbPack>, PathBuf)> {
+        self.library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))
+    }
+
+    pub(crate) fn copy_source(&self, image_id: i64) -> AppResult<PathBuf> {
+        let (database, root) = self.query_source()?;
+        content::original_path(&database, &root, image_id)
     }
 }

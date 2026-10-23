@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0–S3 已实现的契约；AI 任务、feature pack、查看器与图像编辑在后续阶段追加。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0–S4 已实现的契约；AI 任务与 feature pack 在后续阶段追加。
 
 ## 图库清单
 
@@ -149,6 +149,11 @@ ui                 { theme, gridThumbPx }
 | `reorder_collections` | `{ collectionIds }` | `null` |
 | `add_images_to_collection` / `remove_images_from_collection` | `{ collectionId, imageIds }` | 变更条目数 |
 | `combine_collections` | `{ mode, collectionIds, name }` | `CollectionInfo` |
+| `get_viewer_source` | `{ imageId }` | `ViewerSource` |
+| `save_image_edit` | `{ request }` | `EditResult` |
+| `get_image_pose` | `{ imageId }` | `PoseData \| null` |
+| `copy_image` | `{ imageId }` | `null` |
+| `window_toggle_fullscreen` | — | `boolean` |
 | `copy_text` | `{ text }` | `null` |
 | `window_minimize` / `window_toggle_maximize` / `window_is_maximized` / `window_close` | — | 窗口控制 |
 | `get_app_info` | — | `{ version, settingsPath }` |
@@ -182,9 +187,9 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空。详见 [浏览与检索](browse-and-query.md)。
+已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏与姿势查询占位。详见 [查看器与几何编辑](viewer-and-editor.md)。
 
-未实现（后续阶段）：feature pack 与 AI 任务、原图查看器与图像编辑、颜色/pHash/CLIP/pose 相似度、长任务进度/取消。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
+未实现（后续阶段）：feature pack 与 AI 任务、颜色/pHash/CLIP/pose 相似度、拖出到资源管理器（OLE）、长任务进度/取消。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
 ## 测试
 
@@ -199,6 +204,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
 - S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复/永久删除/清空回收站；
-- S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集。
+- S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
+- S4 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
+- S4 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。
 
 性能基准（默认忽略）见 [性能基准](../guides/performance.md)。

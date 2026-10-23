@@ -11,16 +11,19 @@ import {
 import { Button, IconButton } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
 import { LibraryView } from "../modules/library/LibraryView";
+import { viewerApi } from "../modules/viewer/api";
 import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { ThumbBenchOverlay } from "./ThumbBenchOverlay";
+import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
+import type { ViewerSession } from "../shared/viewerSession";
 
 const upcoming = [
-  ["Stage 4", "查看器、旋转/翻转/裁剪/调尺寸"],
   ["Stage 5", "色彩/LUT/DFT/卷积与操作链撤销"],
   ["Stage 6", "AI 描述、Embedding、Pose 与批量任务"],
+  ["Stage 7", "相似度检索与高级集合"],
 ];
 
 export function LibraryWorkspace() {
@@ -31,6 +34,7 @@ export function LibraryWorkspace() {
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null);
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
 
@@ -71,6 +75,15 @@ export function LibraryWorkspace() {
     void refreshStatus().catch((error: unknown) => {
       notify("刷新图库状态失败", "error", errorMessage(error));
     });
+  };
+
+  const handleCopyImage = async (imageId: number) => {
+    try {
+      await viewerApi.copyImage(imageId);
+      notify("图片已复制到剪贴板", "success");
+    } catch (error) {
+      notify("复制图片失败", "error", errorMessage(error));
+    }
   };
 
   const handleClose = async () => {
@@ -143,7 +156,12 @@ export function LibraryWorkspace() {
       </header>
 
       {hasImages ? (
-        <LibraryView key={current.id} refreshToken={refreshToken} />
+        <LibraryView
+          key={current.id}
+          refreshToken={refreshToken}
+          onOpenViewer={setViewerSession}
+          onCopyImage={(imageId) => void handleCopyImage(imageId)}
+        />
       ) : (
         <>
           <div className="stat-grid">
@@ -208,6 +226,13 @@ export function LibraryWorkspace() {
       )}
 
       <ThumbBenchOverlay open={benchOpen} onClose={() => setBenchOpen(false)} />
+      {viewerSession ? (
+        <ViewerHost
+          key={`${current.id}-${viewerSession.initialId}`}
+          session={viewerSession}
+          onClose={() => setViewerSession(null)}
+        />
+      ) : null}
       <ImportDialog
         open={importOpen}
         initialPaths={pendingPaths}

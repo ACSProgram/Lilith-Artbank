@@ -1,5 +1,7 @@
 pub mod collections;
+pub mod content;
 pub mod db;
+pub mod edit;
 pub mod import;
 pub mod manifest;
 pub mod metadata;
@@ -8,6 +10,7 @@ pub mod query;
 pub mod schema;
 pub mod service;
 pub mod thumbs;
+pub mod viewer;
 
 #[cfg(test)]
 mod perf;
