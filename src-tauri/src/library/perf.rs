@@ -6,7 +6,13 @@ use std::{
 
 use rusqlite::{Connection, params};
 
-use crate::{app::error::AppResult, library::service};
+use crate::{
+    app::error::AppResult,
+    library::{
+        query::{self, LibraryFilters, LibraryQuery, QueryCursor, SortKey, SortSpec},
+        service,
+    },
+};
 
 const IMAGE_COUNT: i64 = 200_000;
 const TAG_COUNT: i64 = 200;
@@ -121,9 +127,7 @@ fn perf_metadata_200k() {
     let database = session.db;
 
     let seed_start = Instant::now();
-    let seed_elapsed = database
-        .with_writer(|connection| seed(connection))
-        .expect("seed database");
+    let seed_elapsed = database.with_writer(seed).expect("seed database");
     let wall = seed_start.elapsed();
     println!(
         "[perf] seed {IMAGE_COUNT} images + {} tag links: seed={:.2}s wall={:.2}s",
@@ -304,6 +308,112 @@ fn perf_metadata_200k() {
         ms(reopen_elapsed),
         reopened.info.image_count
     );
+
+    let database = &reopened.db;
+    let page_query = LibraryQuery {
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, page_query.clone(), 40);
+    println!(
+        "[perf] query engine first page 150 (imported desc): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let deep_query = LibraryQuery {
+        sort: SortSpec {
+            key: SortKey::Score,
+            descending: true,
+        },
+        cursor: Some(QueryCursor {
+            sort_key: "2".into(),
+            id: 150_000,
+        }),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, deep_query, 40);
+    println!(
+        "[perf] query engine deep keyset 150 (score/id cursor): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let folder_query = LibraryQuery {
+        filters: LibraryFilters {
+            folder_ids: vec![7],
+            ..Default::default()
+        },
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, folder_query.clone(), 40);
+    println!(
+        "[perf] query engine folder 150: p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let tag_query = LibraryQuery {
+        filters: LibraryFilters {
+            tag_ids: vec![17],
+            ..Default::default()
+        },
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let (p50, p95) = time_query(database, &root, tag_query.clone(), 40);
+    println!(
+        "[perf] query engine tag 150: p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    let mut counts_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let start = Instant::now();
+        let counts = query::filter_counts(database, folder_query.clone()).expect("counts");
+        counts_samples.push(start.elapsed());
+        assert!(counts.total > 0);
+    }
+    println!(
+        "[perf] query engine filter counts: p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&counts_samples, 0.5)),
+        ms(percentile(&counts_samples, 0.95))
+    );
+
+    let start = Instant::now();
+    let ids = query::query_ids(database, tag_query).expect("ids");
+    println!(
+        "[perf] query engine select-all ids ({}): {:.2}ms",
+        ids.len(),
+        ms(start.elapsed())
+    );
+
+    let start = Instant::now();
+    let all_ids = query::query_ids(database, page_query).expect("all ids");
+    println!(
+        "[perf] query engine select-all ids ({}) without filters: {:.2}ms",
+        all_ids.len(),
+        ms(start.elapsed())
+    );
+}
+
+fn time_query(
+    database: &crate::library::db::LibraryDb,
+    root: &std::path::Path,
+    query: LibraryQuery,
+    iterations: usize,
+) -> (Duration, Duration) {
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let page = query::query_page(database, root, query.clone()).expect("query page");
+        assert!(!page.items.is_empty());
+        samples.push(start.elapsed());
+    }
+    (percentile(&samples, 0.5), percentile(&samples, 0.95))
 }
 
 #[test]

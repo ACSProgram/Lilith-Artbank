@@ -15,6 +15,7 @@ use crate::{
     library::{
         db::LibraryDb,
         manifest::{LibraryInspection, inspect},
+        query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
         thumbs::ThumbPack,
     },
@@ -42,20 +43,6 @@ impl AppState {
             .lock()
             .as_ref()
             .map(|session| session.info.clone())
-    }
-
-    #[allow(dead_code)]
-    pub fn current_database(&self) -> Option<std::sync::Arc<crate::library::db::LibraryDb>> {
-        self.library
-            .lock()
-            .as_ref()
-            .map(|session| session.db.clone())
-    }
-
-    #[allow(dead_code)]
-    pub fn require_database(&self) -> AppResult<std::sync::Arc<crate::library::db::LibraryDb>> {
-        self.current_database()
-            .ok_or_else(|| AppError::message("尚未打开图库"))
     }
 
     pub fn current_thumb_source(
@@ -232,5 +219,38 @@ impl AppState {
 
     pub fn inspect_library(&self, path: &Path) -> LibraryInspection {
         inspect(path)
+    }
+
+    fn query_source(&self) -> AppResult<(std::sync::Arc<LibraryDb>, PathBuf)> {
+        let library = self.library.lock();
+        let session = library
+            .as_ref()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        Ok((session.db.clone(), PathBuf::from(&session.info.path)))
+    }
+
+    pub fn query_images(&self, query: LibraryQuery) -> AppResult<ImagePage> {
+        let (database, root) = self.query_source()?;
+        query::query_page(&database, &root, query)
+    }
+
+    pub fn query_image_ids(&self, query: LibraryQuery) -> AppResult<Vec<i64>> {
+        let (database, _) = self.query_source()?;
+        query::query_ids(&database, query)
+    }
+
+    pub fn filter_counts(&self, query: LibraryQuery) -> AppResult<FilterCounts> {
+        let (database, _) = self.query_source()?;
+        query::filter_counts(&database, query)
+    }
+
+    pub fn folders(&self) -> AppResult<Vec<FolderInfo>> {
+        let (database, _) = self.query_source()?;
+        query::list_folders(&database)
+    }
+
+    pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
+        let (database, _) = self.query_source()?;
+        query::list_tags(&database, limit)
     }
 }

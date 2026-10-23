@@ -2,6 +2,7 @@ mod app;
 mod imageops;
 mod import;
 mod library;
+mod platform;
 
 use tauri::Manager;
 

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 设置、图库创建/打开/关闭、schema | `docs/modules/library.md` | `src-tauri/src/app/`、`src-tauri/src/library/` |
 | 导入、BLAKE3、pHash、主色、缩略图包 | `docs/modules/import.md` | `src-tauri/src/import/`、`src-tauri/src/imageops/` |
-| 网格/列表、分页、筛选、排序、集合、回收站 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/` |
+| 网格/列表、分页、筛选、排序、集合、回收站 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/query.rs`、`src-tauri/src/library/` |
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
 | 色彩/LUT/DFT/卷积 | `docs/modules/viewer-and-editor.md` | `src/modules/editor/`、`src-tauri/src/imageops/` |
 | description / embedding / pose、服务进程 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/` |
@@ -17,8 +17,8 @@
 ## 读序
 
 1. 先读所选模块文档与 `docs/planning/current-handoff.md`；未完成事项查 `todo.md`。
-2. 再读前端 `types.ts` / `api.ts` 或 Rust 的 DTO/命令，确认边界。
-3. 最后读实现。数据库工作进入 `src-tauri/src/library/`；像素工作进入 `imageops/`；AI 只进入 `ai/`。
+2. 再读前端 `types.ts` / `api.ts` 或 Rust 的 DTO/命令，确认边界。浏览/查询先看 `src/modules/library/types.ts`、`api.ts` 与 `src-tauri/src/library/query.rs`。
+3. 最后读实现。数据库工作进入 `src-tauri/src/library/`；像素工作进入 `imageops/`；AI 只进入 `ai/`；剪贴板等平台差异进入 `platform/`。
 
 ## 边界
 

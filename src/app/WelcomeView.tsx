@@ -41,7 +41,7 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
           <Button variant="primary" size="md" icon={<FolderPlus size={17} />} onClick={onAddLibrary}>
             打开或创建图库
           </Button>
-          <span className="welcome-stage">Stage 1 · 缩略图管线</span>
+          <span className="welcome-stage">Stage 2 · 虚拟网格与查询</span>
         </div>
         {browserPreview ? (
           <div className="welcome-preview-note">

@@ -4,13 +4,13 @@ import {
   Database,
   FolderOpen,
   Images,
-  RefreshCw,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
 import { Button, IconButton } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
+import { LibraryView } from "../modules/library/LibraryView";
 import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
@@ -23,9 +23,9 @@ function errorMessage(error: unknown): string {
 }
 
 const upcoming = [
-  ["Stage 2", "虚拟化网格、列表视图、选择与键盘操作"],
-  ["Stage 3", "标签/评分/描述、筛选、排序、集合与回收站"],
+  ["Stage 3", "标签/评分/描述、搜索、筛选、集合与回收站"],
   ["Stage 4", "查看器、旋转/翻转/裁剪/调尺寸"],
+  ["Stage 5", "色彩/LUT/DFT/卷积与操作链撤销"],
 ];
 
 export function LibraryWorkspace() {
@@ -35,6 +35,7 @@ export function LibraryWorkspace() {
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [refreshToken, setRefreshToken] = useState(0);
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
 
@@ -68,13 +69,13 @@ export function LibraryWorkspace() {
 
   if (!current) return null;
 
-  const handleRefresh = async () => {
-    try {
-      await refreshStatus();
-      notify("图库状态已刷新", "success");
-    } catch (error) {
-      notify("刷新状态失败", "error", errorMessage(error));
-    }
+  const hasImages = current.imageCount > 0;
+
+  const handleImportFinished = () => {
+    setRefreshToken((value) => value + 1);
+    void refreshStatus().catch((error: unknown) => {
+      notify("刷新图库状态失败", "error", errorMessage(error));
+    });
   };
 
   const handleClose = async () => {
@@ -106,12 +107,16 @@ export function LibraryWorkspace() {
   };
 
   return (
-    <div className="workspace">
+    <div className={`workspace${hasImages ? " workspace-browse" : ""}`}>
       <header className="workspace-toolbar">
         <div className="workspace-heading">
           <span className="workspace-eyebrow">LIBRARY</span>
           <div className="workspace-title-row">
             <h1>{current.name}</h1>
+            <span className="workspace-count">
+              {current.imageCount.toLocaleString()} 张 · 回收站{" "}
+              {current.trashCount.toLocaleString()}
+            </span>
             <span className="workspace-path" title={current.path}>
               {current.path}
             </span>
@@ -136,82 +141,83 @@ export function LibraryWorkspace() {
           >
             导入图片
           </Button>
-          <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} onClick={() => void handleRefresh()}>
-            刷新状态
-          </Button>
           <IconButton label="关闭图库" onClick={() => void handleClose()}>
             <X size={16} />
           </IconButton>
         </div>
       </header>
 
-      <div className="stat-grid">
-        <div className="stat-card">
-          <span className="stat-icon"><Images size={18} /></span>
-          <div>
-            <span className="stat-value">{current.imageCount.toLocaleString()}</span>
-            <span className="stat-label">图片</span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-icon"><Trash2 size={18} /></span>
-          <div>
-            <span className="stat-value">{current.trashCount.toLocaleString()}</span>
-            <span className="stat-label">回收站</span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-icon"><Database size={18} /></span>
-          <div>
-            <span className="stat-value">v{current.schemaVersion}</span>
-            <span className="stat-label">Schema</span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-icon"><FolderOpen size={18} /></span>
-          <div>
-            <span className="stat-value stat-value-small" title={current.path}>{current.path}</span>
-            <span className="stat-label">图库位置</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="workspace-empty">
-        <div className="workspace-empty-icon">
-          <Images size={34} />
-        </div>
-        <h2>{current.imageCount > 0 ? "图库已有内容" : "把图片拖进来"}</h2>
-        <p>
-          {current.imageCount > 0
-            ? `已经收进 ${current.imageCount.toLocaleString()} 张图片。导入会继续追加，重复内容按内容哈希跳过或合并。`
-            : "把图片或文件夹拖进窗口，或者从本地选择。原图复制入库，缩略图、pHash 与主色同步生成。"}
-        </p>
-        <div className="workspace-empty-actions">
-          <Button variant="primary" icon={<Upload size={15} />} onClick={() => openImport()}>
-            {current.imageCount > 0 ? "继续导入" : "导入图片"}
-          </Button>
-        </div>
-        <div className="stage-list">
-          {upcoming.map(([stage, text]) => (
-            <div key={stage} className="stage-item">
-              <span className="stage-badge">{stage}</span>
-              <span>{text}</span>
+      {hasImages ? (
+        <LibraryView key={current.id} refreshToken={refreshToken} />
+      ) : (
+        <>
+          <div className="stat-grid">
+            <div className="stat-card">
+              <span className="stat-icon"><Images size={18} /></span>
+              <div>
+                <span className="stat-value">{current.imageCount.toLocaleString()}</span>
+                <span className="stat-label">图片</span>
+              </div>
             </div>
-          ))}
-        </div>
-        {browserPreview ? (
-          <p className="workspace-note">
-            浏览器预览模式不会创建真实数据库；请用 <code>npm run tauri dev</code> 验证导入与图库读写。
-          </p>
-        ) : null}
-      </div>
+            <div className="stat-card">
+              <span className="stat-icon"><Trash2 size={18} /></span>
+              <div>
+                <span className="stat-value">{current.trashCount.toLocaleString()}</span>
+                <span className="stat-label">回收站</span>
+              </div>
+            </div>
+            <div className="stat-card">
+              <span className="stat-icon"><Database size={18} /></span>
+              <div>
+                <span className="stat-value">v{current.schemaVersion}</span>
+                <span className="stat-label">Schema</span>
+              </div>
+            </div>
+            <div className="stat-card">
+              <span className="stat-icon"><FolderOpen size={18} /></span>
+              <div>
+                <span className="stat-value stat-value-small" title={current.path}>{current.path}</span>
+                <span className="stat-label">图库位置</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="workspace-empty">
+            <div className="workspace-empty-icon">
+              <Images size={34} />
+            </div>
+            <h2>把图片拖进来</h2>
+            <p>
+              把图片或文件夹拖进窗口，或者从本地选择。原图复制入库，缩略图、pHash 与主色同步生成。
+            </p>
+            <div className="workspace-empty-actions">
+              <Button variant="primary" icon={<Upload size={15} />} onClick={() => openImport()}>
+                导入图片
+              </Button>
+            </div>
+            <div className="stage-list">
+              {upcoming.map(([stage, text]) => (
+                <div key={stage} className="stage-item">
+                  <span className="stage-badge">{stage}</span>
+                  <span>{text}</span>
+                </div>
+              ))}
+            </div>
+            {browserPreview ? (
+              <p className="workspace-note">
+                浏览器预览模式不会创建真实数据库；请用 <code>npm run tauri dev</code> 验证导入与图库读写。
+              </p>
+            ) : null}
+          </div>
+        </>
+      )}
 
       <ThumbBenchOverlay open={benchOpen} onClose={() => setBenchOpen(false)} />
       <ImportDialog
         open={importOpen}
         initialPaths={pendingPaths}
         onClose={closeImport}
-        onFinished={() => void refreshStatus()}
+        onFinished={handleImportFinished}
       />
 
       {dragging && !importOpen ? (

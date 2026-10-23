@@ -11,7 +11,11 @@ use crate::{
         state::AppState,
     },
     import::{ImportRequest, job::ImportSnapshot},
-    library::{manifest::LibraryInspection, service::LibraryInfo},
+    library::{
+        manifest::LibraryInspection,
+        query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        service::LibraryInfo,
+    },
 };
 
 #[tauri::command]
@@ -187,6 +191,42 @@ pub fn get_import_status(
     Ok(state.import_status(&job_id))
 }
 
+#[tauri::command]
+pub fn copy_text(text: String) -> Result<(), String> {
+    AppError::command(crate::platform::clipboard::copy_text(&text))
+}
+
+#[tauri::command]
+pub fn query_images(state: State<'_, AppState>, query: LibraryQuery) -> Result<ImagePage, String> {
+    AppError::command(state.query_images(query))
+}
+
+#[tauri::command]
+pub fn query_image_ids(
+    state: State<'_, AppState>,
+    query: LibraryQuery,
+) -> Result<Vec<i64>, String> {
+    AppError::command(state.query_image_ids(query))
+}
+
+#[tauri::command]
+pub fn get_filter_counts(
+    state: State<'_, AppState>,
+    query: LibraryQuery,
+) -> Result<FilterCounts, String> {
+    AppError::command(state.filter_counts(query))
+}
+
+#[tauri::command]
+pub fn get_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.folders())
+}
+
+#[tauri::command]
+pub fn get_tags(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<TagInfo>, String> {
+    AppError::command(state.tags(limit))
+}
+
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         get_settings,
@@ -210,6 +250,12 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         thumb_bench_cleanup,
         start_import,
         cancel_import,
-        get_import_status
+        get_import_status,
+        copy_text,
+        query_images,
+        query_image_ids,
+        get_filter_counts,
+        get_folders,
+        get_tags
     ]
 }

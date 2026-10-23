@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { MOCK_IMAGE_COUNT } from "../modules/library/mockConfig";
 import type {
   AppInfo,
   LibraryEntry,
@@ -40,7 +41,7 @@ function mockLibrary(name: string, path: string): LibraryInfo {
     id: crypto.randomUUID(),
     name,
     path,
-    imageCount: 0,
+    imageCount: MOCK_IMAGE_COUNT,
     trashCount: 0,
     schemaVersion: 1,
     openedAt: Date.now(),
@@ -111,7 +112,13 @@ export const appApi = {
     if (!isTauri()) {
       const entry = mockSettings.libraries.find((library) => library.id === libraryId);
       if (!entry) throw new Error("图库不在列表中");
-      mockCurrent = { ...entry, imageCount: 0, trashCount: 0, schemaVersion: 1, openedAt: Date.now() };
+      mockCurrent = {
+        ...entry,
+        imageCount: MOCK_IMAGE_COUNT,
+        trashCount: 0,
+        schemaVersion: 1,
+        openedAt: Date.now(),
+      };
       return mockCurrent;
     }
     return invoke<LibraryInfo>("open_library", { libraryId });

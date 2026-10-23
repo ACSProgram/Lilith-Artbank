@@ -14,20 +14,20 @@ AI 能力（description、image/text embedding、pose）统一走本机 HTTP 服
 
 ```text
 src/app/                     应用外壳、设置、图库入口、全局通知、跨模块编排
-src/modules/library/         图库视图、选择、网格/列表（后续）
+src/modules/library/         图库视图、虚拟网格/列表、筛选、选择、查询控制器
 src/modules/import/          导入弹窗、进度、结果与失败清单
 src/modules/viewer/          查看器（后续）
 src/modules/editor/          图像处理（后续）
 src/modules/ai/              AI 任务与设置页（后续）
-src/shared/                  无领域语义的控件、API 调用、缩略图 URL 与格式化
+src/shared/                  无领域语义的控件、API 调用、缩略图 URL、剪贴板与格式化
 
 src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 协议
-src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、缩略图 pack、导入仓储、查询与仓储（逐步补齐）
+src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、缩略图 pack、导入仓储、键集查询
 src-tauri/src/import/        BLAKE3、解码/EXIF、扫描、pHash/主色调度、导入后台任务
 src-tauri/src/imageops/      缩略图编码、pHash、主色；裁剪/旋转/调尺寸/色彩/LUT/DFT/卷积（后续）
+src-tauri/src/platform/      剪贴板等平台差异（当前为文本写入）
 src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管（后续）
 src-tauri/src/features/      pHash/颜色/向量/姿势相似度（后续）
-src-tauri/src/platform/      剪贴板、拖出、Windows 差异集中处（后续）
 ```
 
 Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数、把错误转成稳定字符串。业务逻辑不写在命令里。
@@ -78,8 +78,11 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - `src/modules/<module>/api.ts` 是该领域命令的唯一入口；`types.ts` 只放边界 DTO。
 - 模块之间不互相导入；跨模块编排放在 `src/app/`。
 - 页面组件只做视图、弹窗与局部交互；读取、mutation、busy、错误与请求代次在 controller 中。
-- 列表数据使用键集游标（`(sort_key, id)`），不用深 `OFFSET`。
+- 列表数据使用键集游标（`(sort_key, id)`），不用深 `OFFSET`；一页默认 150，最多 300。
+- 浏览命令只经 `src/modules/library/api.ts`；返回行只含列表字段与缩略图版本，不含 embedding/pose。
 - 缩略图通过本地协议按需加载（`thumb://` / `http://thumb.localhost`），浏览器负责解码与缓存；网格只挂载视口附近项目。
+- 选择集只存图片 id；`Ctrl+A` 通过 `query_image_ids` 取当前筛选的全部 id，而不是只选已加载行。
+- 复制文件路径在 Rust 侧写系统剪贴板；前端不直接读图库目录。
 
 ## 性能原则
 
@@ -97,6 +100,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 | 缩略图 | 追加式 `thumbs/*.pack` | 15 万次随机读实测比逐文件快约 16 倍，且避免 20 万小文件 |
 | 缩略图格式 | WebP q80（libwebp 静态链接） | 体积约 JPEG 一半，解码时间同级；浏览器原生解码，不用 DDS/WebGPU；无额外 DLL |
 | 原图命名 | BLAKE3 内容哈希 | 精确去重、天然不可变；感知相似用独立 256 位 pHash |
+| 列表显示 | 尺寸/格式/大小/评分/标签/时间 | 不保存原始文件名；原图文件名就是内容哈希，避免导入时维护额外身份 |
 | 编辑历史 | 参数化操作链 | 不再保存全分辨率像素副本；预览在降采样图上由 Rust 渲染 |
 | AI | 本机 HTTP 服务 + 应用托管进程 | 模型/Python 环境与图库解耦；离线时图库功能不受影响 |
 | 旧数据 | 不读 `.data` | 新数据结构独立；迁移脚本后续单独做，应用不背历史格式 |
@@ -109,4 +113,6 @@ S1 前半已实现：WebP 缩略图编码、追加式缩略图包、`thumb://` �
 
 S1 后半已实现：文件/目录/拖放导入、流式 BLAKE3、原子发布、EXIF 方向、pHash、4/8 主色、精确重复与合并、感知重复提示、rayon 工作池、单写批量入库、进度/取消/失败清单、导入界面。1000 张合成图实测 47.7–50.0 张/秒；真实窗口导入界面待用户手工验收。
 
-尚未实现：查询/筛选、查看器、图像处理、AI。具体见 [路线图](../planning/roadmap.md)。
+S2 已实现：键集查询引擎、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本、虚拟网格/列表、缩略图占位与重试、选择/键盘/右键菜单、基础筛选面板、导入后刷新。20 万行查询预算全部达标；真实窗口滚动与复制路径待手工验收。拖出到资源管理器与复制图片未在 S2 实现。
+
+尚未实现：搜索、完整筛选、集合、回收站操作、查看器、图像处理、AI。具体见 [路线图](../planning/roadmap.md)。

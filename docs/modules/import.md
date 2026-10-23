@@ -75,7 +75,7 @@
 - URL：`thumb://<imageId>?v=<thumbVersion>`。Windows 的 WebView2 只接受 `http://thumb.localhost/<imageId>?v=<thumbVersion>`；前端统一经 `src/shared/thumbUrl.ts` 的 `thumbnailUrl()` 生成，不自己拼字符串。
 - 查询串只作为浏览器缓存键，服务端只解析路径里的 id，不校验 `v`。
 - 响应头：`Content-Type` 取自 `thumb_format`（当前只有 `image/webp`）、`Content-Length`、`Cache-Control: public, max-age=31536000, immutable`、`ETag: "v<thumb_version>"`、`X-Content-Type-Options: nosniff`。
-- 状态码：id 不是整数 → 400；图库未打开、图片无缩略图、pack 缺失或指针越界 → 404；数据库与文件读取异常 → 500。错误响应带 `Cache-Control: no-store`，不会被长缓存钉住。
+- 状态码：id 不是整数 → 400；图库未打开、图片无缩略图、pack 缺失或指针越界 → 404；数据库与文件读取异常 → 500。错误响应带 `Cache-Control: no-store`，不会被长缓存钉住。网格/列表在图库打开后按 `thumb_version` 请求；404 时显示占位，点击重试会附加 `retry` 查询参数。
 - 开发构建另有 `thumb://bench/<index>?run=<n>`：读取应用内基准样本，`run` 变化即强制冷加载；`bench/` 前缀与图片 id 互不冲突。
 
 ### 并发、进度与取消
@@ -95,6 +95,7 @@
 - 命令入口：`src/modules/import/api.ts`。
 - 类型：`src/modules/import/types.ts`。
 - 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。
+- 导入完成时工作区递增浏览刷新令牌，`LibraryView` 重新查询第一页并刷新图库计数；筛选条件保留，图片选择清空。结果弹窗仍显示最近 24 张预览，关闭后回到网格。
 
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
@@ -145,5 +146,3 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 - “保留源目录层级”选项；当前所有图片进入指定目标文件夹。
 - 移动模式；默认只复制，不改用户原文件。源目录若在图库内，原文件也不会被移动或删除；请优先从图库外导入。
 - 感知重复的分桶索引与阈值标定（S7 用真实样本做）。
-- 导入完成后的网格浏览（S2）；当前只显示最近 24 张缩略图预览。
-- 删除 pack 后的网格占位组件（S2）；协议层已返回 404。

@@ -6,7 +6,7 @@
 
 - 图库打开/创建/关闭、设置、SQLite schema：读 `docs/modules/library.md`，再进入 `src-tauri/src/app/`、`src-tauri/src/library/`。
 - 导入、哈希、pHash、主色、缩略图包：读 `docs/modules/import.md`，再进入 `src-tauri/src/import/`、`src-tauri/src/imageops/`。
-- 网格/列表、分页、筛选、排序、集合、回收站：读 `docs/modules/browse-and-query.md`，再进入 `src/modules/library/`、`src-tauri/src/library/`。
+- 网格/列表、分页、筛选、排序、集合、回收站：读 `docs/modules/browse-and-query.md`，再进入 `src/modules/library/`、`src-tauri/src/library/query.rs`、`src-tauri/src/library/`。
 - 查看器、裁剪/旋转/调尺寸、图像处理：读 `docs/modules/viewer-and-editor.md`，再进入 `src/modules/viewer/`、`src/modules/editor/`、`src-tauri/src/imageops/`。
 - description / embedding / pose、AI 服务进程：读 `docs/modules/ai-service.md`，再进入 `src-tauri/src/ai/`、`src/modules/ai/`。
 - 清理、缩略图重建、描述导入导出：读 `docs/modules/maintenance.md`。
@@ -29,7 +29,7 @@
 - `src/modules/<module>/api.ts` 是该领域 Tauri 命令的唯一前端入口。
 - `src/modules/<module>/types.ts` 只放边界 DTO；纯前端计算放模块自己的 model/helper。
 - 前端模块之间不互相导入；跨模块流程在 `src/app/` 编排。
-- `src-tauri/src/app/` 管设置、状态、命令适配与生命周期；`library/` 管 schema、连接池与仓储；`imageops/` 只做像素；`ai/` 只做 HTTP 与任务。
+- `src-tauri/src/app/` 管设置、状态、命令适配与生命周期；`library/` 管 schema、连接池与仓储；`imageops/` 只做像素；`ai/` 只做 HTTP 与任务；`platform/` 只放剪贴板等平台差异。
 - Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数、把错误转成字符串；不在命令里写业务。
 - 所有文件系统、数据库与模型操作都在 Rust 完成。前端不直接读图库目录。
 - SQLite 写入必须单写连接；读取走连接池。长任务必须可取消并有进度事件。
