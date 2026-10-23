@@ -9,6 +9,8 @@ import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import type { Settings } from "./types";
 import { errorMessage } from "../shared/errors";
+import { aiApi, aiBrowserPreview } from "../modules/ai/api";
+import type { AiStatus } from "../modules/ai/types";
 
 function numberOrNull(value: string): number | null {
   if (!value.trim()) return null;
@@ -22,13 +24,55 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
   const [draft, setDraft] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
     setDraft(settings ? structuredClone(settings) : null);
     setError(null);
     setSaving(false);
+    setAiError(null);
+    void aiApi
+      .getStatus()
+      .then(setAiStatus)
+      .catch((cause: unknown) => setAiError(errorMessage(cause)));
   }, [isOpen, settings]);
+
+  const refreshAi = async () => {
+    setAiBusy(true);
+    try {
+      setAiStatus(await aiApi.getStatus());
+      setAiError(null);
+    } catch (cause) {
+      setAiError(errorMessage(cause));
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const runAi = async (action: "start" | "stop" | "ensure") => {
+    setAiBusy(true);
+    setAiError(null);
+    try {
+      if (action === "start") await aiApi.startService();
+      if (action === "stop") await aiApi.stopService();
+      if (action === "ensure") {
+        await aiApi.ensureModels([
+          "imageEmbedding",
+          "textEmbedding",
+          "pose",
+          "description",
+        ]);
+      }
+      await refreshAi();
+    } catch (cause) {
+      setAiError(errorMessage(cause));
+    } finally {
+      setAiBusy(false);
+    }
+  };
 
   const patch = (update: (current: Settings) => Settings) => {
     setDraft((current) => (current ? update(structuredClone(current)) : current));
@@ -123,7 +167,7 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
     <Modal
       open={isOpen}
       title="设置"
-      subtitle="这里只保存尚未接入模块的参数；写入后立即生效的只有界面与图库读取设置。"
+      subtitle="设置保存在本机；AI 服务参数在下次检测或启动时生效。"
       onClose={onClose}
       width={720}
       dismissible={!saving}
@@ -165,7 +209,7 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
 
           <Section
             title="AI 服务"
-            description="description / embedding / pose 都走本地 HTTP 服务。服务进程托管与推理接口将在 Stage 6 接入。"
+            description="description / embedding / pose 都走本地 HTTP 服务；embedding 为 SigLIP2 1536 维，服务返回模型名与维度。"
           >
             <div className="settings-grid">
               <Field label="服务地址" hint="默认本机 127.0.0.1:18766。">
@@ -239,9 +283,73 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
                 <small>接入后由应用管理进程、端口探活与退出顺序。</small>
               </span>
             </label>
+            <div className="ai-settings-status">
+              <div>
+                <strong>
+                  {aiStatus?.online
+                    ? "服务在线"
+                    : aiStatus?.process.state === "starting"
+                      ? "服务启动中"
+                      : "服务离线"}
+                </strong>
+                <span>
+                  {aiError ??
+                    aiStatus?.process.message ??
+                    aiStatus?.baseUrl ??
+                    "尚未检测服务"}
+                </span>
+                {aiStatus?.health ? (
+                  <span>
+                    {Object.entries(aiStatus.health.capabilities)
+                      .map(
+                        ([name, capability]) =>
+                          `${name}: ${capability.ready ? "就绪" : "未加载"}${
+                            capability.dim ? ` (${capability.dim})` : ""
+                          }`,
+                      )
+                      .join(" · ")}
+                  </span>
+                ) : null}
+              </div>
+              <div className="settings-inline-actions">
+                <Button size="sm" variant="ghost" loading={aiBusy} onClick={() => void refreshAi()}>
+                  检测
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  loading={aiBusy}
+                  disabled={aiBrowserPreview}
+                  onClick={() => void runAi("ensure")}
+                >
+                  加载模型
+                </Button>
+                {aiStatus?.process.owned ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    loading={aiBusy}
+                    disabled={aiBrowserPreview}
+                    onClick={() => void runAi("stop")}
+                  >
+                    停止服务
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={aiBusy}
+                    disabled={aiBrowserPreview}
+                    onClick={() => void runAi("start")}
+                  >
+                    启动服务
+                  </Button>
+                )}
+              </div>
+            </div>
             <div className="settings-inline-note">
               <Sparkles size={14} />
-              当前阶段只保存参数；离线时图库本体功能不受影响。
+              离线时 AI 按钮会提示错误，图库浏览、导入与编辑不受影响。
             </div>
           </Section>
 

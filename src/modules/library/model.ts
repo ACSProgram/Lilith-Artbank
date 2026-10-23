@@ -227,3 +227,25 @@ export function bytesToMbInput(bytes: number | null): string {
   if (bytes == null) return "";
   return String(Math.round((bytes / (1024 * 1024)) * 10) / 10);
 }
+
+/** 语义搜索结果的数据源契约；由 src/app 的控制器实现，LibraryView 只消费。 */
+export interface SemanticBrowseState {
+  active: boolean;
+  text: string;
+  token: string | null;
+  model: string;
+  total: number;
+  elapsedMs: number;
+  busy: boolean;
+  error: string | null;
+  items: ImageRow[];
+  status: "loading" | "ready" | "error";
+  moreStatus: "idle" | "loading" | "error";
+  moreError: string | null;
+  hasMore: boolean;
+  search: (text: string) => void;
+  clear: () => void;
+  loadMore: () => void;
+  retry: () => void;
+  ids: () => Promise<number[]>;
+}

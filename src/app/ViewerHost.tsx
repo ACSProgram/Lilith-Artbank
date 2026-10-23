@@ -1,15 +1,23 @@
 import { useState } from "react";
 import { InspectorPanel } from "../modules/library/Inspector";
 import { ImageViewer } from "../modules/viewer/ImageViewer";
+import type { PoseData } from "../modules/viewer/types";
 import type { ViewerSession } from "../shared/viewerSession";
 
 interface ViewerHostProps {
   session: ViewerSession;
   onClose: () => void;
+  onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
+  onGeneratePose?: (imageId: number) => Promise<PoseData>;
 }
 
 /** 查看器与图库详情侧栏的编排层；两个模块不互相导入。 */
-export function ViewerHost({ session, onClose }: ViewerHostProps) {
+export function ViewerHost({
+  session,
+  onClose,
+  onGenerateDescription,
+  onGeneratePose,
+}: ViewerHostProps) {
   const [activeId, setActiveId] = useState(session.initialId);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [version, setVersion] = useState(0);
@@ -27,6 +35,7 @@ export function ViewerHost({ session, onClose }: ViewerHostProps) {
       onToggleSidebar={() => setSidebarOpen((value) => !value)}
       onActiveChange={setActiveId}
       onSaved={() => setVersion((value) => value + 1)}
+      onGeneratePose={onGeneratePose ? () => onGeneratePose(activeId) : undefined}
       sidebar={
         <InspectorPanel
           selectedIds={[activeId]}
@@ -52,6 +61,7 @@ export function ViewerHost({ session, onClose }: ViewerHostProps) {
               if (changed) onClose();
             });
           }}
+          onGenerateDescription={onGenerateDescription}
         />
       }
     />

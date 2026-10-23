@@ -9,6 +9,7 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
+    ai::runtime::AiRuntime,
     app::{
         bench::ThumbBench,
         error::{AppError, AppResult},
@@ -27,7 +28,7 @@ use crate::{
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
         thumbs::ThumbPack,
-        viewer::{self, PoseData},
+        viewer::PoseData,
     },
 };
 
@@ -41,6 +42,7 @@ impl Drop for MaintenanceGuard {
 
 pub struct AppState {
     pub settings: SettingsStore,
+    pub ai: AiRuntime,
     library: Mutex<Option<LibrarySession>>,
     thumb_bench: Mutex<Option<Arc<ThumbBench>>>,
     import_job: Mutex<Option<Arc<ImportJob>>>,
@@ -51,6 +53,7 @@ impl AppState {
     pub fn new(settings: SettingsStore) -> Self {
         Self {
             settings,
+            ai: AiRuntime::new(),
             library: Mutex::new(None),
             thumb_bench: Mutex::new(None),
             import_job: Mutex::new(None),
@@ -183,6 +186,9 @@ impl AppState {
         if self.import_running() {
             return Err(AppError::message("导入进行中，请等待完成或取消导入"));
         }
+        if self.ai.job_running() {
+            return Err(AppError::message("AI 任务进行中，请等待完成或取消任务"));
+        }
         Ok(())
     }
 
@@ -206,6 +212,12 @@ impl AppState {
             added_at: service::now_ms(),
         })?;
         self.settings.set_last_library(Some(manifest.library_id))?;
+        self.ai.library_opened(
+            info.id.clone(),
+            session.db.clone(),
+            session.thumbs.clone(),
+            PathBuf::from(&info.path),
+        );
         *self.library.lock() = Some(session);
         Ok(info)
     }
@@ -222,12 +234,19 @@ impl AppState {
             added_at: service::now_ms(),
         })?;
         self.settings.set_last_library(Some(info.id.clone()))?;
+        self.ai.library_opened(
+            info.id.clone(),
+            session.db.clone(),
+            session.thumbs.clone(),
+            PathBuf::from(&info.path),
+        );
         *self.library.lock() = Some(session);
         Ok(info)
     }
 
     pub fn close_library(&self) -> AppResult<()> {
         self.ensure_no_activity()?;
+        self.ai.library_closed();
         *self.library.lock() = None;
         self.settings.set_last_library(None)?;
         Ok(())
@@ -240,6 +259,7 @@ impl AppState {
             .map(|info| info.id == library_id)
             .unwrap_or(false);
         if is_current {
+            self.ai.library_closed();
             *self.library.lock() = None;
         }
         self.settings.remove_library(library_id)
@@ -354,24 +374,32 @@ impl AppState {
 
     pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::set_trashed(&database, image_ids, true)
+        let changed = metadata::set_trashed(&database, image_ids, true)?;
+        self.ai.invalidate_semantic();
+        Ok(changed)
     }
 
     pub fn restore_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::set_trashed(&database, image_ids, false)
+        let changed = metadata::set_trashed(&database, image_ids, false)?;
+        self.ai.invalidate_semantic();
+        Ok(changed)
     }
 
     pub fn delete_images(&self, image_ids: &[i64]) -> AppResult<DeleteReport> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        metadata::delete_images(&database, &root, image_ids)
+        let report = metadata::delete_images(&database, &root, image_ids)?;
+        self.ai.invalidate_semantic();
+        Ok(report)
     }
 
     pub fn empty_trash(&self) -> AppResult<DeleteReport> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        metadata::empty_trash(&database, &root)
+        let report = metadata::empty_trash(&database, &root)?;
+        self.ai.invalidate_semantic();
+        Ok(report)
     }
 
     pub fn collections(&self) -> AppResult<Vec<CollectionInfo>> {
@@ -428,12 +456,13 @@ impl AppState {
     }
 
     pub fn image_pose(&self, image_id: i64) -> AppResult<Option<PoseData>> {
-        let (database, _) = self.query_source()?;
-        viewer::pose(&database, image_id)
+        self.ai.read_pose(image_id)
     }
 
     pub(crate) fn begin_edit(&self) -> AppResult<MaintenanceGuard> {
-        self.begin_maintenance()
+        let guard = self.begin_maintenance()?;
+        self.ai.invalidate_semantic();
+        Ok(guard)
     }
 
     pub(crate) fn edit_handles(&self) -> AppResult<(Arc<LibraryDb>, Arc<ThumbPack>, PathBuf)> {

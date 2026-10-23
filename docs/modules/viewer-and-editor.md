@@ -14,7 +14,7 @@
 - 大图：浏览器原生格式且 ≤2400 万像素时直接加载原图；超过阈值、格式不能由 WebView2 直接解码（TIFF/TGA）、或带 EXIF 方向时，由 Rust 生成最长边 4096 的 WebP 预览，缓存在 `.artbank/temp/viewer/<id>-<hash>.webp`。打开图库会清空 `temp`，保存会删除该图旧哈希的预览。
 - 带 EXIF 方向的图片也走 Rust 预览：预览已转正，避免 WebView2 的自然尺寸/方向语义与数据库宽高不一致，从而保证裁剪坐标可预测。编辑保存始终重新解码原图并应用方向。
 - `img://` 协议：Windows 为 `http://img.localhost/<id>?v=<hash>`（原图）与 `http://img.localhost/preview/<id>?v=<hash>`（预览）。响应带 `Cache-Control: immutable`、ETag=内容哈希；id 不是整数返回 400，图片行/原图/预览缺失返回 404（前端据此走失败态），路径解析失败返回 500。前端统一经 `src/shared/imgUrl.ts` 生成 URL，重试参数由 `withRetry` 追加。
-- 姿势叠加：已实现 33 点 MediaPipe 骨架与可见点过滤；S4 的 `get_image_pose` 固定返回 `null`，按钮禁用并提示“姿势数据将在 S6 提供”。S6 接入 feature pack 后只需返回 landmark。
+- 姿势叠加：33 点 MediaPipe 骨架与可见点过滤；`get_image_pose` 从 S6 的 feature pack 读取 landmark。没有可见姿势时按钮调用 `ai_generate_pose`（512px 缩略图输入），保存后立即叠加；服务返回空点集时提示未检测到人体。
 - 复制图片：`copy_image` 解码原图、应用 EXIF 方向后以 RGBA 写入系统剪贴板；超过 5000 万像素给出可行动错误。
 - 拖出到资源管理器（Windows OLE）：评估后暂缓到后续阶段；S4 保留“复制图片”和已有的“复制文件路径”。
 - 元数据侧栏：由 `src/app/ViewerHost.tsx` 复用图库详情侧栏，评分、标签、描述、文件夹可直接编辑；回收站/恢复/永久删除成功后关闭查看器，刷新由图库侧统一完成。
@@ -51,7 +51,8 @@
 | --- | --- | --- |
 | `get_viewer_source` | `{ imageId }` | `ViewerSource` |
 | `save_image_edit` | `{ request }` | `EditResult` |
-| `get_image_pose` | `{ imageId }` | `PoseData \| null` |
+| `get_image_pose` | `{ imageId }` | `PoseData \| null`（读取 feature pack） |
+| `ai_generate_pose` | `{ imageId }` | `PoseData`（调用 AI 服务并写入 feature pack） |
 | `copy_image` | `{ imageId }` | `null` |
 | `window_toggle_fullscreen` | — | `boolean` |
 

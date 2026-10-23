@@ -243,6 +243,38 @@ pub fn update_description(database: &LibraryDb, image_id: i64, description: &str
     })
 }
 
+/// AI 描述只覆盖空描述或非用户来源；手写描述默认受保护。
+pub fn set_ai_description(
+    database: &LibraryDb,
+    image_id: i64,
+    description: &str,
+    model: &str,
+) -> AppResult<bool> {
+    if image_id <= 0 {
+        return Err(AppError::message("图片 id 无效"));
+    }
+    let description = description.trim();
+    if description.is_empty() {
+        return Err(AppError::message("AI 描述为空"));
+    }
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(AppError::message(format!(
+            "描述不能超过 {MAX_DESCRIPTION_CHARS} 个字符"
+        )));
+    }
+    database.with_writer(|connection| {
+        let changed = connection.execute(
+            "UPDATE images
+             SET description = ?1, description_source = 'ai', description_model = ?2,
+                 modified_at = ?3
+             WHERE id = ?4
+               AND (description = '' OR description_source <> 'user')",
+            params![description, model, now_ms(), image_id],
+        )?;
+        Ok(changed > 0)
+    })
+}
+
 pub fn set_image_tags(
     database: &LibraryDb,
     image_id: i64,

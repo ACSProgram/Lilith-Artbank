@@ -54,6 +54,7 @@ interface ImageViewerProps {
   onToggleSidebar: () => void;
   onActiveChange?: (imageId: number) => void;
   onSaved?: (imageId: number) => void;
+  onGeneratePose?: () => Promise<PoseData>;
 }
 
 type SourceStatus = "loading" | "ready" | "error";
@@ -96,6 +97,7 @@ export function ImageViewer({
   onToggleSidebar,
   onActiveChange,
   onSaved,
+  onGeneratePose,
 }: ImageViewerProps) {
   const { notify } = useNotices();
   const items = useSyncExternalStore(session.subscribe, session.getItems, session.getItems);
@@ -103,12 +105,15 @@ export function ImageViewer({
   itemsRef.current = items;
 
   const [activeId, setActiveId] = useState(session.initialId);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const [source, setSource] = useState<ViewerSource | null>(null);
   const [sourceStatus, setSourceStatus] = useState<SourceStatus>("loading");
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [geometry, setGeometry] = useState<GeometryState | null>(null);
   const [pose, setPose] = useState<PoseData | null>(null);
   const [poseOpen, setPoseOpen] = useState(false);
+  const [poseBusy, setPoseBusy] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
   const [retry, setRetry] = useState(0);
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -488,6 +493,31 @@ export function ImageViewer({
     }
   };
 
+  const togglePose = async () => {
+    if (hasPose) {
+      setPoseOpen((value) => !value);
+      return;
+    }
+    if (!onGeneratePose || poseBusy) return;
+    const target = activeId;
+    setPoseBusy(true);
+    try {
+      const next = await onGeneratePose();
+      if (activeIdRef.current !== target) return;
+      setPose(next);
+      if (hasVisiblePose(next)) {
+        setPoseOpen(true);
+        notify("姿势骨架已生成", "success");
+      } else {
+        notify("没有检测到人体姿势", "info", "图片中可能没有清晰可见的人物。");
+      }
+    } catch (cause) {
+      notify("姿势识别失败", "error", errorMessage(cause));
+    } finally {
+      setPoseBusy(false);
+    }
+  };
+
   const copyImage = async () => {
     try {
       await viewerApi.copyImage(activeId);
@@ -654,12 +684,20 @@ export function ImageViewer({
             <Copy size={15} />
           </IconButton>
           <IconButton
-            label={hasPose ? "显示姿势骨架" : "姿势数据将在 S6 提供"}
+            label={
+              poseBusy
+                ? "正在识别姿势…"
+                : hasPose
+                  ? poseOpen
+                    ? "隐藏姿势骨架"
+                    : "显示姿势骨架"
+                  : "生成姿势骨架"
+            }
             className={poseOpen ? "is-active" : ""}
-            disabled={!hasPose}
-            onClick={() => setPoseOpen((value) => !value)}
+            disabled={poseBusy || (!hasPose && !onGeneratePose)}
+            onClick={() => void togglePose()}
           >
-            <PersonStanding size={15} />
+            {poseBusy ? <Spinner size={14} /> : <PersonStanding size={15} />}
           </IconButton>
           <IconButton
             label={sidebarOpen ? "隐藏详情侧栏" : "显示详情侧栏"}

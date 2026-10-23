@@ -19,6 +19,7 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
+  Sparkles,
   X,
 } from "lucide-react";
 import { useAppRuntime } from "../../app/runtimeContext";
@@ -49,11 +50,13 @@ import {
   selectionRange,
   sortOptionsFor,
   type BrowseState,
+  type SemanticBrowseState,
 } from "./model";
 import type {
   CollectionInfo,
   FolderInfo,
   ImageRow,
+  LibraryQuery,
   LibraryView as LibraryViewType,
   SortKey,
   SortSpec,
@@ -69,6 +72,10 @@ interface LibraryViewProps {
   refreshToken: number;
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
+  semantic?: SemanticBrowseState;
+  onOpenAiTasks?: (context: { selectedIds: number[]; query: LibraryQuery | null }) => void;
+  onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
+  aiOnline?: boolean;
 }
 
 /** 涉及文件（文件夹移动、永久删除）的批量上限，与 Rust `MAX_FILE_BATCH_IDS` 保持一致。 */
@@ -89,7 +96,15 @@ function sortForView(view: LibraryViewType, sort: SortSpec): SortSpec {
   return sort.key === "collectionPosition" ? DEFAULT_SORT : sort;
 }
 
-export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: LibraryViewProps) {
+export function LibraryView({
+  refreshToken,
+  onOpenViewer,
+  onCopyImage,
+  semantic,
+  onOpenAiTasks,
+  onGenerateDescription,
+  aiOnline = false,
+}: LibraryViewProps) {
   const { settings, current, refreshStatus } = useAppRuntime();
   const { notify, confirm } = useNotices();
 
@@ -114,6 +129,8 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
   const [emptyingTrash, setEmptyingTrash] = useState(false);
   const [viewBusy, setViewBusy] = useState(false);
+  const [semanticOpen, setSemanticOpen] = useState(false);
+  const [semanticDraft, setSemanticDraft] = useState("");
 
   const viewRef = useRef<VirtualViewHandle>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
@@ -129,24 +146,26 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
     effectiveView === "collection" ? browse.collectionId : null;
 
   const query = useMemo(() => buildQuery(browse), [browse]);
-  const {
-    items,
-    status,
-    error,
-    moreStatus,
-    moreError,
-    hasMore,
-    loadMore,
-    retry,
-    retryMore,
-  } = useImageQuery(query, refreshToken + dataVersion);
+  const imageQuery = useImageQuery(query, refreshToken + dataVersion);
+  const semanticActive = semantic?.active === true;
+  const items = semanticActive && semantic ? semantic.items : imageQuery.items;
+  const status = semanticActive && semantic ? semantic.status : imageQuery.status;
+  const error = semanticActive && semantic ? semantic.error : imageQuery.error;
+  const moreStatus =
+    semanticActive && semantic ? semantic.moreStatus : imageQuery.moreStatus;
+  const moreError = semanticActive && semantic ? semantic.moreError : imageQuery.moreError;
+  const hasMore = semanticActive && semantic ? semantic.hasMore : imageQuery.hasMore;
+  const loadMore = semanticActive && semantic ? semantic.loadMore : imageQuery.loadMore;
+  const retry = semanticActive && semantic ? semantic.retry : imageQuery.retry;
+  const retryMore = semanticActive && semantic ? semantic.loadMore : imageQuery.retryMore;
+  const semanticKey = semanticActive ? `semantic:${semantic?.token ?? ""}` : "";
   const resetSignature = useMemo(
-    () => `${queryKey(query)}|${refreshToken}`,
-    [query, refreshToken],
+    () => `${queryKey(query)}|${refreshToken}|${semanticKey}`,
+    [query, refreshToken, semanticKey],
   );
   const selectionResetSignature = useMemo(
-    () => `${filterKey(query)}|${refreshToken}`,
-    [query, refreshToken],
+    () => `${filterKey(query)}|${refreshToken}|${semanticKey}`,
+    [query, refreshToken, semanticKey],
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
 
@@ -219,6 +238,15 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
     setContextMenu(null);
   }, [selectionResetSignature]);
 
+  // 外部刷新（导入、批处理完成、元数据变化）会让语义结果过期，直接退出语义模式。
+  const semanticClear = semantic?.clear;
+  const semanticRefreshRef = useRef(refreshToken + dataVersion);
+  useEffect(() => {
+    if (semanticRefreshRef.current === refreshToken + dataVersion) return;
+    semanticRefreshRef.current = refreshToken + dataVersion;
+    semanticClear?.();
+  }, [refreshToken, dataVersion, semanticClear]);
+
   useEffect(() => {
     try {
       localStorage.setItem("lilith.viewMode", viewMode);
@@ -283,7 +311,8 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
     setHistory(previous.slice(0, -1));
     browseRef.current = next;
     setBrowse(next);
-  }, []);
+    semanticClear?.();
+  }, [semanticClear]);
 
   // 切换固定视图时搜索范围回到“当前视图”，集合内顺序排序在离开集合时回退到默认排序。
   const showAll = useCallback(() => {
@@ -294,7 +323,8 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
       searchScope: "view",
       sort: sortForView("all", browseRef.current.sort),
     });
-  }, [applyBrowse]);
+    semanticClear?.();
+  }, [applyBrowse, semanticClear]);
 
   const showTrash = useCallback(() => {
     applyBrowse({
@@ -304,7 +334,8 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
       searchScope: "view",
       sort: sortForView("trash", browseRef.current.sort),
     });
-  }, [applyBrowse]);
+    semanticClear?.();
+  }, [applyBrowse, semanticClear]);
 
   const showCollection = useCallback(
     (collectionId: number) => {
@@ -319,8 +350,9 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             ? currentState.sort
             : COLLECTION_SORT,
       });
+      semanticClear?.();
     },
-    [applyBrowse],
+    [applyBrowse, semanticClear],
   );
 
   const setSearchScope = (scope: BrowseState["searchScope"]) => {
@@ -394,7 +426,10 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
     if (selectingAll) return;
     setSelectingAll(true);
     try {
-      const ids = await libraryApi.queryImageIds(query);
+      const ids =
+        semanticActive && semantic
+          ? await semantic.ids()
+          : await libraryApi.queryImageIds(query);
       setSelected(new Set(ids));
       const first = ids[0] ?? null;
       setAnchorId(first);
@@ -403,14 +438,18 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
       notify(
         `已选择 ${ids.length.toLocaleString()} 张`,
         "info",
-        ids.length === 0 ? "当前条件没有图片" : "包含尚未滚动加载的图片",
+        ids.length === 0
+          ? "当前条件没有图片"
+          : semanticActive
+            ? "包含语义搜索结果中尚未滚动加载的图片"
+            : "包含尚未滚动加载的图片",
       );
     } catch (cause) {
       notify("全选失败", "error", errorMessage(cause));
     } finally {
       setSelectingAll(false);
     }
-  }, [notify, query, selectingAll]);
+  }, [notify, query, selectingAll, semantic, semanticActive]);
 
   const copyPaths = useCallback(async () => {
     const targets = contextMenu?.items ?? [];
@@ -851,6 +890,7 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
               value={searchDraft}
               placeholder="搜索描述、标签、文件夹"
               aria-label="搜索图片"
+              disabled={semanticActive}
               onChange={(event) => setSearchDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
@@ -886,8 +926,22 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             ) : null}
           </div>
 
+          <Button
+            size="sm"
+            variant={semanticActive ? "primary" : "secondary"}
+            icon={<Sparkles size={14} />}
+            disabled={!semantic}
+            onClick={() => setSemanticOpen((open) => !open)}
+          >
+            语义搜索
+          </Button>
+
           <span className="library-loaded">
-            {status === "loading" ? "正在读取…" : `${items.length.toLocaleString()} 张已载入`}
+            {semanticActive && semantic?.busy
+              ? "正在计算语义相似度…"
+              : status === "loading"
+                ? "正在读取…"
+                : `${items.length.toLocaleString()} 张已载入`}
           </span>
           {hasMore ? <span className="library-loaded-hint">继续滚动载入更多</span> : null}
         </div>
@@ -912,11 +966,28 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             <PanelRight size={14} />
           </IconButton>
 
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={<Sparkles size={14} />}
+            disabled={!onOpenAiTasks}
+            title={aiOnline ? "AI 服务在线" : "AI 服务离线；任务会提示连接状态"}
+            onClick={() =>
+              onOpenAiTasks?.({
+                selectedIds: [...selected],
+                query: semanticActive ? null : query,
+              })
+            }
+          >
+            AI 任务
+          </Button>
+
           <div className="filter-anchor" ref={filterAnchorRef}>
             <Button
               size="sm"
               variant={filterCount > 0 ? "primary" : "secondary"}
               icon={<SlidersHorizontal size={14} />}
+              disabled={semanticActive}
               onClick={() => setFilterOpen((open) => !open)}
             >
               筛选
@@ -941,6 +1012,7 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
               className="input sort-select"
               value={browse.sort.key}
               aria-label="排序方式"
+              disabled={semanticActive}
               onChange={(event) => {
                 const key = event.target.value as SortKey;
                 const descending =
@@ -963,6 +1035,7 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             </select>
             <IconButton
               label={browse.sort.descending ? "降序，点击切换为升序" : "升序，点击切换为降序"}
+              disabled={semanticActive}
               onClick={() =>
                 applyBrowse(
                   {
@@ -983,7 +1056,66 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
         </div>
       </div>
 
-      {filterSummary.length > 0 ? (
+      {semanticOpen && semantic ? (
+        <div className="semantic-search-bar">
+          <Sparkles size={14} />
+          <input
+            className="input"
+            value={semanticDraft}
+            placeholder="描述想找的画面，例如：红色斗篷的侧身人物"
+            aria-label="语义搜索"
+            autoFocus
+            onChange={(event) => setSemanticDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                semantic.search(semanticDraft);
+                setSemanticOpen(false);
+              }
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                setSemanticOpen(false);
+              }
+            }}
+          />
+          <Button
+            size="sm"
+            variant="primary"
+            loading={semantic.busy}
+            disabled={!semanticDraft.trim()}
+            onClick={() => {
+              semantic.search(semanticDraft);
+              setSemanticOpen(false);
+            }}
+          >
+            搜索
+          </Button>
+          <span className="semantic-hint">
+            {semantic.error ??
+              (semantic.busy
+                ? "正在请求文本 embedding 并扫描本地向量…"
+                : "文本只用于生成查询向量，不写入图库。")}
+          </span>
+          <IconButton label="关闭语义搜索" onClick={() => setSemanticOpen(false)}>
+            <X size={13} />
+          </IconButton>
+        </div>
+      ) : null}
+
+      {semanticActive && semantic ? (
+        <div className="filter-summary semantic-summary">
+          <Sparkles size={14} />
+          <span>
+            语义搜索「{semantic.text}」 · {semantic.total.toLocaleString()} 张结果 ·{" "}
+            {semantic.model} · {semantic.elapsedMs}ms
+          </span>
+          <button type="button" className="text-button" onClick={() => semantic.clear()}>
+            退出语义搜索
+          </button>
+        </div>
+      ) : null}
+
+      {filterSummary.length > 0 && !semanticActive ? (
         <div className="filter-summary">
           <span>{filterSummary.join(" · ")}</span>
           {hasActiveFilters(browse.filters) ? (
@@ -1004,8 +1136,12 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
           {status === "loading" && items.length === 0 ? (
             <div className="library-state">
               <Spinner size={22} />
-              <strong>正在读取图片</strong>
-              <span>正在查询首屏元数据…</span>
+              <strong>{semanticActive ? "正在计算语义相似度" : "正在读取图片"}</strong>
+              <span>
+                {semanticActive
+                  ? "正在生成文本 embedding 并扫描本地向量包…"
+                  : "正在查询首屏元数据…"}
+              </span>
             </div>
           ) : null}
 
@@ -1024,22 +1160,30 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             <div className="library-state">
               <ImageOff size={24} />
               <strong>
-                {effectiveView === "trash"
-                  ? "回收站是空的"
-                  : hasActiveQuery(browse)
-                    ? "没有符合条件的图片"
-                    : "当前视图没有可显示的图片"}
+                {semanticActive
+                  ? "没有语义匹配的图片"
+                  : effectiveView === "trash"
+                    ? "回收站是空的"
+                    : hasActiveQuery(browse)
+                      ? "没有符合条件的图片"
+                      : "当前视图没有可显示的图片"}
               </strong>
               <span>
-                {hasActiveQuery(browse)
-                  ? "调整搜索或筛选条件，或者清除后查看全部图片。"
-                  : effectiveView === "trash"
-                    ? "从图库移入回收站的图片会显示在这里，可以恢复或永久删除。"
-                    : effectiveView === "collection"
-                      ? "把选中的图片加入这个集合后，它们会出现在这里。"
-                      : "导入图片后会显示在这里。"}
+                {semanticActive
+                  ? "换一种描述，或者先为图片生成 embedding 后再试。"
+                  : hasActiveQuery(browse)
+                    ? "调整搜索或筛选条件，或者清除后查看全部图片。"
+                    : effectiveView === "trash"
+                      ? "从图库移入回收站的图片会显示在这里，可以恢复或永久删除。"
+                      : effectiveView === "collection"
+                        ? "把选中的图片加入这个集合后，它们会出现在这里。"
+                        : "导入图片后会显示在这里。"}
               </span>
-              {hasActiveFilters(browse.filters) ? (
+              {semanticActive ? (
+                <Button size="sm" variant="primary" onClick={() => semantic?.clear()}>
+                  退出语义搜索
+                </Button>
+              ) : hasActiveFilters(browse.filters) ? (
                 <Button size="sm" variant="primary" onClick={resetFilters}>
                   清除筛选
                 </Button>
@@ -1105,6 +1249,7 @@ export function LibraryView({ refreshToken, onOpenViewer, onCopyImage }: Library
             onTrash={(ids) => void trashSelected(ids)}
             onRestore={(ids) => void restoreSelected(ids)}
             onDelete={(ids) => void deleteSelected(ids)}
+            onGenerateDescription={onGenerateDescription}
           />
         ) : null}
       </div>

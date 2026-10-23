@@ -36,7 +36,8 @@ git diff --check
 - 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端在浏览器预览中检查 DOM 数量、筛选/排序/搜索重置与缩略图占位。
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
 - 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端另跑 typecheck/build，并在浏览器预览中检查查看器布局、缩放、裁剪拖拽映射与上下张。
-- 大图预览、剪贴板与全屏只能在真实 Tauri 窗口手工验收；浏览器预览不会验证 WebView2 解码、系统剪贴板或窗口状态。
+- AI 改动跑 `cargo test --lib ai::`：客户端 mock（成功、5xx 重试、4xx 不重试、超时相关路径）、feature pack、均值中心化、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
+- 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口手工验收；浏览器预览不会验证 WebView2 解码、系统剪贴板、模型推理或真实向量包。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 
 ## 数据库与文件
@@ -55,7 +56,10 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
+cargo test --manifest-path src-tauri/Cargo.toml --lib ai::embedding::perf_tests -- --ignored --nocapture
 ```
+
+最后一项会生成约 614 MB 的临时 fp16 向量包，结束后删除；只用于 20 万条 × 1536 维扫描基准。
 
 `perf_metadata_200k` 现在同时输出原始 SQL 与 S2 查询引擎（`query_page`、`filter_counts`、`query_ids`）的 p50/p95。
 
@@ -89,6 +93,16 @@ npm run tauri dev
 # 旋转/翻转/裁剪/调尺寸 → 选择输出格式与质量 → 保存
 # 确认：原图文件替换、缩略图与查看器立即刷新、标签/评分/描述/集合保留、embedding/pose 清除
 # 右键“复制图片” → 粘贴到画图/聊天工具；大图与 EXIF 方向图确认显示与裁剪一致
+```
+
+S6 AI 的真实窗口验收：
+
+```bash
+npm run tauri dev
+# 设置 → AI 服务 → 检测/启动/加载模型 → 确认 health 能力与维度
+# 选中图片或当前视图 → AI 任务 → embedding/pose/description 批量任务
+# 确认进度、取消、失败清单、手写描述不被覆盖；语义搜索输入文本并翻页
+# 查看器无 pose 时点击“生成姿势骨架”；详情侧栏点击“AI 生成”
 ```
 
 浏览器预览的检查方式（不驱动真实窗口）：

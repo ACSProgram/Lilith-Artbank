@@ -174,11 +174,6 @@ fn write_preview(target: &Path, bytes: &[u8]) -> AppResult<()> {
     }
 }
 
-/// 姿势数据存放在 S6 的 feature pack 中；S4 只保留查询契约与画布，当前没有可读数据。
-pub fn pose(_database: &LibraryDb, _image_id: i64) -> AppResult<Option<PoseData>> {
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -342,16 +337,6 @@ mod tests {
         let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
         fs::remove_file(row.path(&LibraryPaths::new(&fixture.root)).unwrap()).unwrap();
         assert!(source(&fixture.session.db, &fixture.root, fixture.image_id).is_err());
-    }
-
-    #[test]
-    fn pose_is_absent_until_feature_pack() {
-        let fixture = fixture(false);
-        assert!(
-            pose(&fixture.session.db, fixture.image_id)
-                .unwrap()
-                .is_none()
-        );
     }
 
     fn jpeg_with_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {

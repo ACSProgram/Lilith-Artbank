@@ -11,6 +11,7 @@ import {
   Palette,
   Plus,
   RotateCcw,
+  Sparkles,
   Star,
   Tags,
   Trash2,
@@ -43,6 +44,7 @@ interface InspectorPanelProps {
   onTrash: (ids: number[]) => void;
   onRestore: (ids: number[]) => void;
   onDelete: (ids: number[]) => void;
+  onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
 }
 
 function descriptionSourceLabel(source: string): string {
@@ -63,6 +65,7 @@ export function InspectorPanel({
   onTrash,
   onRestore,
   onDelete,
+  onGenerateDescription,
 }: InspectorPanelProps) {
   const single = selectedIds.length === 1 ? selectedIds[0] : null;
   return (
@@ -90,6 +93,7 @@ export function InspectorPanel({
           onTrash={() => onTrash([single])}
           onRestore={() => onRestore([single])}
           onDelete={() => onDelete([single])}
+          onGenerateDescription={onGenerateDescription}
         />
       ) : (
         <BatchInspector
@@ -119,6 +123,7 @@ interface ImageInspectorProps {
   onTrash: () => void;
   onRestore: () => void;
   onDelete: () => void;
+  onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
 }
 
 function ImageInspector({
@@ -132,12 +137,14 @@ function ImageInspector({
   onTrash,
   onRestore,
   onDelete,
+  onGenerateDescription,
 }: ImageInspectorProps) {
   const { notify } = useNotices();
   const [detail, setDetail] = useState<ImageDetails | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [aiBusy, setAiBusy] = useState(false);
   const [thumbFailed, setThumbFailed] = useState(false);
   const [descriptionDraft, setDescriptionDraft] = useState("");
   const [tagDraft, setTagDraft] = useState("");
@@ -216,6 +223,31 @@ function ImageInspector({
     void run(async () => {
       await libraryApi.updateImageDescription(detail.id, descriptionDraft);
     }, "描述已保存");
+  };
+
+  const generateDescription = async () => {
+    if (!onGenerateDescription || !detail || aiBusy) return;
+    setAiBusy(true);
+    try {
+      const result = await onGenerateDescription(detail.id);
+      setDescriptionDraft(result.text);
+      setDetail((previous) =>
+        previous
+          ? {
+              ...previous,
+              description: result.text,
+              descriptionSource: "ai",
+              descriptionModel: result.model,
+            }
+          : previous,
+      );
+      notify("AI 描述已生成", "success");
+      onChanged();
+    } catch (cause) {
+      notify("AI 描述失败", "error", errorMessage(cause));
+    } finally {
+      setAiBusy(false);
+    }
   };
 
   const setScore = (score: number) => {
@@ -443,6 +475,18 @@ function ImageInspector({
           >
             保存描述
           </Button>
+          {onGenerateDescription ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Sparkles size={13} />}
+              loading={aiBusy}
+              disabled={busy || detail.deletedAt != null}
+              onClick={() => void generateDescription()}
+            >
+              AI 生成
+            </Button>
+          ) : null}
           <IconButton
             label="复制描述"
             disabled={!detail.description}

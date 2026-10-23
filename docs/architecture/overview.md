@@ -26,8 +26,8 @@ src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、�
 src-tauri/src/import/        BLAKE3、解码/EXIF、扫描、pHash/主色调度、导入后台任务
 src-tauri/src/imageops/      缩略图编码、pHash、主色、几何编辑；色彩/LUT/DFT/卷积（后续）
 src-tauri/src/platform/      剪贴板等平台差异（文本与图片写入）
-src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管（后续）
-src-tauri/src/features/      pHash/颜色/向量/姿势相似度（后续）
+src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管、feature pack、语义检索
+src-tauri/src/features/      pHash/颜色/姿势相似度（S7；S6 的向量检索在 ai/）
 ```
 
 Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数、把错误转成稳定字符串。业务逻辑不写在命令里。
@@ -50,7 +50,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
     library.json           图库清单（格式、版本、libraryId、名称、创建时间）
     library.db             SQLite 元数据（WAL，FTS5）
     thumbs/0001.pack       追加式缩略图包（段头 16 字节，默认 1 GiB/段）
-    features/              embedding / pose 包（后续）
+    features/              embedding（fp16）/ pose（f32）追加式包
     temp/                  原子写入与编辑中间文件；打开图库时清理
     temp/viewer/           大图降采样预览缓存（`<id>-<hash>.webp`，按内容哈希失效）
   <folder>/<content-hash>.<ext>
@@ -91,7 +91,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 启动：打开库只读清单、schema 版本与计数；不遍历图片、不载入全量元数据。
 - 首屏：一次取 150 条元数据；缩略图按可见顺序读取包文件，前端预取前后一屏。
 - 查询：常见筛选/排序走索引；文本搜索走 FTS5 trigram，2 字以内回退 `LIKE`。
-- 相似度：pHash 常驻为紧凑数组做线性扫描；CLIP/pose 从 mmap 特征包扫描，不逐条查库。
+- 相似度：pHash 常驻为紧凑数组做线性扫描；SigLIP2/pose 从 mmap 特征包分块扫描，不整体载入、不逐条查库。向量检索使用打开图库时算出的全库均值做中心化余弦。
 - 所有性能结论必须有本机实测，方法与门槛见 [性能基准](../guides/performance.md)。
 
 ## 关键取舍记录
@@ -105,6 +105,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 | 列表显示 | 尺寸/格式/大小/评分/标签/时间 | 不保存原始文件名；原图文件名就是内容哈希，避免导入时维护额外身份 |
 | 编辑历史 | 参数化操作链 | 不再保存全分辨率像素副本；预览在降采样图上由 Rust 渲染 |
 | AI | 本机 HTTP 服务 + 应用托管进程 | 模型/Python 环境与图库解耦；离线时图库功能不受影响 |
+| 向量 | SigLIP2 1536 维 fp16 + mmap | 50 万条约 1.6GB 磁盘，查询不常驻大块内存；均值中心化余弦与原程序一致 |
 | 旧数据 | 不读 `.data` | 新数据结构独立；迁移脚本后续单独做，应用不背历史格式 |
 
 ## 当前实现状态
@@ -121,4 +122,6 @@ S3 已实现：描述/标签/文件夹搜索（当前视图/全库）、时间/�
 
 S4 已实现：查看器（缩放/平移/全屏/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、复制图片与新命令、可编辑详情侧栏。`img://` 协议按内容哈希提供原图与预览；姿势叠加 UI 就绪但数据待 S6。OLE 拖出暂缓。真实 Tauri 窗口的 S1–S4 交互待用户手工验收。
 
-尚未实现：颜色/pHash/CLIP/pose 相似度、图像处理、AI。具体见 [路线图](../planning/roadmap.md)。
+S6 已实现：AI 服务进程托管（启动/探活/退避重启/退出）、`/v1` 客户端与重试、feature pack（embedding fp16 / pose f32）、打开图库计算均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务与取消/失败清单、查看器姿势生成与叠加、详情侧栏 AI 描述。真实 AI 服务与 WebView2 界面待手工验收。
+
+尚未实现：S7 的 pHash/颜色/向量/pose 相似度排序与高级集合；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

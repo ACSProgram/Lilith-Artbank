@@ -290,6 +290,72 @@ pub fn query_page(database: &LibraryDb, root: &Path, query: LibraryQuery) -> App
     })
 }
 
+/// 按给定 id 顺序取完整行；用于语义搜索结果的分页回填。
+pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<Vec<ImageRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = crate::library::placeholders(ids.len());
+    let sql = format!(
+        "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
+                folders.path, images.file_size, images.width, images.height,
+                images.format, images.has_alpha, images.score, images.imported_at,
+                images.modified_at, images.deleted_at, images.thumb_version,
+                images.thumb_width, images.thumb_height
+         FROM images
+         JOIN folders ON folders.id = images.folder_id
+         WHERE images.id IN ({placeholders})"
+    );
+    let values: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
+    database.with_reader(|connection| {
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                let content_hash: String = row.get(1)?;
+                let file_ext: String = row.get(2)?;
+                let folder_path: String = row.get(4)?;
+                let file_name = format!("{content_hash}.{file_ext}");
+                let file_path = if folder_path.is_empty() {
+                    root.join(&file_name)
+                } else {
+                    root.join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                        .join(&file_name)
+                };
+                Ok(ImageRow {
+                    id: row.get(0)?,
+                    content_hash,
+                    file_ext,
+                    folder_id: row.get(3)?,
+                    folder_path,
+                    file_path: file_path.to_string_lossy().into_owned(),
+                    file_size: row.get(5)?,
+                    width: row.get(6)?,
+                    height: row.get(7)?,
+                    format: row.get(8)?,
+                    has_alpha: row.get::<_, i64>(9)? != 0,
+                    score: row.get(10)?,
+                    imported_at: row.get(11)?,
+                    modified_at: row.get(12)?,
+                    deleted_at: row.get(13)?,
+                    thumb_version: row.get(14)?,
+                    thumb_width: row.get(15)?,
+                    thumb_height: row.get(16)?,
+                    tags: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut by_id: HashMap<i64, ImageRow> = rows.into_iter().map(|row| (row.id, row)).collect();
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = by_id.remove(id) {
+                items.push(row);
+            }
+        }
+        attach_tags(connection, &mut items)?;
+        Ok(items)
+    })
+}
+
 pub fn query_ids(database: &LibraryDb, query: LibraryQuery) -> AppResult<Vec<i64>> {
     // 全选只取 id，不翻页；游标与 limit 在这里没有意义。
     let (query, _) = normalize(query)?;

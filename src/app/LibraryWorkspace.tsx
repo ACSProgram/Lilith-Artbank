@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Database,
   FolderOpen,
   Images,
+  Sparkles,
   Trash2,
   Upload,
   X,
@@ -11,8 +12,13 @@ import {
 import { Button, IconButton } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
 import { LibraryView } from "../modules/library/LibraryView";
+import { aiApi } from "../modules/ai/api";
+import { AiTaskDialog } from "../modules/ai/AiTaskDialog";
+import { useAiStatus } from "../modules/ai/useAiStatus";
+import type { LibraryQuery } from "../modules/library/types";
 import { viewerApi } from "../modules/viewer/api";
 import { browserPreview } from "./api";
+import { useSemanticSearch } from "./useSemanticSearch";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { ThumbBenchOverlay } from "./ThumbBenchOverlay";
@@ -21,7 +27,6 @@ import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 
 const upcoming = [
-  ["Stage 5", "色彩/LUT/DFT/卷积与操作链撤销"],
   ["Stage 6", "AI 描述、Embedding、Pose 与批量任务"],
   ["Stage 7", "相似度检索与高级集合"],
 ];
@@ -35,8 +40,19 @@ export function LibraryWorkspace() {
   const [dragging, setDragging] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
   const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null);
+  const [aiTasks, setAiTasks] = useState<{
+    selectedIds: number[];
+    query: LibraryQuery | null;
+  } | null>(null);
+  const semantic = useSemanticSearch();
+  const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
+
+  useEffect(() => {
+    semantic.clear();
+    // 图库切换时丢弃旧库的语义结果；clear 是稳定回调。
+  }, [current?.id, semantic.clear]);
 
   useEffect(() => {
     if (browserPreview) return;
@@ -64,6 +80,23 @@ export function LibraryWorkspace() {
       disposed = true;
       unlisten?.();
     };
+  }, []);
+
+  const handleAiFinished = useCallback(() => {
+    setRefreshToken((value) => value + 1);
+    void refreshStatus().catch((error: unknown) => {
+      notify("刷新图库状态失败", "error", errorMessage(error));
+    });
+    void refreshAi();
+  }, [notify, refreshAi, refreshStatus]);
+
+  const generateDescription = useCallback(async (imageId: number) => {
+    const result = await aiApi.describeImage(imageId);
+    return { text: result.text, model: result.model };
+  }, []);
+
+  const generatePose = useCallback(async (imageId: number) => {
+    return aiApi.generatePose(imageId);
   }, []);
 
   if (!current) return null;
@@ -131,6 +164,19 @@ export function LibraryWorkspace() {
           </div>
         </div>
         <div className="workspace-actions">
+          <button
+            type="button"
+            className={`ai-status-pill${aiStatus?.online ? " is-online" : ""}`}
+            title={aiStatus?.process.message ?? "打开 AI 任务"}
+            onClick={() => setAiTasks({ selectedIds: [], query: null })}
+          >
+            <Sparkles size={13} />
+            {aiStatus?.online
+              ? "AI 在线"
+              : aiStatus?.process.state === "starting"
+                ? "AI 启动中"
+                : "AI 离线"}
+          </button>
           {import.meta.env.DEV && !browserPreview ? (
             <Button
               size="sm"
@@ -161,6 +207,10 @@ export function LibraryWorkspace() {
           refreshToken={refreshToken}
           onOpenViewer={setViewerSession}
           onCopyImage={(imageId) => void handleCopyImage(imageId)}
+          semantic={semantic}
+          onOpenAiTasks={setAiTasks}
+          onGenerateDescription={generateDescription}
+          aiOnline={aiStatus?.online ?? false}
         />
       ) : (
         <>
@@ -231,8 +281,19 @@ export function LibraryWorkspace() {
           key={`${current.id}-${viewerSession.initialId}`}
           session={viewerSession}
           onClose={() => setViewerSession(null)}
+          onGenerateDescription={generateDescription}
+          onGeneratePose={generatePose}
         />
       ) : null}
+      <AiTaskDialog
+        open={aiTasks !== null}
+        onClose={() => setAiTasks(null)}
+        selectedIds={aiTasks?.selectedIds ?? []}
+        query={aiTasks?.query ?? null}
+        status={aiStatus}
+        onRefreshStatus={refreshAi}
+        onFinished={handleAiFinished}
+      />
       <ImportDialog
         open={importOpen}
         initialPaths={pendingPaths}

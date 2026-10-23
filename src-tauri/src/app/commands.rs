@@ -4,6 +4,10 @@ use serde::Serialize;
 use tauri::{AppHandle, State, WebviewWindow};
 
 use crate::{
+    ai::{
+        job::{AiJobRequest, AiJobSnapshot},
+        runtime::{AiDescriptionResult, AiStatus, SemanticSearchResult, SimilarityPage},
+    },
     app::{
         bench::{self, ThumbBenchInfo, ThumbReadStats},
         error::AppError,
@@ -451,6 +455,131 @@ pub fn get_image_pose(
 }
 
 #[tauri::command]
+pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.status(&settings))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn ai_ensure_models(
+    state: State<'_, AppState>,
+    capabilities: Vec<String>,
+) -> Result<AiStatus, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.ensure_models(&settings, &capabilities))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn ai_start_service(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.snapshot().ai;
+    AppError::command(state.ai.start_service(&settings))
+}
+
+#[tauri::command]
+pub fn ai_stop_service(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.snapshot().ai;
+    state.ai.stop_service(&settings);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_ai_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: AiJobRequest,
+) -> Result<AiJobSnapshot, String> {
+    let settings = state.settings.snapshot().ai;
+    let request = request.normalized().map_err(|error| error.to_string())?;
+    state
+        .ai
+        .start_job(app, &settings, request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_ai_job(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
+    AppError::command(state.ai.cancel_job(&job_id))
+}
+
+#[tauri::command]
+pub fn get_ai_job_status(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Option<AiJobSnapshot>, String> {
+    Ok(state.ai.job_status(&job_id))
+}
+
+#[tauri::command]
+pub async fn ai_describe_image(
+    state: State<'_, AppState>,
+    image_id: i64,
+    prompt: Option<String>,
+    max_tokens: Option<u32>,
+) -> Result<AiDescriptionResult, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.describe_image(&settings, image_id, prompt.as_deref(), max_tokens)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn ai_generate_pose(
+    state: State<'_, AppState>,
+    image_id: i64,
+) -> Result<PoseData, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.generate_pose(&settings, image_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn semantic_search(
+    state: State<'_, AppState>,
+    text: String,
+    limit: Option<usize>,
+) -> Result<SemanticSearchResult, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.semantic_search(&settings, &text, limit))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_similarity_page(
+    state: State<'_, AppState>,
+    token: String,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<SimilarityPage, String> {
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.similarity_page(&token, offset, limit))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_similarity_ids(state: State<'_, AppState>, token: String) -> Result<Vec<i64>, String> {
+    AppError::command(state.ai.similarity_ids(&token))
+}
+
+#[tauri::command]
 pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(), String> {
     let path = state
         .copy_source(image_id)
@@ -519,6 +648,18 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_viewer_source,
         save_image_edit,
         get_image_pose,
-        copy_image
+        copy_image,
+        get_ai_status,
+        ai_ensure_models,
+        ai_start_service,
+        ai_stop_service,
+        start_ai_job,
+        cancel_ai_job,
+        get_ai_job_status,
+        ai_describe_image,
+        ai_generate_pose,
+        semantic_search,
+        get_similarity_page,
+        get_similarity_ids
     ]
 }
