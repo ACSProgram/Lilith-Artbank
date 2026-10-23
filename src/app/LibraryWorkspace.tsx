@@ -26,10 +26,7 @@ import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 
-const upcoming = [
-  ["Stage 6", "AI 描述、Embedding、Pose 与批量任务"],
-  ["Stage 7", "相似度检索与高级集合"],
-];
+const upcoming = [["Stage 7", "相似度检索与高级集合"]];
 
 export function LibraryWorkspace() {
   const { current, refreshStatus, closeLibrary } = useAppRuntime();

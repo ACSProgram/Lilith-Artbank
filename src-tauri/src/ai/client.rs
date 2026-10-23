@@ -11,6 +11,7 @@ const POSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(300);
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// `/v1` 调用失败。`retryable` 决定 `with_retry` 是否再试：网络错误与 5xx 为 true，4xx 与响应格式错误为 false。
 #[derive(Debug, Clone)]
 pub struct AiError {
     pub message: String,
@@ -58,6 +59,7 @@ pub struct Capability {
     pub dim: Option<u32>,
 }
 
+/// `/v1/health` 与 `/v1/models/ensure` 的公共结构；没有该能力时字段可整体缺省。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
@@ -93,9 +95,10 @@ struct EmbeddingResponse {
     status: Option<String>,
     model: String,
     dim: u32,
-    normalized: Option<bool>,
     vector: Vec<f32>,
-    truncated: Option<bool>,
+    /// 文本 embedding 被服务端截断时置位；客户端只记日志，不改变结果。
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +144,7 @@ pub struct AiClient {
 }
 
 impl AiClient {
+    /// `base_url` 去掉首尾空白与结尾斜杠；所有请求共用同一个 agent（连接复用）。
     pub fn new(base_url: &str) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
@@ -260,14 +264,10 @@ impl AiClient {
         max_tokens: Option<u32>,
         bytes: &[u8],
     ) -> Result<Description, AiError> {
-        let mut query = Vec::new();
-        if !prompt.trim().is_empty() {
-            query.push(("prompt", prompt));
-        }
-        let max_tokens_text;
-        if let Some(value) = max_tokens {
-            max_tokens_text = value.to_string();
-            query.push(("maxTokens", max_tokens_text.as_str()));
+        let max_tokens_text = max_tokens.map(|value| value.to_string());
+        let mut query = vec![("prompt", prompt)];
+        if let Some(value) = max_tokens_text.as_deref() {
+            query.push(("maxTokens", value));
         }
         let url = query_url(&self.url("/v1/describe"), &query);
         with_retry(|| {
@@ -318,9 +318,11 @@ fn embedding_from(response: EmbeddingResponse) -> Result<Embedding, AiError> {
             response.vector.len()
         )));
     }
-    let _ = response.truncated;
+    if response.truncated {
+        log::warn!("文本 embedding 被服务端截断，按截断后的向量继续");
+    }
+    // 服务端通常已归一化，这里再归一化一次，避免不守约的服务端污染检索。
     let vector = normalize(response.vector)?;
-    let _ = response.normalized;
     Ok(Embedding {
         model: response.model,
         dim: response.dim,
@@ -328,22 +330,8 @@ fn embedding_from(response: EmbeddingResponse) -> Result<Embedding, AiError> {
     })
 }
 
-pub fn normalize(mut vector: Vec<f32>) -> Result<Vec<f32>, AiError> {
-    let mut norm = 0.0_f32;
-    for value in &vector {
-        if !value.is_finite() {
-            return Err(AiError::invalid("embedding 包含非有限数值"));
-        }
-        norm += value * value;
-    }
-    let norm = norm.sqrt();
-    if norm <= 1e-12 {
-        return Err(AiError::invalid("embedding 是零向量"));
-    }
-    for value in &mut vector {
-        *value /= norm;
-    }
-    Ok(vector)
+pub fn normalize(vector: Vec<f32>) -> Result<Vec<f32>, AiError> {
+    super::embedding::normalize_f32(&vector).map_err(|error| AiError::invalid(error.to_string()))
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -377,24 +365,20 @@ fn map_error(error: ureq::Error) -> AiError {
     }
 }
 
+/// 网络错误与 5xx 重试 2 次（250ms、1s 退避）；4xx 立即失败。
 fn with_retry<T>(mut call: impl FnMut() -> Result<T, AiError>) -> Result<T, AiError> {
     const DELAYS_MS: [u64; 2] = [250, 1000];
-    let mut last = None;
     for attempt in 0..=DELAYS_MS.len() {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(DELAYS_MS[attempt - 1]));
         }
         match call() {
             Ok(value) => return Ok(value),
-            Err(error) => {
-                if !error.retryable || attempt == DELAYS_MS.len() {
-                    return Err(error);
-                }
-                last = Some(error);
-            }
+            Err(error) if !error.retryable || attempt == DELAYS_MS.len() => return Err(error),
+            Err(_) => {}
         }
     }
-    Err(last.unwrap_or_else(|| AiError::transport("AI 请求失败")))
+    unreachable!("重试循环最后一次尝试一定返回")
 }
 
 fn query_url(base: &str, params: &[(&str, &str)]) -> String {
@@ -410,14 +394,20 @@ fn query_url(base: &str, params: &[(&str, &str)]) -> String {
     }
 }
 
+/// 最小 RFC 3986 百分号编码；查询值只有模型名与提示词，不需要处理完整 URI。
 fn encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 output.push(byte as char);
             }
-            _ => output.push_str(&format!("%{byte:02X}")),
+            _ => {
+                output.push('%');
+                output.push(HEX[usize::from(byte >> 4)] as char);
+                output.push(HEX[usize::from(byte & 0x0F)] as char);
+            }
         }
     }
     output

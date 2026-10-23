@@ -9,6 +9,7 @@ import { aiApi, aiBrowserPreview } from "./api";
 import {
   DEFAULT_DESCRIPTION_PROMPT,
   type AiJobKind,
+  type AiJobPhase,
   type AiJobProgress,
   type AiJobSnapshot,
   type AiStatus,
@@ -18,6 +19,7 @@ interface AiTaskDialogProps {
   open: boolean;
   onClose: () => void;
   selectedIds: number[];
+  /** 图库查询条件；AI 模块不反向依赖图库类型，按不透明对象透传。 */
   query: object | null;
   status: AiStatus | null;
   onRefreshStatus: () => Promise<AiStatus | null>;
@@ -30,6 +32,14 @@ const KIND_LABELS: Record<AiJobKind, string> = {
   embedding: "Embedding",
   pose: "姿势",
   description: "描述",
+};
+
+const PHASE_LABELS: Record<AiJobPhase, string> = {
+  preparing: "准备中",
+  running: "进行中",
+  completed: "已完成",
+  cancelled: "已取消",
+  failed: "失败",
 };
 
 const CAPABILITY: Record<AiJobKind, string> = {
@@ -59,6 +69,8 @@ export function AiTaskDialog({
   const [error, setError] = useState<string | null>(null);
   const jobRef = useRef<AiJobSnapshot | null>(null);
   jobRef.current = job;
+  const statusRef = useRef(status);
+  statusRef.current = status;
   const finishedRef = useRef(false);
 
   const running = job?.phase === "preparing" || job?.phase === "running";
@@ -70,11 +82,13 @@ export function AiTaskDialog({
     setOverwrite(false);
     setPrompt(DEFAULT_DESCRIPTION_PROMPT);
     setMaxTokens(160);
-    setJob(null);
+    // 重新打开对话框时接管仍在运行的任务，避免进度空白。
+    setJob(statusRef.current?.job ?? null);
     setError(null);
     setStarting(false);
     setEnsuring(false);
     finishedRef.current = false;
+    // 只在开关状态变化时重置表单；状态轮询不应清空用户输入。
   }, [open]);
 
   useEffect(() => {
@@ -166,7 +180,6 @@ export function AiTaskDialog({
             };
       const started = await aiApi.startJob(request);
       setJob(started);
-      finishedRef.current = false;
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -390,7 +403,7 @@ export function AiTaskDialog({
           <div className="ai-job">
             <div className="ai-job-head">
               <strong>
-                {KIND_LABELS[job.kind]} · {job.phase}
+                {KIND_LABELS[job.kind]} · {PHASE_LABELS[job.phase]}
               </strong>
               <span>
                 {job.completed.toLocaleString()} / {job.total.toLocaleString()}

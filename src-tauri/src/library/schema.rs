@@ -99,7 +99,8 @@ CREATE TABLE thumb_segments (
 ) STRICT;
 
 -- 嵌入向量与姿势数据不放进主库：主库只记录它们在 feature pack 中的位置，
--- 避免几十万条 1024 维向量把元数据库撑到数百 MB。
+-- 避免几十万条 1536 维向量把元数据库撑到数百 MB。
+-- dim 对 embedding 是向量维度，对 pose 是 landmark 个数（33）；包内记录长度以包头为准。
 CREATE TABLE feature_blobs (
     image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose')),

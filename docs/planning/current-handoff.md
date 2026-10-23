@@ -45,7 +45,7 @@ npm run typecheck
 npm run build
 cargo fmt --check
 cargo clippy --all-targets   # 无警告
-cargo test --lib             # 98 passed, 5 ignored
+cargo test --lib             # 99 passed, 5 ignored
 ```
 
 新增测试：
@@ -53,10 +53,20 @@ cargo test --lib             # 98 passed, 5 ignored
 - 客户端：health/embedding 解析与归一化、5xx 重试、4xx 不重试、describe 查询参数编码、pose 33 点。
 - job：mock 服务下 embedding/pose/description 端到端；手写描述在 overwrite 下仍不被覆盖。
 - pack：追加/读取/越界/包头一致性；pose 缺失点补零。
-- embedding：均值中心化排序、回收站图片排除。
+- embedding：均值中心化排序、回收站图片排除、top-K 只返回前 K 条且按分数排序。
 - 基准：20 万条 × 1536 维 fp16 单 pack 扫描 449.26 ms（开发档），低于 500 ms 预算。
 
 浏览器静态检查未能完成：内置浏览器导航 `http://127.0.0.1:5173` 连续超时、页面为空白；未使用真实窗口或输入自动化。语义/任务界面的实际布局仍需用户在 `npm run tauri dev` 中手工验收。
+
+本轮收尾整理（不改行为契约）：
+
+- 客户端：去掉恒为空的 `normalized`/`truncated` 占位逻辑（截断改为记日志）；`with_retry` 去掉不可达的兜底分支；`describe` 的查询参数构造简化；百分号编码不再逐字节 `format!`；L2 归一化收敛到 `embedding::normalize_f32` 一处实现。
+- 检索：top-K 改为 `select_nth_unstable_by` 部分选择后再排序，与文档一致，不再为取 K 条对全量结果排序；新增对应测试。
+- 运行时：`MeanSlot` 增加 `ready/empty/failed` 构造，均值状态的四处字段赋值收敛；`status()` 只取一次进程锁；监督线程改用 `SupervisorGuard` 按代次释放标记，避免旧线程清掉新线程的 `supervising`；启动次数上限提取为 `process::MAX_START_ATTEMPTS`。
+- 任务：`existing_features` 的 kind 改为绑定参数、分支合并；描述状态改为 `DescriptionState`；描述长度默认值收敛为 `job::DEFAULT_DESCRIBE_TOKENS`；去掉重复的失败路径克隆。
+- 命令：`ai_stop_service` 改为异步 + 阻塞线程池，停止服务不再卡住 IPC 线程。
+- 前端：`aiApi` 用 `requireTauri`/`offlineStatus()` 去掉 13 处重复分支；语义结果与图库查询在 `LibraryView` 合并为单一 `listSource`；`useSemanticSearch.retry` 去掉走不到的 token 分支；任务对话框重新打开时接管 `status.job`，并补上阶段中文标签；设置页去掉“接入后……”等过期文案。
+- 文档：修正 pack 命名（含 hash 后缀）、pose 的 dim 语义、进度节流 150ms、启动失败重试与“运行中崩溃不自动重启”的实际行为、`features/*.bin` 笔误；路线图标记 S6 已实现；清理交接文档中 S5/S6 的过期结论。
 
 ## 本批次完成：S4 查看器与几何编辑
 
@@ -121,16 +131,19 @@ S4 新增测试覆盖：
 - 4K/8K 保存耗时与内存峰值；超过 5000 万像素的只读限制与拒绝提示。
 - 真实 Windows 程序粘贴剪贴板图片；透明图与 EXIF 方向。
 - 深分页中打开查看器后保存会刷新回第一页，上下张上下文会重置（已知限制）。
-- 姿势叠加 UI 已就绪，但 `get_image_pose` 要到 S6 的 feature pack 才能返回真实 landmark。
+- 真实 AI 服务：health/ensure/embed/pose/describe 全链路、模型维度校验与失败文案。
+- 真实窗口 AI 任务进度、取消、失败清单与手写描述保护；语义搜索分页与 Ctrl+A。
+- 真实窗口查看器姿势生成/叠加与详情侧栏 AI 描述。
 - 文件夹移动、永久删除、清空回收站仍无进度事件与取消（S8/S9 前补齐）。
 - 20 万行滚动、150 张缩略图从请求到可见、冷/热缓存与 WebView2 内存行为。
 - release 构建的 exe 与 DLL 清单（S9）。
 
 ## 下一步
 
-1. 用户手工验收：`npm run tauri dev` → 打开图库 → 在网格/列表打开查看器 → 缩放/平移/全屏 → 旋转、翻转、裁剪、调尺寸 → 保存并确认缩略图与原图更新、标签/评分/集合保留 → 复制图片并粘贴到其他程序。
-2. S4 验收通过后进入 S5：色彩/LUT/DFT/卷积处理链与 Rust 降采样预览。
-3. 待决策项见 [待办与待决策](todo.md)，尤其是 OLE 拖出、深分页保存刷新与编辑上限的进度/取消。
+1. 用户手工验收：`npm run tauri dev` → 打开图库 → 设置页检测/启动 AI 服务并加载模型 → 运行 embedding/pose/description 批量任务（含取消与失败清单）→ 语义搜索与翻页 → 查看器生成姿势骨架 → 详情侧栏“AI 生成”。
+2. 同时复验 S1–S4 的真实窗口流程（导入、浏览、编辑、查看器保存、剪贴板）。
+3. 验收通过后进入 S7：pHash/颜色/向量/pose 相似度与高级集合。
+4. 待决策项见 [待办与待决策](todo.md)，尤其是 AI 服务崩溃是否自动重启、语义搜索是否叠加筛选、OLE 拖出与编辑上限的进度/取消。
 
 ## 约束
 

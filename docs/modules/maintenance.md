@@ -39,7 +39,7 @@
 
 ## 特征包维护
 
-- embedding/pose 存放在 `features/*.bin`，`feature_blobs` 记录 model/dim/offset/length。
+- embedding/pose 存放在 `features/<kind>-<model>-<dim>-<dtype>-<hash>.pack`，`feature_blobs` 记录 model/dim/offset/length。
 - 模型变更后，旧向量保留但标记为不兼容；维护页可“重算全部 embedding/pose”或“清理不兼容向量”。
 - 特征包同样只追加；清理时可重写压缩。特征是可重建数据，丢失可重算。
 

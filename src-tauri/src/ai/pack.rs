@@ -108,12 +108,16 @@ impl FeatureStore {
         self.writers.lock().clear();
     }
 
-    fn file_path(&self, pack_name: &str) -> AppResult<PathBuf> {
+    fn root(&self) -> AppResult<PathBuf> {
         let root = self.root.read().clone();
         if root.as_os_str().is_empty() {
             return Err(AppError::message("尚未打开图库"));
         }
-        Ok(root.join(pack_name))
+        Ok(root)
+    }
+
+    fn file_path(&self, pack_name: &str) -> AppResult<PathBuf> {
+        Ok(self.root()?.join(pack_name))
     }
 
     /// 追加一条记录；返回数据库需要保存的指针。
@@ -138,9 +142,9 @@ impl FeatureStore {
         }
 
         let pack_name = pack_name(kind, model, dim, dtype);
-        let path = self.file_path(&pack_name)?;
-        let root = self.root.read().clone();
+        let root = self.root()?;
         std::fs::create_dir_all(&root)?;
+        let path = root.join(&pack_name);
 
         let mut writers = self.writers.lock();
         if !writers.contains_key(&pack_name) {

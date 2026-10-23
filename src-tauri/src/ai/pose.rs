@@ -16,6 +16,7 @@ const VALUES_PER_LANDMARK: usize = 4;
 const POSE_VALUES: usize = LANDMARK_COUNT * VALUES_PER_LANDMARK;
 const POSE_BYTES: usize = POSE_VALUES * 4;
 
+/// 写入 33 点 f32；不足 33 点按零填充（visibility=0 表示无效点，叠加层会跳过）。
 pub fn store(
     database: &LibraryDb,
     store: &FeatureStore,
@@ -74,6 +75,7 @@ pub fn store(
     })
 }
 
+/// 按 `feature_blobs` 指针单条读取；没有记录返回 `None`。
 pub fn load(
     database: &LibraryDb,
     store: &FeatureStore,

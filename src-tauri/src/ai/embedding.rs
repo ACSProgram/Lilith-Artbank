@@ -27,6 +27,7 @@ pub struct MeanEmbedding {
     pub count: u64,
 }
 
+/// 归一化后按 fp16 追加写入特征包，并更新 `feature_blobs` 指针。
 pub fn store(
     database: &LibraryDb,
     store: &FeatureStore,
@@ -80,6 +81,7 @@ pub fn store(
     })
 }
 
+/// 取出参与检索的行指针：同 model/dim、未删除；按包名与偏移排序，便于顺序读。
 pub fn rows(database: &LibraryDb, model: &str, dim: u32) -> AppResult<Vec<EmbeddingRow>> {
     database.with_reader(|connection| {
         let mut statement = connection.prepare(
@@ -105,6 +107,7 @@ pub fn rows(database: &LibraryDb, model: &str, dim: u32) -> AppResult<Vec<Embedd
     })
 }
 
+/// 全库 embedding 按 (model, dim) 分组的条数，最多的一组排在最前；打开图库时用它挑均值模型。
 pub fn distinct_groups(database: &LibraryDb) -> AppResult<Vec<(String, u32, u64)>> {
     database.with_reader(|connection| {
         let mut statement = connection.prepare(
@@ -265,16 +268,22 @@ pub fn search_rows(
         scored.extend(partial);
     }
 
-    scored.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
-    scored.truncate(limit);
+    if scored.len() > limit {
+        // 只做部分选择再排序，避免为取 top-K 对全量结果排序。
+        scored.select_nth_unstable_by(limit, by_score_desc);
+        scored.truncate(limit);
+    }
+    scored.sort_by(by_score_desc);
     Ok(scored)
+}
+
+fn by_score_desc(left: &(i64, f32), right: &(i64, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .partial_cmp(&left.1)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.0.cmp(&right.0))
 }
 
 fn group_by_pack(rows: Vec<EmbeddingRow>) -> BTreeMap<String, Vec<EmbeddingRow>> {
@@ -307,7 +316,8 @@ fn decode_f16(bytes: &[u8], output: &mut [f32]) {
     }
 }
 
-fn normalize_f32(vector: &[f32]) -> AppResult<Vec<f32>> {
+/// L2 归一化；非有限值或零向量直接拒绝。客户端与落盘前共用同一实现。
+pub(crate) fn normalize_f32(vector: &[f32]) -> AppResult<Vec<f32>> {
     let mut norm = 0.0_f32;
     for value in vector {
         if !value.is_finite() {
@@ -383,6 +393,35 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 1);
         assert!(results[0].1 >= results[1].1);
+    }
+
+    #[test]
+    fn returns_only_top_k_in_score_order() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        // 五条方向不同的向量，第 4 维随序号略增；查询指向第 4 维。
+        for (index, id) in (1..=5).enumerate() {
+            insert_image(&session.db, id);
+            let mut vector = [0.0_f32; 4];
+            vector[index % 4] = 1.0;
+            vector[3] += index as f32 * 0.01;
+            store(&session.db, &packs, id, "model", 4, &vector).unwrap();
+        }
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        let results = search(
+            &session.db,
+            &packs,
+            "model",
+            4,
+            &[0.0, 0.0, 0.0, 1.0],
+            &mean.vector,
+            2,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1 >= results[1].1);
+        assert!(results.iter().all(|(id, _)| (1..=5).contains(id)));
     }
 
     #[test]

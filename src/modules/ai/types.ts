@@ -78,6 +78,7 @@ export interface AiStatus {
 export interface AiJobRequest {
   kind: AiJobKind;
   imageIds: number[];
+  /** 图库查询条件（不透明透传，由后端反序列化）；AI 模块不依赖图库类型。 */
   query: object | null;
   overwrite: boolean;
   prompt?: string | null;

@@ -31,7 +31,7 @@ use super::{
     job::{self, AiJob, AiJobRequest, AiJobSnapshot, JobContext},
     pack::FeatureStore,
     pose,
-    process::{AiProcess, ProcessState, ProcessStatus},
+    process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -65,10 +65,14 @@ struct MeanSlot {
 
 impl MeanSlot {
     fn missing(message: impl Into<String>) -> Self {
+        Self::empty(None, None, message)
+    }
+
+    fn empty(model: Option<String>, dim: Option<u32>, message: impl Into<String>) -> Self {
         Self {
             phase: MeanPhase::Missing,
-            model: None,
-            dim: None,
+            model,
+            dim,
             count: 0,
             vector: None,
             message: Some(message.into()),
@@ -83,6 +87,28 @@ impl MeanSlot {
             count: 0,
             vector: None,
             message: Some("正在计算 embedding 均值…".into()),
+        }
+    }
+
+    fn ready(model: &str, dim: u32, mean: &embedding::MeanEmbedding) -> Self {
+        Self {
+            phase: MeanPhase::Ready,
+            model: Some(model.to_owned()),
+            dim: Some(dim),
+            count: mean.count,
+            vector: Some(Arc::new(mean.vector.clone())),
+            message: None,
+        }
+    }
+
+    fn failed(model: &str, dim: u32, message: impl Into<String>) -> Self {
+        Self {
+            phase: MeanPhase::Failed,
+            model: Some(model.to_owned()),
+            dim: Some(dim),
+            count: 0,
+            vector: None,
+            message: Some(message.into()),
         }
     }
 
@@ -241,20 +267,20 @@ impl AiRuntime {
     pub fn status(&self, settings: &AiSettings) -> AiStatus {
         let client = AiClient::new(&settings.base_url);
         let health = client.health().ok();
-        if let Some(health) = &health {
+        let process_state = {
             let mut process = self.inner.process.lock();
-            let owned = process.is_owned_running();
-            process.mark_online(owned);
-            let _ = health;
-        } else {
-            let mut process = self.inner.process.lock();
-            process.poll_child();
-            if process.state() == ProcessState::External {
-                process.mark_stopped(Some("AI 服务未响应".into()));
+            if health.is_some() {
+                let owned = process.is_owned_running();
+                process.mark_online(owned);
+            } else {
+                process.poll_child();
+                if process.state() == ProcessState::External {
+                    process.mark_stopped(Some("AI 服务未响应".into()));
+                }
             }
-        }
+            process.state()
+        };
 
-        let process_state = self.inner.process.lock().state();
         if health.is_none()
             && settings.auto_start
             && !self.inner.manual_stop.load(Ordering::SeqCst)
@@ -357,11 +383,15 @@ impl AiRuntime {
         let health = client
             .health()
             .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
-        let capability = job::ensure_capability(&client, &health, "description")
+        job::ensure_capability(&client, &health, "description")
             .map_err(|error| AppError::message(format!("无法加载描述模型：{error}")))?;
         let bytes = super::input::description_bytes(&handles.database, &handles.root, image_id)?;
         let result = client
-            .describe(prompt.unwrap_or(""), max_tokens.or(Some(160)), &bytes)
+            .describe(
+                prompt.unwrap_or(""),
+                Some(max_tokens.unwrap_or(job::DEFAULT_DESCRIBE_TOKENS)),
+                &bytes,
+            )
             .map_err(|error| AppError::message(error.to_string()))?;
         if result.text.trim().is_empty() {
             return Err(AppError::message("描述服务返回了空文本"));
@@ -375,7 +405,6 @@ impl AiRuntime {
         if !changed {
             return Err(AppError::message("这张图片已有手写描述，未覆盖"));
         }
-        let _ = capability;
         Ok(AiDescriptionResult {
             image_id,
             model: result.model,
@@ -397,6 +426,7 @@ impl AiRuntime {
             .pose(&capability.model, &bytes)
             .map_err(|error| AppError::message(error.to_string()))?;
         pose::store(&handles.database, &self.inner.store, image_id, &result)?;
+        // 回读一次，确认包头、指针与数据库记录一致后再交给查看器。
         pose::load(&handles.database, &self.inner.store, image_id)?
             .ok_or_else(|| AppError::message("姿势保存后无法读取"))
     }
@@ -431,7 +461,6 @@ impl AiRuntime {
         spawn_job_progress(app.clone(), job.clone());
         let runtime = self.clone();
         let fallback_app = app.clone();
-        let fallback_job = job.clone();
         let worker_job = job.clone();
         let spawn = std::thread::Builder::new()
             .name(format!("ai-job-{}", job.id()))
@@ -461,9 +490,9 @@ impl AiRuntime {
             });
         if let Err(error) = spawn {
             log::error!("无法启动 AI 任务线程：{error}");
-            job.finish(job::AiJobPhase::Failed);
             job.set_message(format!("无法启动 AI 任务：{error}"));
-            let _ = fallback_app.emit("ai-job-finished", fallback_job.snapshot());
+            job.finish(job::AiJobPhase::Failed);
+            let _ = fallback_app.emit("ai-job-finished", job.snapshot());
             return Err(AppError::message("无法启动 AI 任务"));
         }
         Ok(job.snapshot())
@@ -488,6 +517,8 @@ impl AiRuntime {
             .map(|job| job.snapshot())
     }
 
+    /// 语义搜索：text embedding → 与同 model/dim 的图片向量做中心化余弦扫描。
+    /// 结果 id 缓存在内存里，按图库代次与 library_id 绑定；关库、换库或数据变化后失效。
     pub fn semantic_search(
         &self,
         settings: &AiSettings,
@@ -564,6 +595,7 @@ impl AiRuntime {
         })
     }
 
+    /// 按 token 分页回填完整行；token 不属于当前图库代次时要求重新搜索。
     pub fn similarity_page(
         &self,
         token: &str,
@@ -650,32 +682,21 @@ impl AiRuntime {
         let mut slot = self.inner.mean.write();
         match result {
             Ok(mean) if mean.count > 0 => {
-                slot.phase = MeanPhase::Ready;
-                slot.model = Some(model.to_owned());
-                slot.dim = Some(dim);
-                slot.count = mean.count;
-                slot.vector = Some(Arc::new(mean.vector.clone()));
-                slot.message = None;
+                *slot = MeanSlot::ready(model, dim, &mean);
                 Ok(mean)
             }
             Ok(_) => {
-                slot.phase = MeanPhase::Missing;
-                slot.model = Some(model.to_owned());
-                slot.dim = Some(dim);
-                slot.count = 0;
-                slot.vector = None;
-                slot.message = Some("还没有图片 embedding，请先运行 AI 任务".into());
+                *slot = MeanSlot::empty(
+                    Some(model.to_owned()),
+                    Some(dim),
+                    "还没有图片 embedding，请先运行 AI 任务",
+                );
                 Err(AppError::message(
                     "还没有图片 embedding，请先运行 AI 任务生成",
                 ))
             }
             Err(error) => {
-                slot.phase = MeanPhase::Failed;
-                slot.model = Some(model.to_owned());
-                slot.dim = Some(dim);
-                slot.count = 0;
-                slot.vector = None;
-                slot.message = Some(error.to_string());
+                *slot = MeanSlot::failed(model, dim, error.to_string());
                 Err(error)
             }
         }
@@ -711,24 +732,11 @@ impl AiRuntime {
             }
             let mut slot = inner.mean.write();
             match result {
-                Ok(mean) if mean.count > 0 => {
-                    slot.phase = MeanPhase::Ready;
-                    slot.model = Some(model);
-                    slot.dim = Some(dim);
-                    slot.count = mean.count;
-                    slot.vector = Some(Arc::new(mean.vector));
-                    slot.message = None;
-                }
+                Ok(mean) if mean.count > 0 => *slot = MeanSlot::ready(&model, dim, &mean),
                 Ok(_) => {
-                    slot.phase = MeanPhase::Missing;
-                    slot.count = 0;
-                    slot.message = Some("还没有图片 embedding".into());
+                    *slot = MeanSlot::empty(Some(model.clone()), Some(dim), "还没有图片 embedding")
                 }
-                Err(error) => {
-                    slot.phase = MeanPhase::Failed;
-                    slot.count = 0;
-                    slot.message = Some(error.to_string());
-                }
+                Err(error) => *slot = MeanSlot::failed(&model, dim, error.to_string()),
             }
         });
     }
@@ -740,10 +748,15 @@ impl AiRuntime {
         let inner = self.inner.clone();
         let token = inner.supervisor_generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
+            // 退出时只释放自己这一代，避免把 start_service 新拉起的监督线程标记清掉。
+            let _guard = SupervisorGuard {
+                inner: inner.clone(),
+                token,
+            };
+            let stale = || token != inner.supervisor_generation.load(Ordering::SeqCst);
             let client = AiClient::new(&settings.base_url);
             if client.health().is_ok() {
                 inner.process.lock().mark_online(false);
-                inner.supervising.store(false, Ordering::SeqCst);
                 return;
             }
             let Some(executable) = settings
@@ -752,14 +765,12 @@ impl AiRuntime {
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
             else {
-                inner.supervising.store(false, Ordering::SeqCst);
                 return;
             };
 
             let mut online = false;
-            for attempt in 1..=3_u32 {
-                if token != inner.supervisor_generation.load(Ordering::SeqCst) {
-                    inner.supervising.store(false, Ordering::SeqCst);
+            for attempt in 1..=MAX_START_ATTEMPTS {
+                if stale() {
                     return;
                 }
                 {
@@ -772,8 +783,7 @@ impl AiRuntime {
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
-                    if token != inner.supervisor_generation.load(Ordering::SeqCst) {
-                        inner.supervising.store(false, Ordering::SeqCst);
+                    if stale() {
                         return;
                     }
                     if client.health().is_ok() {
@@ -793,18 +803,31 @@ impl AiRuntime {
                 if online {
                     break;
                 }
-                if attempt < 3 {
+                if attempt < MAX_START_ATTEMPTS {
                     std::thread::sleep(Duration::from_secs(1 << attempt));
                 }
             }
-            if !online && token == inner.supervisor_generation.load(Ordering::SeqCst) {
+            if !online && !stale() {
                 let mut process = inner.process.lock();
                 if process.state() != ProcessState::Failed {
                     process.mark_failed("AI 服务启动失败");
                 }
             }
-            inner.supervising.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+/// 监督线程的存活标记；Drop 时按代次释放，不覆盖新一代线程。
+struct SupervisorGuard {
+    inner: Arc<Inner>,
+    token: u64,
+}
+
+impl Drop for SupervisorGuard {
+    fn drop(&mut self) {
+        if self.token == self.inner.supervisor_generation.load(Ordering::SeqCst) {
+            self.inner.supervising.store(false, Ordering::SeqCst);
+        }
     }
 }
 

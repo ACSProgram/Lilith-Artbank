@@ -7,9 +7,13 @@ use serde::Serialize;
 
 use crate::app::error::{AppError, AppResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// 启动尝试上限；监督线程与状态文案共用同一数字。
+pub const MAX_START_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ProcessState {
+    #[default]
     Stopped,
     Starting,
     Running,
@@ -26,24 +30,13 @@ pub struct ProcessStatus {
     pub attempts: u32,
 }
 
+#[derive(Default)]
 pub struct AiProcess {
     child: Option<Child>,
     state: ProcessState,
     message: Option<String>,
     attempts: u32,
     owned: bool,
-}
-
-impl Default for AiProcess {
-    fn default() -> Self {
-        Self {
-            child: None,
-            state: ProcessState::Stopped,
-            message: None,
-            attempts: 0,
-            owned: false,
-        }
-    }
 }
 
 impl AiProcess {
@@ -104,7 +97,9 @@ impl AiProcess {
     pub fn note_attempt(&mut self, attempt: u32) {
         self.attempts = attempt;
         self.state = ProcessState::Starting;
-        self.message = Some(format!("正在启动 AI 服务（第 {attempt}/3 次尝试）"));
+        self.message = Some(format!(
+            "正在启动 AI 服务（第 {attempt}/{MAX_START_ATTEMPTS} 次尝试）"
+        ));
     }
 
     pub fn spawn(&mut self, executable: &str, port: u16) -> AppResult<()> {
@@ -141,7 +136,15 @@ impl AiProcess {
             .map_err(|error| AppError::message(format!("无法启动 AI 服务：{error}")))?;
         self.child = Some(child);
         self.owned = true;
-        self.set_starting("AI 服务进程已启动，等待健康检查…");
+        let message = if self.attempts <= 1 {
+            "AI 服务进程已启动，等待健康检查…".to_owned()
+        } else {
+            format!(
+                "AI 服务进程已启动（第 {}/{MAX_START_ATTEMPTS} 次尝试），等待健康检查…",
+                self.attempts
+            )
+        };
+        self.set_starting(message);
         Ok(())
     }
 
@@ -166,9 +169,10 @@ impl AiProcess {
         }
     }
 
-    pub fn stop(&mut self, graceful: bool) {
+    /// `wait_for_exit`：已发过 shutdown 请求时先等进程自行退出，超时再强杀。
+    pub fn stop(&mut self, wait_for_exit: bool) {
         if let Some(mut child) = self.child.take() {
-            if graceful {
+            if wait_for_exit {
                 for _ in 0..20 {
                     match child.try_wait() {
                         Ok(Some(_)) => break,

@@ -14,11 +14,15 @@
 
 **S3 已实现（自动验收通过）**：描述/标签名/文件夹路径搜索（当前视图或全库）、导入时间与文件大小范围、描述/embedding/pose 存在性筛选、集合内手工顺序；详情与批量编辑（评分/描述/标签/文件夹移动）、标签重命名与删除、集合 CRUD/排序/并集交集差集、回收站软删除/恢复/永久删除/清空。普通视图的分面计数在预算内，搜索与超大集合的计数超 100 ms 时筛选面板显示加载态。
 
-真实 WebView2 的 150 张门槛已由用户确认；真实窗口中的导入、浏览、编辑、集合与回收站操作待手工验收。尚未实现：颜色/pHash/CLIP/pose 相似度、查看器、图像处理、AI 服务调用。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
+**S4 已实现（自动验收通过）**：全屏查看器（缩放/平移/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、`img://` 原图与预览协议、复制图片到剪贴板、可编辑详情侧栏。
+
+**S6 已实现（自动验收通过）**：本机 `/v1` AI 客户端与服务进程托管、feature pack（embedding fp16 / pose f32）、打开图库计算全库均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务（进度/取消/失败清单）、查看器姿势生成与叠加、详情侧栏 AI 描述。
+
+S5 图像处理（色彩/LUT/DFT/卷积）已按用户决定取消。真实 WebView2 的 150 张门槛已由用户确认；真实窗口中的导入、浏览、编辑、集合、回收站、查看器、AI 服务与语义搜索待手工验收。尚未实现：S7 的颜色/pHash/向量/pose 相似度与高级集合。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
 
 ## 功能边界
 
-保留原 Lilith 图库本体的能力：导入与去重、标签/评分/描述、文件夹、筛选排序、集合、回收站、查看器、裁剪/旋转/调尺寸、图像处理（色彩/LUT/滤波/卷积）、批量维护。
+保留原 Lilith 图库本体的能力：导入与去重、标签/评分/描述、文件夹、筛选排序、集合、回收站、查看器、裁剪/旋转/调尺寸、批量维护。图像处理（色彩/LUT/滤波/卷积）已按用户决定取消，不再实现。
 
 明确不做：
 
@@ -48,7 +52,7 @@ AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应�
     library.json         图库清单
     library.db           SQLite 元数据（WAL）
     thumbs/0001.pack     追加式缩略图包
-    features/            embedding / pose 包（Stage 6）
+    features/            embedding（fp16）/ pose（f32）追加式包
     temp/                原子写入与导入临时目录；启动时清理
   <folder>/<content-hash>.<ext>
   recycle/

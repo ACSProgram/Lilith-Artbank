@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -8,7 +8,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rusqlite::params_from_iter;
+use rusqlite::{params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -35,8 +35,12 @@ use super::{
 
 const MAX_FAILURES: usize = 200;
 const MAX_IDS: usize = 1_000_000;
+/// 连续失败达到该数量即判定服务不可用，停止任务，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const CHUNK: usize = 400;
+
+/// 描述长度未指定时使用的上限，与服务端 `/v1/describe` 的 `maxTokens` 约定一致。
+pub const DEFAULT_DESCRIBE_TOKENS: u32 = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -209,7 +213,7 @@ impl AiJob {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn set_phase(&self, phase: AiJobPhase) {
+    fn set_phase(&self, phase: AiJobPhase) {
         *self.phase.lock() = phase;
     }
 
@@ -279,6 +283,8 @@ impl AiJob {
     }
 }
 
+/// 任务主流程：探活并确保能力 → 解析范围 → 过滤缺失项 → 逐张处理。
+/// 取消只在图片之间生效；单张失败记入清单，连续失败达到上限才中止。
 pub fn execute(context: &JobContext, job: &AiJob, request: &AiJobRequest) -> AppResult<()> {
     let client = AiClient::new(&context.settings.base_url);
     job.set_phase(AiJobPhase::Preparing);
@@ -388,7 +394,7 @@ fn process_one(
             let result = client
                 .describe(
                     request.prompt.as_deref().unwrap_or(""),
-                    request.max_tokens.or(Some(160)),
+                    Some(request.max_tokens.unwrap_or(DEFAULT_DESCRIBE_TOKENS)),
                     &bytes,
                 )
                 .map_err(|error| AppError::message(error.to_string()))?;
@@ -473,40 +479,27 @@ fn filter_missing(
             _ => ids,
         });
     }
-    match kind {
+    let existing = match kind {
         AiJobKind::Embedding => {
             let dim = capability.dim.ok_or_else(|| {
                 AppError::message("health 没有返回 embedding 维度，无法判断缺失项")
             })?;
-            let existing =
-                existing_features(database, &ids, "embedding", Some((&capability.model, dim)))?;
-            Ok(ids
-                .into_iter()
-                .filter(|id| !existing.contains(id))
-                .collect())
+            existing_features(database, &ids, "embedding", Some((&capability.model, dim)))?
         }
-        AiJobKind::Pose => {
-            let existing = existing_features(database, &ids, "pose", None)?;
-            Ok(ids
-                .into_iter()
-                .filter(|id| !existing.contains(id))
-                .collect())
-        }
-        AiJobKind::Description => {
-            let described = described_ids(database, &ids)?;
-            Ok(ids
-                .into_iter()
-                .filter(|id| !described.contains(id))
-                .collect())
-        }
-    }
+        AiJobKind::Pose => existing_features(database, &ids, "pose", None)?,
+        AiJobKind::Description => described_ids(database, &ids)?,
+    };
+    Ok(ids
+        .into_iter()
+        .filter(|id| !existing.contains(id))
+        .collect())
 }
 
 fn filter_user_descriptions(database: &LibraryDb, ids: Vec<i64>) -> AppResult<Vec<i64>> {
     let states = description_states(database, &ids)?;
     Ok(ids
         .into_iter()
-        .filter(|id| !states.get(id).is_some_and(|(_, source)| source == "user"))
+        .filter(|id| !states.get(id).is_some_and(|state| state.is_user))
         .collect())
 }
 
@@ -518,50 +511,51 @@ fn existing_features(
 ) -> AppResult<HashSet<i64>> {
     let mut found = HashSet::new();
     for chunk in ids.chunks(CHUNK) {
-        let set = database.with_reader(|connection| {
+        let rows = database.with_reader(|connection| {
             let placeholders = placeholders(chunk.len());
-            let sql = if model_dim.is_some() {
-                format!(
-                    "SELECT image_id FROM feature_blobs
-                     WHERE kind = '{kind}' AND model = ? AND dim = ?
-                       AND image_id IN ({placeholders})"
-                )
-            } else {
-                format!(
-                    "SELECT image_id FROM feature_blobs
-                     WHERE kind = '{kind}' AND image_id IN ({placeholders})"
-                )
+            let (sql, mut params) = match model_dim {
+                Some((model, dim)) => (
+                    format!(
+                        "SELECT image_id FROM feature_blobs
+                         WHERE kind = ?1 AND model = ?2 AND dim = ?3
+                           AND image_id IN ({placeholders})"
+                    ),
+                    vec![
+                        Value::Text(kind.to_owned()),
+                        Value::Text(model.to_owned()),
+                        Value::Integer(i64::from(dim)),
+                    ],
+                ),
+                None => (
+                    format!(
+                        "SELECT image_id FROM feature_blobs
+                         WHERE kind = ?1 AND image_id IN ({placeholders})"
+                    ),
+                    vec![Value::Text(kind.to_owned())],
+                ),
             };
-            let mut values: Vec<rusqlite::types::Value> = chunk
-                .iter()
-                .map(|id| rusqlite::types::Value::Integer(*id))
-                .collect();
+            params.extend(chunk.iter().map(|id| Value::Integer(*id)));
             let mut statement = connection.prepare(&sql)?;
-            let rows = if let Some((model, dim)) = model_dim {
-                let mut params: Vec<rusqlite::types::Value> = vec![
-                    rusqlite::types::Value::Text(model.to_owned()),
-                    rusqlite::types::Value::Integer(i64::from(dim)),
-                ];
-                params.append(&mut values);
-                statement
-                    .query_map(params_from_iter(params.iter()), |row| row.get::<_, i64>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                statement
-                    .query_map(params_from_iter(values.iter()), |row| row.get::<_, i64>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            let rows = statement
+                .query_map(params_from_iter(params.iter()), |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
-        found.extend(set);
+        found.extend(rows);
     }
     Ok(found)
+}
+
+/// 描述文本与来源；来源为 `user` 时 AI 不得覆盖。
+struct DescriptionState {
+    text: String,
+    is_user: bool,
 }
 
 fn described_ids(database: &LibraryDb, ids: &[i64]) -> AppResult<HashSet<i64>> {
     Ok(description_states(database, ids)?
         .into_iter()
-        .filter(|(_, (text, _))| !text.trim().is_empty())
+        .filter(|(_, state)| !state.text.trim().is_empty())
         .map(|(id, _)| id)
         .collect())
 }
@@ -569,17 +563,14 @@ fn described_ids(database: &LibraryDb, ids: &[i64]) -> AppResult<HashSet<i64>> {
 fn description_states(
     database: &LibraryDb,
     ids: &[i64],
-) -> AppResult<std::collections::HashMap<i64, (String, String)>> {
-    let mut states = std::collections::HashMap::new();
+) -> AppResult<HashMap<i64, DescriptionState>> {
+    let mut states = HashMap::new();
     for chunk in ids.chunks(CHUNK) {
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, description, description_source FROM images WHERE id IN ({placeholders})"
         );
-        let values: Vec<rusqlite::types::Value> = chunk
-            .iter()
-            .map(|id| rusqlite::types::Value::Integer(*id))
-            .collect();
+        let values: Vec<Value> = chunk.iter().map(|id| Value::Integer(*id)).collect();
         database.with_reader(|connection| {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
@@ -592,7 +583,13 @@ fn description_states(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (id, text, source) in rows {
-                states.insert(id, (text, source));
+                states.insert(
+                    id,
+                    DescriptionState {
+                        text,
+                        is_user: source == "user",
+                    },
+                );
             }
             Ok(())
         })?;

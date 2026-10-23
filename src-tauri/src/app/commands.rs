@@ -483,10 +483,13 @@ pub fn ai_start_service(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn ai_stop_service(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn ai_stop_service(state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.snapshot().ai;
-    state.ai.stop_service(&settings);
-    Ok(())
+    let runtime = state.ai.clone();
+    // 停止包含 shutdown 请求与等待进程退出，放到阻塞线程池避免卡住界面。
+    tauri::async_runtime::spawn_blocking(move || runtime.stop_service(&settings))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

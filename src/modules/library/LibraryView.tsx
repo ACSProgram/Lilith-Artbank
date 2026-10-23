@@ -148,15 +148,11 @@ export function LibraryView({
   const query = useMemo(() => buildQuery(browse), [browse]);
   const imageQuery = useImageQuery(query, refreshToken + dataVersion);
   const semanticActive = semantic?.active === true;
-  const items = semanticActive && semantic ? semantic.items : imageQuery.items;
-  const status = semanticActive && semantic ? semantic.status : imageQuery.status;
-  const error = semanticActive && semantic ? semantic.error : imageQuery.error;
-  const moreStatus =
-    semanticActive && semantic ? semantic.moreStatus : imageQuery.moreStatus;
-  const moreError = semanticActive && semantic ? semantic.moreError : imageQuery.moreError;
-  const hasMore = semanticActive && semantic ? semantic.hasMore : imageQuery.hasMore;
-  const loadMore = semanticActive && semantic ? semantic.loadMore : imageQuery.loadMore;
-  const retry = semanticActive && semantic ? semantic.retry : imageQuery.retry;
+  // 语义模式下网格换成语义结果源；两者共享 items/status/error/hasMore 契约。
+  const listSource = semanticActive && semantic ? semantic : imageQuery;
+  const { items, status, error, moreStatus, moreError, hasMore } = listSource;
+  const loadMore = listSource.loadMore;
+  const retry = listSource.retry;
   const retryMore = semanticActive && semantic ? semantic.loadMore : imageQuery.retryMore;
   const semanticKey = semanticActive ? `semantic:${semantic?.token ?? ""}` : "";
   const resetSignature = useMemo(

@@ -280,7 +280,7 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
               />
               <span>
                 <strong>随应用启动 AI 服务</strong>
-                <small>接入后由应用管理进程、端口探活与退出顺序。</small>
+                <small>需要已填写可执行文件；探活失败时按 1s/2s 退避重试，最多 3 次。</small>
               </span>
             </label>
             <div className="ai-settings-status">

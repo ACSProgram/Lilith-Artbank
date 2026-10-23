@@ -146,15 +146,10 @@ export function useSemanticSearch(): SemanticBrowseState {
     })();
   }, []);
 
+  // 只有整次搜索失败时才会走到重试；翻页失败由 moreStatus 走 loadMore。
   const retry = useCallback(() => {
-    if (tokenRef.current) {
-      const text = state.text;
-      clear();
-      search(text);
-    } else if (state.text) {
-      search(state.text);
-    }
-  }, [clear, search, state.text]);
+    if (state.text) search(state.text);
+  }, [search, state.text]);
 
   const ids = useCallback(async () => {
     const token = tokenRef.current;
