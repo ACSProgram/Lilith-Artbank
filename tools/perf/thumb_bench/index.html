@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>thumbnail-bench</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #111214;
+      }
+      #grid {
+        display: grid;
+        grid-template-columns: repeat(15, minmax(0, 1fr));
+        gap: 4px;
+        padding: 4px;
+      }
+      #grid img {
+        display: block;
+        width: 100%;
+        height: 108px;
+        object-fit: cover;
+        background: #1b1d21;
+      }
+      #result {
+        position: fixed;
+        left: 8px;
+        bottom: 8px;
+        margin: 0;
+        padding: 8px 10px;
+        background: rgba(0, 0, 0, 0.72);
+        color: #d7fef7;
+        font: 12px/1.5 Consolas, monospace;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="grid"></div>
+    <pre id="result">running</pre>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const format = params.get("format") === "webp" ? "webp" : "jpg";
+      const count = Math.max(1, Math.min(150, Number(params.get("count")) || 150));
+      const grid = document.getElementById("grid");
+      for (let index = 1; index <= count; index += 1) {
+        const image = document.createElement("img");
+        image.src = `images/${format}/${String(index).padStart(3, "0")}.${format}`;
+        image.decoding = "async";
+        image.fetchPriority = "high";
+        image.alt = "";
+        grid.appendChild(image);
+      }
+
+      async function finish() {
+        const images = Array.from(document.images);
+        try {
+          await Promise.all(images.map((image) => image.decode()));
+        } catch (error) {
+          // 记录失败数量而不是中断整轮基准。
+        }
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        );
+        const elapsed = performance.now();
+        const resources = performance.getEntriesByType("resource");
+        const transfer = resources.reduce((sum, entry) => sum + (entry.transferSize || 0), 0);
+        const decoded = resources.reduce((sum, entry) => sum + (entry.decodedBodySize || 0), 0);
+        const result = {
+          format,
+          count,
+          elapsedMs: Number(elapsed.toFixed(2)),
+          resources: resources.length,
+          transferMB: Number((transfer / 1048576).toFixed(2)),
+          decodedMB: Number((decoded / 1048576).toFixed(2)),
+          complete: images.every((image) => image.complete && image.naturalWidth > 0),
+          userAgent: navigator.userAgent,
+        };
+        window.__THUMB_BENCH__ = result;
+        document.getElementById("result").textContent = JSON.stringify(result, null, 2);
+      }
+
+      window.addEventListener("load", () => {
+        void finish();
+      });
+    </script>
+  </body>
+</html>

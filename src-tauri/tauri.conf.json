@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lilith Artbank",
+  "version": "0.1.0",
+  "identifier": "com.lilith.artbank",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Lilith Artbank",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1040,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "dragDropEnabled": true,
+        "backgroundColor": "#0f1012"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: asset: http://asset.localhost http://thumb.localhost http://img.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "shortDescription": "大规模本地美术素材图库",
+    "longDescription": "面向数十万张图片与数百 GB 素材的本地图库，负责导入、检索、浏览与编辑。"
+  }
+}

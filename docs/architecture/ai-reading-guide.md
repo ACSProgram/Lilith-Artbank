@@ -1,0 +1,35 @@
+# AI 阅读引导
+
+代码任务的第一入口。按问题选择一条路由，只读对应契约与实现；只有跨模块契约变化时才补读相邻模块。
+
+| 问题 | 起点文档 | 实现位置 |
+| --- | --- | --- |
+| 设置、图库创建/打开/关闭、schema | `docs/modules/library.md` | `src-tauri/src/app/`、`src-tauri/src/library/` |
+| 导入、BLAKE3、pHash、主色、缩略图包 | `docs/modules/import.md` | `src-tauri/src/import/`、`src-tauri/src/imageops/` |
+| 网格/列表、分页、筛选、排序、集合、回收站 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/` |
+| 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
+| 色彩/LUT/DFT/卷积 | `docs/modules/viewer-and-editor.md` | `src/modules/editor/`、`src-tauri/src/imageops/` |
+| description / embedding / pose、服务进程 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/` |
+| 清理、缩略图重建、描述导入导出 | `docs/modules/maintenance.md` | `src-tauri/src/` 对应领域模块 |
+| 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
+| 当前阶段/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |
+
+## 读序
+
+1. 先读所选模块文档与 `docs/planning/current-handoff.md`；未完成事项查 `todo.md`。
+2. 再读前端 `types.ts` / `api.ts` 或 Rust 的 DTO/命令，确认边界。
+3. 最后读实现。数据库工作进入 `src-tauri/src/library/`；像素工作进入 `imageops/`；AI 只进入 `ai/`。
+
+## 边界
+
+- 前端模块之间不互相导入；跨模块流程在 `src/app/` 编排。
+- `src/modules/<module>/api.ts` 是该领域命令的唯一入口；页面组件不直接 `invoke`。
+- Tauri 命令只做适配；业务函数放在领域模块。
+- SQLite 写入只走单写连接；不要从读连接写库。
+- 任何全量载入/全量扫描方案先对照 `docs/guides/performance.md`。
+- 真实仓库 `G:\Lilith Image Library` 只读；测试用临时目录。
+- 不做 PinBoard/PasteBoard/调色盘/色彩测试/截屏，不建版本/CHANGELOG/法务文件。
+
+## 变更规则
+
+入口或契约变化时更新 `docs/architecture/` 或 `docs/modules/` 的对应段落；未完成工作写 `todo.md`，当前批次状态写 `current-handoff.md`。不再有效的计划移入 `planning/archive/`。

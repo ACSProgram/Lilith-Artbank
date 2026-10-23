@@ -1,0 +1,289 @@
+use rusqlite::{Connection, TransactionBehavior, params};
+
+use crate::{
+    app::error::{AppError, AppResult},
+    library::manifest::LibraryManifest,
+};
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+const SCHEMA_SQL: &str = r#"
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE folders (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE images (
+    id INTEGER PRIMARY KEY,
+    content_hash TEXT NOT NULL UNIQUE CHECK (length(content_hash) = 64),
+    file_ext TEXT NOT NULL,
+    folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE RESTRICT,
+    file_size INTEGER NOT NULL CHECK (file_size >= 0),
+    width INTEGER NOT NULL CHECK (width > 0),
+    height INTEGER NOT NULL CHECK (height > 0),
+    format TEXT NOT NULL,
+    has_alpha INTEGER NOT NULL DEFAULT 0 CHECK (has_alpha IN (0, 1)),
+    phash BLOB NOT NULL CHECK (length(phash) = 32),
+    colors4 BLOB NOT NULL CHECK (length(colors4) = 16),
+    colors8 BLOB NOT NULL CHECK (length(colors8) = 32),
+    score INTEGER NOT NULL DEFAULT 0 CHECK (score BETWEEN 0 AND 5),
+    description TEXT NOT NULL DEFAULT '',
+    description_source TEXT NOT NULL DEFAULT 'user'
+        CHECK (description_source IN ('user', 'ai', 'import')),
+    description_model TEXT NOT NULL DEFAULT '',
+    imported_at INTEGER NOT NULL,
+    modified_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    thumb_segment INTEGER NOT NULL DEFAULT 0,
+    thumb_offset INTEGER NOT NULL DEFAULT 0,
+    thumb_length INTEGER NOT NULL DEFAULT 0,
+    thumb_format TEXT NOT NULL DEFAULT 'jpeg',
+    thumb_width INTEGER NOT NULL DEFAULT 0,
+    thumb_height INTEGER NOT NULL DEFAULT 0,
+    thumb_version INTEGER NOT NULL DEFAULT 1
+) STRICT;
+
+CREATE INDEX idx_images_active_score
+    ON images(deleted_at, score DESC, id DESC);
+CREATE INDEX idx_images_active_imported
+    ON images(deleted_at, imported_at DESC, id DESC);
+CREATE INDEX idx_images_active_size
+    ON images(deleted_at, file_size DESC, id DESC);
+CREATE INDEX idx_images_folder_imported
+    ON images(folder_id, deleted_at, imported_at DESC, id DESC);
+CREATE INDEX idx_images_trash
+    ON images(deleted_at) WHERE deleted_at IS NOT NULL;
+
+CREATE TABLE tags (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+) STRICT;
+
+CREATE TABLE image_tags (
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (image_id, tag_id)
+) STRICT;
+
+CREATE INDEX idx_image_tags_tag ON image_tags(tag_id, image_id);
+
+CREATE TABLE collections (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE collection_items (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (collection_id, image_id)
+) STRICT;
+
+CREATE INDEX idx_collection_items_order
+    ON collection_items(collection_id, position);
+
+CREATE TABLE thumb_segments (
+    id INTEGER PRIMARY KEY,
+    file_name TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+-- 嵌入向量与姿势数据不放进主库：主库只记录它们在 feature pack 中的位置，
+-- 避免几十万条 1024 维向量把元数据库撑到数百 MB。
+CREATE TABLE feature_blobs (
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose')),
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    pack_name TEXT NOT NULL,
+    pack_offset INTEGER NOT NULL,
+    pack_length INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (image_id, kind)
+) STRICT;
+
+CREATE VIRTUAL TABLE image_search USING fts5(
+    description,
+    content='images',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER images_search_insert AFTER INSERT ON images BEGIN
+    INSERT INTO image_search(rowid, description) VALUES (new.id, new.description);
+END;
+
+CREATE TRIGGER images_search_delete AFTER DELETE ON images BEGIN
+    INSERT INTO image_search(image_search, rowid, description)
+    VALUES ('delete', old.id, old.description);
+END;
+
+CREATE TRIGGER images_search_update AFTER UPDATE OF description ON images BEGIN
+    INSERT INTO image_search(image_search, rowid, description)
+    VALUES ('delete', old.id, old.description);
+    INSERT INTO image_search(rowid, description) VALUES (new.id, new.description);
+END;
+"#;
+
+pub fn configure(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -65536;
+         PRAGMA mmap_size = 268435456;",
+    )?;
+    Ok(())
+}
+
+pub fn read_version(connection: &Connection) -> AppResult<u32> {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    Ok(version)
+}
+
+pub fn initialize(connection: &mut Connection, manifest: &LibraryManifest) -> AppResult<()> {
+    let version = read_version(connection)?;
+    if version != 0 {
+        return Err(AppError::message("图库数据库已经初始化"));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(SCHEMA_SQL)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES ('appFormat', ?1), ('schemaVersion', ?2), ('libraryId', ?3), ('createdAt', ?4)",
+        params![
+            crate::library::paths::LIBRARY_FORMAT,
+            SCHEMA_VERSION.to_string(),
+            manifest.library_id,
+            manifest.created_at.to_string()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO folders(path, created_at) VALUES ('', ?1)",
+        params![now],
+    )?;
+    transaction.execute(
+        "INSERT INTO thumb_segments(id, file_name, size, created_at) VALUES (0, '', 0, ?1)",
+        params![now],
+    )?;
+    transaction.execute_batch("INSERT INTO image_search(image_search) VALUES ('rebuild');")?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppResult<()> {
+    let version = read_version(connection)?;
+    match version {
+        0 => initialize(connection, manifest),
+        SCHEMA_VERSION => {
+            let format: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'appFormat'",
+                [],
+                |row| row.get(0),
+            )?;
+            if format != crate::library::paths::LIBRARY_FORMAT {
+                return Err(AppError::message("数据库不是 Lilith Artbank 图库"));
+            }
+            let library_id: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'libraryId'",
+                [],
+                |row| row.get(0),
+            )?;
+            if library_id != manifest.library_id {
+                return Err(AppError::message("图库清单与数据库的 libraryId 不一致"));
+            }
+            Ok(())
+        }
+        other => Err(AppError::message(format!(
+            "图库 schema 版本 {other} 高于当前程序支持的 {SCHEMA_VERSION}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> LibraryManifest {
+        LibraryManifest {
+            format: crate::library::paths::LIBRARY_FORMAT.into(),
+            format_version: crate::library::paths::LIBRARY_FORMAT_VERSION,
+            library_id: "test-library".into(),
+            name: "测试".into(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn initializes_schema_and_search() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+
+        let now = chrono::Utc::now().timestamp_millis();
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'jpg', 1, 10, 4, 3, 'jpeg', 0, zeroblob(32), zeroblob(16), zeroblob(32), 3, '一张人物速写', ?2, ?2)",
+                params!["a".repeat(64), now],
+            )
+            .unwrap();
+
+        let found: i64 = connection
+            .query_row(
+                "SELECT rowid FROM image_search WHERE image_search MATCH '人物速'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1);
+
+        connection
+            .execute(
+                "UPDATE images SET description = '新的描述' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        let old_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM image_search WHERE image_search MATCH '人物速'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+        let new_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM image_search WHERE image_search MATCH '新的描'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_count, 1);
+    }
+
+    #[test]
+    fn refuses_double_initialization() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        assert!(initialize(&mut connection, &manifest()).is_err());
+        ensure(&mut connection, &manifest()).unwrap();
+    }
+}

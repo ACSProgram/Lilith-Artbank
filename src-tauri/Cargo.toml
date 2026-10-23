@@ -1,0 +1,49 @@
+[package]
+name = "lilith-artbank"
+version = "0.1.0"
+description = "Large-scale local art asset library"
+authors = ["ACSProgram"]
+edition = "2024"
+publish = false
+
+[lib]
+name = "lilith_artbank_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga", "tiff", "webp"] }
+log = "0.4"
+parking_lot = "0.12"
+rayon = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+strip = true
+
+# 导入、缩放和 SQLite 在未优化构建下会慢一个数量级；只在开发档提升依赖优化，
+# 保持本 crate 的增量编译速度。
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

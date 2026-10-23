@@ -1,0 +1,23 @@
+# Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Rust / Tauri
+target/
+src-tauri/gen/
+
+# Local tooling
+.idea/
+.vscode/
+*.log
+*.pdb
+*.ilk
+
+# Test and benchmark scratch data
+/tmp/
+/perf-data/
+
+# Generated benchmark thumbnails
+/tools/perf/thumb_bench/images/
