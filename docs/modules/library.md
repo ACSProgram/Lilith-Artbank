@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有当前图库会话，元数据由 SQLite 管理。本文件记录 Stage 0–S4 已实现的契约；AI 任务与 feature pack 在后续阶段追加。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v2、schema v2 与多级文件夹；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,15 +36,15 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 1；版本高于程序支持值时拒绝打开。
-- schema 在空库上一次性创建，不做兼容迁移；新结构直接调整。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 2；版本高于程序支持值时拒绝打开。
+- v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 
 ### 表
 
 | 表 | 作用 |
 | --- | --- |
 | `meta` | `appFormat`、`schemaVersion`、`libraryId`、`createdAt` |
-| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''` |
+| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''`；每个祖先都有行，路径 NOCASE 唯一 |
 | `images` | 图片元数据与缩略图指针 |
 | `tags` / `image_tags` | 规范化标签与多对多关系 |
 | `collections` / `collection_items` | 手工集合与顺序 |
@@ -85,6 +85,7 @@ thumb_width / thumb_height / thumb_version
 - `images(deleted_at, imported_at DESC, id DESC)`：时间排序。
 - `images(deleted_at, file_size DESC, id DESC)`：大小排序。
 - `images(folder_id, deleted_at, imported_at DESC, id DESC)`：文件夹页。
+- `folders(path COLLATE NOCASE)` UNIQUE：路径解析、重名检查与 v2 迁移。
 - `images(deleted_at) WHERE deleted_at IS NOT NULL`：回收站。
 - `image_tags(tag_id, image_id)`：标签反查。
 - `collection_items(collection_id, position)`：集合顺序。
@@ -94,15 +95,16 @@ thumb_width / thumb_height / thumb_version
 设置文件由 Tauri `app_config_dir` 下的 `settings.json` 保存，原子替换（临时文件 + rename）。字段：
 
 ```text
-settingsVersion
-libraries[]        { id, name, path, addedAt }
-lastLibraryId      后端维护；设置页提交不会覆盖它
+settingsVersion    当前为 2
+libraryPath        当前图库绝对路径；null 表示未打开。由后端维护
 ai                 { baseUrl, executablePath, port, autoStart }
 performance        { readerConnections, workerThreads, thumbnailCacheMb }
 ui                 { theme, gridThumbPx }
 ```
 
-- 图库路径必须绝对；路径按 Windows 规则去尾斜杠、小写后去重。
+- 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。
+- v1 的 `libraries[]` 与 `lastLibraryId` 在读取时迁移为单个 `libraryPath`：优先 `lastLibraryId` 对应条目，否则取第一个条目。迁移后不再写回旧字段。
+- 图库路径必须绝对；保存时去掉尾部路径分隔符，但保留盘符根（`G:\`）。
 - `readerConnections` 1-16；`workerThreads` 为空表示自动；`thumbnailCacheMb` ≥64。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
 
@@ -115,18 +117,19 @@ ui                 { theme, gridThumbPx }
 | `get_settings` | — | `Settings` |
 | `save_settings` | `{ settings }` | `Settings` |
 | `inspect_library_path` | `{ path }` | `LibraryInspection` |
-| `create_library` | `{ name, path }` | `LibraryInfo` |
-| `add_library_path` | `{ name, path }` | `LibraryInfo` |
-| `open_library` | `{ libraryId }` | `LibraryInfo` |
-| `open_library_path` | `{ path }` | `LibraryInfo` |
+| `create_library` | `{ name, path }` | `LibraryInfo`（创建并打开） |
+| `open_library_path` | `{ path }` | `LibraryInfo`（只打开已存在的图库） |
 | `close_library` | — | `null` |
 | `get_library_status` | — | `LibraryInfo \| null` |
-| `remove_library` | `{ libraryId }` | `Settings` |
-| `rename_library` | `{ libraryId, name }` | `Settings` |
+| `rename_library` | `{ name }` | `LibraryInfo`（只改名称，不改目录） |
 | `query_images` | `{ query }` | `{ items, nextCursor }` |
 | `query_image_ids` | `{ query }` | `number[]` |
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
 | `get_folders` | — | `FolderInfo[]` |
+| `create_folder` | `{ path }` | `FolderInfo[]`（完整列表） |
+| `rename_folder` | `{ folderId, name }` | `FolderInfo[]` |
+| `move_folder` | `{ folderId, parentId }` | `FolderInfo[]` |
+| `delete_folder` | `{ folderId }` | `FolderInfo[]` |
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]` |
 | `get_image_detail` | `{ imageId }` | `ImageDetails` |
@@ -169,26 +172,42 @@ ui                 { theme, gridThumbPx }
 
 `LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`schemaVersion`、`openedAt`。
 
+`FolderInfo`：`{ id, path, directImageCount, totalImageCount }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。
+
 S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
 
 - 元数据写入都走单写连接；批量操作按 400 个 id 分块。
-- 文件夹移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除先删行再删文件。
-- 文件操作（移动、永久删除、清空回收站）与导入、图库切换共用 `maintenance` 守卫；长任务当前没有进度事件与取消。
+- 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除先删行再删文件。
+- 文件操作（图片移动、文件夹操作、永久删除、清空回收站）与导入、图库切换共用 `maintenance` 守卫；长任务当前没有进度事件与取消。
 - 集合只引用图片 id；集合运算新建集合，不修改源集合。
+
+## 文件夹
+
+文件夹路径既是显示层级也是磁盘位置：`folders.path` 的每一段对应图库根目录下的同名目录。
+
+- 路径规范：`/` 分隔、无空段、不能以 `/` 开头或结尾；每段拒绝 Windows 非法字符 `<>:"\|?*`、控制字符、结尾空格/句点、保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1-9`、`LPT1-9` 等）。
+- 任何层级都拒绝 `.artbank`、`recycle`、`output`；根目录不能创建、重命名、移动或删除。
+- 新建可以给出多级路径；不存在的祖先会同时创建物理目录与数据库行。路径按 NOCASE 判重，大小写不同也视为已存在。
+- 重命名只改最后一段，保留父路径；仅大小写变化时通过临时目录中转（Windows 不能直接改大小写）。移动接收目标父文件夹 id，拒绝移动到自身或后代。
+- 重命名/移动会先改物理目录，再在单写事务里更新整个子树的 `path`；数据库失败时把目录移回。目标位置已有同名文件夹或磁盘目录时拒绝。
+- 删除只允许空文件夹：没有子文件夹、没有任何图片（包括回收站图片）、物理目录为空。删除先移除空目录，再删数据库行；数据库失败时重建目录。
+- 四个命令都返回完整 `FolderInfo[]`，前端用返回值整体刷新树，不做本地路径推算。
+- 文件夹计数由 `get_folders` 用一条直接计数查询在内存中沿路径前缀累加到祖先，结果随命令返回。
 
 ## 生命周期
 
-- `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 加入设置 → 打开。
-- `open_library`：校验清单/库 → 建连接池 → 校验 schema → 读计数 → 加入设置并记录 `lastLibraryId`。
-- 打开新库成功后才替换旧会话；失败保留旧会话。
-- `close_library`：释放连接并清空 `lastLibraryId`，不动文件。
-- `remove_library`：只从设置移除；若正打开则先关闭。不删除磁盘内容。
-- `rename_library`：更新设置名称与清单名称；不改目录名。
-- 导入任务运行时，关闭、切换、创建与移除图库都会被拒绝；需要先取消或等待导入结束。
+- `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 打开 → 把路径写入设置。
+- `open_library_path`：校验清单/库 → 建连接池 → 校验或迁移 schema → 读计数 → 打开 → 把路径写入设置。空目录或无效目录直接拒绝，需先创建。
+- 打开或创建新库成功后才替换旧会话；失败保留旧会话与设置中的旧路径。
+- 启动：`open_configured_library` 按 `libraryPath` 自动打开；失败只记日志，前端随后再尝试一次并提示，最终退回欢迎页。
+- `close_library`：释放连接、清空 AI 运行时状态与 `libraryPath`，不动文件。
+- `rename_library`：更新清单名称与当前 `LibraryInfo.name`；不改目录名，也不写设置。
+- 应用内没有多库列表与“移除图库”操作；换库由“打开另一个图库”完成。
+- 导入/AI 任务/文件操作运行时，关闭、切换与创建图库都会被拒绝；需要先取消或等待任务结束。
 
 ## 已实现与未实现
 
-已实现：上述生命周期、schema v1、连接池、设置、窗口命令、Stage 0 UI；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v2（含 v1 迁移）、连接池、设置 v2、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹与路径校验；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：S7 颜色/pHash/向量/pose 相似度排序与高级集合、拖出到资源管理器（OLE）、维护类长任务进度/取消。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -196,13 +215,14 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 `cargo test` 覆盖：
 
-- 设置往返、重复路径拒绝、后端维护 `lastLibraryId`；
-- schema 初始化、FTS 插入/更新、重复初始化拒绝；
-- 目录规范校验；
+- 设置往返、v1 `lastLibraryId`/首项迁移、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
+- schema 初始化、v1→v2 迁移、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
+- 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝；
 - 导入仓储插入、内容哈希冲突与合并元数据；
 - 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）；
-- S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；
+- S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；文件夹子树筛选（后代命中、相似前缀不误匹配、根目录等价全库）、直接/子树计数、文件夹分面按子树展开；
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
 - S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复/永久删除/清空回收站；
 - S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；

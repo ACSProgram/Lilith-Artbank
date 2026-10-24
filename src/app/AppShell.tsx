@@ -51,21 +51,33 @@ export function AppShell() {
   return (
     <div className="app-frame">
       <WindowTitleBar />
-      <div className="app-body">
-        <Sidebar
-          onAddLibrary={() => setLibraryDialogOpen(true)}
+      {current ? (
+        <LibraryWorkspace
+          key={current.id}
           onOpenSettings={() => setSettingsOpen(true)}
+          onChangeLibrary={() => setLibraryDialogOpen(true)}
         />
-        <main className="app-main">
-          {current ? (
-            <LibraryWorkspace />
-          ) : (
+      ) : (
+        <div className="app-body">
+          <Sidebar
+            onOpenSettings={() => setSettingsOpen(true)}
+            onChangeLibrary={() => setLibraryDialogOpen(true)}
+            onCloseLibrary={() => undefined}
+          />
+          <main className="app-main">
             <WelcomeView onAddLibrary={() => setLibraryDialogOpen(true)} />
-          )}
-        </main>
-      </div>
+          </main>
+        </div>
+      )}
       <LibraryDialog open={libraryDialogOpen} onClose={() => setLibraryDialogOpen(false)} />
-      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onChangeLibrary={() => {
+          setSettingsOpen(false);
+          setLibraryDialogOpen(true);
+        }}
+      />
     </div>
   );
 }

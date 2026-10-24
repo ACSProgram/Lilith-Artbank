@@ -95,7 +95,10 @@ export interface FilterCounts {
 export interface FolderInfo {
   id: number;
   path: string;
-  imageCount: number;
+  /** 直接位于该文件夹的未删除图片数。 */
+  directImageCount: number;
+  /** 包含全部后代的未删除图片数。 */
+  totalImageCount: number;
 }
 
 export interface TagInfo {

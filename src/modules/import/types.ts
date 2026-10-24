@@ -1,4 +1,10 @@
 export type DuplicatePolicy = "skip" | "merge";
+export type FolderMode = "flat" | "preserve";
+
+export interface ImportFolder {
+  id: number;
+  path: string;
+}
 
 export type ImportPhase =
   | "scanning"
@@ -11,6 +17,7 @@ export type ImportPhase =
 export interface ImportRequest {
   paths: string[];
   folder: string;
+  folderMode: FolderMode;
   tags: string[];
   score: number;
   duplicatePolicy: DuplicatePolicy;

@@ -3,11 +3,14 @@ import { AlertTriangle, FolderOpen, ImagePlus, Images, UploadCloud } from "lucid
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Button } from "../../shared/components/Button";
 import { Field } from "../../shared/components/Field";
+import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Modal } from "../../shared/components/Modal";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import { importApi } from "./api";
 import type {
   DuplicatePolicy,
+  FolderMode,
+  ImportFolder,
   ImportPhase,
   ImportProgress,
   ImportSnapshot,
@@ -21,6 +24,7 @@ type View = "options" | "running" | "done";
 interface ImportDialogProps {
   open: boolean;
   initialPaths: string[];
+  folders: ImportFolder[];
   onClose: () => void;
   onFinished: () => void;
 }
@@ -66,9 +70,17 @@ function formatDuration(milliseconds: number): string {
   return `${minutes} 分 ${Math.round(seconds % 60)} 秒`;
 }
 
-export function ImportDialog({ open, initialPaths, onClose, onFinished }: ImportDialogProps) {
+export function ImportDialog({
+  open,
+  initialPaths,
+  folders,
+  onClose,
+  onFinished,
+}: ImportDialogProps) {
   const [paths, setPaths] = useState<string[]>([]);
   const [folder, setFolder] = useState("");
+  const [folderMode, setFolderMode] = useState<FolderMode>("flat");
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [tagsText, setTagsText] = useState("");
   const [score, setScore] = useState(0);
   const [policy, setPolicy] = useState<DuplicatePolicy>("skip");
@@ -115,6 +127,8 @@ export function ImportDialog({ open, initialPaths, onClose, onFinished }: Import
     if (!open) return;
     setPaths(initialRef.current);
     setFolder("");
+    setFolderMode("flat");
+    setFolderPickerOpen(false);
     setTagsText("");
     setScore(0);
     setPolicy("skip");
@@ -237,6 +251,7 @@ export function ImportDialog({ open, initialPaths, onClose, onFinished }: Import
       const snapshot = await importApi.start({
         paths,
         folder: folder.trim(),
+        folderMode,
         tags: parseTags(tagsText),
         score,
         duplicatePolicy: policy,
@@ -353,12 +368,21 @@ export function ImportDialog({ open, initialPaths, onClose, onFinished }: Import
 
           <div className="import-options-grid">
             <Field label="目标文件夹" hint="图库内相对路径，留空表示根目录">
-              <input
-                className="input"
-                value={folder}
-                placeholder="例如 人物/速写"
-                onChange={(event) => setFolder(event.target.value)}
-              />
+              <div className="input-row">
+                <input
+                  className="input"
+                  value={folder}
+                  placeholder="例如 人物/速写"
+                  onChange={(event) => setFolder(event.target.value)}
+                />
+                <Button
+                  size="sm"
+                  icon={<FolderOpen size={14} />}
+                  onClick={() => setFolderPickerOpen(true)}
+                >
+                  选择
+                </Button>
+              </div>
             </Field>
             <Field label="初始评分">
               <select
@@ -383,6 +407,28 @@ export function ImportDialog({ open, initialPaths, onClose, onFinished }: Import
               onChange={(event) => setTagsText(event.target.value)}
             />
           </Field>
+
+          <div className="field">
+            <span className="field-label">目录层级</span>
+            <div className="import-policy">
+              <button
+                type="button"
+                className={`import-policy-option${folderMode === "flat" ? " is-active" : ""}`}
+                onClick={() => setFolderMode("flat")}
+              >
+                <strong>平铺</strong>
+                <span>所有图片进入目标文件夹</span>
+              </button>
+              <button
+                type="button"
+                className={`import-policy-option${folderMode === "preserve" ? " is-active" : ""}`}
+                onClick={() => setFolderMode("preserve")}
+              >
+                <strong>保留源目录</strong>
+                <span>按每个输入目录下的相对层级建文件夹</span>
+              </button>
+            </div>
+          </div>
 
           <div className="field">
             <span className="field-label">重复内容</span>
@@ -412,6 +458,19 @@ export function ImportDialog({ open, initialPaths, onClose, onFinished }: Import
               <span>{error}</span>
             </div>
           ) : null}
+
+          <FolderPickerDialog
+            open={folderPickerOpen}
+            title="选择目标文件夹"
+            subtitle="图片会进入该文件夹；保留源目录时在其下继续建子文件夹。"
+            folders={folders}
+            selectedPath={folder}
+            onClose={() => setFolderPickerOpen(false)}
+            onSelect={(target) => {
+              setFolder(target.path);
+              setFolderPickerOpen(false);
+            }}
+          />
         </div>
       ) : (
         <div className="import-progress">

@@ -18,6 +18,9 @@ const IMAGE_COUNT: i64 = 200_000;
 const TAG_COUNT: i64 = 200;
 const TAGS_PER_IMAGE: i64 = 3;
 const PAGE_SIZE: i64 = 150;
+/// 每个顶层文件夹下 10×50 个叶子，补足 1 万个嵌套文件夹。
+const TREE_FOLDERS: i64 = 10_000;
+const TOTAL_FOLDERS: i64 = 1 + 20 + 200 + TREE_FOLDERS;
 
 fn percentile(samples: &[Duration], percentile: f64) -> Duration {
     if samples.is_empty() {
@@ -52,11 +55,22 @@ fn sample_query<T>(
 fn seed(connection: &mut Connection) -> AppResult<Duration> {
     let start = Instant::now();
     let transaction = connection.transaction()?;
+    let mut leaf_folder_ids = Vec::with_capacity(TREE_FOLDERS as usize);
     {
         let mut folder_statement =
             transaction.prepare("INSERT INTO folders(path, created_at) VALUES (?1, ?2)")?;
-        for index in 0..20 {
-            folder_statement.execute(params![format!("folder{index}"), 1_i64])?;
+        for top in 0..20 {
+            let top_path = format!("folder{top}");
+            folder_statement.execute(params![top_path, 1_i64])?;
+            for middle in 0..10 {
+                let middle_path = format!("{top_path}/set{middle}");
+                folder_statement.execute(params![middle_path, 1_i64])?;
+                for leaf in 0..50 {
+                    let leaf_path = format!("{middle_path}/leaf{leaf}");
+                    folder_statement.execute(params![leaf_path, 1_i64])?;
+                    leaf_folder_ids.push(transaction.last_insert_rowid());
+                }
+            }
         }
     }
     {
@@ -87,7 +101,7 @@ fn seed(connection: &mut Connection) -> AppResult<Duration> {
         let colors8 = vec![180_u8; 32];
         for index in 0..IMAGE_COUNT {
             let content_hash = format!("{index:064x}");
-            let folder_id = 2 + (index % 20);
+            let folder_id = leaf_folder_ids[(index % TREE_FOLDERS) as usize];
             let file_size = 100_000 + (index % 1_000) * 1_000;
             let score = index % 6;
             let description = if index % 10 == 0 {
@@ -357,19 +371,41 @@ fn perf_metadata_200k() {
         ms(p95)
     );
 
+    // 选中一个顶层文件夹（500 个叶子、约 1 万张图），让子树条件真正展开一批文件夹。
+    let top_folder_id = folder_id(database, "folder0");
     let folder_query = LibraryQuery {
         filters: LibraryFilters {
-            folder_ids: vec![7],
+            folder_ids: vec![top_folder_id],
             ..Default::default()
         },
         limit: Some(PAGE_SIZE as u32),
         ..Default::default()
     };
+    let subtree_page =
+        query::query_page(database, &root, folder_query.clone()).expect("subtree page");
+    assert_eq!(
+        subtree_page.items.len() as i64,
+        PAGE_SIZE,
+        "子树条件应能填满一页"
+    );
     let (p50, p95) = time_query(database, &root, folder_query.clone(), 40);
     println!(
-        "[perf] query engine folder 150: p50={:.2}ms p95={:.2}ms",
+        "[perf] query engine subtree folder 150: p50={:.2}ms p95={:.2}ms",
         ms(p50),
         ms(p95)
+    );
+
+    let mut folder_list_samples = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let folders = query::list_folders(database).expect("list folders");
+        assert_eq!(folders.len() as i64, TOTAL_FOLDERS);
+        folder_list_samples.push(start.elapsed());
+    }
+    println!(
+        "[perf] query engine get_folders ({TOTAL_FOLDERS} folders): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&folder_list_samples, 0.5)),
+        ms(percentile(&folder_list_samples, 0.95))
     );
 
     let tag_query = LibraryQuery {
@@ -395,7 +431,7 @@ fn perf_metadata_200k() {
         assert!(counts.total > 0);
     }
     println!(
-        "[perf] query engine filter counts: p50={:.2}ms p95={:.2}ms",
+        "[perf] query engine filter counts (subtree folder): p50={:.2}ms p95={:.2}ms",
         ms(percentile(&counts_samples, 0.5)),
         ms(percentile(&counts_samples, 0.95))
     );
@@ -501,6 +537,18 @@ fn perf_metadata_200k() {
             ms(percentile(&samples, 0.95))
         );
     }
+}
+
+fn folder_id(database: &crate::library::db::LibraryDb, path: &str) -> i64 {
+    database
+        .with_reader(|connection| {
+            let id =
+                connection.query_row("SELECT id FROM folders WHERE path = ?1", [path], |row| {
+                    row.get(0)
+                })?;
+            Ok(id)
+        })
+        .expect("benchmark folder id")
 }
 
 fn time_query(

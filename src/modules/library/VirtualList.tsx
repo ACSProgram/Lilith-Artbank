@@ -4,6 +4,7 @@ import {
   useImperativeHandle,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { RefreshCw } from "lucide-react";
@@ -34,6 +35,7 @@ interface VirtualListProps {
   onItemClick: (item: ImageRow, event: ReactMouseEvent) => void;
   onItemActivate: (item: ImageRow) => void;
   onItemContextMenu: (item: ImageRow, event: ReactMouseEvent) => void;
+  onItemDragStart: (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => void;
   onBackgroundClick: () => void;
 }
 
@@ -56,6 +58,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
     onItemClick,
     onItemActivate,
     onItemContextMenu,
+    onItemDragStart,
     onBackgroundClick,
   },
   ref,
@@ -192,6 +195,8 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
             }}
             onDoubleClick={() => onItemActivate(item)}
             onContextMenu={(event) => onItemContextMenu(item, event)}
+            draggable
+            onDragStart={(event) => onItemDragStart(item, event)}
           >
             <span className="virtual-list-thumb">
               <LibraryThumbnail image={item} />

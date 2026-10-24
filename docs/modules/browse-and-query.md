@@ -1,6 +1,6 @@
 # 浏览与检索
 
-S3 在 S2 的键集查询与虚拟网格之上补齐了搜索、扩展筛选、集合、回收站和详情/批量编辑。前端仍不持有全库数组，每次只请求一页；筛选计数只在筛选面板打开时计算。
+S3 在 S2 的键集查询与虚拟网格之上补齐了搜索、扩展筛选、集合、回收站和详情/批量编辑。当前批次把文件夹改为多级树，并把浏览状态提升到工作区，让文件夹树与网格共享同一份筛选。前端仍不持有全库数组，每次只请求一页；筛选计数只在筛选面板打开时计算。
 
 ## 查询 DTO
 
@@ -13,7 +13,7 @@ LibraryQuery {
   search: string,
   searchScope: "view" | "library",  // 默认只搜当前视图
   filters: {
-    folderIds: number[],
+    folderIds: number[],            // 每个 id 表示包含全部后代的子树；根目录等价全库
     extensions: string[],
     scores: number[],               // 0-5
     tagIds: number[],
@@ -36,6 +36,7 @@ LibraryQuery {
 ```
 
 - 筛选去重并校验：文件夹最多 256、扩展名最多 32、评分只允许 0-5、标签最多 64。
+- 文件夹 id 先解析为路径；每个路径匹配自身与全部后代，使用路径边界（`path = ?` 或 `path LIKE ? || '/%'`），避免 `人物` 命中 `人物速写`。选中的 id 全部失效时查询返回空集；包含根目录时不限制文件夹；多选之间取并集。
 - `collectionPosition` 只在集合视图有效；集合视图默认按手工顺序升序。
 - 排序键都是整数列，游标 `sortKey` 用十进制字符串传递。
 - `ImageRow` 新增 `deletedAt`；回收站行在网格/列表中带“回收站”前缀。
@@ -64,8 +65,8 @@ tags: string[]
 
 ## 筛选与计数
 
-- 筛选面板覆盖文件夹、扩展名、评分、标签（任一/全部）、导入时间范围、文件大小范围、有描述/有 embedding/有 pose。
-- 每个分面计数排除该分面自身的筛选条件。例如选中文件夹后，文件夹计数仍显示其他文件夹在其余筛选下的数量。
+- 筛选面板覆盖扩展名、评分、标签（任一/全部）、导入时间范围、文件大小范围、有描述/有 embedding/有 pose。文件夹筛选移到左侧文件夹树，不再在面板内重复一套。
+- 每个分面计数排除该分面自身的筛选条件。文件夹分面在计数时按子树展开：先统计每个文件夹的直接命中数，再沿路径前缀累加到自身与全部祖先；`FilterCounts.folders[].count` 因此与树上的子树总数一致。
 - 搜索或集合视图下，计数用单条 `WITH matched AS MATERIALIZED (...)` 语句一次求出命中集，再在五个 `UNION ALL` 分支里分别统计总数/文件夹/扩展名/评分/标签；普通视图直接按分面查询。
 - 计数只在筛选面板打开时请求，面板内有 160 ms 防抖与加载态；搜索/集合很大时可能超过 100 ms（见[性能](../guides/performance.md)），不会阻塞网格翻页。
 - 标签管理器提供标签搜索、计数、重命名与删除；删除前在确认框显示影响数量。管理器一次只载入图片最多的 500 个标签，搜索在该列表内过滤。
@@ -81,7 +82,7 @@ tags: string[]
 | `query_images` | `{ query }` | `{ items, nextCursor }` |
 | `query_image_ids` | `{ query }` | `number[]`（当前查询的全部 id，最多 100 万） |
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
-| `get_folders` | — | `FolderInfo[]` |
+| `get_folders` | — | `FolderInfo[]`（`directImageCount` / `totalImageCount`，按路径排序） |
 | `get_tags` | `{ limit? }` | `TagInfo[]`（默认/最多 500，按活跃图片数降序） |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]`（按名称子串，最多 200） |
 | `copy_text` | `{ text }` | `null`（Rust `arboard` 写系统剪贴板） |
@@ -165,7 +166,7 @@ WHERE (images.score, images.id) > (?, ?)
 ```
 
 - 视图条件：`deleted_at IS NULL`（all）、`deleted_at IS NOT NULL`（trash）、集合 `JOIN collection_items`（collection）。
-- 文件夹筛选使用 `folder_id IN (...)`，只做精确匹配，不自动包含子文件夹。
+- 文件夹筛选先把选中 id 解析为路径，再用 `images.folder_id IN (SELECT id FROM folders WHERE path = ? OR path LIKE ? ESCAPE '\')` 匹配整棵子树。子树展开只扫描 `folders` 行，代价随文件夹数量而不是图片数量增长；路径的唯一性由 `folders(path COLLATE NOCASE)` 保证。
 - 扩展名、评分、标签筛选都用参数化 `IN`；标签 `all` 为每个标签一个 `EXISTS`。
 - 时间/大小范围是半开区间之外的闭区间（`>=` / `<=`）；描述/embedding/pose 用 `description <> ''` 或 `EXISTS feature_blobs`。
 - 首屏、深分页、文件夹、标签、集合都命中现有索引；20 万行实测见[性能基准](../guides/performance.md)。
@@ -175,19 +176,24 @@ WHERE (images.score, images.id) > (?, ?)
 
 ```text
 src/modules/library/
-  types.ts                  边界 DTO
+  types.ts                  边界 DTO（含 FolderInfo）
   api.ts                    Tauri 命令入口 + 浏览器预览 mock
-  mock.ts                   浏览器预览用的可变数据集与查询/编辑实现
+  mock.ts                   浏览器预览用的可变数据集与查询/编辑/文件夹实现
   model.ts                  BrowseState、查询构造、排序选项、格式化、筛选键
+  useLibraryBrowse.ts       受控 BrowseState、浏览历史与返回
   useImageQuery.ts          首屏/下一页、代次、查询与翻页状态类型、错误重试
-  LibraryView.tsx           控制器：视图/搜索/筛选/排序/选择/键盘/右键菜单
+  LibraryView.tsx           视图：搜索/排序/选择/键盘/右键菜单/面包屑
   LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
   ViewBar.tsx               全部/回收站标签、集合胶囊、集合管理入口、清空回收站
-  VirtualGrid.tsx           自适应列数虚拟网格
-  VirtualList.tsx           固定行高虚拟列表
+  FolderTree.tsx            侧栏文件夹树：多选、展开、右键菜单、拖放
+  folderTreeModel.ts        树构建、可见行展开、祖先路径、面包屑、包含判断
+  FolderDialogs.tsx         文件夹命名/重命名对话框
+  dnd.ts                    图片与文件夹拖放的内部 MIME 读写
+  VirtualGrid.tsx           自适应列数虚拟网格（支持拖出图片 id）
+  VirtualList.tsx           固定行高虚拟列表（支持拖出图片 id）
   virtual.ts                两个虚拟视图共用的滚动句柄类型
-  FilterPanel.tsx           完整筛选面板（含范围与存在性筛选）
-  Inspector.tsx             单张详情与批量编辑侧栏
+  FilterPanel.tsx           范围与存在性筛选（不含文件夹分面）
+  Inspector.tsx             单张详情与批量编辑侧栏（文件夹选择器）
   CollectionManagerDialog.tsx 集合新建/重命名/删除/排序/运算
   CollectionPickerDialog.tsx  把选中图片加入现有或新集合
   TagManagerDialog.tsx      标签搜索、重命名、删除
@@ -197,13 +203,17 @@ src/modules/library/
 - 网格列数由容器宽度和设置里的 `ui.gridThumbPx` 决定；只挂载视口前后各一屏的行。
 - 列表固定 44px 行高，32px 粘性表头；窄窗口隐藏“导入时间/文件夹”列。
 - 缩略图只挂载当前可见 + 前后一屏的单元格；`<img decoding="async">` 指向 `thumb://`。失败显示占位，点击重试会给 URL 加 `retry` 参数绕过失败缓存；缓存命中时挂载后补查 `img.complete`。
-- 浏览器预览（无 Tauri）用 4,000 行可变 mock 数据与 SVG data URL 缩略图；可编辑评分/标签/描述/文件夹、操作集合与回收站、执行集合运算；只用于 UI/布局检查，不代表真实性能。
+- 浏览器预览（无 Tauri）用 4,000 行可变 mock 数据与 SVG data URL 缩略图；含嵌套与空文件夹，可创建/重命名/移动/删除文件夹、拖放图片与文件夹、子树筛选，也可编辑评分/标签/描述、操作集合与回收站；只用于 UI/布局检查，不代表真实性能。
 - 滚动接近已加载末尾时请求下一页；一页返回后追加，不整库载入。**限制**：已加载的页不会被回收，用户一直滚到全库末尾时前端会持有全部行；分页窗口回收留给 S9。
 
 ## 视图、选择与键盘
 
 - 视图栏：全部 / 回收站两个标签、集合胶囊、集合管理、清空回收站。切回标签时搜索范围重置为“当前视图”。
-- 浏览历史保存完整的视图/搜索/筛选/排序快照；只有视图、搜索或筛选变化才新增记录（切换排序不单独入栈）。`Ctrl/Cmd+Z` 或工具栏后退按钮回到上一状态。
+- 左侧文件夹树以“全部图片”为根；单击文件夹即把 `filters.folderIds` 设为该子树并显示在面包屑中。Ctrl/Cmd 单击多选，Shift 单击按可见顺序选择区间；展开/折叠状态只影响树，不进入浏览历史。
+- 面包屑条位于视图栏下方，显示当前选中的文件夹；点击层级跳回对应子树，“全部图片”清空文件夹筛选。
+- 树右键菜单：新建子文件夹、重命名、移动到…、删除空文件夹、把当前选中的图片移到此文件夹。空文件夹也显示在树中，计数为 0。
+- 拖放：网格/列表中的图片可拖到树节点或文件夹选择器；树节点可拖到另一个节点改变层级。图片拖放使用 `application/x-artbank-images` 携带 id，文件夹拖放使用 `application/x-artbank-folder`；位置与冲突由 Rust 校验。
+- 浏览历史保存完整的视图/搜索/筛选/排序快照；视图、搜索或文件夹筛选变化都会新增记录（切换排序不单独入栈）。`Ctrl/Cmd+Z` 或工具栏后退按钮回到上一状态。
 - 单击选中；Ctrl/Cmd 单击切换；Shift 单击按当前已加载顺序区间选择。
 - `Ctrl+A` 调 `query_image_ids` 取当前筛选的全部 id，包含尚未滚动加载的图片；状态栏显示总数。
 - 方向键移动活动项（网格按列数上下移动），Shift+方向键扩展区间；PageUp/PageDown、Home/End 滚动。
@@ -232,7 +242,7 @@ src/modules/library/
 
 ## 性能
 
-20 万行合成库、4 个读连接、开发档实测（同一台机器；不同轮次受系统负载影响约 2 倍）：
+20 万行合成库、4 个读连接、开发档实测（同一台机器；不同轮次受系统负载影响约 2 倍）。下表全部来自 20 文件夹数据集；10,221 个文件夹库上的子树页、`get_folders` 与子树分面计数见[性能基准](../guides/performance.md)的“多级文件夹与子树”一节，不在两处重复维护数字：
 
 | 路径 | p50 | p95 | 预算 |
 | --- | --- | --- | --- |
@@ -259,7 +269,7 @@ src/modules/library/
 ## 尚未实现
 
 - 列表列头点击排序、列隐藏；当前用工具栏排序。
-- 拖出到资源管理器（Windows OLE）、复制图片到剪贴板（S4）。
+- 拖出到资源管理器（Windows OLE）；复制图片到剪贴板已在 S4 实现。
 - 颜色 / pHash / CLIP / pose 相似度筛选与排序（S7）。
 - 原始文件名：当前不入库；如需按文件名识别，需要 schema 变更与导入记录。
 - 已加载页的窗口回收；长时间滚动到 20 万末尾时前端内存会随已加载行增长。

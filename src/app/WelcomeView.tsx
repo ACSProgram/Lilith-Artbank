@@ -1,23 +1,8 @@
-import { ArrowRight, Database, FolderPlus, Gauge, Images, ShieldCheck } from "lucide-react";
+import { FolderPlus, Gauge, Images, ShieldCheck } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { browserPreview } from "./api";
-import { useNotices } from "./noticeContext";
-import { useAppRuntime } from "./runtimeContext";
-import { errorMessage } from "../shared/errors";
 
 export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
-  const { settings, openLibrary } = useAppRuntime();
-  const { notify } = useNotices();
-  const libraries = settings?.libraries ?? [];
-
-  const handleOpen = async (libraryId: string) => {
-    try {
-      await openLibrary(libraryId);
-    } catch (error) {
-      notify("打开图库失败", "error", errorMessage(error));
-    }
-  };
-
   return (
     <div className="welcome">
       <div className="welcome-hero">
@@ -29,14 +14,13 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
           收进一个真正快的图库
         </h1>
         <p className="welcome-lede">
-          Lilith Artbank 面向数十万张图片、数百 GB 的美术素材仓库。元数据走 SQLite，
-          缩略图走追加式包文件，原图保持内容寻址；界面只是视图，重活都在 Rust 里完成。
+          Lilith Artbank 面向数十万张图片、数百 GB 的美术素材仓库。一个图库、一棵真实文件夹树；
+          元数据走 SQLite，缩略图走追加式包文件，原图保持内容寻址。
         </p>
         <div className="welcome-actions">
           <Button variant="primary" size="md" icon={<FolderPlus size={17} />} onClick={onAddLibrary}>
             打开或创建图库
           </Button>
-          <span className="welcome-stage">Stage 2 · 虚拟网格与查询</span>
         </div>
         {browserPreview ? (
           <div className="welcome-preview-note">
@@ -62,35 +46,6 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
           <p>导入只复制到图库目录并按内容哈希命名；编辑产生新文件，旧版本不会被悄悄覆盖。</p>
         </article>
       </div>
-
-      {libraries.length > 0 ? (
-        <section className="recent-libraries">
-          <div className="recent-heading">
-            <Database size={16} />
-            <h2>最近的图库</h2>
-          </div>
-          <div className="recent-list">
-            {libraries
-              .slice()
-              .sort((left, right) => right.addedAt - left.addedAt)
-              .slice(0, 6)
-              .map((library) => (
-                <button
-                  key={library.id}
-                  type="button"
-                  className="recent-item"
-                  onClick={() => void handleOpen(library.id)}
-                >
-                  <span className="recent-item-text">
-                    <span className="recent-item-name">{library.name}</span>
-                    <span className="recent-item-path">{library.path}</span>
-                  </span>
-                  <ArrowRight size={16} />
-                </button>
-              ))}
-          </div>
-        </section>
-      ) : null}
     </div>
   );
 }

@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{Connection, params, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::{db::LibraryDb, paths::normalize_content_extension, placeholders},
+    library::{
+        db::LibraryDb,
+        paths::{escape_like, normalize_content_extension, subtree_like_pattern},
+        placeholders,
+    },
 };
 
 pub const DEFAULT_LIMIT: u32 = 150;
@@ -187,7 +191,10 @@ pub struct FilterCounts {
 pub struct FolderInfo {
     pub id: i64,
     pub path: String,
-    pub image_count: u64,
+    /// 直接位于该文件夹的未删除图片数。
+    pub direct_image_count: u64,
+    /// 包含全部后代的未删除图片数。
+    pub total_image_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,7 +208,8 @@ pub struct TagInfo {
 pub fn query_page(database: &LibraryDb, root: &Path, query: LibraryQuery) -> AppResult<ImagePage> {
     let (query, limit) = normalize(query)?;
     database.with_reader(|connection| {
-        let mut prepared = PreparedQuery::new(&query, None, SearchMode::Page);
+        let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+        let mut prepared = PreparedQuery::new(&query, None, SearchMode::Page, &folder_paths);
 
         let sort_column = sort_column(query.sort.key);
         let direction = if query.sort.descending { "DESC" } else { "ASC" };
@@ -360,7 +368,8 @@ pub fn query_ids(database: &LibraryDb, query: LibraryQuery) -> AppResult<Vec<i64
     // 全选只取 id，不翻页；游标与 limit 在这里没有意义。
     let (query, _) = normalize(query)?;
     database.with_reader(|connection| {
-        let prepared = PreparedQuery::new(&query, None, SearchMode::Count);
+        let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+        let prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
         let direction = if query.sort.descending { "DESC" } else { "ASC" };
         let mut params = prepared.join_params.clone();
         params.extend(prepared.filters.params.iter().cloned());
@@ -389,27 +398,38 @@ pub fn query_ids(database: &LibraryDb, query: LibraryQuery) -> AppResult<Vec<i64
 
 pub fn filter_counts(database: &LibraryDb, query: LibraryQuery) -> AppResult<FilterCounts> {
     let (query, _) = normalize(query)?;
-    database.with_reader(|connection| build_filter_counts(connection, &query))
+    database.with_reader(|connection| {
+        let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+        build_filter_counts(connection, &query, &folder_paths)
+    })
 }
 
 pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
     database.with_reader(|connection| {
+        let folders = all_folders(connection)?;
         let mut statement = connection.prepare(
-            "SELECT folders.id, folders.path, count(images.id)
-             FROM folders
-             LEFT JOIN images ON images.folder_id = folders.id AND images.deleted_at IS NULL
-             GROUP BY folders.id
-             ORDER BY folders.path",
+            "SELECT folder_id, count(*) FROM images
+             WHERE deleted_at IS NULL GROUP BY folder_id",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok(FolderInfo {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                image_count: row.get::<_, i64>(2)?.max(0) as u64,
+        let direct = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
+        let totals: HashMap<i64, u64> =
+            expand_folder_counts(direct, &folders).into_iter().collect();
+        Ok(folders
+            .into_iter()
+            .map(|(id, path)| FolderInfo {
+                id,
+                path,
+                direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
+                total_image_count: totals.get(&id).copied().unwrap_or(0),
             })
-        })?;
-        let folders = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(folders)
+            .collect())
     })
 }
 
@@ -601,6 +621,12 @@ enum SearchMode {
     Count,
 }
 
+/// 单个选中文件夹的子树条件：两个参数依次是路径本身与 `subtree_like_pattern`。
+const FOLDER_SUBTREE_SQL: &str = "images.folder_id IN (
+    SELECT scope_folders.id FROM folders scope_folders
+    WHERE scope_folders.path = ? OR scope_folders.path LIKE ? ESCAPE '\\'
+)";
+
 struct PreparedQuery {
     join_sql: String,
     join_params: Vec<Value>,
@@ -608,7 +634,12 @@ struct PreparedQuery {
 }
 
 impl PreparedQuery {
-    fn new(query: &LibraryQuery, exclude: Option<Facet>, search_mode: SearchMode) -> Self {
+    fn new(
+        query: &LibraryQuery,
+        exclude: Option<Facet>,
+        search_mode: SearchMode,
+        folder_paths: &[String],
+    ) -> Self {
         let mut prepared = Self {
             join_sql: String::new(),
             join_params: Vec::new(),
@@ -641,7 +672,9 @@ impl PreparedQuery {
             }
         }
         prepared.filters.push_search(&query.search, search_mode);
-        prepared.filters.push_filters(&query.filters, exclude);
+        prepared
+            .filters
+            .push_filters(&query.filters, exclude, folder_paths);
         prepared
     }
 }
@@ -722,12 +755,27 @@ impl FilterSet {
         ));
     }
 
-    fn push_filters(&mut self, filters: &LibraryFilters, exclude: Option<Facet>) {
+    fn push_filters(
+        &mut self,
+        filters: &LibraryFilters,
+        exclude: Option<Facet>,
+        folder_paths: &[String],
+    ) {
         if exclude != Some(Facet::Folders) && !filters.folder_ids.is_empty() {
-            let marks = placeholders(filters.folder_ids.len());
-            self.clauses.push(format!("images.folder_id IN ({marks})"));
-            self.params
-                .extend(filters.folder_ids.iter().map(|id| Value::Integer(*id)));
+            if folder_paths.iter().any(String::is_empty) {
+                // 根目录的子树就是整库，等价于不限制文件夹。
+            } else if folder_paths.is_empty() {
+                self.clauses.push("0".to_owned());
+            } else {
+                // 每个选中路径一组参数：自身精确匹配 + 后代前缀匹配（路径边界避免
+                // `人物` 命中 `人物速写`）。多选之间取并集。
+                let parts = vec![FOLDER_SUBTREE_SQL.to_owned(); folder_paths.len()];
+                for path in folder_paths {
+                    self.params.push(Value::Text(path.clone()));
+                    self.params.push(Value::Text(subtree_like_pattern(path)));
+                }
+                self.clauses.push(format!("({})", parts.join(" OR ")));
+            }
         }
 
         if exclude != Some(Facet::Extensions) && !filters.extensions.is_empty() {
@@ -814,13 +862,6 @@ fn push_feature_presence(clauses: &mut Vec<String>, kind: &str, presence: Presen
     }
 }
 
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn fts_phrase(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -854,33 +895,52 @@ fn attach_tags(connection: &Connection, items: &mut [ImageRow]) -> AppResult<()>
     Ok(())
 }
 
-fn build_filter_counts(connection: &Connection, query: &LibraryQuery) -> AppResult<FilterCounts> {
+fn build_filter_counts(
+    connection: &Connection,
+    query: &LibraryQuery,
+    folder_paths: &[String],
+) -> AppResult<FilterCounts> {
     // 搜索与集合视图的命中集会被四个 facet 分别扫描一遍，单条 MATERIALIZED CTE 只求一次。
     if query.view == LibraryView::Collection || !query.search.is_empty() {
-        return build_materialized_counts(connection, query);
+        return build_materialized_counts(connection, query, folder_paths);
     }
 
     let total = {
-        let prepared = PreparedQuery::new(query, None, SearchMode::Count);
+        let prepared = PreparedQuery::new(query, None, SearchMode::Count, folder_paths);
         let (sql, params) = count_sql(&prepared);
         count_rows(connection, &sql, &params)?
     };
 
     let folders = {
-        let prepared = PreparedQuery::new(query, Some(Facet::Folders), SearchMode::Count);
+        let prepared =
+            PreparedQuery::new(query, Some(Facet::Folders), SearchMode::Count, folder_paths);
         let (sql, params) = grouped_sql(
             &prepared,
             "images.folder_id, count(*)",
             "GROUP BY images.folder_id ORDER BY count(*) DESC, images.folder_id",
         );
-        grouped_i64(connection, &sql, &params)?
+        let direct = grouped_i64(connection, &sql, &params)?;
+        let all = all_folders(connection)?;
+        let mut folders: Vec<FolderCount> = expand_folder_counts(direct, &all)
             .into_iter()
             .map(|(folder_id, count)| FolderCount { folder_id, count })
-            .collect()
+            .collect();
+        folders.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then(left.folder_id.cmp(&right.folder_id))
+        });
+        folders
     };
 
     let extensions = {
-        let prepared = PreparedQuery::new(query, Some(Facet::Extensions), SearchMode::Count);
+        let prepared = PreparedQuery::new(
+            query,
+            Some(Facet::Extensions),
+            SearchMode::Count,
+            folder_paths,
+        );
         let (sql, params) = grouped_sql(
             &prepared,
             "images.file_ext, count(*)",
@@ -897,7 +957,8 @@ fn build_filter_counts(connection: &Connection, query: &LibraryQuery) -> AppResu
     };
 
     let scores = {
-        let prepared = PreparedQuery::new(query, Some(Facet::Scores), SearchMode::Count);
+        let prepared =
+            PreparedQuery::new(query, Some(Facet::Scores), SearchMode::Count, folder_paths);
         let (sql, params) = grouped_sql(
             &prepared,
             "images.score, count(*)",
@@ -913,7 +974,8 @@ fn build_filter_counts(connection: &Connection, query: &LibraryQuery) -> AppResu
     };
 
     let tags = {
-        let prepared = PreparedQuery::new(query, Some(Facet::Tags), SearchMode::Count);
+        let prepared =
+            PreparedQuery::new(query, Some(Facet::Tags), SearchMode::Count, folder_paths);
         let (sql, params) = tags_grouped_sql(&prepared);
         grouped_i64(connection, &sql, &params)?
             .into_iter()
@@ -933,6 +995,7 @@ fn build_filter_counts(connection: &Connection, query: &LibraryQuery) -> AppResu
 fn build_materialized_counts(
     connection: &Connection,
     query: &LibraryQuery,
+    folder_paths: &[String],
 ) -> AppResult<FilterCounts> {
     let base_query = LibraryQuery {
         view: query.view,
@@ -941,16 +1004,16 @@ fn build_materialized_counts(
         search_scope: query.search_scope,
         ..Default::default()
     };
-    let base = PreparedQuery::new(&base_query, None, SearchMode::Count);
+    let base = PreparedQuery::new(&base_query, None, SearchMode::Count, &[]);
     let mut params = base.join_params.clone();
     params.extend(base.filters.params.iter().cloned());
 
     let filters = &query.filters;
-    let total = filters_only(filters, None);
-    let folders = filters_only(filters, Some(Facet::Folders));
-    let extensions = filters_only(filters, Some(Facet::Extensions));
-    let scores = filters_only(filters, Some(Facet::Scores));
-    let tags = filters_only(filters, Some(Facet::Tags));
+    let total = filters_only(filters, None, folder_paths);
+    let folders = filters_only(filters, Some(Facet::Folders), folder_paths);
+    let extensions = filters_only(filters, Some(Facet::Extensions), folder_paths);
+    let scores = filters_only(filters, Some(Facet::Scores), folder_paths);
+    let tags = filters_only(filters, Some(Facet::Tags), folder_paths);
 
     let mut branches = Vec::with_capacity(5);
     push_count_branch(
@@ -1039,14 +1102,12 @@ fn build_materialized_counts(
         scores: Vec::new(),
         tags: Vec::new(),
     };
+    let mut direct_folders: Vec<(i64, u64)> = Vec::new();
     for row in rows {
         let (kind, value, count) = row?;
         match kind.as_str() {
             "total" => counts.total = count,
-            "folders" => counts.folders.push(FolderCount {
-                folder_id: parse_count_key(&value)?,
-                count,
-            }),
+            "folders" => direct_folders.push((parse_count_key(&value)?, count)),
             "extensions" => counts.extensions.push(ValueCount { value, count }),
             "scores" => counts.scores.push(ValueCount { value, count }),
             "tags" => counts.tags.push(TagCount {
@@ -1056,6 +1117,11 @@ fn build_materialized_counts(
             _ => {}
         }
     }
+    let all = all_folders(connection)?;
+    counts.folders = expand_folder_counts(direct_folders, &all)
+        .into_iter()
+        .map(|(folder_id, count)| FolderCount { folder_id, count })
+        .collect();
     counts.folders.sort_by(|left, right| {
         right
             .count
@@ -1082,14 +1148,78 @@ fn build_materialized_counts(
     Ok(counts)
 }
 
-fn filters_only(filters: &LibraryFilters, exclude: Option<Facet>) -> PreparedQuery {
+fn filters_only(
+    filters: &LibraryFilters,
+    exclude: Option<Facet>,
+    folder_paths: &[String],
+) -> PreparedQuery {
     let mut prepared = PreparedQuery {
         join_sql: String::new(),
         join_params: Vec::new(),
         filters: FilterSet::new(),
     };
-    prepared.filters.push_filters(filters, exclude);
     prepared
+        .filters
+        .push_filters(filters, exclude, folder_paths);
+    prepared
+}
+
+/// 把选中的文件夹 id 解析成路径；已不存在或非法的 id 直接丢弃。
+fn folder_scope_paths(connection: &Connection, ids: &[i64]) -> AppResult<Vec<String>> {
+    let mut paths = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(path) = connection
+            .query_row("SELECT path FROM folders WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn all_folders(connection: &Connection) -> AppResult<Vec<(i64, String)>> {
+    // 按路径排序命中 `folders(path)` 唯一索引；前端树与计数都不依赖顺序，但返回值保持稳定。
+    let mut statement = connection.prepare("SELECT id, path FROM folders ORDER BY path")?;
+    let folders = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(folders)
+}
+
+/// 把“直接位于该文件夹”的计数累加到自身与全部祖先，得到子树计数。
+///
+/// 只返回计数非零的文件夹；空文件夹由调用方按 0 补齐。
+fn expand_folder_counts(direct: Vec<(i64, u64)>, folders: &[(i64, String)]) -> Vec<(i64, u64)> {
+    let by_path: HashMap<&str, i64> = folders
+        .iter()
+        .map(|(id, path)| (path.as_str(), *id))
+        .collect();
+    let path_by_id: HashMap<i64, &str> = folders
+        .iter()
+        .map(|(id, path)| (*id, path.as_str()))
+        .collect();
+    let mut totals: HashMap<i64, u64> = HashMap::new();
+    for (folder_id, count) in direct {
+        let Some(path) = path_by_id.get(&folder_id).copied() else {
+            continue;
+        };
+        let mut current = Some(path);
+        while let Some(prefix) = current {
+            if let Some(id) = by_path.get(prefix) {
+                *totals.entry(*id).or_default() += count;
+            }
+            if prefix.is_empty() {
+                break;
+            }
+            current = Some(prefix.rsplit_once('/').map_or("", |(parent, _)| parent));
+        }
+    }
+    totals.into_iter().collect()
 }
 
 fn push_count_branch(
@@ -1516,6 +1646,121 @@ mod tests {
     }
 
     #[test]
+    fn folder_filter_includes_descendants_but_not_similar_prefixes() {
+        let fixture = fixture();
+        let (nested_id, lookalike_id) = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                let nested = ensure_folder(connection, "人物/速写", 1)?;
+                let lookalike = ensure_folder(connection, "人物速写", 1)?;
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    2,
+                    nested,
+                    600,
+                    6_000,
+                    600,
+                    600,
+                    None,
+                    &[],
+                );
+                insert_image(
+                    connection,
+                    "g",
+                    "jpg",
+                    2,
+                    lookalike,
+                    700,
+                    7_000,
+                    600,
+                    600,
+                    None,
+                    &[],
+                );
+                Ok((nested, lookalike))
+            })
+            .unwrap();
+
+        let by_parent = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_people],
+                    ..Default::default()
+                },
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&by_parent), vec![6, 1, 2]);
+
+        let by_nested = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![nested_id],
+                    ..Default::default()
+                },
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&by_nested), vec![6]);
+
+        let by_lookalike = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![lookalike_id],
+                    ..Default::default()
+                },
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&by_lookalike), vec![7]);
+
+        let counts = filter_counts(
+            &fixture.session.db,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![nested_id],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            counts
+                .folders
+                .iter()
+                .find(|item| item.folder_id == fixture.folder_people)
+                .map(|item| item.count),
+            Some(3)
+        );
+
+        let folders = list_folders(&fixture.session.db).unwrap();
+        let people = folders
+            .iter()
+            .find(|item| item.id == fixture.folder_people)
+            .unwrap();
+        assert_eq!(people.direct_image_count, 2);
+        assert_eq!(people.total_image_count, 3);
+        let root = folders.iter().find(|item| item.path.is_empty()).unwrap();
+        assert_eq!(root.total_image_count, 6);
+    }
+
+    #[test]
     fn reports_filter_counts_and_lists_folders_and_tags() {
         let fixture = fixture();
         let counts = filter_counts(
@@ -1557,7 +1802,8 @@ mod tests {
         let folders = list_folders(&fixture.session.db).unwrap();
         assert_eq!(folders.len(), 3);
         assert_eq!(folders[1].path, "人物");
-        assert_eq!(folders[1].image_count, 2);
+        assert_eq!(folders[1].direct_image_count, 2);
+        assert_eq!(folders[1].total_image_count, 2);
 
         let tags = list_tags(&fixture.session.db, None).unwrap();
         assert_eq!(tags.len(), 2);

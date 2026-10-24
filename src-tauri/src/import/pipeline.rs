@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -16,13 +16,17 @@ use crate::{
     app::error::{AppError, AppResult},
     imageops::{colors, phash, thumbnail},
     import::{
-        ImportRequest, ImportSource, decode,
+        FolderMode, ImportRequest, ImportSource, decode,
         job::{DuplicatePolicy, ImportHint, ImportJob, ImportPhase},
         scan,
     },
     library::{
-        db::LibraryDb, import as repository, import::ImageInsert, paths::LibraryPaths,
-        service::now_ms, thumbs::ThumbPack,
+        db::LibraryDb,
+        import as repository,
+        import::ImageInsert,
+        paths::{LibraryPaths, join_folder, normalize_folder},
+        service::now_ms,
+        thumbs::ThumbPack,
     },
 };
 
@@ -43,7 +47,6 @@ impl Drop for TempGuard {
 }
 
 struct WriterOptions {
-    folder: String,
     tags: Vec<String>,
     score: u8,
     policy: DuplicatePolicy,
@@ -58,6 +61,7 @@ struct Staged {
 struct Prepared {
     source_path: PathBuf,
     destination: PathBuf,
+    folder: String,
     published: bool,
     content_hash: String,
     file_ext: String,
@@ -92,6 +96,7 @@ struct WorkerContext {
     paths: LibraryPaths,
     temp_dir: PathBuf,
     folder: String,
+    folder_mode: FolderMode,
     threshold: u8,
     inflight: Arc<Mutex<HashSet<String>>>,
     index: Arc<RwLock<PhashIndex>>,
@@ -160,7 +165,6 @@ fn run_inner(
     let inflight = Arc::new(Mutex::new(HashSet::new()));
     let (sender, receiver) = mpsc::sync_channel::<Outcome>(CHANNEL_DEPTH);
     let writer_options = WriterOptions {
-        folder: request.folder.clone(),
         tags: request.tags.clone(),
         score: request.score,
         policy: request.duplicate_policy,
@@ -198,6 +202,7 @@ fn run_inner(
             paths: paths.clone(),
             temp_dir: temp_dir.to_path_buf(),
             folder: request.folder.clone(),
+            folder_mode: request.folder_mode,
             threshold: request.perceptual_threshold,
             inflight,
             index,
@@ -209,7 +214,7 @@ fn run_inner(
             scanned
                 .files
                 .par_iter()
-                .for_each(|path| process_one(path, &context));
+                .for_each(|file| process_one(&file.path, &file.relative_folder, &context));
         });
     }
 
@@ -224,7 +229,7 @@ fn run_inner(
     }
 }
 
-fn process_one(path: &Path, context: &WorkerContext) {
+fn process_one(path: &Path, relative_folder: &str, context: &WorkerContext) {
     if context.job.should_cancel() {
         return;
     }
@@ -240,7 +245,7 @@ fn process_one(path: &Path, context: &WorkerContext) {
         context.job.set_current(name.to_string_lossy());
     }
 
-    match process_file(path, context) {
+    match process_file(path, relative_folder, context) {
         Ok(Some(outcome)) => {
             context.job.inc_processed();
             if context.sender.send(outcome).is_err() {
@@ -258,15 +263,20 @@ fn process_one(path: &Path, context: &WorkerContext) {
     }
 }
 
-fn process_file(path: &Path, context: &WorkerContext) -> AppResult<Option<Outcome>> {
+fn process_file(
+    path: &Path,
+    relative_folder: &str,
+    context: &WorkerContext,
+) -> AppResult<Option<Outcome>> {
     let staged = stage_file(path, &context.temp_dir)?;
-    let result = process_staged(path, &staged, context);
+    let result = process_staged(path, relative_folder, &staged, context);
     let _ = std::fs::remove_file(&staged.path);
     result
 }
 
 fn process_staged(
     source_path: &Path,
+    relative_folder: &str,
     staged: &Staged,
     context: &WorkerContext,
 ) -> AppResult<Option<Outcome>> {
@@ -294,7 +304,7 @@ fn process_staged(
         }
     }
 
-    let result = build_prepared(source_path, staged, context);
+    let result = build_prepared(source_path, relative_folder, staged, context);
     if !matches!(result, Ok(Some(_))) {
         context.inflight.lock().remove(&staged.hash);
     }
@@ -303,6 +313,7 @@ fn process_staged(
 
 fn build_prepared(
     source_path: &Path,
+    relative_folder: &str,
     staged: &Staged,
     context: &WorkerContext,
 ) -> AppResult<Option<Outcome>> {
@@ -324,14 +335,21 @@ fn build_prepared(
         return Ok(None);
     }
 
+    let folder = match context.folder_mode {
+        FolderMode::Preserve if !relative_folder.is_empty() => {
+            normalize_folder(&join_folder(&context.folder, relative_folder))?
+        }
+        _ => context.folder.clone(),
+    };
     let file_ext = content_extension(decoded.format).to_owned();
     let file_name = format!("{}.{}", staged.hash, file_ext);
-    let destination = context.paths.content_file(&context.folder, &file_name);
+    let destination = context.paths.content_file(&folder, &file_name);
     let published = publish(&staged.path, &destination)?;
 
     Ok(Some(Outcome::Prepared(Prepared {
         source_path: source_path.to_path_buf(),
         destination,
+        folder,
         published,
         content_hash: staged.hash.clone(),
         file_ext,
@@ -444,6 +462,14 @@ fn content_extension(format: &str) -> &str {
     }
 }
 
+/// 写线程的待提交缓冲。`folder_ids` 跨批次保留，避免同一批导入反复解析同一目录。
+#[derive(Default)]
+struct WriteBuffer {
+    prepared: Vec<Prepared>,
+    duplicates: Vec<DuplicateOutcome>,
+    folder_ids: HashMap<String, i64>,
+}
+
 fn write_loop(
     receiver: mpsc::Receiver<Outcome>,
     database: Arc<LibraryDb>,
@@ -452,50 +478,28 @@ fn write_loop(
     job: Arc<ImportJob>,
     index: Arc<RwLock<PhashIndex>>,
 ) {
-    let mut prepared = Vec::with_capacity(BATCH_SIZE);
-    let mut duplicates = Vec::new();
+    let mut buffer = WriteBuffer {
+        prepared: Vec::with_capacity(BATCH_SIZE),
+        ..Default::default()
+    };
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(Outcome::Prepared(item)) => prepared.push(item),
+            Ok(Outcome::Prepared(item)) => buffer.prepared.push(item),
             Ok(Outcome::Duplicate { hash, in_batch }) => {
-                duplicates.push(DuplicateOutcome { hash, in_batch })
+                buffer.duplicates.push(DuplicateOutcome { hash, in_batch })
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                flush(
-                    &database,
-                    &pack,
-                    &options,
-                    &job,
-                    &index,
-                    &mut prepared,
-                    &mut duplicates,
-                );
+                flush(&database, &pack, &options, &job, &index, &mut buffer);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                flush(
-                    &database,
-                    &pack,
-                    &options,
-                    &job,
-                    &index,
-                    &mut prepared,
-                    &mut duplicates,
-                );
+                flush(&database, &pack, &options, &job, &index, &mut buffer);
                 break;
             }
         }
 
-        if prepared.len() >= BATCH_SIZE || duplicates.len() >= DUPLICATE_BATCH {
-            flush(
-                &database,
-                &pack,
-                &options,
-                &job,
-                &index,
-                &mut prepared,
-                &mut duplicates,
-            );
+        if buffer.prepared.len() >= BATCH_SIZE || buffer.duplicates.len() >= DUPLICATE_BATCH {
+            flush(&database, &pack, &options, &job, &index, &mut buffer);
         }
     }
 }
@@ -506,20 +510,18 @@ fn flush(
     options: &WriterOptions,
     job: &ImportJob,
     index: &RwLock<PhashIndex>,
-    prepared: &mut Vec<Prepared>,
-    duplicates: &mut Vec<DuplicateOutcome>,
+    buffer: &mut WriteBuffer,
 ) {
-    if prepared.is_empty() && duplicates.is_empty() {
+    if buffer.prepared.is_empty() && buffer.duplicates.is_empty() {
         return;
     }
-    let batch = std::mem::take(prepared);
-    let dups = std::mem::take(duplicates);
+    let batch = std::mem::take(&mut buffer.prepared);
+    let dups = std::mem::take(&mut buffer.duplicates);
 
     let commit = database.with_writer(|connection| {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_ms();
-        let folder_id = repository::ensure_folder(&transaction, &options.folder, now)?;
         let tag_ids = repository::ensure_tags(&transaction, &options.tags)?;
 
         let mut stats = CommitStats {
@@ -567,6 +569,14 @@ fn flush(
                 imported_at: now,
             };
 
+            let folder_id = match buffer.folder_ids.get(&item.folder) {
+                Some(id) => *id,
+                None => {
+                    let id = repository::ensure_folder(&transaction, &item.folder, now)?;
+                    buffer.folder_ids.insert(item.folder.clone(), id);
+                    id
+                }
+            };
             match repository::insert_image(&transaction, folder_id, &insert) {
                 Ok(Some(id)) => {
                     repository::attach_tags(&transaction, id, &tag_ids)?;
@@ -760,6 +770,7 @@ mod tests {
         ImportRequest {
             paths: vec![directory.to_string_lossy().into_owned()],
             folder: "导入".into(),
+            folder_mode: FolderMode::Flat,
             tags: vec!["测试".into()],
             score: 3,
             duplicate_policy: DuplicatePolicy::Skip,
@@ -854,6 +865,50 @@ mod tests {
         assert_eq!(snapshot.progress.imported, 0);
         assert_eq!(snapshot.progress.duplicates, 8);
         assert_eq!(snapshot.progress.failed, 0);
+    }
+
+    #[test]
+    fn preserves_source_folders_and_merges_same_names() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("素材A");
+        let second = temp.path().join("素材B");
+        std::fs::create_dir_all(first.join("人物").join("速写")).unwrap();
+        std::fs::create_dir_all(second.join("人物").join("色彩")).unwrap();
+        sample_image(1, 64, 48)
+            .save(first.join("人物").join("速写").join("a.png"))
+            .unwrap();
+        sample_image(2, 64, 48)
+            .save(second.join("人物").join("色彩").join("b.png"))
+            .unwrap();
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+
+        let mut preserve = request(&first);
+        preserve.paths = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+        preserve.folder_mode = FolderMode::Preserve;
+        let job = Arc::new(ImportJob::new("preserve-job"));
+        run(source(&session, &library_root), job.clone(), preserve).unwrap();
+        job.finish(ImportPhase::Completed);
+        assert_eq!(job.snapshot().progress.imported, 2);
+
+        let folders: Vec<String> = session
+            .db
+            .with_reader(|connection| {
+                let mut statement = connection.prepare("SELECT path FROM folders ORDER BY path")?;
+                let paths = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(paths)
+            })
+            .unwrap();
+        assert!(folders.contains(&"导入/人物".to_owned()));
+        assert!(folders.contains(&"导入/人物/速写".to_owned()));
+        assert!(folders.contains(&"导入/人物/色彩".to_owned()));
+        assert!(library_root.join("导入").join("人物").join("速写").is_dir());
+        assert!(library_root.join("导入").join("人物").join("色彩").is_dir());
     }
 
     #[test]

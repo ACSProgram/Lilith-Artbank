@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -18,6 +18,9 @@ CREATE TABLE folders (
     path TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL
 ) STRICT;
+
+-- Windows 下文件夹路径大小写不敏感；NOCASE 只覆盖 ASCII，中文不受影响。
+CREATE UNIQUE INDEX idx_folders_path_nocase ON folders(path COLLATE NOCASE);
 
 CREATE TABLE images (
     id INTEGER PRIMARY KEY,
@@ -189,29 +192,70 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
     let version = read_version(connection)?;
     match version {
         0 => initialize(connection, manifest),
+        1 => {
+            verify_meta(connection, manifest)?;
+            migrate_v1_to_v2(connection)
+        }
         SCHEMA_VERSION => {
-            let format: String = connection.query_row(
-                "SELECT value FROM meta WHERE key = 'appFormat'",
-                [],
-                |row| row.get(0),
-            )?;
-            if format != crate::library::paths::LIBRARY_FORMAT {
-                return Err(AppError::message("数据库不是 Lilith Artbank 图库"));
-            }
-            let library_id: String = connection.query_row(
-                "SELECT value FROM meta WHERE key = 'libraryId'",
-                [],
-                |row| row.get(0),
-            )?;
-            if library_id != manifest.library_id {
-                return Err(AppError::message("图库清单与数据库的 libraryId 不一致"));
-            }
+            verify_meta(connection, manifest)?;
             Ok(())
         }
         other => Err(AppError::message(format!(
             "图库 schema 版本 {other} 高于当前程序支持的 {SCHEMA_VERSION}"
         ))),
     }
+}
+
+fn verify_meta(connection: &Connection, manifest: &LibraryManifest) -> AppResult<()> {
+    let format: String = connection.query_row(
+        "SELECT value FROM meta WHERE key = 'appFormat'",
+        [],
+        |row| row.get(0),
+    )?;
+    if format != crate::library::paths::LIBRARY_FORMAT {
+        return Err(AppError::message("数据库不是 Lilith Artbank 图库"));
+    }
+    let library_id: String = connection.query_row(
+        "SELECT value FROM meta WHERE key = 'libraryId'",
+        [],
+        |row| row.get(0),
+    )?;
+    if library_id != manifest.library_id {
+        return Err(AppError::message("图库清单与数据库的 libraryId 不一致"));
+    }
+    Ok(())
+}
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> AppResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT path FROM folders GROUP BY path COLLATE NOCASE HAVING count(*) > 1
+         ORDER BY path",
+    )?;
+    let conflicts = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    if !conflicts.is_empty() {
+        return Err(AppError::message(format!(
+            "图库存在大小写冲突的文件夹路径，无法升级 schema：{}",
+            conflicts.join("、")
+        )));
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_path_nocase
+         ON folders(path COLLATE NOCASE)",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schemaVersion'",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v1 升级到 v{SCHEMA_VERSION}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,5 +330,86 @@ mod tests {
         initialize(&mut connection, &manifest()).unwrap();
         assert!(initialize(&mut connection, &manifest()).is_err());
         ensure(&mut connection, &manifest()).unwrap();
+    }
+
+    fn downgrade_to_v1(connection: &Connection) {
+        connection
+            .execute("DROP INDEX idx_folders_path_nocase", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '1' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn migrates_v1_to_v2_and_adds_case_insensitive_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v1(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 1);
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schemaVersion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        let indexes: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_folders_path_nocase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES ('People', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO folders(path, created_at) VALUES ('people', 2)",
+                    []
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn refuses_v1_migration_on_case_conflicts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v1(&connection);
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES ('People', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES ('people', 2)",
+                [],
+            )
+            .unwrap();
+
+        let error = ensure(&mut connection, &manifest()).unwrap_err();
+        assert!(error.to_string().contains("大小写冲突"));
+        assert_eq!(read_version(&connection).unwrap(), 1);
     }
 }

@@ -43,7 +43,9 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir)?;
             let settings =
                 app::settings::SettingsStore::load_or_create(config_dir.join("settings.json"))?;
-            application.manage(app::state::AppState::new(settings));
+            let state = app::state::AppState::new(settings);
+            state.open_configured_library();
+            application.manage(state);
             log::info!(
                 "Lilith Artbank starting: version={}, config={}",
                 env!("CARGO_PKG_VERSION"),

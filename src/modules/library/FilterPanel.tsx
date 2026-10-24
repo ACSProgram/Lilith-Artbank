@@ -7,7 +7,6 @@ import {
   activeFilterCount,
   bytesToMbInput,
   dateInputValue,
-  folderLabel,
   localDayEnd,
   localDayStart,
   mbToBytes,
@@ -16,7 +15,6 @@ import {
 } from "./model";
 import type {
   FilterCounts,
-  FolderInfo,
   LibraryFilters,
   LibraryQuery,
   PresenceFilter,
@@ -45,7 +43,6 @@ export function FilterPanel({
   onReset,
   onManageTags,
 }: FilterPanelProps) {
-  const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [tags, setTags] = useState<TagInfo[]>([]);
   const [counts, setCounts] = useState<FilterCounts | null>(null);
   const [optionsLoading, setOptionsLoading] = useState(false);
@@ -61,11 +58,7 @@ export function FilterPanel({
     setOptionsLoading(true);
     setOptionsError(null);
     try {
-      const [nextFolders, nextTags] = await Promise.all([
-        libraryApi.getFolders(),
-        libraryApi.getTags(),
-      ]);
-      setFolders(nextFolders);
+      const nextTags = await libraryApi.getTags();
       setTags(nextTags);
     } catch (cause) {
       setOptionsError(errorMessage(cause));
@@ -114,10 +107,6 @@ export function FilterPanel({
     if (!open) setTagQuery("");
   }, [open]);
 
-  const folderCounts = useMemo(
-    () => new Map((counts?.folders ?? []).map((item) => [item.folderId, item.count])),
-    [counts],
-  );
   const extensionCounts = useMemo(
     () => new Map((counts?.extensions ?? []).map((item) => [item.value, item.count])),
     [counts],
@@ -215,35 +204,6 @@ export function FilterPanel({
             <span>{countsError}</span>
           </div>
         ) : null}
-
-        <section className="filter-section">
-          <h4>文件夹</h4>
-          <div className="filter-option-list">
-            {optionsLoading && folders.length === 0 ? (
-              <span className="filter-loading">
-                <Spinner size={12} /> 载入文件夹…
-              </span>
-            ) : (
-              folders.map((folder) => {
-                const active = filters.folderIds.includes(folder.id);
-                const count = counts ? (folderCounts.get(folder.id) ?? 0) : folder.imageCount;
-                return (
-                  <label key={folder.id} className={`filter-option${active ? " is-active" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={active}
-                      onChange={() => patch({ folderIds: toggleValue(filters.folderIds, folder.id) })}
-                    />
-                    <span className="filter-option-label" title={folder.path}>
-                      {folderLabel(folder.path)}
-                    </span>
-                    <em>{count}</em>
-                  </label>
-                );
-              })
-            )}
-          </div>
-        </section>
 
         <section className="filter-section">
           <h4>扩展名</h4>

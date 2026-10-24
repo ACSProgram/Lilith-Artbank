@@ -18,7 +18,7 @@ function basename(path: string): string {
 }
 
 export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClose: () => void }) {
-  const { addLibrary } = useAppRuntime();
+  const { current, createLibrary, openLibrary } = useAppRuntime();
   const { notify } = useNotices();
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
@@ -104,8 +104,11 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
     setSubmitting(true);
     setError(null);
     try {
-      const existing = inspection?.kind === "library";
-      await addLibrary(existing ? "" : name.trim(), path.trim());
+      if (inspection?.kind === "library") {
+        await openLibrary(path.trim());
+      } else {
+        await createLibrary(name.trim(), path.trim());
+      }
       onClose();
     } catch (cause) {
       const message = errorMessage(cause);
@@ -122,8 +125,12 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
   return (
     <Modal
       open={isOpen}
-      title="打开或创建图库"
-      subtitle="图库目录保存图片本体与 .artbank 数据。已有图库会直接打开，空目录会初始化新库。"
+      title={current ? "更换图库" : "打开或创建图库"}
+      subtitle={
+        current
+          ? "新图库会替换当前打开的图库；当前图库的数据不会被修改。"
+          : "图库目录保存图片本体与 .artbank 数据。已有图库会直接打开，空目录会初始化新库。"
+      }
       onClose={onClose}
       width={620}
       dismissible={!submitting}
@@ -199,7 +206,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
         </div>
 
         {inspection?.kind !== "library" ? (
-          <Field label="图库名称" hint="只影响列表与窗口标题，不会重命名目录。">
+          <Field label="图库名称" hint="只影响窗口标题与清单名称，不会重命名目录。">
             <input
               className="input"
               value={name}

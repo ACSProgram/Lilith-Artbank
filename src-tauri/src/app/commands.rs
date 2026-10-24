@@ -51,33 +51,13 @@ pub fn create_library(
 }
 
 #[tauri::command]
-pub fn add_library_path(
-    state: State<'_, AppState>,
-    name: String,
-    path: String,
-) -> Result<LibraryInfo, String> {
+pub fn open_library_path(state: State<'_, AppState>, path: String) -> Result<LibraryInfo, String> {
     let path = PathBuf::from(path);
     match state.inspect_library(&path) {
         LibraryInspection::Library { .. } => AppError::command(state.open_library(&path)),
-        LibraryInspection::Empty => AppError::command(state.create_library(&path, &name)),
+        LibraryInspection::Empty => Err("目录不是图库，请先创建图库".to_owned()),
         LibraryInspection::Invalid { reason } => Err(format!("该目录无法作为图库：{reason}")),
     }
-}
-
-#[tauri::command]
-pub fn open_library(state: State<'_, AppState>, library_id: String) -> Result<LibraryInfo, String> {
-    let settings = state.settings.snapshot();
-    let entry = settings
-        .libraries
-        .iter()
-        .find(|item| item.id == library_id)
-        .ok_or_else(|| "图库不在列表中".to_owned())?;
-    AppError::command(state.open_library(&PathBuf::from(&entry.path)))
-}
-
-#[tauri::command]
-pub fn open_library_path(state: State<'_, AppState>, path: String) -> Result<LibraryInfo, String> {
-    AppError::command(state.open_library(&PathBuf::from(path)))
 }
 
 #[tauri::command]
@@ -91,17 +71,8 @@ pub fn get_library_status(state: State<'_, AppState>) -> Result<Option<LibraryIn
 }
 
 #[tauri::command]
-pub fn remove_library(state: State<'_, AppState>, library_id: String) -> Result<Settings, String> {
-    AppError::command(state.remove_library(&library_id))
-}
-
-#[tauri::command]
-pub fn rename_library(
-    state: State<'_, AppState>,
-    library_id: String,
-    name: String,
-) -> Result<Settings, String> {
-    AppError::command(state.rename_library(&library_id, &name))
+pub fn rename_library(state: State<'_, AppState>, name: String) -> Result<LibraryInfo, String> {
+    AppError::command(state.rename_current_library(&name))
 }
 
 #[tauri::command]
@@ -237,6 +208,37 @@ pub fn get_filter_counts(
 #[tauri::command]
 pub fn get_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
     AppError::command(state.folders())
+}
+
+#[tauri::command]
+pub fn create_folder(state: State<'_, AppState>, path: String) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.create_folder(&path))
+}
+
+#[tauri::command]
+pub fn rename_folder(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    name: String,
+) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.rename_folder(folder_id, &name))
+}
+
+#[tauri::command]
+pub fn move_folder(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    parent_id: i64,
+) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.move_folder(folder_id, parent_id))
+}
+
+#[tauri::command]
+pub fn delete_folder(
+    state: State<'_, AppState>,
+    folder_id: i64,
+) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.delete_folder(folder_id))
 }
 
 #[tauri::command]
@@ -600,12 +602,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         save_settings,
         inspect_library_path,
         create_library,
-        add_library_path,
-        open_library,
         open_library_path,
         close_library,
         get_library_status,
-        remove_library,
         rename_library,
         window_minimize,
         window_toggle_maximize,
@@ -624,6 +623,10 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         query_image_ids,
         get_filter_counts,
         get_folders,
+        create_folder,
+        rename_folder,
+        move_folder,
+        delete_folder,
         get_tags,
         search_tags,
         get_image_detail,

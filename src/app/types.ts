@@ -1,10 +1,3 @@
-export interface LibraryEntry {
-  id: string;
-  name: string;
-  path: string;
-  addedAt: number;
-}
-
 export interface AiSettings {
   baseUrl: string;
   executablePath: string | null;
@@ -25,8 +18,7 @@ export interface UiSettings {
 
 export interface Settings {
   settingsVersion: number;
-  libraries: LibraryEntry[];
-  lastLibraryId: string | null;
+  libraryPath: string | null;
   ai: AiSettings;
   performance: PerformanceSettings;
   ui: UiSettings;

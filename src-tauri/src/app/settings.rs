@@ -8,14 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub settings_version: u32,
-    pub libraries: Vec<LibraryEntry>,
-    pub last_library_id: Option<String>,
+    pub library_path: Option<String>,
     pub ai: AiSettings,
     pub performance: PerformanceSettings,
     pub ui: UiSettings,
@@ -25,22 +24,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             settings_version: SETTINGS_VERSION,
-            libraries: Vec::new(),
-            last_library_id: None,
+            library_path: None,
             ai: AiSettings::default(),
             performance: PerformanceSettings::default(),
             ui: UiSettings::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LibraryEntry {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-    pub added_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,30 +93,10 @@ impl Settings {
         if self.settings_version != SETTINGS_VERSION {
             return Err(AppError::message("设置文件版本不受支持"));
         }
-        if self.libraries.len() > 64 {
-            return Err(AppError::message("图库数量超过上限"));
-        }
-        let mut ids = std::collections::HashSet::new();
-        let mut paths = std::collections::HashSet::new();
-        for library in &self.libraries {
-            if library.id.trim().is_empty() {
-                return Err(AppError::message("图库 ID 不能为空"));
-            }
-            let name = library.name.trim();
-            if name.is_empty() || name.chars().count() > 120 {
-                return Err(AppError::message("图库名称必须为 1-120 个字符"));
-            }
-            if !Path::new(&library.path).is_absolute() {
-                return Err(AppError::message(format!(
-                    "图库路径必须是绝对路径：{}",
-                    library.path
-                )));
-            }
-            if !ids.insert(library.id.clone()) {
-                return Err(AppError::message("图库 ID 重复"));
-            }
-            if !paths.insert(normalize_path_key(&library.path)) {
-                return Err(AppError::message("同一个图库路径被重复添加"));
+        if let Some(path) = &self.library_path {
+            let path = path.trim();
+            if path.is_empty() || !Path::new(path).is_absolute() {
+                return Err(AppError::message("图库路径必须是非空的绝对路径"));
             }
         }
         let url = self.ai.base_url.trim();
@@ -170,13 +139,9 @@ impl SettingsStore {
         let settings = if path.is_file() {
             match std::fs::read(&path)
                 .map_err(AppError::from)
-                .and_then(|bytes| {
-                    serde_json::from_slice::<Settings>(&bytes).map_err(AppError::from)
-                }) {
-                Ok(mut settings) => {
-                    settings.settings_version = SETTINGS_VERSION;
-                    settings
-                }
+                .and_then(|bytes| parse_settings(&bytes))
+            {
+                Ok(settings) => settings,
                 Err(error) => {
                     let backup = path.with_extension(format!(
                         "bad-{}.json",
@@ -209,70 +174,29 @@ impl SettingsStore {
         settings.validate()?;
         {
             let mut guard = self.value.lock();
-            // 最近打开的图库由后端维护，设置页不应把它覆盖成过期值。
-            settings.last_library_id = guard.last_library_id.clone();
+            // 当前图库由后端维护；设置页提交不应覆盖成过期路径。
+            settings.library_path = guard.library_path.clone();
             *guard = settings.clone();
         }
         self.persist()?;
         Ok(settings)
     }
 
-    pub fn set_last_library(&self, library_id: Option<String>) -> AppResult<()> {
+    pub fn set_library_path(&self, path: Option<String>) -> AppResult<()> {
+        let path = path.map(|value| {
+            let mut trimmed = value.trim().to_owned();
+            // 保留盘符根（G:\），其余尾部分隔符去掉，避免同一路径出现两种写法。
+            while trimmed.len() > 3 && (trimmed.ends_with('\\') || trimmed.ends_with('/')) {
+                trimmed.pop();
+            }
+            trimmed
+        });
         {
             let mut guard = self.value.lock();
-            guard.last_library_id = library_id;
+            guard.library_path = path;
+            guard.validate()?;
         }
         self.persist()
-    }
-
-    pub fn upsert_library(&self, entry: LibraryEntry) -> AppResult<Settings> {
-        {
-            let mut guard = self.value.lock();
-            if let Some(existing) = guard
-                .libraries
-                .iter_mut()
-                .find(|item| same_path(&item.path, &entry.path) || item.id == entry.id)
-            {
-                existing.name = entry.name.clone();
-                existing.path = entry.path.clone();
-            } else {
-                guard.libraries.push(entry);
-            }
-            guard.validate()?;
-        }
-        self.persist()?;
-        Ok(self.snapshot())
-    }
-
-    pub fn remove_library(&self, library_id: &str) -> AppResult<Settings> {
-        {
-            let mut guard = self.value.lock();
-            guard.libraries.retain(|item| item.id != library_id);
-            if guard.last_library_id.as_deref() == Some(library_id) {
-                guard.last_library_id = None;
-            }
-        }
-        self.persist()?;
-        Ok(self.snapshot())
-    }
-
-    pub fn rename_library(&self, library_id: &str, name: &str) -> AppResult<Settings> {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
-            return Err(AppError::message("图库名称不能为空"));
-        }
-        {
-            let mut guard = self.value.lock();
-            let entry = guard
-                .libraries
-                .iter_mut()
-                .find(|item| item.id == library_id)
-                .ok_or_else(|| AppError::message("图库不在列表中"))?;
-            entry.name = name;
-            guard.validate()?;
-        }
-        self.persist()?;
-        Ok(self.snapshot())
     }
 
     pub fn path(&self) -> &Path {
@@ -295,15 +219,58 @@ impl SettingsStore {
     }
 }
 
-fn normalize_path_key(value: &str) -> String {
-    value
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
+fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let version = value
+        .get("settingsVersion")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u32;
+    if version < 2 {
+        return migrate_v1(&value);
+    }
+    if version != SETTINGS_VERSION {
+        return Err(AppError::message(format!(
+            "设置文件版本 {version} 高于当前程序支持的 {SETTINGS_VERSION}"
+        )));
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
-fn same_path(left: &str, right: &str) -> bool {
-    normalize_path_key(left) == normalize_path_key(right)
+/// v1 保存多个图库条目与 `lastLibraryId`；v2 只保留一个 `libraryPath`。
+fn migrate_v1(value: &serde_json::Value) -> AppResult<Settings> {
+    let libraries = value
+        .get("libraries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let last_id = value
+        .get("lastLibraryId")
+        .and_then(serde_json::Value::as_str);
+    let chosen = last_id
+        .and_then(|id| {
+            libraries
+                .iter()
+                .find(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        })
+        .or_else(|| libraries.first());
+    let library_path = chosen
+        .and_then(|entry| entry.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .map(ToOwned::to_owned);
+
+    let mut migrated = value.clone();
+    if let Some(object) = migrated.as_object_mut() {
+        object.insert(
+            "settingsVersion".into(),
+            serde_json::json!(SETTINGS_VERSION),
+        );
+        object.insert("libraryPath".into(), serde_json::json!(library_path));
+        object.remove("libraries");
+        object.remove("lastLibraryId");
+    }
+    Ok(serde_json::from_value(migrated)?)
 }
 
 #[cfg(test)]
@@ -311,14 +278,10 @@ mod tests {
     use super::*;
 
     fn sample() -> Settings {
-        let mut settings = Settings::default();
-        settings.libraries.push(LibraryEntry {
-            id: "lib-1".into(),
-            name: "素材".into(),
-            path: r"G:\Lilith Image Library\参考".into(),
-            added_at: 1,
-        });
-        settings
+        Settings {
+            library_path: Some(r"G:\Lilith Image Library".into()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -327,36 +290,97 @@ mod tests {
         let path = temp.path().join("settings.json");
         let store = SettingsStore::load_or_create(path.clone()).unwrap();
         store.replace(sample()).unwrap();
+        store
+            .set_library_path(Some(r"G:\Lilith Image Library\".into()))
+            .unwrap();
         let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
-        assert_eq!(loaded.libraries.len(), 1);
-        assert_eq!(loaded.libraries[0].name, "素材");
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(
+            loaded.library_path.as_deref(),
+            Some(r"G:\Lilith Image Library")
+        );
         assert_eq!(loaded.ui.theme, "light");
     }
 
     #[test]
-    fn rejects_duplicate_paths() {
+    fn migrates_v1_prefers_last_library() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
-        let store = SettingsStore::load_or_create(path).unwrap();
-        let mut settings = sample();
-        settings.libraries.push(LibraryEntry {
-            id: "lib-2".into(),
-            name: "重复".into(),
-            path: r"g:\lilith image library\参考".into(),
-            added_at: 2,
-        });
-        assert!(store.replace(settings).is_err());
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 1,
+                "libraries": [
+                    {"id": "a", "name": "参考", "path": "G:\\Lilith Image Library\\参考", "addedAt": 1},
+                    {"id": "b", "name": "画作", "path": "G:\\Lilith Image Library\\画作", "addedAt": 2}
+                ],
+                "lastLibraryId": "b",
+                "ai": {"baseUrl": "http://127.0.0.1:18766", "port": 18766, "autoStart": true},
+                "performance": {"readerConnections": 4, "thumbnailCacheMb": 1024},
+                "ui": {"theme": "light", "gridThumbPx": 220}
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(
+            loaded.library_path.as_deref(),
+            Some(r"G:\Lilith Image Library\画作")
+        );
     }
 
     #[test]
-    fn keeps_backend_managed_last_library() {
+    fn migrates_v1_without_last_library_to_first_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 1,
+                "libraries": [
+                    {"id": "a", "name": "参考", "path": "G:\\Lilith Image Library\\参考", "addedAt": 1}
+                ],
+                "lastLibraryId": null
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
+        assert_eq!(
+            loaded.library_path.as_deref(),
+            Some(r"G:\Lilith Image Library\参考")
+        );
+    }
+
+    #[test]
+    fn keeps_backend_managed_library_path() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         let store = SettingsStore::load_or_create(path).unwrap();
-        store.set_last_library(Some("lib-1".into())).unwrap();
-        let mut submitted = sample();
-        submitted.last_library_id = Some("stale".into());
+        store
+            .set_library_path(Some(r"G:\Lilith Image Library".into()))
+            .unwrap();
+        let submitted = Settings {
+            library_path: Some(r"D:\stale".into()),
+            ..Default::default()
+        };
         let saved = store.replace(submitted).unwrap();
-        assert_eq!(saved.last_library_id.as_deref(), Some("lib-1"));
+        assert_eq!(
+            saved.library_path.as_deref(),
+            Some(r"G:\Lilith Image Library")
+        );
+    }
+
+    #[test]
+    fn rejects_relative_library_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settingsVersion": 2, "libraryPath": "relative"}"#,
+        )
+        .unwrap();
+        assert!(SettingsStore::load_or_create(path).is_err());
     }
 }

@@ -1,11 +1,10 @@
-// 这些路径助手在 Stage 1/3 才会接入；保留完整布局，避免各阶段重复定义。
-#![allow(dead_code)]
-
 use std::path::{Component, Path, PathBuf};
 
 use crate::app::error::{AppError, AppResult};
 
 pub const DATA_DIR: &str = ".artbank";
+/// 旧程序的图库数据目录名。新应用不读取；扫描时与 `.artbank` 一样跳过。
+pub const LEGACY_DATA_DIR: &str = ".data";
 pub const DATABASE_FILE: &str = "library.db";
 pub const MANIFEST_FILE: &str = "library.json";
 pub const THUMBS_DIR: &str = "thumbs";
@@ -16,6 +15,14 @@ pub const OUTPUT_DIR: &str = "output";
 pub const LIBRARY_FORMAT: &str = "lilith-artbank";
 pub const LIBRARY_FORMAT_VERSION: u32 = 1;
 
+const RESERVED_DIRECTORY_NAMES: [&str; 3] = [DATA_DIR, RECYCLE_DIR, OUTPUT_DIR];
+const RESERVED_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// `.artbank/` 内的运行时路径。`recycle`、`output` 在库根下，用同名常量拼接，
+/// 需要时通过 `root.join(RECYCLE_DIR)` 取得。
 #[derive(Debug, Clone)]
 pub struct LibraryPaths {
     pub root: PathBuf,
@@ -25,8 +32,6 @@ pub struct LibraryPaths {
     pub thumbs: PathBuf,
     pub features: PathBuf,
     pub temp: PathBuf,
-    pub recycle: PathBuf,
-    pub output: PathBuf,
 }
 
 impl LibraryPaths {
@@ -39,8 +44,6 @@ impl LibraryPaths {
             thumbs: data.join(THUMBS_DIR),
             features: data.join(FEATURES_DIR),
             temp: data.join(TEMP_DIR),
-            recycle: root.join(RECYCLE_DIR),
-            output: root.join(OUTPUT_DIR),
             data,
             root,
         }
@@ -64,13 +67,30 @@ impl LibraryPaths {
         }
     }
 
-    pub fn thumb_segment(&self, segment_id: u32) -> PathBuf {
-        self.thumbs.join(format!("{segment_id:04}.pack"))
+    pub fn folder_dir(&self, folder: &str) -> PathBuf {
+        if folder.is_empty() {
+            self.root.clone()
+        } else {
+            self.root
+                .join(folder.replace('/', std::path::MAIN_SEPARATOR_STR))
+        }
     }
+}
 
-    pub fn feature_file(&self, kind: &str) -> PathBuf {
-        self.features.join(format!("{kind}.bin"))
-    }
+/// 转义 LIKE 的通配符，配合 `ESCAPE '\'` 使用。
+pub fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// 子树匹配的 LIKE 模式，配合 `ESCAPE '\'` 使用。
+///
+/// 返回 `<path>/%`，只匹配后代、不匹配自身；根目录（空串）没有后代前缀，
+/// 调用方要先把它当作“不限制文件夹”处理。
+pub fn subtree_like_pattern(path: &str) -> String {
+    format!("{}/%", escape_like(path))
 }
 
 /// 图库内文件夹使用 `/` 分隔的相对路径；根目录用空字符串表示。
@@ -89,6 +109,9 @@ pub fn normalize_folder(value: &str) -> AppResult<String> {
     if trimmed.chars().any(|ch| ch.is_control()) {
         return Err(AppError::message("文件夹路径包含控制字符"));
     }
+    for segment in trimmed.split('/') {
+        validate_folder_segment(segment)?;
+    }
     let path = Path::new(trimmed);
     if path.is_absolute()
         || path
@@ -98,6 +121,69 @@ pub fn normalize_folder(value: &str) -> AppResult<String> {
         return Err(AppError::message("文件夹必须是图库内的相对路径"));
     }
     Ok(trimmed.to_owned())
+}
+
+/// 单个文件夹名称（不含分隔符），用于新建与重命名。
+pub fn normalize_folder_name(value: &str) -> AppResult<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(AppError::message("文件夹名称不能为空"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(AppError::message("文件夹名称不能包含路径分隔符"));
+    }
+    validate_folder_segment(name)?;
+    Ok(name.to_owned())
+}
+
+fn validate_folder_segment(segment: &str) -> AppResult<()> {
+    if segment.is_empty() {
+        return Err(AppError::message("文件夹路径包含空目录名"));
+    }
+    if segment == "." || segment == ".." {
+        return Err(AppError::message("文件夹必须是图库内的相对路径"));
+    }
+    if segment.chars().count() > 255 {
+        return Err(AppError::message("文件夹名称过长"));
+    }
+    if segment.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::message("文件夹名称包含控制字符"));
+    }
+    if segment
+        .chars()
+        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\'))
+    {
+        return Err(AppError::message("文件夹名称包含 Windows 不允许的字符"));
+    }
+    if segment.ends_with(' ') || segment.ends_with('.') {
+        return Err(AppError::message("文件夹名称不能以空格或点结尾"));
+    }
+    let lower = segment.to_lowercase();
+    if RESERVED_DIRECTORY_NAMES.iter().any(|name| lower == *name) {
+        return Err(AppError::message(format!(
+            "「{segment}」是图库保留目录名，不能用作文件夹"
+        )));
+    }
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if RESERVED_DEVICE_NAMES.iter().any(|name| stem == *name) {
+        return Err(AppError::message(format!(
+            "「{segment}」是 Windows 保留设备名，不能用作文件夹"
+        )));
+    }
+    Ok(())
+}
+
+pub fn join_folder(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 pub fn normalize_content_extension(value: &str) -> AppResult<String> {
@@ -119,5 +205,40 @@ mod tests {
         assert!(normalize_folder("../外面").is_err());
         assert!(normalize_folder(r"C:\绝对").is_err());
         assert!(normalize_folder("/root").is_err());
+        assert!(normalize_folder("人物//速写").is_err());
+    }
+
+    #[test]
+    fn rejects_windows_reserved_names_and_characters() {
+        for value in [
+            "CON",
+            "con",
+            "CON.txt",
+            "人物/AUX/速写",
+            "a:b",
+            "人物/速写?",
+            "人物/结尾空格 /速写",
+            "人物/结尾点./速写",
+            ".artbank",
+            "recycle",
+            "人物/output",
+        ] {
+            assert!(normalize_folder(value).is_err(), "{value} 应被拒绝");
+        }
+        assert!(normalize_folder_name("速写").is_ok());
+        assert!(normalize_folder_name("a/b").is_err());
+        assert!(normalize_folder_name("NUL").is_err());
+    }
+
+    #[test]
+    fn builds_subtree_like_patterns() {
+        assert_eq!(subtree_like_pattern("人物"), "人物/%");
+        assert_eq!(
+            subtree_like_pattern(r"a\b%c_d"),
+            r"a\\b\%c\_d/%",
+            "通配符与反斜杠都要转义"
+        );
+        assert_eq!(join_folder("人物", "速写"), "人物/速写");
+        assert_eq!(join_folder("", "速写"), "速写");
     }
 }

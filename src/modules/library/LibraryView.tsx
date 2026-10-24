@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -12,6 +13,8 @@ import {
   ArrowDownUp,
   ArrowLeft,
   CheckSquare,
+  ChevronRight,
+  FolderOpen,
   ImageOff,
   LayoutGrid,
   List,
@@ -36,12 +39,14 @@ import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
 import { TagManagerDialog } from "./TagManagerDialog";
 import { ViewBar } from "./ViewBar";
+import { IMAGE_DRAG_MIME } from "./dnd";
+import { breadcrumbsFor, buildFolderTree } from "./folderTreeModel";
 import {
   COLLECTION_SORT,
   DEFAULT_SORT,
   activeFilterCount,
   buildQuery,
-  defaultBrowseState,
+  emptyFilters,
   filterKey,
   hasActiveFilters,
   hasActiveQuery,
@@ -69,6 +74,13 @@ import type { VirtualViewHandle } from "./virtual";
 import type { ViewerSession } from "../../shared/viewerSession";
 
 interface LibraryViewProps {
+  browse: BrowseState;
+  canGoBack: boolean;
+  folders: FolderInfo[];
+  onApplyBrowse: (next: BrowseState, pushHistory?: boolean) => void;
+  onGoBack: () => void;
+  onFoldersChanged?: () => void;
+  onImageSelectionChange?: (imageIds: number[]) => void;
   refreshToken: number;
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
@@ -97,6 +109,13 @@ function sortForView(view: LibraryViewType, sort: SortSpec): SortSpec {
 }
 
 export function LibraryView({
+  browse,
+  canGoBack,
+  folders,
+  onApplyBrowse,
+  onGoBack,
+  onFoldersChanged,
+  onImageSelectionChange,
   refreshToken,
   onOpenViewer,
   onCopyImage,
@@ -108,9 +127,7 @@ export function LibraryView({
   const { settings, current, refreshStatus } = useAppRuntime();
   const { notify, confirm } = useNotices();
 
-  const [browse, setBrowse] = useState<BrowseState>(defaultBrowseState);
-  const [searchDraft, setSearchDraft] = useState("");
-  const [history, setHistory] = useState<BrowseState[]>([]);
+  const [searchDraft, setSearchDraft] = useState(browse.search);
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
   const [filterOpen, setFilterOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -123,7 +140,6 @@ export function LibraryView({
   const [dataVersion, setDataVersion] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [collectionsLoaded, setCollectionsLoaded] = useState(false);
-  const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [collectionManagerOpen, setCollectionManagerOpen] = useState(false);
   const [collectionPickerOpen, setCollectionPickerOpen] = useState(false);
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
@@ -137,8 +153,13 @@ export function LibraryView({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const browseRef = useRef(browse);
   browseRef.current = browse;
-  const historyRef = useRef(history);
-  historyRef.current = history;
+  const applyBrowse = onApplyBrowse;
+
+  const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
+  const breadcrumbs = useMemo(
+    () => breadcrumbsFor(folderTree, browse.filters.folderIds),
+    [folderTree, browse.filters.folderIds],
+  );
 
   const effectiveView: LibraryViewType =
     browse.search && browse.searchScope === "library" ? "all" : browse.view;
@@ -186,11 +207,12 @@ export function LibraryView({
     (options?: { clearSelection?: boolean }) => {
       if (options?.clearSelection) clearSelection();
       setDataVersion((value) => value + 1);
+      onFoldersChanged?.();
       void refreshStatus().catch((cause: unknown) => {
         notify("刷新图库状态失败", "error", errorMessage(cause));
       });
     },
-    [clearSelection, notify, refreshStatus],
+    [clearSelection, notify, onFoldersChanged, refreshStatus],
   );
 
   const collectionsGeneration = useRef(0);
@@ -208,24 +230,9 @@ export function LibraryView({
     }
   }, [notify]);
 
-  const foldersGeneration = useRef(0);
-  const reloadFolders = useCallback(async () => {
-    const generation = foldersGeneration.current + 1;
-    foldersGeneration.current = generation;
-    try {
-      const next = await libraryApi.getFolders();
-      if (generation !== foldersGeneration.current) return;
-      setFolders(next);
-    } catch (cause) {
-      if (generation !== foldersGeneration.current) return;
-      notify("读取文件夹失败", "error", errorMessage(cause));
-    }
-  }, [notify]);
-
   useEffect(() => {
     void reloadCollections();
-    void reloadFolders();
-  }, [reloadCollections, reloadFolders, refreshToken, dataVersion]);
+  }, [reloadCollections, refreshToken, dataVersion]);
 
   useEffect(() => {
     setSelected(new Set());
@@ -291,24 +298,10 @@ export function LibraryView({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [filterOpen]);
 
-  const applyBrowse = useCallback((next: BrowseState, pushHistory = true) => {
-    const previous = browseRef.current;
-    if (pushHistory && filterKey(buildQuery(previous)) !== filterKey(buildQuery(next))) {
-      setHistory((value) => [...value.slice(-29), previous]);
-    }
-    browseRef.current = next;
-    setBrowse(next);
-  }, []);
-
   const goBack = useCallback(() => {
-    const previous = historyRef.current;
-    if (previous.length === 0) return;
-    const next = previous[previous.length - 1];
-    setHistory(previous.slice(0, -1));
-    browseRef.current = next;
-    setBrowse(next);
+    onGoBack();
     semanticClear?.();
-  }, [semanticClear]);
+  }, [onGoBack, semanticClear]);
 
   // 切换固定视图时搜索范围回到“当前视图”，集合内顺序排序在离开集合时回退到默认排序。
   const showAll = useCallback(() => {
@@ -362,6 +355,19 @@ export function LibraryView({
           : currentState.sort,
     });
   };
+
+  useEffect(() => {
+    onImageSelectionChange?.([...selected]);
+  }, [selected, onImageSelectionChange]);
+
+  const handleItemDragStart = useCallback(
+    (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => {
+      const ids = selected.has(item.id) ? [...selected] : [item.id];
+      event.dataTransfer.setData(IMAGE_DRAG_MIME, JSON.stringify({ imageIds: ids }));
+      event.dataTransfer.effectAllowed = "move";
+    },
+    [selected],
+  );
 
   const handleItemClick = useCallback(
     (item: ImageRow, event: ReactMouseEvent) => {
@@ -707,8 +713,22 @@ export function LibraryView({
   );
 
   const resetFilters = useCallback(() => {
-    applyBrowse({ ...browseRef.current, filters: defaultBrowseState().filters });
+    applyBrowse({ ...browseRef.current, filters: emptyFilters() });
   }, [applyBrowse]);
+
+  const showFolder = useCallback(
+    (folderId: number | null) => {
+      const currentState = browseRef.current;
+      applyBrowse({
+        ...currentState,
+        filters: {
+          ...currentState.filters,
+          folderIds: folderId == null ? [] : [folderId],
+        },
+      });
+    },
+    [applyBrowse],
+  );
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
@@ -847,6 +867,52 @@ export function LibraryView({
         onEmptyTrash={() => void emptyTrash()}
       />
 
+      <div className="folder-breadcrumbs" aria-label="当前文件夹">
+        <button
+          type="button"
+          className={`folder-crumb${browse.filters.folderIds.length === 0 ? " is-current" : ""}`}
+          onClick={() => showFolder(null)}
+        >
+          <FolderOpen size={13} />
+          全部图片
+        </button>
+        {browse.filters.folderIds.length > 1 ? (
+          <>
+            <ChevronRight size={12} className="folder-crumb-separator" />
+            <span className="folder-crumb is-current">
+              已选择 {browse.filters.folderIds.length.toLocaleString()} 个文件夹
+            </span>
+            <button
+              type="button"
+              className="text-button"
+              onClick={() =>
+                applyBrowse({
+                  ...browseRef.current,
+                  filters: { ...browseRef.current.filters, folderIds: [] },
+                })
+              }
+            >
+              清除
+            </button>
+          </>
+        ) : (
+          breadcrumbs.slice(1).map((crumb, index, trail) => (
+            <span key={crumb.path} className="folder-crumb-group">
+              <ChevronRight size={12} className="folder-crumb-separator" />
+              <button
+                type="button"
+                className={`folder-crumb${index === trail.length - 1 ? " is-current" : ""}`}
+                onClick={() => showFolder(crumb.id)}
+                disabled={crumb.id == null}
+                title={crumb.path}
+              >
+                {crumb.label}
+              </button>
+            </span>
+          ))
+        )}
+      </div>
+
       <div className="library-toolbar">
         <div className="library-toolbar-left">
           <div className="segmented" role="group" aria-label="视图模式">
@@ -872,7 +938,7 @@ export function LibraryView({
 
           <IconButton
             label="返回上一视图"
-            disabled={history.length === 0}
+            disabled={!canGoBack}
             onClick={goBack}
           >
             <ArrowLeft size={14} />
@@ -1207,6 +1273,7 @@ export function LibraryView({
               onItemClick={handleItemClick}
               onItemActivate={activateItem}
               onItemContextMenu={handleItemContextMenu}
+              onItemDragStart={handleItemDragStart}
               onBackgroundClick={handleBackgroundClick}
               onLayout={setGridColumns}
             />
@@ -1227,6 +1294,7 @@ export function LibraryView({
               onItemClick={handleItemClick}
               onItemActivate={activateItem}
               onItemContextMenu={handleItemContextMenu}
+              onItemDragStart={handleItemDragStart}
               onBackgroundClick={handleBackgroundClick}
             />
           ) : null}

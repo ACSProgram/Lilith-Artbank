@@ -13,7 +13,7 @@ use crate::{
     app::{
         bench::ThumbBench,
         error::{AppError, AppResult},
-        settings::{LibraryEntry, Settings, SettingsStore},
+        settings::SettingsStore,
     },
     import::{
         ImportRequest, ImportSource,
@@ -23,6 +23,7 @@ use crate::{
         collections::{self, CollectionInfo, CombineMode},
         content,
         db::LibraryDb,
+        folders as folder_service,
         manifest::{LibraryInspection, inspect},
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
@@ -59,13 +60,6 @@ impl AppState {
             import_job: Mutex::new(None),
             maintenance: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    pub fn current(&self) -> Option<LibraryInfo> {
-        self.library
-            .lock()
-            .as_ref()
-            .map(|session| session.info.clone())
     }
 
     pub fn current_thumb_source(&self) -> Option<(Arc<LibraryDb>, Arc<ThumbPack>)> {
@@ -203,15 +197,9 @@ impl AppState {
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
         self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
-        let (session, manifest) = service::create(path, name, read_connections)?;
+        let (session, _manifest) = service::create(path, name, read_connections)?;
         let info = session.info.clone();
-        self.settings.upsert_library(LibraryEntry {
-            id: manifest.library_id.clone(),
-            name: manifest.name.clone(),
-            path: info.path.clone(),
-            added_at: service::now_ms(),
-        })?;
-        self.settings.set_last_library(Some(manifest.library_id))?;
+        self.settings.set_library_path(Some(info.path.clone()))?;
         self.ai.library_opened(
             info.id.clone(),
             session.db.clone(),
@@ -227,13 +215,7 @@ impl AppState {
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let session = service::open(path, read_connections)?;
         let info = session.info.clone();
-        self.settings.upsert_library(LibraryEntry {
-            id: info.id.clone(),
-            name: info.name.clone(),
-            path: info.path.clone(),
-            added_at: service::now_ms(),
-        })?;
-        self.settings.set_last_library(Some(info.id.clone()))?;
+        self.settings.set_library_path(Some(info.path.clone()))?;
         self.ai.library_opened(
             info.id.clone(),
             session.db.clone(),
@@ -244,41 +226,36 @@ impl AppState {
         Ok(info)
     }
 
+    /// 启动时按设置自动打开上次的图库；失败只记录，不阻塞应用启动。
+    pub fn open_configured_library(&self) {
+        let Some(path) = self.settings.snapshot().library_path else {
+            return;
+        };
+        if let Err(error) = self.open_library(Path::new(&path)) {
+            log::warn!("上次打开的图库无法加载（{path}）：{error}");
+        }
+    }
+
     pub fn close_library(&self) -> AppResult<()> {
         self.ensure_no_activity()?;
         self.ai.library_closed();
         *self.library.lock() = None;
-        self.settings.set_last_library(None)?;
+        self.settings.set_library_path(None)?;
         Ok(())
     }
 
-    pub fn remove_library(&self, library_id: &str) -> AppResult<Settings> {
-        self.ensure_no_activity()?;
-        let is_current = self
-            .current()
-            .map(|info| info.id == library_id)
-            .unwrap_or(false);
-        if is_current {
-            self.ai.library_closed();
-            *self.library.lock() = None;
+    pub fn rename_current_library(&self, name: &str) -> AppResult<LibraryInfo> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 120 {
+            return Err(AppError::message("图库名称必须为 1-120 个字符"));
         }
-        self.settings.remove_library(library_id)
-    }
-
-    pub fn rename_library(&self, library_id: &str, name: &str) -> AppResult<Settings> {
-        let settings = self.settings.rename_library(library_id, name)?;
         let mut guard = self.library.lock();
-        if let Some(session) = guard.as_mut()
-            && session.info.id == library_id
-        {
-            let trimmed = name.trim();
-            session.info.name = trimmed.to_owned();
-            let path = std::path::Path::new(&session.info.path);
-            if let Err(error) = service::rename_manifest(path, trimmed) {
-                log::warn!("图库清单重命名失败：{error}");
-            }
-        }
-        Ok(settings)
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        service::rename_manifest(Path::new(&session.info.path), trimmed)?;
+        session.info.name = trimmed.to_owned();
+        Ok(session.info.clone())
     }
 
     pub fn inspect_library(&self, path: &Path) -> LibraryInspection {
@@ -309,6 +286,30 @@ impl AppState {
     pub fn folders(&self) -> AppResult<Vec<FolderInfo>> {
         let (database, _) = self.query_source()?;
         query::list_folders(&database)
+    }
+
+    pub fn create_folder(&self, path: &str) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        folder_service::create(&database, &root, path)
+    }
+
+    pub fn rename_folder(&self, folder_id: i64, name: &str) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        folder_service::rename(&database, &root, folder_id, name)
+    }
+
+    pub fn move_folder(&self, folder_id: i64, parent_id: i64) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        folder_service::move_to(&database, &root, folder_id, parent_id)
+    }
+
+    pub fn delete_folder(&self, folder_id: i64) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        folder_service::delete(&database, &root, folder_id)
     }
 
     pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {

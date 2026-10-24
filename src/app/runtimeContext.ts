@@ -7,11 +7,10 @@ export interface AppRuntime {
   appInfo: AppInfo | null;
   loading: boolean;
   busy: string | null;
-  addLibrary: (name: string, path: string) => Promise<LibraryInfo>;
-  openLibrary: (libraryId: string) => Promise<LibraryInfo>;
+  createLibrary: (name: string, path: string) => Promise<LibraryInfo>;
+  openLibrary: (path: string) => Promise<LibraryInfo>;
   closeLibrary: () => Promise<void>;
-  removeLibrary: (libraryId: string) => Promise<void>;
-  renameLibrary: (libraryId: string, name: string) => Promise<void>;
+  renameLibrary: (name: string) => Promise<void>;
   saveSettings: (next: Settings) => Promise<Settings>;
   refreshStatus: () => Promise<void>;
 }

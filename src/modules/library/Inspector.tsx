@@ -18,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
+import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Spinner } from "../../shared/components/Spinner";
 import { copyText } from "../../shared/clipboard";
 import { thumbnailUrl } from "../../shared/thumbUrl";
@@ -150,6 +151,7 @@ function ImageInspector({
   const [tagDraft, setTagDraft] = useState("");
   const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState("");
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -287,9 +289,12 @@ function ImageInspector({
     });
   };
 
-  const moveFolder = () => {
+  const moveFolder = (targetPath?: string) => {
     if (!detail) return;
-    const target = folderDraft.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
+    const target = (targetPath ?? folderDraft)
+      .replaceAll("\\", "/")
+      .trim()
+      .replace(/^\/+|\/+$/g, "");
     if (target === detail.folderPath) {
       notify("图片已在该文件夹", "info");
       return;
@@ -299,6 +304,7 @@ function ImageInspector({
       if (report.failures.length > 0) {
         throw new Error(report.failures[0].reason);
       }
+      setFolderDraft(target);
       if (report.moved === 0) {
         notify("图片已在该文件夹", "info");
       } else {
@@ -519,15 +525,34 @@ function ImageInspector({
               }
             }}
           />
-          <Button size="sm" loading={busy} onClick={moveFolder}>
+          <Button size="sm" loading={busy} onClick={() => moveFolder()}>
             移动
           </Button>
+          <IconButton
+            label="从文件夹树选择"
+            disabled={busy}
+            onClick={() => setFolderPickerOpen(true)}
+          >
+            <FolderInput size={13} />
+          </IconButton>
         </div>
         <datalist id="inspector-folders">
           {folders.map((folder) => (
             <option key={folder.id} value={folder.path} />
           ))}
         </datalist>
+        <FolderPickerDialog
+          open={folderPickerOpen}
+          title="移动图片"
+          subtitle="选择目标文件夹；图片会移动到该文件夹下。"
+          folders={folders}
+          selectedPath={detail.folderPath}
+          onClose={() => setFolderPickerOpen(false)}
+          onSelect={(target) => {
+            setFolderPickerOpen(false);
+            moveFolder(target.path);
+          }}
+        />
       </section>
 
       <section className="inspector-section">
@@ -635,6 +660,7 @@ function BatchInspector({
   const [tagAdd, setTagAdd] = useState("");
   const [tagRemove, setTagRemove] = useState("");
   const [folderDraft, setFolderDraft] = useState("");
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
   const count = imageIds.length;
   const run = async (operation: () => Promise<string>, fallback: string) => {
@@ -686,8 +712,11 @@ function BatchInspector({
     }, "标签已移除");
   };
 
-  const applyMove = () => {
-    const target = folderDraft.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
+  const applyMove = (targetPath?: string) => {
+    const target = (targetPath ?? folderDraft)
+      .replaceAll("\\", "/")
+      .trim()
+      .replace(/^\/+|\/+$/g, "");
     if (target === "") {
       notify("请输入目标文件夹", "info", "要移动到根目录，请用下方的「移动到根目录」。");
       return;
@@ -699,6 +728,7 @@ function BatchInspector({
           `${report.failures.length} 张移动失败：${report.failures[0].reason}`,
         );
       }
+      setFolderDraft(target);
       return `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`;
     }, "文件夹已更新");
   };
@@ -812,15 +842,35 @@ function BatchInspector({
               }
             }}
           />
-          <Button size="sm" loading={busy} disabled={!folderDraft.trim()} onClick={applyMove}>
+          <Button size="sm" loading={busy} disabled={!folderDraft.trim()} onClick={() => applyMove()}>
             移动
           </Button>
+          <IconButton
+            label="从文件夹树选择"
+            disabled={busy}
+            onClick={() => setFolderPickerOpen(true)}
+          >
+            <FolderInput size={13} />
+          </IconButton>
         </div>
         <datalist id="inspector-folders-batch">
           {folders.map((folder) => (
             <option key={folder.id} value={folder.path} />
           ))}
         </datalist>
+        <FolderPickerDialog
+          open={folderPickerOpen}
+          title="移动选中图片"
+          subtitle={`将 ${count.toLocaleString()} 张图片移动到…`}
+          folders={folders}
+          onClose={() => setFolderPickerOpen(false)}
+          onSelect={(target) => {
+            setFolderPickerOpen(false);
+            // 根目录的路径是空串，走专门的“移动到根目录”入口，避免被当成未填写。
+            if (target.id == null || target.path === "") moveToRoot();
+            else applyMove(target.path);
+          }}
+        />
         <button
           type="button"
           className="text-button"

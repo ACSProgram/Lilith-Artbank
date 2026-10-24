@@ -4,6 +4,7 @@ import {
   useImperativeHandle,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { Check, RefreshCw } from "lucide-react";
@@ -32,6 +33,7 @@ interface VirtualGridProps {
   onItemClick: (item: ImageRow, event: ReactMouseEvent) => void;
   onItemActivate: (item: ImageRow) => void;
   onItemContextMenu: (item: ImageRow, event: ReactMouseEvent) => void;
+  onItemDragStart: (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => void;
   onBackgroundClick: () => void;
   onLayout: (columns: number) => void;
 }
@@ -56,6 +58,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     onItemClick,
     onItemActivate,
     onItemContextMenu,
+    onItemDragStart,
     onBackgroundClick,
     onLayout,
   },
@@ -211,6 +214,8 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             }}
             onDoubleClick={() => onItemActivate(item)}
             onContextMenu={(event) => onItemContextMenu(item, event)}
+            draggable
+            onDragStart={(event) => onItemDragStart(item, event)}
           >
             <span className="grid-cell-image">
               <LibraryThumbnail image={item} />

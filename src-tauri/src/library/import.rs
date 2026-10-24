@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::thumbs::ThumbLocation,
+    library::{paths::normalize_folder, thumbs::ThumbLocation},
 };
 
 pub struct ImageInsert {
@@ -26,16 +26,40 @@ pub struct ImageInsert {
     pub imported_at: i64,
 }
 
+/// 创建文件夹行以及全部缺失祖先；路径按 Windows 大小写语义解析。
 pub fn ensure_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i64> {
+    let path = normalize_folder(path)?;
+    if path.is_empty() {
+        return resolve_folder(connection, "", now);
+    }
+    let mut current = String::new();
+    let mut id = resolve_folder(connection, "", now)?;
+    for segment in path.split('/') {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(segment);
+        id = resolve_folder(connection, &current, now)?;
+    }
+    Ok(id)
+}
+
+fn resolve_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i64> {
+    if let Some(id) = connection
+        .query_row(
+            "SELECT id FROM folders WHERE path = ?1 COLLATE NOCASE",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
     connection.execute(
-        "INSERT INTO folders(path, created_at) VALUES (?1, ?2)
-         ON CONFLICT(path) DO NOTHING",
+        "INSERT INTO folders(path, created_at) VALUES (?1, ?2)",
         params![path, now],
     )?;
-    let id = connection.query_row("SELECT id FROM folders WHERE path = ?1", [path], |row| {
-        row.get(0)
-    })?;
-    Ok(id)
+    Ok(connection.last_insert_rowid())
 }
 
 pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i64>> {

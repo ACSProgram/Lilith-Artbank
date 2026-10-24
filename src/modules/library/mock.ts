@@ -1,4 +1,5 @@
 import { MOCK_IMAGE_COUNT } from "./mockConfig";
+import { isSameOrDescendant } from "./folderTreeModel";
 import type {
   ColorEntry,
   CollectionInfo,
@@ -20,7 +21,19 @@ import type {
   ValueCount,
 } from "./types";
 
-const FOLDER_PATHS = ["", "人物", "人物/速写", "风景", "概念设计", "参考/材质"];
+const FOLDER_PATHS = [
+  "",
+  "人物",
+  "人物/速写",
+  "风景",
+  "概念设计",
+  "参考",
+  "参考/材质",
+  "人物/速写/手部",
+  "灵感",
+  "灵感/待整理",
+];
+const IMAGE_FOLDER_PATHS = ["", "人物", "人物/速写", "风景", "概念设计", "参考/材质"];
 const TAG_NAMES = ["速写", "参考", "练习", "色彩", "人设", "场景", "材质", "光影"];
 const EXTENSIONS = ["jpg", "png", "webp", "tif", "bmp", "gif"];
 const DIMENSIONS: [number, number][] = [
@@ -32,11 +45,11 @@ const DIMENSIONS: [number, number][] = [
   [900, 1600],
 ];
 
-const folderPaths = [...FOLDER_PATHS];
+const folderState = FOLDER_PATHS.map((path, index) => ({ id: index + 1, path }));
 const tagState = TAG_NAMES.map((name, index) => ({ id: index + 1, name }));
 const descriptions = new Map<number, string>();
 const palettes = new Map<number, { colors4: ColorEntry[]; colors8: ColorEntry[] }>();
-let nextFolderId = folderPaths.length + 1;
+let nextFolderId = folderState.length + 1;
 let nextTagId = tagState.length + 1;
 let nextCollectionId = 1;
 let collections: CollectionInfo[] = [];
@@ -59,8 +72,9 @@ function createMockRows(count: number): ImageRow[] {
   const rows: ImageRow[] = [];
   for (let index = 0; index < count; index += 1) {
     const id = index + 1;
-    const folderIndex = index % folderPaths.length;
-    const folderPath = folderPaths[folderIndex];
+    const folderIndex = index % IMAGE_FOLDER_PATHS.length;
+    const folderPath = IMAGE_FOLDER_PATHS[folderIndex];
+    const folderId = folderState.find((folder) => folder.path === folderPath)?.id ?? 1;
     const extension = EXTENSIONS[index % EXTENSIONS.length];
     const [width, height] = DIMENSIONS[index % DIMENSIONS.length];
     const contentHash = hashOf(index);
@@ -72,7 +86,7 @@ function createMockRows(count: number): ImageRow[] {
       id,
       contentHash,
       fileExt: extension,
-      folderId: folderIndex + 1,
+      folderId,
       folderPath,
       filePath: filePathOf(contentHash, extension, folderPath),
       fileSize: 180_000 + (index % 37) * 120_000,
@@ -98,12 +112,33 @@ function createMockRows(count: number): ImageRow[] {
 const mockImages = createMockRows(MOCK_IMAGE_COUNT);
 
 export function mockFolders(): FolderInfo[] {
-  return folderPaths.map((path, index) => ({
-    id: index + 1,
-    path,
-    imageCount: mockImages.filter((image) => image.folderId === index + 1 && image.deletedAt == null)
-      .length,
-  }));
+  const direct = new Map<number, number>();
+  for (const image of mockImages) {
+    if (image.deletedAt != null) continue;
+    direct.set(image.folderId, (direct.get(image.folderId) ?? 0) + 1);
+  }
+  const byPath = new Map(folderState.map((folder) => [folder.path, folder.id]));
+  const totals = new Map<number, number>(folderState.map((folder) => [folder.id, 0]));
+  for (const folder of folderState) {
+    const count = direct.get(folder.id) ?? 0;
+    if (count === 0) continue;
+    let current: string | null = folder.path;
+    while (current !== null) {
+      const id = byPath.get(current);
+      if (id != null) totals.set(id, (totals.get(id) ?? 0) + count);
+      if (current === "") break;
+      const index = current.lastIndexOf("/");
+      current = index < 0 ? "" : current.slice(0, index);
+    }
+  }
+  return folderState
+    .map((folder) => ({
+      id: folder.id,
+      path: folder.path,
+      directImageCount: direct.get(folder.id) ?? 0,
+      totalImageCount: totals.get(folder.id) ?? 0,
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path, "zh-Hans-CN"));
 }
 
 export function mockTags(): TagInfo[] {
@@ -161,9 +196,17 @@ function tagNameOf(tagId: number): string | undefined {
   return tagState.find((tag) => tag.id === tagId)?.name;
 }
 
+function folderPathOf(folderId: number): string | undefined {
+  return folderState.find((folder) => folder.id === folderId)?.path;
+}
+
 function matchesFilters(image: ImageRow, filters: LibraryFilters, exclude: Facet): boolean {
   if (exclude !== "folders" && filters.folderIds.length > 0) {
-    if (!filters.folderIds.includes(image.folderId)) return false;
+    const matched = filters.folderIds.some((folderId) => {
+      const path = folderPathOf(folderId);
+      return path != null && isSameOrDescendant(image.folderPath, path);
+    });
+    if (!matched) return false;
   }
   if (exclude !== "extensions" && filters.extensions.length > 0) {
     if (!filters.extensions.includes(image.fileExt)) return false;
@@ -252,10 +295,7 @@ function groupCounts(rows: ImageRow[], key: (image: ImageRow) => string): Map<st
 
 export function mockFilterCounts(query: LibraryQuery): FilterCounts {
   const total = mockImages.filter((image) => matches(image, query, null)).length;
-  const folderCounts = groupCounts(
-    mockImages.filter((image) => matches(image, query, "folders")),
-    (image) => String(image.folderId),
-  );
+  const matchedForFolders = mockImages.filter((image) => matches(image, query, "folders"));
   const extensionCounts = groupCounts(
     mockImages.filter((image) => matches(image, query, "extensions")),
     (image) => image.fileExt,
@@ -271,8 +311,14 @@ export function mockFilterCounts(query: LibraryQuery): FilterCounts {
     }
   }
 
-  const folders: FolderCount[] = [...folderCounts.entries()]
-    .map(([folderId, count]) => ({ folderId: Number(folderId), count }))
+  const folders: FolderCount[] = folderState
+    .map((folder) => ({
+      folderId: folder.id,
+      count: matchedForFolders.filter((image) =>
+        isSameOrDescendant(image.folderPath, folder.path),
+      ).length,
+    }))
+    .filter((item) => item.count > 0)
     .sort((a, b) => b.count - a.count || a.folderId - b.folderId);
   const extensions: ValueCount[] = [...extensionCounts.entries()]
     .map(([value, count]) => ({ value, count }))
@@ -454,14 +500,142 @@ export function mockDeleteTag(tagId: number): number {
   return affected;
 }
 
-export function mockMoveImages(ids: number[], folderPath: string): MoveReport {
-  const normalized = folderPath.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
-  let folderId = folderPaths.indexOf(normalized) + 1;
-  if (folderId === 0) {
-    folderPaths.push(normalized);
-    folderId = nextFolderId;
-    nextFolderId += 1;
+function normalizeMockFolder(value: string): string {
+  return value.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
+}
+
+function findFolder(id: number): { id: number; path: string } {
+  const folder = folderState.find((item) => item.id === id);
+  if (!folder) throw new Error("文件夹不存在");
+  return folder;
+}
+
+function validateFolderName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("文件夹名称不能为空");
+  if (/[\\/:*?"<>|]/.test(trimmed)) {
+    throw new Error("文件夹名称包含 Windows 不允许的字符");
   }
+  if (/[. ]$/.test(trimmed)) {
+    throw new Error("文件夹名称不能以空格或点结尾");
+  }
+  if (["con", "prn", "aux", "nul"].includes(trimmed.toLowerCase())) {
+    throw new Error("该名称是 Windows 保留设备名");
+  }
+  return trimmed;
+}
+
+function ensureMockFolder(path: string): number {
+  if (!path) return folderState[0].id;
+  const existing = folderState.find(
+    (folder) => folder.path.toLowerCase() === path.toLowerCase(),
+  );
+  if (existing) return existing.id;
+  let id = folderState[0].id;
+  let current = "";
+  for (const segment of path.split("/")) {
+    current = current ? `${current}/${segment}` : segment;
+    const found = folderState.find(
+      (folder) => folder.path.toLowerCase() === current.toLowerCase(),
+    );
+    if (found) {
+      id = found.id;
+      continue;
+    }
+    const folder = { id: nextFolderId++, path: current };
+    folderState.push(folder);
+    id = folder.id;
+  }
+  return id;
+}
+
+function replaceFolderPrefix(oldPath: string, newPath: string) {
+  for (const folder of folderState) {
+    if (folder.path === oldPath) folder.path = newPath;
+    else if (folder.path.startsWith(`${oldPath}/`)) {
+      folder.path = `${newPath}${folder.path.slice(oldPath.length)}`;
+    }
+  }
+  for (const image of mockImages) {
+    if (image.folderPath === oldPath || image.folderPath.startsWith(`${oldPath}/`)) {
+      image.folderPath = `${newPath}${image.folderPath.slice(oldPath.length)}`;
+      const folder = folderState.find((item) => item.path === image.folderPath);
+      if (folder) image.folderId = folder.id;
+      image.filePath = filePathOf(image.contentHash, image.fileExt, image.folderPath);
+      image.modifiedAt = Date.now();
+    }
+  }
+}
+
+export function mockCreateFolder(path: string): FolderInfo[] {
+  const normalized = normalizeMockFolder(path);
+  if (!normalized) throw new Error("根目录已经存在");
+  const segments = normalized.split("/");
+  segments.forEach(validateFolderName);
+  if (folderState.some((folder) => folder.path.toLowerCase() === normalized.toLowerCase())) {
+    throw new Error("文件夹已存在");
+  }
+  ensureMockFolder(normalized);
+  return mockFolders();
+}
+
+export function mockRenameFolder(id: number, name: string): FolderInfo[] {
+  const folder = findFolder(id);
+  if (!folder.path) throw new Error("不能重命名图库根目录");
+  const nextName = validateFolderName(name);
+  const index = folder.path.lastIndexOf("/");
+  const parent = index < 0 ? "" : folder.path.slice(0, index);
+  const nextPath = parent ? `${parent}/${nextName}` : nextName;
+  if (nextPath === folder.path) return mockFolders();
+  if (
+    folderState.some(
+      (item) => item.id !== id && item.path.toLowerCase() === nextPath.toLowerCase(),
+    )
+  ) {
+    throw new Error("目标文件夹已存在");
+  }
+  replaceFolderPrefix(folder.path, nextPath);
+  return mockFolders();
+}
+
+export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
+  const folder = findFolder(id);
+  const parent = findFolder(parentId);
+  if (!folder.path) throw new Error("不能移动图库根目录");
+  if (parent.path === folder.path || parent.path.startsWith(`${folder.path}/`)) {
+    throw new Error("不能把文件夹移动到自身或子文件夹");
+  }
+  const leaf = folder.path.slice(folder.path.lastIndexOf("/") + 1);
+  const nextPath = parent.path ? `${parent.path}/${leaf}` : leaf;
+  if (nextPath === folder.path) return mockFolders();
+  if (
+    folderState.some(
+      (item) => item.id !== id && item.path.toLowerCase() === nextPath.toLowerCase(),
+    )
+  ) {
+    throw new Error("目标位置已经有同名文件夹");
+  }
+  replaceFolderPrefix(folder.path, nextPath);
+  return mockFolders();
+}
+
+export function mockDeleteFolder(id: number): FolderInfo[] {
+  const folder = findFolder(id);
+  if (!folder.path) throw new Error("不能删除图库根目录");
+  if (folderState.some((item) => item.path.startsWith(`${folder.path}/`))) {
+    throw new Error("文件夹还包含子文件夹，不能删除");
+  }
+  if (mockImages.some((image) => image.folderId === id)) {
+    throw new Error("文件夹中还有图片，不能删除");
+  }
+  const index = folderState.findIndex((item) => item.id === id);
+  folderState.splice(index, 1);
+  return mockFolders();
+}
+
+export function mockMoveImages(ids: number[], folderPath: string): MoveReport {
+  const normalized = normalizeMockFolder(folderPath);
+  const folderId = ensureMockFolder(normalized);
   let moved = 0;
   let skipped = 0;
   for (const id of ids) {

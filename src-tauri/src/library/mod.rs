@@ -2,6 +2,7 @@ pub mod collections;
 pub mod content;
 pub mod db;
 pub mod edit;
+pub mod folders;
 pub mod import;
 pub mod manifest;
 pub mod metadata;

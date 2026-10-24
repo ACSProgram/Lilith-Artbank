@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { mockLibraryCounts } from "../modules/library/mock";
 import type {
   AppInfo,
-  LibraryEntry,
   LibraryInfo,
   LibraryInspection,
   Settings,
@@ -13,9 +12,8 @@ import type {
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 1,
-  libraries: [],
-  lastLibraryId: null,
+  settingsVersion: 2,
+  libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
     executablePath: null,
@@ -36,6 +34,11 @@ const defaultSettings: Settings = {
 let mockSettings: Settings = structuredClone(defaultSettings);
 let mockCurrent: LibraryInfo | null = null;
 
+function basename(path: string): string {
+  const parts = path.trim().replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || "图库";
+}
+
 function mockLibrary(name: string, path: string): LibraryInfo {
   const counts = mockLibraryCounts();
   return {
@@ -44,17 +47,8 @@ function mockLibrary(name: string, path: string): LibraryInfo {
     path,
     imageCount: counts.imageCount,
     trashCount: counts.trashCount,
-    schemaVersion: 1,
+    schemaVersion: 2,
     openedAt: Date.now(),
-  };
-}
-
-function mockEntry(library: LibraryInfo): LibraryEntry {
-  return {
-    id: library.id,
-    name: library.name,
-    path: library.path,
-    addedAt: Date.now(),
   };
 }
 
@@ -83,52 +77,28 @@ export const appApi = {
 
   async createLibrary(name: string, path: string): Promise<LibraryInfo> {
     if (!isTauri()) {
-      const library = mockLibrary(name || "新图库", path);
+      const library = mockLibrary(name || basename(path), path);
       mockCurrent = library;
-      mockSettings = {
-        ...mockSettings,
-        libraries: [...mockSettings.libraries, mockEntry(library)],
-        lastLibraryId: library.id,
-      };
+      mockSettings = { ...mockSettings, libraryPath: path };
       return library;
     }
     return invoke<LibraryInfo>("create_library", { name, path });
   },
 
-  async addLibraryPath(name: string, path: string): Promise<LibraryInfo> {
+  async openLibraryPath(path: string): Promise<LibraryInfo> {
     if (!isTauri()) {
-      const library = mockLibrary(name || "新图库", path);
+      const library = mockLibrary(basename(path), path);
       mockCurrent = library;
-      mockSettings = {
-        ...mockSettings,
-        libraries: [...mockSettings.libraries, mockEntry(library)],
-        lastLibraryId: library.id,
-      };
+      mockSettings = { ...mockSettings, libraryPath: path };
       return library;
     }
-    return invoke<LibraryInfo>("add_library_path", { name, path });
-  },
-
-  async openLibrary(libraryId: string): Promise<LibraryInfo> {
-    if (!isTauri()) {
-      const entry = mockSettings.libraries.find((library) => library.id === libraryId);
-      if (!entry) throw new Error("图库不在列表中");
-      const counts = mockLibraryCounts();
-      mockCurrent = {
-        ...entry,
-        imageCount: counts.imageCount,
-        trashCount: counts.trashCount,
-        schemaVersion: 1,
-        openedAt: Date.now(),
-      };
-      return mockCurrent;
-    }
-    return invoke<LibraryInfo>("open_library", { libraryId });
+    return invoke<LibraryInfo>("open_library_path", { path });
   },
 
   async closeLibrary(): Promise<void> {
     if (!isTauri()) {
       mockCurrent = null;
+      mockSettings = { ...mockSettings, libraryPath: null };
       return;
     }
     return invoke<void>("close_library");
@@ -149,31 +119,13 @@ export const appApi = {
     return invoke<LibraryInfo | null>("get_library_status");
   },
 
-  async removeLibrary(libraryId: string): Promise<Settings> {
+  async renameLibrary(name: string): Promise<LibraryInfo> {
     if (!isTauri()) {
-      mockSettings = {
-        ...mockSettings,
-        libraries: mockSettings.libraries.filter((library) => library.id !== libraryId),
-        lastLibraryId: mockSettings.lastLibraryId === libraryId ? null : mockSettings.lastLibraryId,
-      };
-      if (mockCurrent?.id === libraryId) mockCurrent = null;
-      return structuredClone(mockSettings);
+      if (!mockCurrent) throw new Error("尚未打开图库");
+      mockCurrent = { ...mockCurrent, name };
+      return mockCurrent;
     }
-    return invoke<Settings>("remove_library", { libraryId });
-  },
-
-  async renameLibrary(libraryId: string, name: string): Promise<Settings> {
-    if (!isTauri()) {
-      mockSettings = {
-        ...mockSettings,
-        libraries: mockSettings.libraries.map((library) =>
-          library.id === libraryId ? { ...library, name } : library,
-        ),
-      };
-      if (mockCurrent?.id === libraryId) mockCurrent = { ...mockCurrent, name };
-      return structuredClone(mockSettings);
-    }
-    return invoke<Settings>("rename_library", { libraryId, name });
+    return invoke<LibraryInfo>("rename_library", { name });
   },
 
   async getAppInfo(): Promise<AppInfo> {

@@ -9,6 +9,7 @@
 - [当前阶段状态](planning/current-handoff.md)：现在做到哪里、验证过什么。
 - [待办与待决策](planning/todo.md)：唯一未完成清单。
 - [分阶段路线图](planning/roadmap.md)：阶段目标、代码预算与验收门槛。
+- [单库与多级文件夹重构计划](planning/2026-10-23-single-library-multilevel-folders-plan.md)：阶段 A–C 已实现；迁移器与试点未开始。
 
 ## 领域模块
 

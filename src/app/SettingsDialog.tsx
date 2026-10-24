@@ -18,8 +18,16 @@ function numberOrNull(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClose: () => void }) {
-  const { settings, appInfo, saveSettings } = useAppRuntime();
+export function SettingsDialog({
+  open: isOpen,
+  onClose,
+  onChangeLibrary,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onChangeLibrary: () => void;
+}) {
+  const { settings, current, appInfo, saveSettings } = useAppRuntime();
   const { notify } = useNotices();
   const [draft, setDraft] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -188,23 +196,31 @@ export function SettingsDialog({ open: isOpen, onClose }: { open: boolean; onClo
         <div className="settings-body">
           <Section
             title="图库"
-            description="图库的添加、切换与移除在左侧栏完成；这里只显示当前登记的路径。"
+            description="应用只维护一个图库；更换图库会替换当前打开的库，不会修改原数据。"
           >
-            <div className="settings-library-list">
-              {draft.libraries.length === 0 ? (
-                <p className="form-note">尚未添加图库。</p>
-              ) : (
-                draft.libraries.map((library) => (
-                  <div key={library.id} className="settings-library-row">
-                    <Database size={15} />
-                    <span className="settings-library-name">{library.name}</span>
-                    <span className="settings-library-path" title={library.path}>
-                      {library.path}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
+            {current ? (
+              <div className="settings-library-row">
+                <Database size={15} />
+                <span className="settings-library-name">{current.name}</span>
+                <span className="settings-library-path" title={current.path}>
+                  {current.path}
+                </span>
+                <span className="settings-library-count">
+                  {current.imageCount.toLocaleString()} 张
+                </span>
+                <Button size="sm" variant="secondary" onClick={onChangeLibrary}>
+                  更换图库
+                </Button>
+              </div>
+            ) : (
+              <div className="settings-library-row">
+                <Database size={15} />
+                <span className="settings-library-name">尚未打开图库</span>
+                <Button size="sm" variant="secondary" onClick={onChangeLibrary}>
+                  打开图库
+                </Button>
+              </div>
+            )}
           </Section>
 
           <Section

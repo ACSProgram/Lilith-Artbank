@@ -5,19 +5,23 @@ import {
   mockCollections,
   mockCombineCollections,
   mockCreateCollection,
+  mockCreateFolder,
   mockDeleteCollection,
+  mockDeleteFolder,
   mockDeleteImages,
   mockDeleteTag,
   mockEmptyTrash,
   mockFilterCounts,
   mockFolders,
   mockImageDetail,
+  mockMoveFolder,
   mockMoveImages,
   mockQueryIds,
   mockQueryPage,
   mockRemoveFromCollection,
   mockRemoveTags,
   mockRenameCollection,
+  mockRenameFolder,
   mockRenameTag,
   mockReorderCollections,
   mockRestoreImages,
@@ -64,6 +68,26 @@ export const libraryApi = {
   async getFolders(): Promise<FolderInfo[]> {
     if (!isTauri()) return mockFolders();
     return invoke<FolderInfo[]>("get_folders");
+  },
+
+  async createFolder(path: string): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockCreateFolder(path);
+    return invoke<FolderInfo[]>("create_folder", { path });
+  },
+
+  async renameFolder(folderId: number, name: string): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockRenameFolder(folderId, name);
+    return invoke<FolderInfo[]>("rename_folder", { folderId, name });
+  },
+
+  async moveFolder(folderId: number, parentId: number): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockMoveFolder(folderId, parentId);
+    return invoke<FolderInfo[]>("move_folder", { folderId, parentId });
+  },
+
+  async deleteFolder(folderId: number): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockDeleteFolder(folderId);
+    return invoke<FolderInfo[]>("delete_folder", { folderId });
   },
 
   async getTags(limit = 500): Promise<TagInfo[]> {

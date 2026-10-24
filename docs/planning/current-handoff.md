@@ -1,11 +1,60 @@
 # 当前阶段状态
 
-日期：2026-10-23
-阶段：**S5 已取消；S6 已实现，自动验收通过；真实 AI 服务与 Tauri 界面待用户手工验收**
+日期：2026-10-24
+阶段：**单库与多级文件夹（计划阶段 A–C）已实现，自动验收通过；迁移器未开始，真实窗口待用户手工验收**
 
 历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
 
-## 本批次前提
+## 当前批次：单库与多级文件夹（A–C）
+
+Rust：
+
+- 设置 v2：只保存 `libraryPath`；v1 的 `libraries[]` / `lastLibraryId` 读取时迁移；设置页提交不回写图库路径。
+- schema v2：`folders(path COLLATE NOCASE)` 唯一索引；v1→v2 迁移检测大小写冲突并拒绝打开冲突库。
+- 单库生命周期：`create_library` / `open_library_path` / `close_library` / `rename_library`；启动自动打开上次图库；删除多库列表与移除命令。
+- 文件夹服务：路径规范化（Windows 非法字符、保留名、保留目录）、祖先补齐、创建/重命名/移动/删除空文件夹；物理目录与数据库事务同步、失败回滚、仅大小写重命名。
+- 查询：`folderIds` 改为子树语义（路径边界）；`get_folders` 返回直接/子树计数；文件夹分面按子树展开。
+- 导入：`folderMode=flat|preserve`；扫描记录相对目录；写线程缓存 `folder_id`。
+- 性能基准：200k 图片 + 10,221 个文件夹；子树页（顶层文件夹、约 1 万张）4 ms、`get_folders` 25-29 ms、子树条件下文件夹分面 62-66 ms（p95 峰值 119 ms，在 100 ms 预算边缘，面板保留加载态）。
+
+前端：
+
+- 单库外壳：欢迎页创建/打开、启动自动打开、设置页更换图库、关闭图库；移除多库列表。
+- 文件夹树（多选、展开、右键菜单、拖放）、面包屑、通用文件夹选择器、内部拖放 MIME。
+- `BrowseState` 提升到 `LibraryWorkspace`；树、网格、面包屑、选择器共享 `filters.folderIds`；筛选面板移除文件夹分面。
+- 导入与详情批量移动复用树选择器；浏览器 mock 支持文件夹 CRUD、空文件夹、子树筛选与拖放。
+
+## 验证结果（当前批次）
+
+```text
+npm run typecheck
+npm run build
+cargo fmt --check
+cargo check
+cargo clippy --all-targets   # 无警告
+cargo test --lib             # 112 passed, 0 failed, 5 ignored
+cargo test --lib -- --ignored --nocapture perf_metadata_200k
+git diff --check
+```
+
+新增测试覆盖：设置 v1 迁移与后端路径保护；schema v1→v2 与大小写冲突；文件夹路径校验、多级创建、重命名/移动子树、仅大小写重命名、空文件夹删除；子树查询与相似前缀不误匹配；直接/子树计数；导入 `preserve` 同名子目录合并。
+
+浏览器预览已完成静态/交互检查（mock 数据）：单库创建、树计数、子树筛选、多选、文件夹 CRUD、图片/文件夹拖放、面包屑、Inspector 选择器。未取得截图，真实 WebView2 布局与交互待用户验收。
+
+本轮收尾整理（不改行为契约）：
+
+- `paths.rs`：删除过期的“Stage 1/3 才接入”说明与整模块 `allow(dead_code)`；移除未被引用的 `thumb_segment`/`feature_file`、以及祖先补齐已由 `ensure_folder` 负责的 `folder_ancestors`；`escape_like` 与新增的 `subtree_like_pattern` 收敛到一处，供查询与文件夹服务共用，并补单测。
+- `query.rs`：子树条件提为常量 `FOLDER_SUBTREE_SQL`；`list_folders` 复用 `expand_folder_counts`，不再重复“沿路径累加到祖先”的实现；`all_folders` 按 `path` 排序，保证返回值稳定。
+- `folders.rs`：新建只调一次 `ensure_folder` 补齐祖先（原先先遍历祖先再调一次）；删除子文件夹的计数改用共享子树模式。
+- `import/pipeline.rs`：`prepared`/`duplicates`/`folder_cache` 收敛为 `WriteBuffer`，`flush` 参数从 8 个降到 6 个并去掉 `too_many_arguments`；`folderMode` 分支合并为两条。
+- `import/scan.rs`：跳过目录改用 `paths` 常量，并补上计划 3.2 要求的旧程序 `.data`；测试覆盖。
+- `library/perf.rs`：子树页基准原先取的是叶子文件夹 id（`folder_ids: vec![7]`，实际约 20 张），与文档“选中一个顶层文件夹”不符；改为按路径取 `folder0` 的 id 并断言填满一页。复测后子树页 4 ms、`get_folders` 25-29 ms、子树分面 62-66 ms，原 0.37 ms/33 ms 是叶子口径的失真数据。
+- 前端：`ancestorPaths` 复用到树展开与面包屑（原先三处各自切分路径），删除重复的 `inFolderSubtree`；批量移动在文件夹选择器里选根目录时改走“移动到根目录”，不再误报“请输入目标文件夹”；面包屑只有最深一级标为当前；合并 `LibraryWorkspace` 重复的类型导入，`FolderTree` 去掉未用的 `FolderTreeModel`。
+- 文档：`overview.md` 删除不存在的 `src/modules/editor` 与 AI 模块的“（后续）”，标注图像处理已取消；`import.md` 补 `.data`；`performance.md` 与 `browse-and-query.md` 更新子树数字并把基准数字收敛到一处；本文件同步。
+
+## 此前批次：S6 AI 客户端与语义搜索
+
+### 前提
 
 - 跳过 S5（色彩/LUT/DFT/卷积），原因与作废计划见 [S5 取消与 AI 模型调整](archive/2026-10-23-S5取消与AI模型调整.md)。
 - image/text embedding 改为 `siglip2-giant-opt-patch16-384`，1536 维，落盘 fp16；旧 CLIP 向量不兼容、不参与检索。
@@ -14,7 +63,7 @@
 - pose 继续用 MediaPipe Pose，S7 相似度按原程序 `ZyImageAlgorithm.cpp` 1:1 移植，不改权重与公式。
 - description 换模型但 `/v1/describe` 契约不变；本批只做客户端，不实现服务端。
 
-## 本批次完成：S6 AI 客户端与语义搜索
+### 完成内容
 
 Rust：
 
@@ -38,7 +87,7 @@ Rust：
 - 查看器：无 pose 时可“生成姿势骨架”，有 pose 时切换叠加；返回 33 点为零时提示未检测到人体。
 - 设置页：AI 服务检测/启动/停止/加载模型与 health 能力展示。
 
-## 验证结果（S6）
+### 验证结果（S6）
 
 ```text
 npm run typecheck
@@ -68,7 +117,7 @@ cargo test --lib             # 99 passed, 5 ignored
 - 前端：`aiApi` 用 `requireTauri`/`offlineStatus()` 去掉 13 处重复分支；语义结果与图库查询在 `LibraryView` 合并为单一 `listSource`；`useSemanticSearch.retry` 去掉走不到的 token 分支；任务对话框重新打开时接管 `status.job`，并补上阶段中文标签；设置页去掉“接入后……”等过期文案。
 - 文档：修正 pack 命名（含 hash 后缀）、pose 的 dim 语义、进度节流 150ms、启动失败重试与“运行中崩溃不自动重启”的实际行为、`features/*.bin` 笔误；路线图标记 S6 已实现；清理交接文档中 S5/S6 的过期结论。
 
-## 本批次完成：S4 查看器与几何编辑
+## 更早批次：S4 查看器与几何编辑
 
 Rust：
 
@@ -125,6 +174,9 @@ S4 新增测试覆盖：
 
 ## 未验证
 
+- 真实 Tauri 窗口的单库流程：欢迎页创建/打开、启动自动打开、设置页更换图库、关闭图库。
+- 真实窗口文件夹树、面包屑、右键菜单、拖放、空文件夹与子树计数；导入“保留源目录”。
+- 文件夹操作在磁盘占用、权限、目标已存在等异常下的失败与回滚。
 - 真实 Tauri 窗口的 S1 导入、S2/S3 浏览与 S4 查看器全流程（含全屏、键盘、侧栏编辑）。
 - 真实 WebView2 的原图/大图预览加载、EXIF 方向图显示与裁剪一致性、缩放平移帧率。
 - 真实图库的保存 round-trip：旧原图删除、`img://` 与缩略图立即刷新、pHash/主色更新、embedding/pose 清除。
@@ -140,9 +192,9 @@ S4 新增测试覆盖：
 
 ## 下一步
 
-1. 用户手工验收：`npm run tauri dev` → 打开图库 → 设置页检测/启动 AI 服务并加载模型 → 运行 embedding/pose/description 批量任务（含取消与失败清单）→ 语义搜索与翻页 → 查看器生成姿势骨架 → 详情侧栏“AI 生成”。
-2. 同时复验 S1–S4 的真实窗口流程（导入、浏览、编辑、查看器保存、剪贴板）。
-3. 验收通过后进入 S7：pHash/颜色/向量/pose 相似度与高级集合。
+1. 用户手工验收当前批次：`npm run tauri dev` → 创建或打开图库 → 文件夹树新建/重命名/移动/删除空文件夹 → 拖放图片与文件夹 → 子树筛选与面包屑 → 导入时切换“平铺 / 保留源目录” → 设置页更换图库。
+2. 复验 S1–S4 的真实窗口流程（导入、浏览、编辑、查看器保存、剪贴板）与 S6 的 AI 服务/语义搜索。
+3. 当前批次验收通过后，再决定是否执行计划阶段 D（旧库迁移器与试点）。
 4. 待决策项见 [待办与待决策](todo.md)，尤其是 AI 服务崩溃是否自动重启、语义搜索是否叠加筛选、OLE 拖出与编辑上限的进度/取消。
 
 ## 约束

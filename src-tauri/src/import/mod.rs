@@ -15,12 +15,24 @@ use crate::{
 
 use job::{DuplicatePolicy, ImportJob, ImportPhase};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderMode {
+    /// 所有图片进入目标文件夹。
+    #[default]
+    Flat,
+    /// 保留每个输入目录下的相对目录层级。
+    Preserve,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportRequest {
     pub paths: Vec<String>,
     #[serde(default)]
     pub folder: String,
+    #[serde(default)]
+    pub folder_mode: FolderMode,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -163,6 +175,7 @@ mod tests {
         ImportRequest {
             paths: vec![std::env::temp_dir().to_string_lossy().into_owned()],
             folder: String::new(),
+            folder_mode: FolderMode::Flat,
             tags: Vec::new(),
             score: 0,
             duplicate_policy: DuplicatePolicy::Skip,

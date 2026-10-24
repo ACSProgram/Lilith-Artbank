@@ -29,10 +29,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
           setCurrent(status);
           return;
         }
-        const lastId = loadedSettings.lastLibraryId;
-        if (lastId) {
+        if (loadedSettings.libraryPath) {
           try {
-            const opened = await appApi.openLibrary(lastId);
+            const opened = await appApi.openLibraryPath(loadedSettings.libraryPath);
             if (!cancelled) setCurrent(opened);
           } catch (error) {
             if (!cancelled) {
@@ -64,9 +63,20 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const addLibrary = useCallback(
+  const createLibrary = useCallback(
     async (name: string, path: string) => {
-      const library = await run("正在打开图库", () => appApi.addLibraryPath(name, path));
+      const library = await run("正在创建图库", () => appApi.createLibrary(name, path));
+      setCurrent(library);
+      setSettings(await appApi.getSettings());
+      notify(`已创建图库「${library.name}」`, "success");
+      return library;
+    },
+    [notify, run],
+  );
+
+  const openLibrary = useCallback(
+    async (path: string) => {
+      const library = await run("正在打开图库", () => appApi.openLibraryPath(path));
       setCurrent(library);
       setSettings(await appApi.getSettings());
       notify(`已打开图库「${library.name}」`, "success");
@@ -75,35 +85,16 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     [notify, run],
   );
 
-  const openLibrary = useCallback(
-    async (libraryId: string) => {
-      const library = await run("正在打开图库", () => appApi.openLibrary(libraryId));
-      setCurrent(library);
-      setSettings(await appApi.getSettings());
-      return library;
-    },
-    [run],
-  );
-
   const closeLibrary = useCallback(async () => {
     await run("正在关闭图库", () => appApi.closeLibrary());
     setCurrent(null);
+    setSettings(await appApi.getSettings());
   }, [run]);
 
-  const removeLibrary = useCallback(
-    async (libraryId: string) => {
-      const updated = await run("正在移除图库", () => appApi.removeLibrary(libraryId));
-      setSettings(updated);
-      setCurrent((value) => (value?.id === libraryId ? null : value));
-    },
-    [run],
-  );
-
   const renameLibrary = useCallback(
-    async (libraryId: string, name: string) => {
-      const updated = await run("正在重命名图库", () => appApi.renameLibrary(libraryId, name));
-      setSettings(updated);
-      setCurrent((value) => (value?.id === libraryId ? { ...value, name } : value));
+    async (name: string) => {
+      const renamed = await run("正在重命名图库", () => appApi.renameLibrary(name));
+      setCurrent(renamed);
     },
     [run],
   );
@@ -130,10 +121,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       appInfo,
       loading,
       busy,
-      addLibrary,
+      createLibrary,
       openLibrary,
       closeLibrary,
-      removeLibrary,
       renameLibrary,
       saveSettings,
       refreshStatus,
@@ -144,10 +134,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       appInfo,
       loading,
       busy,
-      addLibrary,
+      createLibrary,
       openLibrary,
       closeLibrary,
-      removeLibrary,
       renameLibrary,
       saveSettings,
       refreshStatus,

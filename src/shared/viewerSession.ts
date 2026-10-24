@@ -15,7 +15,8 @@ export interface ViewerSessionItem {
 export interface ViewerSessionFolder {
   id: number;
   path: string;
-  imageCount: number;
+  directImageCount: number;
+  totalImageCount: number;
 }
 
 export interface ViewerSession {
