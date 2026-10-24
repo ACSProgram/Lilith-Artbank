@@ -1,16 +1,23 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Database, FolderOpen, Gauge, Sparkles } from "lucide-react";
+import { Database, FolderOpen, Gauge, Monitor, Moon, Sparkles, Sun } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field, Section } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
 import { browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
-import type { Settings } from "./types";
+import { setThemeMode } from "./theme";
+import type { Settings, ThemeMode } from "./types";
 import { errorMessage } from "../shared/errors";
 import { aiApi, aiBrowserPreview } from "../modules/ai/api";
 import type { AiStatus } from "../modules/ai/types";
+
+const THEME_CHOICES: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
+  { value: "light", label: "浅色", icon: Sun },
+  { value: "dark", label: "深色", icon: Moon },
+  { value: "system", label: "跟随系统", icon: Monitor },
+];
 
 function numberOrNull(value: string): number | null {
   if (!value.trim()) return null;
@@ -47,6 +54,15 @@ export function SettingsDialog({
       .then(setAiStatus)
       .catch((cause: unknown) => setAiError(errorMessage(cause)));
   }, [isOpen, settings]);
+
+  // 主题即时预览：改选项马上生效，取消则退回已保存的值。
+  const draftTheme = draft?.ui.theme;
+  const savedTheme = settings?.ui.theme ?? "system";
+  useEffect(() => {
+    if (!isOpen || !draftTheme) return;
+    setThemeMode(draftTheme);
+    return () => setThemeMode(savedTheme);
+  }, [isOpen, draftTheme, savedTheme]);
 
   const refreshAi = async () => {
     setAiBusy(true);
@@ -134,18 +150,18 @@ export function SettingsDialog({
       return "工作线程数必须在 1-128 之间，或留空使用自动值";
     }
     if (
-      !Number.isInteger(value.performance.thumbnailCacheMb) ||
-      value.performance.thumbnailCacheMb < 64 ||
-      value.performance.thumbnailCacheMb > 4096
-    ) {
-      return "缩略图缓存必须在 64-4096 MB 之间";
-    }
-    if (
       !Number.isInteger(value.ui.gridThumbPx) ||
       value.ui.gridThumbPx < 96 ||
       value.ui.gridThumbPx > 512
     ) {
       return "网格缩略图尺寸必须在 96-512 像素之间";
+    }
+    if (
+      !Number.isInteger(value.ui.thumbCacheCount) ||
+      value.ui.thumbCacheCount < 256 ||
+      value.ui.thumbCacheCount > 8192
+    ) {
+      return "缩略图缓存张数必须在 256-8192 之间";
     }
     return null;
   };
@@ -411,24 +427,6 @@ export function SettingsDialog({
                   placeholder="自动"
                 />
               </Field>
-              <Field label="缩略图缓存 (MB)" hint="浏览器与 Rust 侧共享的预算，接入后生效。">
-                <input
-                  className="input"
-                  type="number"
-                  min={64}
-                  max={4096}
-                  value={draft.performance.thumbnailCacheMb}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      performance: {
-                        ...current.performance,
-                        thumbnailCacheMb: Number(event.target.value),
-                      },
-                    }))
-                  }
-                />
-              </Field>
               <Field label="网格缩略图尺寸" hint={`${draft.ui.gridThumbPx}px`}>
                 <input
                   className="range"
@@ -452,13 +450,25 @@ export function SettingsDialog({
             </div>
           </Section>
 
-          <Section title="界面" description="当前使用 Lilith Artworks 风格的浅色工作台。">
-            <div className="theme-row">
-              <span className="theme-swatch" />
-              <div>
-                <strong>浅色</strong>
-                <small>暖白底、深绿强调色，减少界面对素材颜色的干扰。</small>
-              </div>
+          <Section title="界面" description="浅色与深色共用同一套语义变量，查看器与主界面保持同色系。">
+            <div className="theme-options">
+              {THEME_CHOICES.map(({ value, label, icon: Icon }) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={`theme-option${draft.ui.theme === value ? " is-active" : ""}`}
+                  aria-pressed={draft.ui.theme === value}
+                  onClick={() =>
+                    patch((current) => ({ ...current, ui: { ...current.ui, theme: value } }))
+                  }
+                >
+                  <Icon size={15} />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="settings-inline-note">
+              跟随系统时会随操作系统的浅色/深色设置自动切换。
             </div>
           </Section>
 

@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -16,7 +16,8 @@ CREATE TABLE meta (
 CREATE TABLE folders (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    sort_index INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 -- Windows 下文件夹路径大小写不敏感；NOCASE 只覆盖 ASCII，中文不受影响。
@@ -194,7 +195,12 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
         0 => initialize(connection, manifest),
         1 => {
             verify_meta(connection, manifest)?;
-            migrate_v1_to_v2(connection)
+            migrate_v1_to_v2(connection)?;
+            migrate_v2_to_v3(connection)
+        }
+        2 => {
+            verify_meta(connection, manifest)?;
+            migrate_v2_to_v3(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -226,6 +232,16 @@ fn verify_meta(connection: &Connection, manifest: &LibraryManifest) -> AppResult
     Ok(())
 }
 
+/// 版本号同时写在 `PRAGMA user_version`（读取依据）与 `meta.schemaVersion`（人看），必须一起改。
+fn mark_version(connection: &Connection, version: u32) -> AppResult<()> {
+    connection.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schemaVersion'",
+        [version.to_string()],
+    )?;
+    connection.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
+
 fn migrate_v1_to_v2(connection: &mut Connection) -> AppResult<()> {
     let mut statement = connection.prepare(
         "SELECT path FROM folders GROUP BY path COLLATE NOCASE HAVING count(*) > 1
@@ -248,13 +264,30 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> AppResult<()> {
          ON folders(path COLLATE NOCASE)",
         [],
     )?;
-    transaction.execute(
-        "UPDATE meta SET value = ?1 WHERE key = 'schemaVersion'",
-        [SCHEMA_VERSION.to_string()],
-    )?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    mark_version(&transaction, 2)?;
     transaction.commit()?;
-    log::info!("图库 schema 已从 v1 升级到 v{SCHEMA_VERSION}");
+    log::info!("图库 schema 已从 v1 升级到 v2");
+    Ok(())
+}
+
+/// v2 → v3：文件夹增加手动排序位，按现有名称顺序初始化，升级后视觉顺序不变。
+fn migrate_v2_to_v3(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "ALTER TABLE folders ADD COLUMN sort_index INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    transaction.execute(
+        "WITH ordered AS (
+             SELECT id, ROW_NUMBER() OVER (ORDER BY path COLLATE NOCASE, id) - 1 AS position
+             FROM folders
+         )
+         UPDATE folders SET sort_index = (SELECT position FROM ordered WHERE ordered.id = folders.id)",
+        [],
+    )?;
+    mark_version(&transaction, SCHEMA_VERSION)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v2 升级到 v{SCHEMA_VERSION}");
     Ok(())
 }
 
@@ -336,10 +369,26 @@ mod tests {
         connection
             .execute("DROP INDEX idx_folders_path_nocase", [])
             .unwrap();
+        connection
+            .execute("ALTER TABLE folders DROP COLUMN sort_index", [])
+            .unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
         connection
             .execute(
                 "UPDATE meta SET value = '1' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v2(connection: &Connection) {
+        connection
+            .execute("ALTER TABLE folders DROP COLUMN sort_index", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '2' WHERE key = 'schemaVersion'",
                 [],
             )
             .unwrap();
@@ -387,6 +436,69 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_and_orders_folders_by_name() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v2(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 2);
+
+        // 插入顺序与名称顺序不一致，迁移后应按名称重新编号。
+        for (path, created) in [("gamma", 1), ("Alpha", 2), ("beta", 3)] {
+            connection
+                .execute(
+                    "INSERT INTO folders(path, created_at) VALUES (?1, ?2)",
+                    params![path, created],
+                )
+                .unwrap();
+        }
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+
+        let mut statement = connection
+            .prepare("SELECT path, sort_index FROM folders ORDER BY sort_index")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (String::new(), 0),
+                ("Alpha".to_owned(), 1),
+                ("beta".to_owned(), 2),
+                ("gamma".to_owned(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_library_has_folder_sort_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES ('作品', 1)",
+                [],
+            )
+            .unwrap();
+        let index: i64 = connection
+            .query_row(
+                "SELECT sort_index FROM folders WHERE path = '作品'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 0);
     }
 
     #[test]

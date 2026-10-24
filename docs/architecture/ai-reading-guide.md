@@ -26,6 +26,8 @@
 - `src/modules/<module>/api.ts` 是该领域命令的唯一入口；页面组件不直接 `invoke`。
 - Tauri 命令只做适配；业务函数放在领域模块。
 - SQLite 写入只走单写连接；不要从读连接写库。
+- 颜色只在 `src/styles/tokens.css` 定义（`:root` 浅色 / `html[data-theme="dark"]` 深色）；`index.css` 只引用语义变量，不写字面色值。主题切换走 `src/app/theme.ts`，不要在组件里判断主题。
+- 破坏性操作的确认文案走 `src/shared/confirm.ts`，不要在调用点各写一套标题。
 - 任何全量载入/全量扫描方案先对照 `docs/guides/performance.md`。
 - 真实仓库 `G:\Lilith Image Library` 只读；测试用临时目录。
 - 不做 PinBoard/PasteBoard/调色盘/色彩测试/截屏，不建版本/CHANGELOG/法务文件。

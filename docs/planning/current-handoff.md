@@ -1,9 +1,69 @@
 # 当前阶段状态
 
 日期：2026-10-24
-阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 旧库全量迁移已完成（主库 390 542 张、独立测试库 9 455 张、247 条失败内容移出库外），两库自动验证通过；E 自动检查已运行，真实窗口待用户验收；S7 相似度检索与相似分组已实现并通过自动验收，真实窗口与 20 万级基准待验收**
+阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 旧库全量迁移已完成（主库 390 542 张、独立测试库 9 455 张、247 条失败内容移出库外），两库自动验证通过；E 自动检查已运行，真实窗口待用户验收；S7 相似度检索与相似分组已实现并通过自动验收，真实窗口与 20 万级基准待验收；体验整改 P0 基础层已完成并通过用户手工验收，P1–P4 待执行**
 
 历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
+
+## 当前批次：体验整改 P0 基础层（2026-10-24）
+
+来源与后续批次见 [迁移后体验整改计划](2026-10-24-体验整改计划.md)。本批只铺地基，不改用户可见流程（唯一可见变化是主题真正生效、移入回收站开始确认）。
+
+Rust：
+
+- `app/settings.rs`：设置版本升到 3。`UiSettings` 新增 `thumbFit`、`thumbCacheCount`、`sort`、`sortProfiles`、`viewerFilmstrip`、`detailPanelMode`；删除 `PerformanceSettings.thumbnail_cache_mb`；`theme` 增加 `system` 并作为默认值。新增 `SortSpec` / `SortProfile` DTO 与校验：主题三选一、填充两选一、缓存张数 256-8192、详情面板两选一、排序 1-7 级且指标不重复、方案 ≤50 个且名称不区分大小写唯一。
+- `app/settings.rs` 迁移：`parse_settings` 改成 v1→v2→v3 链式，`migrate_v2` 删掉 `performance.thumbnailCacheMb`，其余字段由 serde 默认值补齐，旧值保留。
+- `library/schema.rs`：schema 版本升到 3。`folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`；`migrate_v2_to_v3` 用 `ROW_NUMBER() OVER (ORDER BY path COLLATE NOCASE, id)` 按名称编号，升级后顺序不变；`migrate_v1_to_v2` 只升到 2，由 `ensure` 继续链到 3。
+
+前端：
+
+- `src/styles/tokens.css`（新）：浅色 `:root` 与 `html[data-theme="dark"]` 两套语义变量，覆盖表面/文字/强调/状态/遮罩/画布/缩略图占位/阴影；填充色（`--accent-fill` / `--danger-fill`）与文字色分开，避免深色下白字压浅色按钮。
+- `src/styles/index.css`：`@import "./tokens.css"`，80 余处字面色值全部换成变量（含查看器/编辑器原来的整套深色硬编码、三处 `rgba()` 阴影），`grep -rn "#[0-9a-f]\{3,8\}\|rgba(" src/styles` 现在只命中 tokens.css。设置页的静态主题色块换成三个主题选项按钮（`.theme-options` / `.theme-option`），另加 `.confirm-detail`、`.confirm-checkbox`、`.popover`、`.menu-section*`、`body[data-scroll-lock]`。
+- `src/app/theme.ts`（新）：解析 `light` / `dark` / `system`（`system` 监听 `prefers-color-scheme`），写 `html[data-theme]`；`main.tsx` 在首次渲染前调用 `initTheme()`，`AppRuntimeProvider` 在设置变化后重新应用，`SettingsDialog` 打开时按草稿即时预览、取消则退回已保存值。
+- `src/app/types.ts` / `api.ts`：`Settings` 对齐 v3，默认 `theme=system`、`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{importedAt,desc}]`、`detailPanelMode=overlay`；`SettingsDialog` 删掉“缩略图缓存 (MB)”输入与校验。
+- `src/shared/components/Modal.tsx`：补焦点陷阱（Tab/Shift+Tab 只在面板内循环）、背景滚动锁、初始焦点选项；开着的弹窗按栈记录，只有最上层响应按键。`onClose` 放进 ref，避免重渲染把焦点抢回面板。
+- `src/shared/components/ConfirmDialog.tsx` + `src/app/noticeContext.ts`：`ConfirmOptions` 增加 `detail` 与 `checkbox`（复选框状态由调用方持有，返回值仍是 boolean）。
+- `src/shared/confirm.ts`（新）：`confirmTrash` / `confirmDelete` / `confirmEmptyTrash` 语义化文案。
+- `src/shared/components/Popover.tsx`、`MenuSection.tsx`（新）：排序/筛选/菜单共用弹层与菜单分组标题；本批暂无使用点。
+- `src/modules/library/LibraryView.tsx`：`trashSelected` 统一加 `confirmTrash`，覆盖右键菜单、Delete 键、详情侧栏、查看器四个入口；`deleteSelected` / `emptyTrash` 改用语义化封装。
+
+文档：
+
+- `library.md`：设置 v3 字段与校验、v2→v3 迁移、schema v3 与 `folders.sort_index` 的现状（手动排序命令尚未实现）。
+- `browse-and-query.md`：回收站确认的收口点与三种确认语义。
+- `overview.md`：分层补 `src/styles/`、主题与确认的前端约定、两条取舍记录、P0 实现状态；`ai-reading-guide.md` 补颜色与确认文案的边界。
+
+### 提交前复核（2026-10-24）
+
+- `Modal` 的按键处理改成叠层栈：只有最上层响应 `Esc` / `Tab`，滚动锁跟随栈空/非空。原先只用计数锁滚动，在设置对话框上再开确认框时，两个弹窗会抢同一套按键（`Esc` 会关掉被遮住的那一层，`Tab` 会被抢回底层）。
+- `initialFocus` 由 `first` 改为 `panel` / `footer`：确认框原来聚焦的是标题栏的关闭按钮，现在停在“取消”上。
+- `theme.ts` 收掉外部没有使用的 `resolveTheme` / `currentThemeMode` / `ResolvedTheme` 导出；重复设置同一个值不再写 `data-theme`。
+- `Popover` 修正 `closeOnScroll` 的注释（默认值是 `true`）；上下翻转后统一夹进视口，弹层比视口高时不会再跑到负坐标。
+- Rust：`MAX_SORT_LEVELS` 改为由 `SORT_KEYS.len()` 推导，指标增删时不会和级数上限脱节；排序方案内的排序校验失败时，报错带上方案名；schema 迁移用 `mark_version` 统一写 `user_version` 与 `meta.schemaVersion`。
+
+### 验证结果（P0）
+
+```text
+npm run typecheck
+npm run build
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets   # 无警告
+cargo test --lib             # 131 passed, 0 failed, 5 ignored
+git diff --check
+grep -rn "#[0-9a-f]\{3,8\}\|rgba(" src/styles   # 只命中 tokens.css
+```
+
+新增测试：设置 v2→v3 迁移（`thumbnailCacheMb` 被删除、旧值保留、新字段默认值）、非法主题拒绝、重复排序指标拒绝、schema v2→v3 迁移按名称编号、新库 `folders.sort_index` 默认可写。
+
+用户手工验收（2026-10-24）：`npm run tauri dev` 下浅色/深色/跟随系统切换、查看器与主界面同色系、四个回收站入口确认、弹窗 Tab 焦点循环均通过。
+
+遗留：
+
+- 逐页截图检查未做（本机没有浏览器自动化依赖），两套主题的观感由用户手工确认。
+- 主题之外的六个新设置字段、`Popover`、`MenuSection` 尚无消费者，随 P1/P3/P4 接入。
+
+本批已作为一个提交落地（见 `git log`），未推送。
 
 ## 此前批次：相似度检索与相似分组（S7）
 
@@ -49,7 +109,7 @@ cargo test --lib             # 126 passed, 0 failed, 5 ignored
 - `src/styles/index.css`：补 `.dialog-field` 与 `.similarity-group-*` 样式（原先这些类没有任何规则，分组列表会挤成一列）。
 - 文档：`ai-service.md` 补本地检索与命令表、删除“没有 embedding 时先调用服务生成”的错误描述；`overview.md` 删掉不存在的 `src-tauri/src/features/`；`browse-and-query.md` 补找相似入口与限制；`roadmap.md` 标记 S7 已实现；`todo.md` 换成收尾项。
 
-## 当前批次：旧库全量迁移（D，2026-10-24）
+## 此前批次：旧库全量迁移（D，2026-10-24）
 
 迁移器不属于产品代码，位于仓库外 `research/library-migration/tools/migrator`（主仓库 `.gitignore` 排除 `/research/`）。真实库已完成改造，用户手工验收待执行。
 
@@ -277,11 +337,12 @@ S4 新增测试覆盖：
 
 ## 下一步
 
-1. 用户执行 `npm run tauri dev`：应用设置已指向 `G:\Lilith Image Library`，先验收主库；再从设置页切换/打开 `G:\Lilith Test Library` 验收测试库。
-2. 需要时处理失败内容：按 `G:\Lilith Image Library Failed\manifest.jsonl` 缩小尺寸后重新导入；当前只保证汇总与元数据完整。
-3. 真实窗口验收 A–C 的单库外壳、文件夹树、导入、浏览、编辑、查看器、AI 任务、语义搜索与 S7 找相似/相似分组；待决策项见 [待办与待决策](todo.md)。
-4. 需要在真实库上定阈值时，用复制出来的小样本跑相似度基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
-5. 规划文档已归档；新阶段按 [路线图](roadmap.md) 继续。
+1. 体验整改继续 P1（浏览主界面：侧栏去重、主区头部、工具栏重排、右键菜单分组、新建集合、详情面板不挤缩略图、缩略图信息与显示模式、筛选零值、调试信息）；P0 已完成，批次划分与决策见 [迁移后体验整改计划](2026-10-24-体验整改计划.md)。
+2. 用户执行 `npm run tauri dev`：应用设置已指向 `G:\Lilith Image Library`，先验收主库；再从设置页切换/打开 `G:\Lilith Test Library` 验收测试库。
+3. 需要时处理失败内容：按 `G:\Lilith Image Library Failed\manifest.jsonl` 缩小尺寸后重新导入；当前只保证汇总与元数据完整。
+4. 真实窗口验收 A–C 的单库外壳、文件夹树、导入、浏览、编辑、查看器、AI 任务、语义搜索与 S7 找相似/相似分组；待决策项见 [待办与待决策](todo.md)。
+5. 需要在真实库上定阈值时，用复制出来的小样本跑相似度基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
+6. 规划文档已归档；新阶段按 [路线图](roadmap.md) 继续。
 
 ## 约束
 

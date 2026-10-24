@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { appApi } from "./api";
 import { useNotices } from "./noticeContext";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
+import { setThemeMode } from "./theme";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
 import { errorMessage } from "../shared/errors";
 
@@ -50,6 +51,11 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, [notify]);
+
+  // 设置里的主题真正生效：加载完成、以及每次保存设置后都重新应用。
+  useEffect(() => {
+    setThemeMode(settings?.ui.theme ?? "system");
+  }, [settings?.ui.theme]);
 
   const run = useCallback(
     async <T,>(label: string, operation: () => Promise<T>): Promise<T> => {

@@ -8,7 +8,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
+
+const THEMES: [&str; 3] = ["light", "dark", "system"];
+const THUMB_FITS: [&str; 2] = ["cover", "contain"];
+const DETAIL_PANEL_MODES: [&str; 2] = ["overlay", "push"];
+const SORT_KEYS: [&str; 7] = [
+    "importedAt",
+    "modifiedAt",
+    "score",
+    "size",
+    "pixels",
+    "folder",
+    "collectionPosition",
+];
+
+/// 排序级数上限：等于可用指标数量，不额外设人为限制（每个指标最多用一次）。
+pub const MAX_SORT_LEVELS: usize = SORT_KEYS.len();
+/// 排序方案是存储上限，与排序级数无关。
+pub const MAX_SORT_PROFILES: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -59,7 +77,6 @@ pub struct PerformanceSettings {
     pub reader_connections: u32,
     /// 为空时使用 CPU 可用并行度减去一个线程。
     pub worker_threads: Option<usize>,
-    pub thumbnail_cache_mb: u32,
 }
 
 impl Default for PerformanceSettings {
@@ -67,7 +84,40 @@ impl Default for PerformanceSettings {
         Self {
             reader_connections: 4,
             worker_threads: None,
-            thumbnail_cache_mb: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SortSpec {
+    pub key: String,
+    pub descending: bool,
+}
+
+impl Default for SortSpec {
+    fn default() -> Self {
+        Self {
+            key: "importedAt".into(),
+            descending: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SortProfile {
+    pub id: String,
+    pub name: String,
+    pub sort: Vec<SortSpec>,
+}
+
+impl Default for SortProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            sort: vec![SortSpec::default()],
         }
     }
 }
@@ -77,15 +127,49 @@ impl Default for PerformanceSettings {
 pub struct UiSettings {
     pub theme: String,
     pub grid_thumb_px: u32,
+    pub thumb_fit: String,
+    /// 缩略图缓存按张数，不再用 MB。
+    pub thumb_cache_count: u32,
+    /// 全局一套排序，叠加到全部图库视图。
+    pub sort: Vec<SortSpec>,
+    pub sort_profiles: Vec<SortProfile>,
+    pub viewer_filmstrip: bool,
+    pub detail_panel_mode: String,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "light".into(),
+            theme: "system".into(),
             grid_thumb_px: 220,
+            thumb_fit: "cover".into(),
+            thumb_cache_count: 1024,
+            sort: vec![SortSpec::default()],
+            sort_profiles: Vec::new(),
+            viewer_filmstrip: true,
+            detail_panel_mode: "overlay".into(),
         }
     }
+}
+
+fn validate_sort(sort: &[SortSpec]) -> AppResult<()> {
+    if sort.is_empty() {
+        return Err(AppError::message("排序至少要有一级"));
+    }
+    if sort.len() > MAX_SORT_LEVELS {
+        return Err(AppError::message(format!("排序最多 {MAX_SORT_LEVELS} 级")));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(sort.len());
+    for spec in sort {
+        if !SORT_KEYS.contains(&spec.key.as_str()) {
+            return Err(AppError::message(format!("未知的排序指标：{}", spec.key)));
+        }
+        if seen.contains(&spec.key.as_str()) {
+            return Err(AppError::message(format!("排序指标重复：{}", spec.key)));
+        }
+        seen.push(&spec.key);
+    }
+    Ok(())
 }
 
 impl Settings {
@@ -116,14 +200,41 @@ impl Settings {
         {
             return Err(AppError::message("工作线程数必须在 1-128 之间"));
         }
-        if self.performance.thumbnail_cache_mb < 64 {
-            return Err(AppError::message("缩略图缓存不能小于 64 MB"));
-        }
-        if !matches!(self.ui.theme.as_str(), "dark" | "light") {
-            return Err(AppError::message("主题只能是 dark 或 light"));
+        if !THEMES.contains(&self.ui.theme.as_str()) {
+            return Err(AppError::message("主题只能是 light、dark 或 system"));
         }
         if !(96..=512).contains(&self.ui.grid_thumb_px) {
             return Err(AppError::message("网格缩略图尺寸必须在 96-512 像素之间"));
+        }
+        if !THUMB_FITS.contains(&self.ui.thumb_fit.as_str()) {
+            return Err(AppError::message("缩略图填充方式只能是 cover 或 contain"));
+        }
+        if !(256..=8192).contains(&self.ui.thumb_cache_count) {
+            return Err(AppError::message("缩略图缓存张数必须在 256-8192 之间"));
+        }
+        if !DETAIL_PANEL_MODES.contains(&self.ui.detail_panel_mode.as_str()) {
+            return Err(AppError::message("详情面板模式只能是 overlay 或 push"));
+        }
+        validate_sort(&self.ui.sort)?;
+        if self.ui.sort_profiles.len() > MAX_SORT_PROFILES {
+            return Err(AppError::message(format!(
+                "排序方案最多保存 {MAX_SORT_PROFILES} 个"
+            )));
+        }
+        let mut names: Vec<String> = Vec::with_capacity(self.ui.sort_profiles.len());
+        for profile in &self.ui.sort_profiles {
+            let name = profile.name.trim();
+            if name.is_empty() {
+                return Err(AppError::message("排序方案名称不能为空"));
+            }
+            let folded = name.to_lowercase();
+            if names.contains(&folded) {
+                return Err(AppError::message(format!("排序方案名称重复：{name}")));
+            }
+            names.push(folded);
+            // 方案内的排序走同一套校验，报错时带上方案名，否则定位不到是哪一个。
+            validate_sort(&profile.sort)
+                .map_err(|error| AppError::message(format!("排序方案「{name}」：{error}")))?;
         }
         Ok(())
     }
@@ -220,24 +331,27 @@ impl SettingsStore {
 }
 
 fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value
         .get("settingsVersion")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(1) as u32;
-    if version < 2 {
-        return migrate_v1(&value);
-    }
-    if version != SETTINGS_VERSION {
+    if version > SETTINGS_VERSION {
         return Err(AppError::message(format!(
             "设置文件版本 {version} 高于当前程序支持的 {SETTINGS_VERSION}"
         )));
+    }
+    if version < 2 {
+        value = migrate_v1(&value)?;
+    }
+    if version < 3 {
+        value = migrate_v2(value);
     }
     Ok(serde_json::from_value(value)?)
 }
 
 /// v1 保存多个图库条目与 `lastLibraryId`；v2 只保留一个 `libraryPath`。
-fn migrate_v1(value: &serde_json::Value) -> AppResult<Settings> {
+fn migrate_v1(value: &serde_json::Value) -> AppResult<serde_json::Value> {
     let libraries = value
         .get("libraries")
         .and_then(serde_json::Value::as_array)
@@ -262,15 +376,29 @@ fn migrate_v1(value: &serde_json::Value) -> AppResult<Settings> {
 
     let mut migrated = value.clone();
     if let Some(object) = migrated.as_object_mut() {
-        object.insert(
-            "settingsVersion".into(),
-            serde_json::json!(SETTINGS_VERSION),
-        );
+        object.insert("settingsVersion".into(), serde_json::json!(2));
         object.insert("libraryPath".into(), serde_json::json!(library_path));
         object.remove("libraries");
         object.remove("lastLibraryId");
     }
-    Ok(serde_json::from_value(migrated)?)
+    Ok(migrated)
+}
+
+/// v2 → v3：删掉从未生效的 `performance.thumbnailCacheMb`，新字段由 serde 默认值补齐。
+fn migrate_v2(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "settingsVersion".into(),
+            serde_json::json!(SETTINGS_VERSION),
+        );
+        if let Some(performance) = object
+            .get_mut("performance")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            performance.remove("thumbnailCacheMb");
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -299,7 +427,11 @@ mod tests {
             loaded.library_path.as_deref(),
             Some(r"G:\Lilith Image Library")
         );
-        assert_eq!(loaded.ui.theme, "light");
+        assert_eq!(loaded.ui.theme, "system");
+        assert_eq!(loaded.ui.thumb_fit, "cover");
+        assert_eq!(loaded.ui.thumb_cache_count, 1024);
+        assert_eq!(loaded.ui.detail_panel_mode, "overlay");
+        assert_eq!(loaded.ui.sort, vec![SortSpec::default()]);
     }
 
     #[test]
@@ -328,6 +460,8 @@ mod tests {
             loaded.library_path.as_deref(),
             Some(r"G:\Lilith Image Library\画作")
         );
+        assert_eq!(loaded.ui.theme, "light");
+        assert_eq!(loaded.ui.grid_thumb_px, 220);
     }
 
     #[test]
@@ -351,6 +485,64 @@ mod tests {
             loaded.library_path.as_deref(),
             Some(r"G:\Lilith Image Library\参考")
         );
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_and_drops_dead_cache_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 2,
+                "libraryPath": "G:\\Lilith Image Library",
+                "ai": {"baseUrl": "http://127.0.0.1:18766", "port": 18766, "autoStart": false},
+                "performance": {"readerConnections": 6, "workerThreads": 3, "thumbnailCacheMb": 2048},
+                "ui": {"theme": "dark", "gridThumbPx": 264}
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(loaded.ui.theme, "dark");
+        assert_eq!(loaded.ui.grid_thumb_px, 264);
+        assert_eq!(loaded.performance.reader_connections, 6);
+        assert_eq!(loaded.performance.worker_threads, Some(3));
+        assert!(!loaded.ai.auto_start);
+        // 默认值补齐的新字段
+        assert_eq!(loaded.ui.thumb_fit, "cover");
+        assert_eq!(loaded.ui.thumb_cache_count, 1024);
+        assert!(loaded.ui.viewer_filmstrip);
+        assert_eq!(loaded.ui.detail_panel_mode, "overlay");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("thumbnailCacheMb"));
+        assert!(written.contains("\"settingsVersion\": 3"));
+    }
+
+    #[test]
+    fn rejects_unknown_theme() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"settingsVersion": 3, "ui": {"theme": "sepia"}}"#).unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("主题"));
+    }
+
+    #[test]
+    fn rejects_duplicate_sort_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settingsVersion": 3, "ui": {"sort": [{"key": "score", "descending": true}, {"key": "score", "descending": false}]}}"#,
+        )
+        .unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("重复"));
     }
 
     #[test]

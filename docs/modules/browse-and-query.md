@@ -221,6 +221,7 @@ src/modules/library/
 - Enter 或双击调用查看器入口；查看器本身在 S4，当前只提示占位。
 - Delete/Backspace：普通视图移入回收站，回收站视图永久删除选中项。
 - 右键菜单：打开查看器、在侧栏查看详情、找相似（pHash / 主色 8 色 / 主色 4 色 / 语义 embedding / 姿势；多选时取首张，回收站图片不提供）、复制文件路径/内容哈希/图片、加入集合、从当前集合移出、移入回收站/恢复/永久删除、选择全部匹配项。
+- 移入回收站必须确认，且只有一个收口点：右键菜单、Delete 键、详情侧栏按钮、查看器删除都调用 `LibraryView` 的 `trashSelected`，确认文案来自 `src/shared/confirm.ts` 的 `confirmTrash`（“把 N 张图片移入回收站？”，可恢复所以不标红）。永久删除与清空回收站分别走 `confirmDelete` / `confirmEmptyTrash`（标红）。
 - 详情侧栏在 980px 以下变为覆盖层；选中单张显示详情，多选显示批量编辑。
 - 复制路径走 Rust `copy_text`（`arboard`），浏览器预览回退到 clipboard API / `execCommand`。
 - 拖出到资源管理器（Windows OLE）仍未实现；复制图片留到 S4。

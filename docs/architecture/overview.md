@@ -18,7 +18,8 @@ src/modules/library/         文件夹树、图库视图、虚拟网格/列表�
 src/modules/import/          导入弹窗、进度、结果与失败清单
 src/modules/viewer/          查看器、几何编辑工具、姿势叠加
 src/modules/ai/              AI 状态、任务对话框与设置入口
-src/shared/                  无领域语义的控件、错误文案、缩略图/原图 URL、剪贴板与查看器会话契约
+src/shared/                  无领域语义的控件、确认文案、错误文案、缩略图/原图 URL、剪贴板与查看器会话契约
+src/styles/                  tokens.css（浅/深语义颜色变量）与 index.css（组件样式，只引用变量）
 
 src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 与 img:// 协议
 src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、文件夹服务、缩略图 pack、导入仓储、键集查询、查看器源与编辑保存、pHash/主色相似索引与分组
@@ -34,7 +35,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 
 - 单实例：再次启动只聚焦已有窗口，避免两个进程同时写同一图库。
 - 窗口使用无边框 + 40px 自绘标题栏；最小化/最大化/关闭由 Rust 命令控制。
-- 设置 v2 只保存一个 `libraryPath`；启动时尝试打开它，失败则退回欢迎页并提示，不阻塞启动。
+- 设置 v3 只保存一个 `libraryPath`；启动时尝试打开它，失败则退回欢迎页并提示，不阻塞启动。
 - 同一时间只有一个图库会话。打开或创建新库成功后才替换旧会话；关闭只释放连接并清空 `libraryPath`，不改文件。
 - 导入期间禁止关闭、创建或切换图库；任务完成后恢复。应用退出时已提交批次保留，未完成临时文件在下次打开时清理。
 - 文件夹的创建/重命名/移动/删除与物理目录同步，和导入、图像保存、回收站操作共用 `maintenance` 守卫。
@@ -89,6 +90,8 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 单库外壳由左侧文件夹树 + 主区网格组成；`BrowseState` 提升到工作区，树与网格共享同一份 `filters.folderIds`，树选择即子树筛选。
 - 文件夹操作（新建、重命名、移动、删除空文件夹）只经 `src/modules/library/api.ts`；成功后用返回的完整 `FolderInfo[]` 刷新树，不在前端本地改路径。
 - 网格/列表拖到树或选择器时使用内部 MIME 传递图片 id；文件夹拖放同样只传 id，由 Rust 校验目标与冲突。
+- 样式只有一个颜色来源：`src/styles/tokens.css` 定义浅色（`:root`）与深色（`html[data-theme="dark"]`）两套语义变量，组件样式只引用变量，不写字面色值。主题模式（`light` / `dark` / `system`）由 `src/app/theme.ts` 解析后写到 `html[data-theme]`；查看器、对话框与主界面共用同一套变量，没有“某个界面固定深色”的例外。
+- 破坏性操作必须确认：确认框统一经 `useNotices().confirm`，语义化文案在 `src/shared/confirm.ts`（`confirmTrash` / `confirmDelete` / `confirmEmptyTrash`）。`Modal` 负责焦点陷阱、背景滚动锁与 `Esc` 关闭；弹层（排序、筛选、菜单）统一用 `src/shared/components/Popover.tsx` 定位，菜单分组标题用 `MenuSection`。
 
 ## 性能原则
 
@@ -114,10 +117,12 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 | 图库数量 | 单库，设置只存 `libraryPath` | 避免多会话互斥、缓存与 AI 均值状态按库切换的复杂度；换库即关旧开新 |
 | 文件夹 | 真实磁盘目录 + `folders` 路径行（NOCASE 唯一） | 用户可在资源管理器直接查看/整理；空文件夹可保留；路径本身就是身份，移动时更新子树 |
 | 文件夹筛选 | 选中即包含全部后代 | 与资源管理器树的直觉一致；用路径边界避免 `人物` 误匹配 `人物速写` |
+| 主题 | 单套语义变量 + `html[data-theme]`，浅/深共用组件样式 | 避免两套样式表漂移；查看器不再单独维护深色配色，深色下画布比面板再暗一档 |
+| 设置字段 | 先入库、后接消费者 | `thumbFit` / `thumbCacheCount` / `sort` / `sortProfiles` / `viewerFilmstrip` / `detailPanelMode` 与后续批次一起落地，避免中途再改一次设置版本 |
 
 ## 当前实现状态
 
-S0 已实现：设置、图库清单、SQLite schema（当时为 v1，现为 v2）、连接池、图库创建/打开/关闭、窗口命令、应用外壳与图库入口。
+S0 已实现：设置、图库清单、SQLite schema（当时为 v1，现为 v3）、连接池、图库创建/打开/关闭、窗口命令、应用外壳与图库入口。
 
 S1 前半已实现：WebP 缩略图编码、追加式缩略图包、`thumb://` 协议、应用内 150 张加载基准（用户已确认满足门槛）。
 
@@ -134,5 +139,7 @@ S6 已实现：AI 服务进程托管（启动/探活/启动失败退避重试/�
 2026-10-24 单库与多级文件夹已实现：设置 v2（单一 `libraryPath`）与 v1 迁移、schema v2（`folders.path` NOCASE 唯一索引）、单库生命周期与命令清理、文件夹创建/重命名/移动/删除空文件夹、子树筛选与树计数、导入“平铺/保留源目录”、前端单库外壳与文件夹树/面包屑/选择器/拖放。自动测试覆盖迁移、路径校验、文件夹 CRUD、子树查询与导入层级；真实窗口交互待手工验收。
 
 S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。
+
+2026-10-24 体验整改 P0（基础层）已实现：`tokens.css` 语义变量与 `html[data-theme]` 主题切换（`settings.ui.theme` 支持 `light`/`dark`/`system` 并真正生效）、查看器与主界面统一配色、设置 v3（删掉 `thumbnailCacheMb`，新增缩略图填充/缓存张数/排序/排序方案/胶片带/详情面板模式字段）、schema v3（`folders.sort_index`）、`ConfirmDialog` 的 `detail`/`checkbox`、`Modal` 焦点陷阱与滚动锁、`Popover`/`MenuSection`、移入回收站统一确认。后四个批次（浏览主界面、任务总线、查看器与编辑、文件夹与排序）待执行，见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)。
 
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图重建/压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

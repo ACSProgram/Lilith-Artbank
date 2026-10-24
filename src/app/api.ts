@@ -12,7 +12,7 @@ import type {
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 2,
+  settingsVersion: 3,
   libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
@@ -23,11 +23,16 @@ const defaultSettings: Settings = {
   performance: {
     readerConnections: 4,
     workerThreads: null,
-    thumbnailCacheMb: 1024,
   },
   ui: {
-    theme: "light",
+    theme: "system",
     gridThumbPx: 220,
+    thumbFit: "cover",
+    thumbCacheCount: 1024,
+    sort: [{ key: "importedAt", descending: true }],
+    sortProfiles: [],
+    viewerFilmstrip: true,
+    detailPanelMode: "overlay",
   },
 };
 

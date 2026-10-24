@@ -1,3 +1,11 @@
+import type { SortSpec } from "../modules/library/types";
+
+export type ThemeMode = "light" | "dark" | "system";
+/** 缩略图在方格里的填充方式：裁剪铺满 / 完整可见。 */
+export type ThumbFit = "cover" | "contain";
+/** 详情面板：覆盖在画布上（不重排网格）/ 挤压画布。 */
+export type DetailPanelMode = "overlay" | "push";
+
 export interface AiSettings {
   baseUrl: string;
   executablePath: string | null;
@@ -8,12 +16,25 @@ export interface AiSettings {
 export interface PerformanceSettings {
   readerConnections: number;
   workerThreads: number | null;
-  thumbnailCacheMb: number;
+}
+
+/** 排序方案：全局共享，存设置，数量上限 50 是存储上限。 */
+export interface SortProfile {
+  id: string;
+  name: string;
+  sort: SortSpec[];
 }
 
 export interface UiSettings {
-  theme: "dark" | "light";
+  theme: ThemeMode;
   gridThumbPx: number;
+  thumbFit: ThumbFit;
+  thumbCacheCount: number;
+  /** 全局一套排序，叠加到全部图库视图（相似/语义结果除外）。 */
+  sort: SortSpec[];
+  sortProfiles: SortProfile[];
+  viewerFilmstrip: boolean;
+  detailPanelMode: DetailPanelMode;
 }
 
 export interface Settings {

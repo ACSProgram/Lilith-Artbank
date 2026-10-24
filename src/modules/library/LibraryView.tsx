@@ -31,6 +31,7 @@ import { useNotices } from "../../app/noticeContext";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import { copyText } from "../../shared/clipboard";
+import { confirmDelete, confirmEmptyTrash, confirmTrash } from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
 import { libraryApi } from "./api";
 import { CollectionManagerDialog } from "./CollectionManagerDialog";
@@ -512,6 +513,7 @@ export function LibraryView({
   const trashSelected = useCallback(
     async (ids: number[]): Promise<boolean> => {
       if (ids.length === 0 || viewBusy) return false;
+      if (!(await confirmTrash(confirm, ids.length))) return false;
       setViewBusy(true);
       try {
         const changed = await libraryApi.trashImages(ids);
@@ -525,7 +527,7 @@ export function LibraryView({
         setViewBusy(false);
       }
     },
-    [notify, refreshData, viewBusy],
+    [confirm, notify, refreshData, viewBusy],
   );
 
   const restoreSelected = useCallback(
@@ -558,13 +560,7 @@ export function LibraryView({
         );
         return false;
       }
-      const accepted = await confirm({
-        title: `永久删除 ${ids.length.toLocaleString()} 张图片？`,
-        message:
-          "会从图库删除记录与原图文件，无法恢复。标签、集合引用与缩略图指针会一并清理。",
-        confirmLabel: "永久删除",
-        danger: true,
-      });
+      const accepted = await confirmDelete(confirm, ids.length);
       if (!accepted) return false;
       setViewBusy(true);
       try {
@@ -590,12 +586,7 @@ export function LibraryView({
   const emptyTrash = useCallback(async () => {
     if (viewBusy) return;
     const count = current?.trashCount ?? 0;
-    const accepted = await confirm({
-      title: "清空回收站？",
-      message: `会永久删除回收站中的 ${count.toLocaleString()} 张图片及其原图文件，无法恢复。`,
-      confirmLabel: "清空回收站",
-      danger: true,
-    });
+    const accepted = await confirmEmptyTrash(confirm, count);
     if (!accepted) return;
     setEmptyingTrash(true);
     setViewBusy(true);

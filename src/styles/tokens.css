@@ -1,0 +1,145 @@
+/*
+ * 语义颜色变量：唯一允许出现字面色值的地方。
+ * 组件样式只引用这些变量，切换主题时整块联动。
+ *
+ * 命名约定：
+ * - 表面：--bg / --bg-soft / --panel / --panel-hover / --canvas
+ * - 文字：--text / --text-muted / --text-faint / --on-accent
+ * - 强调：--accent（文字/描边）/ --accent-fill（带白字的实心块）/ --accent-strong /
+ *   --accent-hover / --accent-soft / --accent-border
+ * - 状态：--danger / --success / --warning；实心块用 --danger-fill，另带 -soft / -border
+ * - 叠加：--scrim / --scrim-strong / --scrim-soft（盖在图片或内容上的半透明层）
+ * - 画布：--canvas（查看器背景）/ --checker（棋盘格）/ --thumb-*（缩略图占位）
+ * - 阴影：--shadow-sm（小徽标）/ --shadow-md（浮起的提示）/ --shadow-lg（对话框、弹层）
+ */
+
+:root {
+  color-scheme: light;
+
+  --bg: #f4f5f2;
+  --bg-soft: #f7f8f5;
+  --panel: #ffffff;
+  --panel-hover: #eef0ec;
+  --border: #dfe2dc;
+  --border-strong: #c6ccc7;
+  --control-border: #aeb7af;
+
+  --text: #252927;
+  --text-muted: #747b75;
+  --text-faint: #949b95;
+  --on-accent: #ffffff;
+
+  --accent: #1f7253;
+  --accent-hover: #185c43;
+  --accent-strong: #1f7253;
+  /* 填充色：按钮、徽标、进度条等带白字的实心块，与作为文字色的 --accent 分开。 */
+  --accent-fill: #1f7253;
+  --accent-fill-hover: #185c43;
+  --accent-soft: rgba(31, 114, 83, 0.1);
+  --accent-border: rgba(31, 114, 83, 0.3);
+
+  --danger: #a23b35;
+  --danger-fill: #a23b35;
+  --danger-fill-hover: #8f332e;
+  --danger-soft: rgba(162, 59, 53, 0.09);
+  --danger-border: rgba(162, 59, 53, 0.3);
+
+  --success: #2f7d5c;
+  --success-soft: rgba(47, 125, 92, 0.07);
+  --success-border: rgba(47, 125, 92, 0.3);
+
+  --warning: #7a4f08;
+  --warning-soft: rgba(122, 79, 8, 0.08);
+  --warning-border: rgba(122, 79, 8, 0.26);
+
+  --scrim: rgba(18, 22, 19, 0.42);
+  --scrim-strong: rgba(20, 28, 22, 0.62);
+  --scrim-soft: rgba(10, 14, 11, 0.5);
+
+  --selection-bg: rgba(31, 114, 83, 0.2);
+  --scrollbar-thumb: #c9cfc9;
+  --scrollbar-thumb-hover: #aeb7af;
+  --code-text: #2f3531;
+  --window-close: #c42b1c;
+
+  --star-on: #b8892c;
+  --star-off: #c9cfc9;
+
+  /* 查看器画布：浅色下用中性灰，和主界面同色系，不再是独立的深色块。 */
+  --canvas: #e9ebe6;
+  --checker: #dde0da;
+  --thumb-bg: #e7eae5;
+  --thumb-skeleton-a: #eef1ec;
+  --thumb-skeleton-b: #dfe5df;
+  --placeholder-a: #f1f3ef;
+  --placeholder-b: #e8ece7;
+
+  --shadow-sm: 0 1px 4px rgba(20, 28, 22, 0.28);
+  --shadow-md: 0 12px 34px rgba(20, 28, 22, 0.16);
+  --shadow-lg: 0 18px 56px rgba(20, 28, 22, 0.18);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #151814;
+  --bg-soft: #1a1e19;
+  --panel: #1e231f;
+  --panel-hover: #262c27;
+  --border: #2f3630;
+  --border-strong: #3b433c;
+  --control-border: #4a534b;
+
+  --text: #e6eae5;
+  --text-muted: #a3ada5;
+  --text-faint: #7d8780;
+  --on-accent: #ffffff;
+
+  --accent: #4fb08a;
+  --accent-hover: #5cc196;
+  --accent-strong: #8fe0bd;
+  --accent-fill: #2e7d5f;
+  --accent-fill-hover: #37916f;
+  --accent-soft: rgba(84, 190, 148, 0.16);
+  --accent-border: rgba(84, 190, 148, 0.34);
+
+  --danger: #d4706a;
+  --danger-fill: #b3544e;
+  --danger-fill-hover: #c4645e;
+  --danger-soft: rgba(212, 112, 106, 0.14);
+  --danger-border: rgba(212, 112, 106, 0.36);
+
+  --success: #58b98d;
+  --success-soft: rgba(88, 185, 141, 0.14);
+  --success-border: rgba(88, 185, 141, 0.36);
+
+  --warning: #e0b062;
+  --warning-soft: rgba(224, 176, 98, 0.14);
+  --warning-border: rgba(224, 176, 98, 0.34);
+
+  --scrim: rgba(0, 0, 0, 0.6);
+  --scrim-strong: rgba(0, 0, 0, 0.72);
+  --scrim-soft: rgba(0, 0, 0, 0.55);
+
+  --selection-bg: rgba(84, 190, 148, 0.28);
+  --scrollbar-thumb: #3b433c;
+  --scrollbar-thumb-hover: #4f594f;
+  --code-text: #c8d2c9;
+  --window-close: #c42b1c;
+
+  --star-on: #e0b062;
+  --star-off: #4a534b;
+
+  /* 深色下画布比面板再暗一档。 */
+  --canvas: #0f1210;
+  --checker: #171c18;
+  --thumb-bg: #22281f;
+  --thumb-skeleton-a: #232a22;
+  --thumb-skeleton-b: #1b201a;
+  --placeholder-a: #232922;
+  --placeholder-b: #1b201b;
+
+  --shadow-sm: 0 1px 4px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 12px 34px rgba(0, 0, 0, 0.48);
+  --shadow-lg: 0 18px 56px rgba(0, 0, 0, 0.5);
+}
