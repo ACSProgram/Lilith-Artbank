@@ -9,6 +9,7 @@ import {
   ImageOff,
   Layers,
   Palette,
+  PanelRight,
   Plus,
   RotateCcw,
   Sparkles,
@@ -69,20 +70,32 @@ export function InspectorPanel({
   onGenerateDescription,
 }: InspectorPanelProps) {
   const single = selectedIds.length === 1 ? selectedIds[0] : null;
+  const empty = selectedIds.length === 0;
+  // 空选与单张都是“详情”，多选才是“批量编辑”。
+  const detail = empty || single != null;
   return (
-    <aside className="inspector" aria-label={single ? "图片详情" : "批量编辑"}>
+    <aside className="inspector" aria-label={detail ? "图片详情" : "批量编辑"}>
       <header className="inspector-head">
         <div>
-          <strong>{single ? "图片详情" : "批量编辑"}</strong>
+          <strong>{detail ? "图片详情" : "批量编辑"}</strong>
           <span>
-            {single ? `#${single}` : `已选择 ${selectedIds.length.toLocaleString()} 张`}
+            {empty
+              ? "未选择"
+              : single
+                ? `#${single}`
+                : `已选择 ${selectedIds.length.toLocaleString()} 张`}
           </span>
         </div>
         <IconButton label="关闭侧栏" onClick={onClose}>
           <X size={15} />
         </IconButton>
       </header>
-      {single ? (
+      {empty ? (
+        <div className="inspector-placeholder">
+          <PanelRight size={22} />
+          <span>点选一张图片查看详情</span>
+        </div>
+      ) : single ? (
         <ImageInspector
           imageId={single}
           version={version}

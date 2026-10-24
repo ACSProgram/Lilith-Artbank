@@ -32,7 +32,6 @@ const defaultSettings: Settings = {
     sort: [{ key: "importedAt", descending: true }],
     sortProfiles: [],
     viewerFilmstrip: true,
-    detailPanelMode: "overlay",
   },
 };
 
@@ -135,9 +134,19 @@ export const appApi = {
 
   async getAppInfo(): Promise<AppInfo> {
     if (!isTauri()) {
-      return { version: "0.1.0", settingsPath: "(浏览器预览模式)" };
+      return {
+        version: "0.1.0",
+        settingsPath: "(浏览器预览模式)",
+        logPath: "(浏览器预览模式)",
+      };
     }
     return invoke<AppInfo>("get_app_info");
+  },
+
+  /** 在系统文件管理器里定位文件或打开目录。 */
+  async revealPath(path: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("reveal_path", { path });
   },
 
   async thumbBenchPrepare(): Promise<ThumbBenchInfo> {

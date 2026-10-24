@@ -101,17 +101,18 @@ libraryPath        当前图库绝对路径；null 表示未打开。由后端�
 ai                 { baseUrl, executablePath, port, autoStart }
 performance        { readerConnections, workerThreads }
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
-                     sort, sortProfiles, viewerFilmstrip, detailPanelMode }
+                     sort, sortProfiles, viewerFilmstrip }
 ```
 
 - 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。
 - v1 的 `libraries[]` 与 `lastLibraryId` 在读取时迁移为单个 `libraryPath`：优先 `lastLibraryId` 对应条目，否则取第一个条目。迁移后不再写回旧字段。
-- v2 → v3：删掉从未被任何代码读取的 `performance.thumbnailCacheMb`；新增的 `ui` 字段用默认值补齐（`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{key:"importedAt",descending:true}]`、`sortProfiles=[]`、`viewerFilmstrip=true`、`detailPanelMode=overlay`）；`theme` 增加 `system` 并成为默认值。`ai`、`performance`、`theme`、`gridThumbPx` 的旧值原样保留。
+- v2 → v3：删掉从未被任何代码读取的 `performance.thumbnailCacheMb`；新增的 `ui` 字段用默认值补齐（`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{key:"importedAt",descending:true}]`、`sortProfiles=[]`、`viewerFilmstrip=true`）；`theme` 增加 `system` 并成为默认值。`ai`、`performance`、`theme`、`gridThumbPx` 的旧值原样保留。
+- P0 曾加过 `ui.detailPanelMode`（`overlay`/`push`）；P1 确认详情面板只有“挤压画布 + 列数变化锚定”一种实现，字段已删除。旧设置文件里的 `detailPanelMode` 由 serde 忽略，不报错、不回写。
 - 图库路径必须绝对；保存时去掉尾部路径分隔符，但保留盘符根（`G:\`）。
 - `readerConnections` 1-16；`workerThreads` 为空表示自动。
-- `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192；`detailPanelMode` 只能是 `overlay` / `push`。
+- `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
-- 生效范围：`theme` 已由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit`、`thumbCacheCount`、`sort`、`sortProfiles`、`viewerFilmstrip`、`detailPanelMode` 目前只有数据模型与校验，界面消费者在 P1/P3/P4 接入。
+- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`sort` / `sortProfiles`（P4）、`viewerFilmstrip`（P3）仍只有校验，消费者随各自批次接入。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
 
 ## 命令契约
@@ -166,7 +167,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `window_toggle_fullscreen` | — | `boolean` |
 | `copy_text` | `{ text }` | `null` |
 | `window_minimize` / `window_toggle_maximize` / `window_is_maximized` / `window_close` | — | 窗口控制 |
-| `get_app_info` | — | `{ version, settingsPath }` |
+| `get_app_info` | — | `{ version, settingsPath, logPath }` |
+| `reveal_path` | `{ path }` | `null`（在系统文件管理器里选中该文件，或打开该目录） |
 
 `LibraryInspection`：
 

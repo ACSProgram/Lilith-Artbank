@@ -1,14 +1,27 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Database, FolderOpen, Gauge, Monitor, Moon, Sparkles, Sun } from "lucide-react";
+import {
+  Database,
+  ExternalLink,
+  FolderOpen,
+  Gauge,
+  Info,
+  LogOut,
+  Monitor,
+  Moon,
+  Palette,
+  SlidersHorizontal,
+  Sparkles,
+  Sun,
+} from "lucide-react";
 import { Button } from "../shared/components/Button";
-import { Field, Section } from "../shared/components/Field";
+import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
-import { browserPreview } from "./api";
+import { appApi, browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
-import type { Settings, ThemeMode } from "./types";
+import type { Settings, ThemeMode, ThumbFit } from "./types";
 import { errorMessage } from "../shared/errors";
 import { aiApi, aiBrowserPreview } from "../modules/ai/api";
 import type { AiStatus } from "../modules/ai/types";
@@ -19,24 +32,100 @@ const THEME_CHOICES: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
   { value: "system", label: "跟随系统", icon: Monitor },
 ];
 
+const FIT_CHOICES: { value: ThumbFit; label: string }[] = [
+  { value: "cover", label: "裁剪铺满" },
+  { value: "contain", label: "完整显示" },
+];
+
+type SettingsTab = "general" | "appearance" | "library" | "ai" | "performance" | "about";
+
+const TABS: { id: SettingsTab; label: string; icon: typeof Sun }[] = [
+  { id: "general", label: "通用", icon: SlidersHorizontal },
+  { id: "appearance", label: "外观", icon: Palette },
+  { id: "library", label: "图库", icon: Database },
+  { id: "ai", label: "AI 服务", icon: Sparkles },
+  { id: "performance", label: "性能", icon: Gauge },
+  { id: "about", label: "关于", icon: Info },
+];
+
+const TAB_STORAGE_KEY = "lilith.settingsTab";
+
+const CAPABILITY_LABELS: Record<string, string> = {
+  imageEmbedding: "图像语义",
+  textEmbedding: "文本语义",
+  pose: "姿势",
+  description: "描述",
+};
+
+function initialTab(): SettingsTab {
+  try {
+    const saved = localStorage.getItem(TAB_STORAGE_KEY);
+    if (TABS.some((tab) => tab.id === saved)) return saved as SettingsTab;
+  } catch {
+    // 忽略无法读取本地偏好的情况。
+  }
+  return "general";
+}
+
 function numberOrNull(value: string): number | null {
   if (!value.trim()) return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function Panel({
+  title,
+  children,
+}: {
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="settings-panel">
+      <header className="settings-panel-head">
+        <h3>{title}</h3>
+      </header>
+      <div className="settings-panel-body">{children}</div>
+    </section>
+  );
+}
+
+/** 标签 + 右侧当前值；滑块这类“调多少”的控件用它，省掉另起一行解释单位。 */
+function ValueField({
+  label,
+  value,
+  children,
+}: {
+  label: string;
+  value: string;
+  children: ReactNode;
+}) {
+  return (
+    <label className="settings-field">
+      <span className="settings-field-head">
+        <span className="field-label">{label}</span>
+        <span className="settings-value">{value}</span>
+      </span>
+      {children}
+    </label>
+  );
+}
+
 export function SettingsDialog({
   open: isOpen,
   onClose,
   onChangeLibrary,
+  onCloseLibrary,
 }: {
   open: boolean;
   onClose: () => void;
   onChangeLibrary: () => void;
+  onCloseLibrary: () => Promise<void>;
 }) {
   const { settings, current, appInfo, saveSettings } = useAppRuntime();
-  const { notify } = useNotices();
+  const { notify, confirm } = useNotices();
   const [draft, setDraft] = useState<Settings | null>(null);
+  const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
@@ -54,6 +143,14 @@ export function SettingsDialog({
       .then(setAiStatus)
       .catch((cause: unknown) => setAiError(errorMessage(cause)));
   }, [isOpen, settings]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {
+      // 忽略无法持久化分类偏好的情况。
+    }
+  }, [tab]);
 
   // 主题即时预览：改选项马上生效，取消则退回已保存的值。
   const draftTheme = draft?.ui.theme;
@@ -127,6 +224,30 @@ export function SettingsDialog({
     }
   };
 
+  const closeCurrentLibrary = async () => {
+    const accepted = await confirm({
+      title: "关闭图库？",
+      message: "关闭只释放数据库连接，不会修改图库内容。",
+      confirmLabel: "关闭图库",
+    });
+    if (!accepted) return;
+    try {
+      await onCloseLibrary();
+      onClose();
+    } catch (cause) {
+      notify("关闭图库失败", "error", errorMessage(cause));
+    }
+  };
+
+  const revealPath = async (path: string | undefined, failure: string) => {
+    if (!path) return;
+    try {
+      await appApi.revealPath(path);
+    } catch (cause) {
+      notify(failure, "error", errorMessage(cause));
+    }
+  };
+
   const validate = (value: Settings): string | null => {
     if (!/^https?:\/\//.test(value.ai.baseUrl.trim())) {
       return "AI 服务地址必须以 http:// 或 https:// 开头";
@@ -187,13 +308,17 @@ export function SettingsDialog({
     }
   };
 
+  const capabilities = aiStatus?.health?.capabilities;
+
   return (
     <Modal
       open={isOpen}
       title="设置"
-      subtitle="设置保存在本机；AI 服务参数在下次检测或启动时生效。"
       onClose={onClose}
-      width={720}
+      width={660}
+      // 固定高度 + 内容区自己滚动：切换分类时对话框不会跟着内容忽大忽小。
+      height={560}
+      bodyClassName="modal-body-fixed"
       dismissible={!saving}
       footer={
         <>
@@ -206,276 +331,392 @@ export function SettingsDialog({
         </>
       }
     >
-      {!draft ? (
-        <p className="form-note">正在读取设置…</p>
-      ) : (
-        <div className="settings-body">
-          <Section
-            title="图库"
-            description="应用只维护一个图库；更换图库会替换当前打开的库，不会修改原数据。"
-          >
-            {current ? (
-              <div className="settings-library-row">
-                <Database size={15} />
-                <span className="settings-library-name">{current.name}</span>
-                <span className="settings-library-path" title={current.path}>
-                  {current.path}
-                </span>
-                <span className="settings-library-count">
-                  {current.imageCount.toLocaleString()} 张
-                </span>
-                <Button size="sm" variant="secondary" onClick={onChangeLibrary}>
-                  更换图库
-                </Button>
-              </div>
-            ) : (
-              <div className="settings-library-row">
-                <Database size={15} />
-                <span className="settings-library-name">尚未打开图库</span>
-                <Button size="sm" variant="secondary" onClick={onChangeLibrary}>
-                  打开图库
-                </Button>
-              </div>
-            )}
-          </Section>
+      <div className="settings-body">
+        <nav className="settings-nav" aria-label="设置分类">
+          {TABS.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              className={`settings-nav-item${tab === id ? " is-active" : ""}`}
+              aria-current={tab === id}
+              onClick={() => setTab(id)}
+            >
+              <Icon size={15} />
+              <span>{label}</span>
+            </button>
+          ))}
+        </nav>
 
-          <Section
-            title="AI 服务"
-            description="description / embedding / pose 都走本地 HTTP 服务；embedding 为 SigLIP2 1536 维，服务返回模型名与维度。"
-          >
-            <div className="settings-grid">
-              <Field label="服务地址" hint="默认本机 127.0.0.1:18766。">
-                <input
-                  className="input"
-                  value={draft.ai.baseUrl}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      ai: { ...current.ai, baseUrl: event.target.value },
-                    }))
-                  }
-                  spellCheck={false}
-                />
-              </Field>
-              <Field label="端口" hint="用于托管服务时探活与启动参数。">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={65535}
-                  value={draft.ai.port}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      ai: { ...current.ai, port: Number(event.target.value) },
-                    }))
-                  }
-                />
-              </Field>
-            </div>
-            <Field label="服务可执行文件" hint="留空时只连接外部已启动的服务。">
-              <div className="input-row">
-                <input
-                  className="input"
-                  value={draft.ai.executablePath ?? ""}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      ai: {
-                        ...current.ai,
-                        executablePath: event.target.value.trim() ? event.target.value : null,
-                      },
-                    }))
-                  }
-                  placeholder={"例如 C:\\Lilith Server\\bin\\server.exe"}
-                  spellCheck={false}
-                />
-                <Button
-                  variant="secondary"
-                  icon={<FolderOpen size={16} />}
-                  onClick={() => void pickExecutable()}
-                >
-                  选择
-                </Button>
-              </div>
-            </Field>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={draft.ai.autoStart}
-                onChange={(event) =>
-                  patch((current) => ({
-                    ...current,
-                    ai: { ...current.ai, autoStart: event.target.checked },
-                  }))
-                }
-              />
-              <span>
-                <strong>随应用启动 AI 服务</strong>
-                <small>需要已填写可执行文件；探活失败时按 1s/2s 退避重试，最多 3 次。</small>
-              </span>
-            </label>
-            <div className="ai-settings-status">
-              <div>
-                <strong>
-                  {aiStatus?.online
-                    ? "服务在线"
-                    : aiStatus?.process.state === "starting"
-                      ? "服务启动中"
-                      : "服务离线"}
-                </strong>
-                <span>
-                  {aiError ??
-                    aiStatus?.process.message ??
-                    aiStatus?.baseUrl ??
-                    "尚未检测服务"}
-                </span>
-                {aiStatus?.health ? (
-                  <span>
-                    {Object.entries(aiStatus.health.capabilities)
-                      .map(
-                        ([name, capability]) =>
-                          `${name}: ${capability.ready ? "就绪" : "未加载"}${
-                            capability.dim ? ` (${capability.dim})` : ""
-                          }`,
-                      )
-                      .join(" · ")}
-                  </span>
-                ) : null}
-              </div>
-              <div className="settings-inline-actions">
-                <Button size="sm" variant="ghost" loading={aiBusy} onClick={() => void refreshAi()}>
-                  检测
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  loading={aiBusy}
-                  disabled={aiBrowserPreview}
-                  onClick={() => void runAi("ensure")}
-                >
-                  加载模型
-                </Button>
-                {aiStatus?.process.owned ? (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    loading={aiBusy}
-                    disabled={aiBrowserPreview}
-                    onClick={() => void runAi("stop")}
-                  >
-                    停止服务
-                  </Button>
-                ) : (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={aiBusy}
-                    disabled={aiBrowserPreview}
-                    onClick={() => void runAi("start")}
-                  >
-                    启动服务
-                  </Button>
-                )}
-              </div>
-            </div>
-            <div className="settings-inline-note">
-              <Sparkles size={14} />
-              离线时 AI 按钮会提示错误，图库浏览、导入与编辑不受影响。
-            </div>
-          </Section>
+        <div className="settings-content">
+          {!draft ? (
+            <p className="form-note">正在读取设置…</p>
+          ) : (
+            <>
+              {tab === "general" ? (
+                <Panel title="浏览">
+                  <ValueField label="缩略图尺寸" value={`${draft.ui.gridThumbPx} px`}>
+                    <input
+                      className="range"
+                      type="range"
+                      min={96}
+                      max={512}
+                      step={8}
+                      value={draft.ui.gridThumbPx}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          ui: { ...current.ui, gridThumbPx: Number(event.target.value) },
+                        }))
+                      }
+                    />
+                  </ValueField>
 
-          <Section
-            title="性能"
-            description="元数据只查询当前页；读取连接用于并发查询，写连接始终只有一条。"
-          >
-            <div className="settings-grid">
-              <Field label="读取连接数" hint="1-16，默认 4。">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={16}
-                  value={draft.performance.readerConnections}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      performance: {
-                        ...current.performance,
-                        readerConnections: Number(event.target.value),
-                      },
-                    }))
-                  }
-                />
-              </Field>
-              <Field label="工作线程" hint="留空 = CPU 并行度 - 1。">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={128}
-                  value={draft.performance.workerThreads ?? ""}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      performance: {
-                        ...current.performance,
-                        workerThreads: numberOrNull(event.target.value),
-                      },
-                    }))
-                  }
-                  placeholder="自动"
-                />
-              </Field>
-              <Field label="网格缩略图尺寸" hint={`${draft.ui.gridThumbPx}px`}>
-                <input
-                  className="range"
-                  type="range"
-                  min={96}
-                  max={512}
-                  step={8}
-                  value={draft.ui.gridThumbPx}
-                  onChange={(event) =>
-                    patch((current) => ({
-                      ...current,
-                      ui: { ...current.ui, gridThumbPx: Number(event.target.value) },
-                    }))
-                  }
-                />
-              </Field>
-            </div>
-            <div className="settings-inline-note">
-              <Gauge size={14} />
-              性能门槛与实测方法见 docs/guides/performance.md。
-            </div>
-          </Section>
+                  <div className="settings-field">
+                    <span className="field-label">缩略图填充</span>
+                    <div className="settings-choices">
+                      {FIT_CHOICES.map((choice) => (
+                        <button
+                          key={choice.value}
+                          type="button"
+                          className={`settings-choice${draft.ui.thumbFit === choice.value ? " is-active" : ""}`}
+                          aria-pressed={draft.ui.thumbFit === choice.value}
+                          onClick={() =>
+                            patch((current) => ({
+                              ...current,
+                              ui: { ...current.ui, thumbFit: choice.value },
+                            }))
+                          }
+                        >
+                          {choice.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
 
-          <Section title="界面" description="浅色与深色共用同一套语义变量，查看器与主界面保持同色系。">
-            <div className="theme-options">
-              {THEME_CHOICES.map(({ value, label, icon: Icon }) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={`theme-option${draft.ui.theme === value ? " is-active" : ""}`}
-                  aria-pressed={draft.ui.theme === value}
-                  onClick={() =>
-                    patch((current) => ({ ...current, ui: { ...current.ui, theme: value } }))
-                  }
-                >
-                  <Icon size={15} />
-                  <span>{label}</span>
-                </button>
-              ))}
-            </div>
-            <div className="settings-inline-note">
-              跟随系统时会随操作系统的浅色/深色设置自动切换。
-            </div>
-          </Section>
+                  <ValueField label="缩略图缓存" value={`${draft.ui.thumbCacheCount} 张`}>
+                    <input
+                      className="range"
+                      type="range"
+                      min={256}
+                      max={8192}
+                      step={128}
+                      value={draft.ui.thumbCacheCount}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          ui: { ...current.ui, thumbCacheCount: Number(event.target.value) },
+                        }))
+                      }
+                    />
+                  </ValueField>
+                </Panel>
+              ) : null}
 
-          {error ? <div className="form-error">{error}</div> : null}
-          <p className="settings-path">设置文件：{appInfo?.settingsPath ?? "—"}</p>
+              {tab === "appearance" ? (
+                <Panel title="主题">
+                  <div className="settings-choices">
+                    {THEME_CHOICES.map(({ value, label, icon: Icon }) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={`settings-choice${draft.ui.theme === value ? " is-active" : ""}`}
+                        aria-pressed={draft.ui.theme === value}
+                        onClick={() =>
+                          patch((current) => ({ ...current, ui: { ...current.ui, theme: value } }))
+                        }
+                      >
+                        <Icon size={15} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </Panel>
+              ) : null}
+
+              {tab === "library" ? (
+                <Panel title="当前图库">
+                  {current ? (
+                    <div className="settings-library-card">
+                      <Database size={16} />
+                      <div className="settings-library-info">
+                        <strong>{current.name}</strong>
+                        <span title={current.path}>{current.path}</span>
+                      </div>
+                      <span className="settings-library-count">
+                        {current.imageCount.toLocaleString()} 张
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="settings-library-card">
+                      <Database size={16} />
+                      <div className="settings-library-info">
+                        <strong>尚未打开图库</strong>
+                      </div>
+                    </div>
+                  )}
+                  <div className="settings-inline-actions">
+                    <Button size="sm" variant="secondary" icon={<FolderOpen size={14} />} onClick={onChangeLibrary}>
+                      {current ? "更换图库" : "打开图库"}
+                    </Button>
+                    {current ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon={<ExternalLink size={14} />}
+                        onClick={() => void revealPath(current.path, "打开图库目录失败")}
+                      >
+                        打开图库目录
+                      </Button>
+                    ) : null}
+                    {current ? (
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        icon={<LogOut size={14} />}
+                        onClick={() => void closeCurrentLibrary()}
+                      >
+                        关闭图库
+                      </Button>
+                    ) : null}
+                  </div>
+                  <div className="settings-note">关闭不会删除任何图片或元数据。</div>
+                </Panel>
+              ) : null}
+
+              {tab === "ai" ? (
+                <Panel title="AI 服务">
+                  <div className="settings-grid">
+                    <Field label="服务地址">
+                      <input
+                        className="input"
+                        value={draft.ai.baseUrl}
+                        onChange={(event) =>
+                          patch((current) => ({
+                            ...current,
+                            ai: { ...current.ai, baseUrl: event.target.value },
+                          }))
+                        }
+                        spellCheck={false}
+                      />
+                    </Field>
+                    <Field label="端口">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={draft.ai.port}
+                        onChange={(event) =>
+                          patch((current) => ({
+                            ...current,
+                            ai: { ...current.ai, port: Number(event.target.value) },
+                          }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <Field label="服务可执行文件" hint="留空则只连接已启动的服务。">
+                    <div className="input-row">
+                      <input
+                        className="input"
+                        value={draft.ai.executablePath ?? ""}
+                        onChange={(event) =>
+                          patch((current) => ({
+                            ...current,
+                            ai: {
+                              ...current.ai,
+                              executablePath: event.target.value.trim() ? event.target.value : null,
+                            },
+                          }))
+                        }
+                        placeholder={"例如 C:\\Lilith Server\\bin\\server.exe"}
+                        spellCheck={false}
+                      />
+                      <Button
+                        variant="secondary"
+                        icon={<FolderOpen size={16} />}
+                        onClick={() => void pickExecutable()}
+                      >
+                        选择
+                      </Button>
+                    </div>
+                  </Field>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.ai.autoStart}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          ai: { ...current.ai, autoStart: event.target.checked },
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>随应用启动 AI 服务</strong>
+                      <small>需要已填写可执行文件；启动失败会重试 3 次。</small>
+                    </span>
+                  </label>
+                  <div className="ai-settings-status">
+                    <div>
+                      <strong>
+                        {aiStatus?.online
+                          ? "服务在线"
+                          : aiStatus?.process.state === "starting"
+                            ? "服务启动中"
+                            : "服务离线"}
+                      </strong>
+                      <span>
+                        {aiError ??
+                          aiStatus?.process.message ??
+                          aiStatus?.baseUrl ??
+                          "尚未检测服务"}
+                      </span>
+                      {capabilities ? (
+                        <span>
+                          {Object.entries(capabilities)
+                            .map(
+                              ([name, capability]) =>
+                                `${CAPABILITY_LABELS[name] ?? name}${
+                                  capability.ready ? "就绪" : "未加载"
+                                }`,
+                            )
+                            .join(" · ")}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="settings-inline-actions">
+                      <Button size="sm" variant="ghost" loading={aiBusy} onClick={() => void refreshAi()}>
+                        检测
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        loading={aiBusy}
+                        disabled={aiBrowserPreview}
+                        onClick={() => void runAi("ensure")}
+                      >
+                        加载模型
+                      </Button>
+                      {aiStatus?.process.owned ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          loading={aiBusy}
+                          disabled={aiBrowserPreview}
+                          onClick={() => void runAi("stop")}
+                        >
+                          停止服务
+                        </Button>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={aiBusy}
+                          disabled={aiBrowserPreview}
+                          onClick={() => void runAi("start")}
+                        >
+                          启动服务
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="settings-note">服务离线时，AI 相关按钮不可用，浏览与编辑不受影响。</div>
+                </Panel>
+              ) : null}
+
+              {tab === "performance" ? (
+                <Panel title="性能">
+                  <div className="settings-grid">
+                    <Field label="读取连接数">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={16}
+                        value={draft.performance.readerConnections}
+                        onChange={(event) =>
+                          patch((current) => ({
+                            ...current,
+                            performance: {
+                              ...current.performance,
+                              readerConnections: Number(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label="工作线程">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={128}
+                        value={draft.performance.workerThreads ?? ""}
+                        onChange={(event) =>
+                          patch((current) => ({
+                            ...current,
+                            performance: {
+                              ...current.performance,
+                              workerThreads: numberOrNull(event.target.value),
+                            },
+                          }))
+                        }
+                        placeholder="自动"
+                      />
+                    </Field>
+                  </div>
+                  <div className="settings-note">
+                    <Gauge size={13} />
+                    改动在下次打开图库后生效。
+                  </div>
+                </Panel>
+              ) : null}
+
+              {tab === "about" ? (
+                <Panel title="关于">
+                  <div className="settings-field">
+                    <span className="field-label">设置文件</span>
+                    <div className="settings-path-row">
+                      <code className="settings-path">{appInfo?.settingsPath ?? "—"}</code>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon={<ExternalLink size={13} />}
+                        disabled={!appInfo?.settingsPath}
+                        onClick={() => void revealPath(appInfo?.settingsPath, "打开设置文件所在文件夹失败")}
+                      >
+                        打开文件夹
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="settings-field">
+                    <span className="field-label">日志文件</span>
+                    <div className="settings-path-row">
+                      <code className="settings-path">{appInfo?.logPath || "—"}</code>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon={<ExternalLink size={13} />}
+                        disabled={!appInfo?.logPath}
+                        onClick={() => void revealPath(appInfo?.logPath, "打开日志文件夹失败")}
+                      >
+                        打开文件夹
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="settings-note">
+                    <Info size={13} />
+                    删掉设置文件会回到默认值，图库内容不受影响。
+                  </div>
+                </Panel>
+              ) : null}
+
+              {error ? <div className="form-error">{error}</div> : null}
+            </>
+          )}
         </div>
-      )}
+      </div>
     </Modal>
   );
 }

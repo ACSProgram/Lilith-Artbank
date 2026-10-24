@@ -9,7 +9,7 @@ import { WindowTitleBar } from "./WindowTitleBar";
 import { Spinner } from "../shared/components/Spinner";
 
 export function AppShell() {
-  const { loading, current } = useAppRuntime();
+  const { loading, current, closeLibrary } = useAppRuntime();
   const [libraryDialogOpen, setLibraryDialogOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -61,8 +61,7 @@ export function AppShell() {
         <div className="app-body">
           <Sidebar
             onOpenSettings={() => setSettingsOpen(true)}
-            onChangeLibrary={() => setLibraryDialogOpen(true)}
-            onCloseLibrary={() => undefined}
+            onOpenLibrary={() => setLibraryDialogOpen(true)}
           />
           <main className="app-main">
             <WelcomeView onAddLibrary={() => setLibraryDialogOpen(true)} />
@@ -77,6 +76,7 @@ export function AppShell() {
           setSettingsOpen(false);
           setLibraryDialogOpen(true);
         }}
+        onCloseLibrary={closeLibrary}
       />
     </div>
   );

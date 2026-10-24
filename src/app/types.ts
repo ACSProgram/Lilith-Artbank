@@ -3,8 +3,6 @@ import type { SortSpec } from "../modules/library/types";
 export type ThemeMode = "light" | "dark" | "system";
 /** 缩略图在方格里的填充方式：裁剪铺满 / 完整可见。 */
 export type ThumbFit = "cover" | "contain";
-/** 详情面板：覆盖在画布上（不重排网格）/ 挤压画布。 */
-export type DetailPanelMode = "overlay" | "push";
 
 export interface AiSettings {
   baseUrl: string;
@@ -34,7 +32,6 @@ export interface UiSettings {
   sort: SortSpec[];
   sortProfiles: SortProfile[];
   viewerFilmstrip: boolean;
-  detailPanelMode: DetailPanelMode;
 }
 
 export interface Settings {
@@ -71,6 +68,7 @@ export interface LibraryInfo {
 export interface AppInfo {
   version: string;
   settingsPath: string;
+  logPath: string;
 }
 
 export interface ThumbBenchInfo {

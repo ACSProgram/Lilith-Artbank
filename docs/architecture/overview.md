@@ -118,7 +118,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 | 文件夹 | 真实磁盘目录 + `folders` 路径行（NOCASE 唯一） | 用户可在资源管理器直接查看/整理；空文件夹可保留；路径本身就是身份，移动时更新子树 |
 | 文件夹筛选 | 选中即包含全部后代 | 与资源管理器树的直觉一致；用路径边界避免 `人物` 误匹配 `人物速写` |
 | 主题 | 单套语义变量 + `html[data-theme]`，浅/深共用组件样式 | 避免两套样式表漂移；查看器不再单独维护深色配色，深色下画布比面板再暗一档 |
-| 设置字段 | 先入库、后接消费者 | `thumbFit` / `thumbCacheCount` / `sort` / `sortProfiles` / `viewerFilmstrip` / `detailPanelMode` 与后续批次一起落地，避免中途再改一次设置版本 |
+| 设置字段 | 先入库、后接消费者 | `thumbFit` / `thumbCacheCount` / `sort` / `sortProfiles` / `viewerFilmstrip` 与后续批次一起落地，避免中途再改一次设置版本；只有一种实现的字段（如已删掉的 `detailPanelMode`）不入库 |
 
 ## 当前实现状态
 
@@ -140,6 +140,8 @@ S6 已实现：AI 服务进程托管（启动/探活/启动失败退避重试/�
 
 S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。
 
-2026-10-24 体验整改 P0（基础层）已实现：`tokens.css` 语义变量与 `html[data-theme]` 主题切换（`settings.ui.theme` 支持 `light`/`dark`/`system` 并真正生效）、查看器与主界面统一配色、设置 v3（删掉 `thumbnailCacheMb`，新增缩略图填充/缓存张数/排序/排序方案/胶片带/详情面板模式字段）、schema v3（`folders.sort_index`）、`ConfirmDialog` 的 `detail`/`checkbox`、`Modal` 焦点陷阱与滚动锁、`Popover`/`MenuSection`、移入回收站统一确认。后四个批次（浏览主界面、任务总线、查看器与编辑、文件夹与排序）待执行，见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)。
+2026-10-24 体验整改 P0（基础层）已实现：`tokens.css` 语义变量与 `html[data-theme]` 主题切换（`settings.ui.theme` 支持 `light`/`dark`/`system` 并真正生效）、查看器与主界面统一配色、设置 v3（删掉 `thumbnailCacheMb`，新增缩略图填充/缓存张数/排序/排序方案/胶片带字段）、schema v3（`folders.sort_index`）、`ConfirmDialog` 的 `detail`/`checkbox`、`Modal` 焦点陷阱与滚动锁、`Popover`/`MenuSection`、移入回收站统一确认。
+
+2026-10-24 体验整改 P1（浏览主界面）已实现：侧栏与标题栏去重（关库/换库只留设置入口）、主区头部整块删除、工具栏改两行并把 AI 任务/相似分组/缩略图基准收进“任务”菜单、缩略图纯图方格 + `ui.thumbFit` 裁剪/适应切换、网格列数变化按活动项锚定滚动、右键菜单分组与键盘导航、新建集合独立对话框、筛选分面隐藏零值、调试文案清理、缩略图 LRU 缓存、设置改左侧分类导航且固定高度。P2–P4（任务总线、查看器与编辑、文件夹与排序）待执行，见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)。
 
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图重建/压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

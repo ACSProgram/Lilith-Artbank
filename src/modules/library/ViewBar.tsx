@@ -1,5 +1,17 @@
-import { Images, Layers, Plus, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Copy,
+  Images,
+  Layers,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Trash2,
+} from "lucide-react";
 import { Button } from "../../shared/components/Button";
+import { Popover } from "../../shared/components/Popover";
 import type { CollectionInfo, LibraryView } from "./types";
 
 interface ViewBarProps {
@@ -12,11 +24,24 @@ interface ViewBarProps {
   onShowAll: () => void;
   onShowTrash: () => void;
   onShowCollection: (collectionId: number) => void;
+  onNewCollection: () => void;
   onManageCollections: () => void;
+  onCombineCollections: () => void;
+  onRenameCollection: (collection: CollectionInfo) => void;
+  onDeleteCollection: (collection: CollectionInfo) => void;
+  onMoveCollection: (collection: CollectionInfo, delta: number) => void;
+  /** 以该集合的内容新建一个集合。 */
+  onDuplicateCollection: (collection: CollectionInfo) => void;
   onEmptyTrash: () => void;
 }
 
-/** 视图栏：全部 / 回收站两个固定视图、集合胶囊，以及集合管理与清空回收站入口。 */
+interface TabMenuState {
+  x: number;
+  y: number;
+  collection: CollectionInfo;
+}
+
+/** 视图栏：全部 / 回收站两个固定视图、集合胶囊、新建集合与集合菜单。 */
 export function ViewBar({
   view,
   collectionId,
@@ -27,9 +52,29 @@ export function ViewBar({
   onShowAll,
   onShowTrash,
   onShowCollection,
+  onNewCollection,
   onManageCollections,
+  onCombineCollections,
+  onRenameCollection,
+  onDeleteCollection,
+  onMoveCollection,
+  onDuplicateCollection,
   onEmptyTrash,
 }: ViewBarProps) {
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [tabMenu, setTabMenu] = useState<TabMenuState | null>(null);
+
+  useEffect(() => {
+    if (!tabMenu) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement;
+      if (!target.closest(".view-tab-menu")) setTabMenu(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [tabMenu]);
+
   return (
     <div className="view-bar" role="tablist" aria-label="图库视图">
       <button
@@ -67,8 +112,12 @@ export function ViewBar({
             className={`view-tab view-tab-collection${
               view === "collection" && collectionId === collection.id ? " is-active" : ""
             }`}
-            title={`集合 · ${collection.name}`}
+            title={`集合 · ${collection.name}（右键更多操作）`}
             onClick={() => onShowCollection(collection.id)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              setTabMenu({ x: event.clientX, y: event.clientY, collection });
+            }}
           >
             <Layers size={13} />
             <span>{collection.name}</span>
@@ -76,15 +125,49 @@ export function ViewBar({
           </button>
         ))}
       </div>
+
+      <button type="button" className="view-tab view-tab-add" onClick={onNewCollection}>
+        <Plus size={13} />
+        <span>新建集合</span>
+      </button>
+
       <button
+        ref={moreRef}
         type="button"
         className="view-bar-icon"
-        title="新建或管理集合"
-        aria-label="新建或管理集合"
-        onClick={onManageCollections}
+        title="集合管理"
+        aria-label="集合管理"
+        aria-expanded={menuOpen}
+        onClick={() => setMenuOpen((open) => !open)}
       >
-        <Plus size={14} />
+        <MoreHorizontal size={15} />
       </button>
+      <Popover open={menuOpen} anchorRef={moreRef} onClose={() => setMenuOpen(false)} minWidth={168}>
+        <button
+          type="button"
+          className="context-menu-item"
+          onClick={() => {
+            setMenuOpen(false);
+            onManageCollections();
+          }}
+        >
+          <Layers size={14} />
+          <span>管理集合…</span>
+        </button>
+        <button
+          type="button"
+          className="context-menu-item"
+          disabled={collections.length < 2}
+          title={collections.length < 2 ? "至少需要两个集合" : undefined}
+          onClick={() => {
+            setMenuOpen(false);
+            onCombineCollections();
+          }}
+        >
+          <Plus size={14} />
+          <span>集合运算…</span>
+        </button>
+      </Popover>
 
       <div className="view-bar-actions">
         {view === "trash" ? (
@@ -100,6 +183,78 @@ export function ViewBar({
           </Button>
         ) : null}
       </div>
+
+      {tabMenu ? (
+        <div
+          className="context-menu view-tab-menu"
+          style={{
+            left: Math.min(tabMenu.x, Math.max(8, window.innerWidth - 240)),
+            top: Math.min(tabMenu.y, Math.max(8, window.innerHeight - 200)),
+          }}
+        >
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              onRenameCollection(tabMenu.collection);
+              setTabMenu(null);
+            }}
+          >
+            <Pencil size={14} />
+            <span>重命名</span>
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            disabled={collections.findIndex((item) => item.id === tabMenu.collection.id) <= 0}
+            onClick={() => {
+              onMoveCollection(tabMenu.collection, -1);
+              setTabMenu(null);
+            }}
+          >
+            <ArrowLeft size={14} />
+            <span>左移</span>
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            disabled={
+              collections.findIndex((item) => item.id === tabMenu.collection.id) >=
+              collections.length - 1
+            }
+            onClick={() => {
+              onMoveCollection(tabMenu.collection, 1);
+              setTabMenu(null);
+            }}
+          >
+            <ArrowRight size={14} />
+            <span>右移</span>
+          </button>
+          <div className="context-menu-separator" />
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              onDuplicateCollection(tabMenu.collection);
+              setTabMenu(null);
+            }}
+          >
+            <Copy size={14} />
+            <span>另存为新集合…</span>
+          </button>
+          <button
+            type="button"
+            className="context-menu-item context-menu-danger"
+            onClick={() => {
+              onDeleteCollection(tabMenu.collection);
+              setTabMenu(null);
+            }}
+          >
+            <Trash2 size={14} />
+            <span>删除集合</span>
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

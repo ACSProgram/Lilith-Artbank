@@ -373,7 +373,7 @@ export function ViewerTools({
         >
           重置
         </Button>
-        <p>保存会生成新文件并更新缩略图；标签、评分、描述与集合保留，embedding/pose 清除。</p>
+        <p>保存会生成新文件并更新缩略图；标签、评分、描述与集合保留，AI 特征会在保存后重新生成。</p>
       </div>
     </aside>
   );

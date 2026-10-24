@@ -12,30 +12,41 @@ import {
   AlertTriangle,
   ArrowDownUp,
   ArrowLeft,
-  CheckSquare,
   ChevronRight,
+  Crop,
   FolderOpen,
   ImageOff,
   LayoutGrid,
   List,
+  Maximize,
   PanelRight,
   RefreshCw,
   ScanSearch,
   Search,
   SlidersHorizontal,
   Sparkles,
+  Upload,
+  Wrench,
   X,
 } from "lucide-react";
 import { useAppRuntime } from "../../app/runtimeContext";
 import { useNotices } from "../../app/noticeContext";
 import { Button, IconButton } from "../../shared/components/Button";
+import { MenuSection } from "../../shared/components/MenuSection";
+import { Popover } from "../../shared/components/Popover";
 import { Spinner } from "../../shared/components/Spinner";
 import { copyText } from "../../shared/clipboard";
 import { confirmDelete, confirmEmptyTrash, confirmTrash } from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
+import type { ThumbFit, UiSettings } from "../../app/types";
 import { libraryApi } from "./api";
 import { CollectionManagerDialog } from "./CollectionManagerDialog";
 import { CollectionPickerDialog } from "./CollectionPickerDialog";
+import {
+  CombineCollectionsDialog,
+  CreateCollectionDialog,
+  RenameCollectionDialog,
+} from "./CollectionDialogs";
 import { FilterPanel } from "./FilterPanel";
 import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
@@ -88,6 +99,8 @@ interface LibraryViewProps {
   refreshToken: number;
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
+  onOpenImport?: () => void;
+  onOpenBench?: () => void;
   similarity?: SimilarityBrowseState;
   onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
   onOpenSimilarityGroups?: () => void;
@@ -98,6 +111,11 @@ interface LibraryViewProps {
 
 /** 涉及文件（文件夹移动、永久删除）的批量上限，与 Rust `MAX_FILE_BATCH_IDS` 保持一致。 */
 const MAX_FILE_BATCH = 10_000;
+
+const THUMB_FITS: { value: ThumbFit; label: string; icon: typeof Crop }[] = [
+  { value: "cover", label: "裁剪铺满", icon: Crop },
+  { value: "contain", label: "完整显示", icon: Maximize },
+];
 
 function initialViewMode(): ViewMode {
   try {
@@ -125,6 +143,8 @@ export function LibraryView({
   refreshToken,
   onOpenViewer,
   onCopyImage,
+  onOpenImport,
+  onOpenBench,
   similarity,
   onFindSimilar,
   onOpenSimilarityGroups,
@@ -132,13 +152,13 @@ export function LibraryView({
   onGenerateDescription,
   aiOnline = false,
 }: LibraryViewProps) {
-  const { settings, current, refreshStatus } = useAppRuntime();
+  const { settings, current, refreshStatus, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
 
   const [searchDraft, setSearchDraft] = useState(browse.search);
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
   const [filterOpen, setFilterOpen] = useState(false);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
   const [selected, setSelected] = useState<Set<number>>(() => new Set());
   const [activeId, setActiveId] = useState<number | null>(null);
   const [anchorId, setAnchorId] = useState<number | null>(null);
@@ -150,6 +170,12 @@ export function LibraryView({
   const [collectionsLoaded, setCollectionsLoaded] = useState(false);
   const [collectionManagerOpen, setCollectionManagerOpen] = useState(false);
   const [collectionPickerOpen, setCollectionPickerOpen] = useState(false);
+  const [createCollectionOpen, setCreateCollectionOpen] = useState(false);
+  const [createPreset, setCreatePreset] = useState<CollectionInfo | null>(null);
+  const [renameTarget, setRenameTarget] = useState<CollectionInfo | null>(null);
+  const [combineOpen, setCombineOpen] = useState(false);
+  const [viewCount, setViewCount] = useState<number | null>(null);
+  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
   const [emptyingTrash, setEmptyingTrash] = useState(false);
   const [viewBusy, setViewBusy] = useState(false);
@@ -158,6 +184,7 @@ export function LibraryView({
 
   const viewRef = useRef<VirtualViewHandle>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
+  const taskAnchorRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const browseRef = useRef(browse);
   browseRef.current = browse;
@@ -195,6 +222,7 @@ export function LibraryView({
     [query, refreshToken, similarityKey],
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
+  const thumbFit: ThumbFit = settings?.ui.thumbFit ?? "cover";
 
   const itemsRef = useRef(items);
   itemsRef.current = items;
@@ -205,6 +233,20 @@ export function LibraryView({
   useEffect(() => {
     for (const listener of viewerListeners.current) listener();
   }, [items]);
+
+  /** 界面偏好（填充方式、详情面板）改了就存，不弹“设置已保存”。 */
+  const persistUi = useCallback(
+    (update: Partial<UiSettings>) => {
+      if (!settings) return;
+      void saveSettings(
+        { ...settings, ui: { ...settings.ui, ...update } },
+        { silent: true },
+      ).catch((cause: unknown) => {
+        notify("保存界面偏好失败", "error", errorMessage(cause));
+      });
+    },
+    [notify, saveSettings, settings],
+  );
 
   const clearSelection = useCallback(() => {
     setSelected(new Set());
@@ -308,6 +350,24 @@ export function LibraryView({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [filterOpen]);
 
+  // 新建集合对话框里要显示“当前视图 N 张”，打开时取一次总数（不拉全量 id）。
+  useEffect(() => {
+    if (!createCollectionOpen) return;
+    let cancelled = false;
+    setViewCount(null);
+    void libraryApi
+      .getFilterCounts(query)
+      .then((counts) => {
+        if (!cancelled) setViewCount(counts.total);
+      })
+      .catch(() => {
+        if (!cancelled) setViewCount(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [createCollectionOpen, query]);
+
   const goBack = useCallback(() => {
     onGoBack();
     similarityClear?.();
@@ -379,10 +439,10 @@ export function LibraryView({
     [selected],
   );
 
+  // 单击只选中；双击 / Enter 打开查看器；详情面板由按钮或右键控制，避免每次点图都挤动网格。
   const handleItemClick = useCallback(
     (item: ImageRow, event: ReactMouseEvent) => {
       setContextMenu(null);
-      setInspectorOpen(true);
       if (event.shiftKey && anchorId != null) {
         setSelected(selectionRange(items, anchorId, item.id));
         setActiveId(item.id);
@@ -418,7 +478,6 @@ export function LibraryView({
         setAnchorId(item.id);
       }
       setActiveId(item.id);
-      setInspectorOpen(true);
       setContextMenu({
         x: event.clientX,
         y: event.clientY,
@@ -434,19 +493,36 @@ export function LibraryView({
     clearSelection();
   }, [clearSelection]);
 
+  const resolveResultIds = useCallback(async () => {
+    if (similarityActive && similarity) return similarity.ids();
+    return libraryApi.queryImageIds(query);
+  }, [query, similarity, similarityActive]);
+
+  /** 复制一个已有集合的内容：按集合顺序取全部 id，不受当前筛选影响。 */
+  const resolveCollectionIds = useCallback(
+    async (collectionId: number) =>
+      libraryApi.queryImageIds({
+        view: "collection",
+        collectionId,
+        search: "",
+        searchScope: "view",
+        filters: emptyFilters(),
+        sort: COLLECTION_SORT,
+        cursor: null,
+        limit: null,
+      }),
+    [],
+  );
+
   const selectAllMatches = useCallback(async () => {
     if (selectingAll) return;
     setSelectingAll(true);
     try {
-      const ids =
-        similarityActive && similarity
-          ? await similarity.ids()
-          : await libraryApi.queryImageIds(query);
+      const ids = await resolveResultIds();
       setSelected(new Set(ids));
       const first = ids[0] ?? null;
       setAnchorId(first);
       setActiveId(first);
-      if (ids.length > 0) setInspectorOpen(true);
       notify(
         `已选择 ${ids.length.toLocaleString()} 张`,
         "info",
@@ -461,21 +537,7 @@ export function LibraryView({
     } finally {
       setSelectingAll(false);
     }
-  }, [notify, query, selectingAll, similarity, similarityActive]);
-
-  const createCollectionFromCurrent = useCallback(
-    async (name: string) => {
-      const ids =
-        similarityActive && similarity
-          ? await similarity.ids()
-          : await libraryApi.queryImageIds(query);
-      if (ids.length === 0) throw new Error("当前结果没有图片");
-      const collection = await libraryApi.createCollection(name);
-      await libraryApi.addImagesToCollection(collection.id, ids);
-      await reloadCollections();
-    },
-    [query, reloadCollections, similarity, similarityActive],
-  );
+  }, [notify, resolveResultIds, selectingAll, similarityActive]);
 
   const copyPaths = useCallback(async () => {
     const targets = contextMenu?.items ?? [];
@@ -691,6 +753,68 @@ export function LibraryView({
     refreshData();
   }, [refreshData, reloadCollections]);
 
+  const handleCollectionCreated = useCallback(
+    (collection: CollectionInfo) => {
+      setCreateCollectionOpen(false);
+      setCreatePreset(null);
+      clearSelection();
+      void reloadCollections();
+      applyBrowse({
+        ...browseRef.current,
+        view: "collection",
+        collectionId: collection.id,
+        searchScope: "view",
+        sort: COLLECTION_SORT,
+      });
+    },
+    [applyBrowse, clearSelection, reloadCollections],
+  );
+
+  const deleteCollection = useCallback(
+    async (collection: CollectionInfo) => {
+      const accepted = await confirm({
+        title: `删除集合「${collection.name}」？`,
+        message: `集合内的 ${collection.imageCount.toLocaleString()} 张图片不会被删除，只会移除集合本身。`,
+        confirmLabel: "删除集合",
+        danger: true,
+      });
+      if (!accepted) return;
+      try {
+        await libraryApi.deleteCollection(collection.id);
+        notify("集合已删除", "success");
+        if (browseRef.current.collectionId === collection.id) {
+          applyBrowse({
+            ...browseRef.current,
+            view: "all",
+            collectionId: null,
+            sort: sortForView("all", browseRef.current.sort),
+          });
+        }
+        void reloadCollections();
+      } catch (cause) {
+        notify("删除集合失败", "error", errorMessage(cause));
+      }
+    },
+    [applyBrowse, confirm, notify, reloadCollections],
+  );
+
+  const moveCollection = useCallback(
+    async (collection: CollectionInfo, delta: number) => {
+      const index = collections.findIndex((item) => item.id === collection.id);
+      const target = index + delta;
+      if (index < 0 || target < 0 || target >= collections.length) return;
+      const next = [...collections];
+      [next[index], next[target]] = [next[target], next[index]];
+      try {
+        await libraryApi.reorderCollections(next.map((item) => item.id));
+        void reloadCollections();
+      } catch (cause) {
+        notify("调整集合顺序失败", "error", errorMessage(cause));
+      }
+    },
+    [collections, notify, reloadCollections],
+  );
+
   const handleTagChanged = useCallback(() => {
     refreshData();
   }, [refreshData]);
@@ -708,7 +832,6 @@ export function LibraryView({
       const next = items[nextIndex];
       if (!next) return;
       setActiveId(next.id);
-      setInspectorOpen(true);
       if (extend) {
         if (anchorId == null) {
           setAnchorId(next.id);
@@ -755,7 +878,8 @@ export function LibraryView({
     }
     if (key === "Escape") {
       event.preventDefault();
-      if (filterOpen) setFilterOpen(false);
+      if (taskMenuOpen) setTaskMenuOpen(false);
+      else if (filterOpen) setFilterOpen(false);
       else if (contextMenu) setContextMenu(null);
       else clearSelection();
       return;
@@ -867,97 +991,167 @@ export function LibraryView({
 
   return (
     <div className="library-view" onKeyDown={handleKeyDown}>
-      <ViewBar
-        view={effectiveView}
-        collectionId={effectiveCollectionId}
-        collections={collections}
-        imageCount={current?.imageCount ?? 0}
-        trashCount={current?.trashCount ?? 0}
-        emptyingTrash={emptyingTrash}
-        onShowAll={showAll}
-        onShowTrash={showTrash}
-        onShowCollection={showCollection}
-        onManageCollections={() => setCollectionManagerOpen(true)}
-        onEmptyTrash={() => void emptyTrash()}
-      />
+      <div className="library-topbar">
+        <IconButton label="返回上一视图" disabled={!canGoBack} onClick={goBack}>
+          <ArrowLeft size={14} />
+        </IconButton>
+        <ViewBar
+          view={effectiveView}
+          collectionId={effectiveCollectionId}
+          collections={collections}
+          imageCount={current?.imageCount ?? 0}
+          trashCount={current?.trashCount ?? 0}
+          emptyingTrash={emptyingTrash}
+          onShowAll={showAll}
+          onShowTrash={showTrash}
+          onShowCollection={showCollection}
+          onNewCollection={() => {
+            setCreatePreset(null);
+            setCreateCollectionOpen(true);
+          }}
+          onManageCollections={() => setCollectionManagerOpen(true)}
+          onCombineCollections={() => setCombineOpen(true)}
+          onRenameCollection={setRenameTarget}
+          onDeleteCollection={(collection) => void deleteCollection(collection)}
+          onMoveCollection={(collection, delta) => void moveCollection(collection, delta)}
+          onDuplicateCollection={(collection) => {
+            setCreatePreset(collection);
+            setCreateCollectionOpen(true);
+          }}
+          onEmptyTrash={() => void emptyTrash()}
+        />
 
-      <div className="folder-breadcrumbs" aria-label="当前文件夹">
-        <button
-          type="button"
-          className={`folder-crumb${browse.filters.folderIds.length === 0 ? " is-current" : ""}`}
-          onClick={() => showFolder(null)}
-        >
-          <FolderOpen size={13} />
-          全部图片
-        </button>
-        {browse.filters.folderIds.length > 1 ? (
-          <>
-            <ChevronRight size={12} className="folder-crumb-separator" />
-            <span className="folder-crumb is-current">
-              已选择 {browse.filters.folderIds.length.toLocaleString()} 个文件夹
-            </span>
-            <button
-              type="button"
-              className="text-button"
-              onClick={() =>
-                applyBrowse({
-                  ...browseRef.current,
-                  filters: { ...browseRef.current.filters, folderIds: [] },
-                })
-              }
-            >
-              清除
-            </button>
-          </>
-        ) : (
-          breadcrumbs.slice(1).map((crumb, index, trail) => (
-            <span key={crumb.path} className="folder-crumb-group">
-              <ChevronRight size={12} className="folder-crumb-separator" />
+        <div className="library-topbar-actions">
+          {selected.size > 0 ? (
+            <div className="selection-summary">
+              {selectingAll ? <Spinner size={13} /> : null}
+              <span>已选 {selected.size.toLocaleString()} 张</span>
+              <IconButton label="清除选择" onClick={clearSelection}>
+                <X size={13} />
+              </IconButton>
+            </div>
+          ) : null}
+          <Button
+            size="sm"
+            variant="primary"
+            icon={<Upload size={14} />}
+            disabled={!onOpenImport}
+            onClick={() => onOpenImport?.()}
+          >
+            导入
+          </Button>
+          <button
+            ref={taskAnchorRef}
+            type="button"
+            className="button button-secondary button-sm"
+            aria-expanded={taskMenuOpen}
+            onClick={() => setTaskMenuOpen((open) => !open)}
+          >
+            <Wrench size={14} />
+            任务
+          </button>
+          <Popover
+            open={taskMenuOpen}
+            anchorRef={taskAnchorRef}
+            placement="bottom-end"
+            onClose={() => setTaskMenuOpen(false)}
+            minWidth={190}
+          >
+            <MenuSection title="批量任务">
               <button
                 type="button"
-                className={`folder-crumb${index === trail.length - 1 ? " is-current" : ""}`}
-                onClick={() => showFolder(crumb.id)}
-                disabled={crumb.id == null}
-                title={crumb.path}
+                className="context-menu-item"
+                disabled={!onOpenAiTasks}
+                onClick={() => {
+                  setTaskMenuOpen(false);
+                  onOpenAiTasks?.({
+                    selectedIds: [...selected],
+                    query: similarityActive ? null : query,
+                  });
+                }}
               >
-                {crumb.label}
+                <Sparkles size={14} />
+                <span>AI 任务…</span>
+                <em>{aiOnline ? "在线" : "离线"}</em>
               </button>
-            </span>
-          ))
-        )}
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={!onOpenSimilarityGroups}
+                onClick={() => {
+                  setTaskMenuOpen(false);
+                  onOpenSimilarityGroups?.();
+                }}
+              >
+                <ScanSearch size={14} />
+                <span>相似分组…</span>
+              </button>
+              {import.meta.env.DEV && onOpenBench ? (
+                <button
+                  type="button"
+                  className="context-menu-item"
+                  onClick={() => {
+                    setTaskMenuOpen(false);
+                    onOpenBench();
+                  }}
+                >
+                  <RefreshCw size={14} />
+                  <span>缩略图基准</span>
+                </button>
+              ) : null}
+            </MenuSection>
+          </Popover>
+        </div>
       </div>
 
       <div className="library-toolbar">
-        <div className="library-toolbar-left">
-          <div className="segmented" role="group" aria-label="视图模式">
-            <button
-              type="button"
-              className={viewMode === "grid" ? "is-active" : ""}
-              title="网格视图"
-              aria-label="网格视图"
-              onClick={() => setViewMode("grid")}
-            >
-              <LayoutGrid size={15} />
-            </button>
-            <button
-              type="button"
-              className={viewMode === "list" ? "is-active" : ""}
-              title="列表视图"
-              aria-label="列表视图"
-              onClick={() => setViewMode("list")}
-            >
-              <List size={15} />
-            </button>
-          </div>
-
-          <IconButton
-            label="返回上一视图"
-            disabled={!canGoBack}
-            onClick={goBack}
+        <div className="folder-breadcrumbs" aria-label="当前文件夹">
+          <button
+            type="button"
+            className={`folder-crumb${browse.filters.folderIds.length === 0 ? " is-current" : ""}`}
+            onClick={() => showFolder(null)}
           >
-            <ArrowLeft size={14} />
-          </IconButton>
+            <FolderOpen size={13} />
+            全部图片
+          </button>
+          {browse.filters.folderIds.length > 1 ? (
+            <>
+              <ChevronRight size={12} className="folder-crumb-separator" />
+              <span className="folder-crumb is-current">
+                已选择 {browse.filters.folderIds.length.toLocaleString()} 个文件夹
+              </span>
+              <button
+                type="button"
+                className="text-button"
+                onClick={() =>
+                  applyBrowse({
+                    ...browseRef.current,
+                    filters: { ...browseRef.current.filters, folderIds: [] },
+                  })
+                }
+              >
+                清除
+              </button>
+            </>
+          ) : (
+            breadcrumbs.slice(1).map((crumb, index, trail) => (
+              <span key={crumb.path} className="folder-crumb-group">
+                <ChevronRight size={12} className="folder-crumb-separator" />
+                <button
+                  type="button"
+                  className={`folder-crumb${index === trail.length - 1 ? " is-current" : ""}`}
+                  onClick={() => showFolder(crumb.id)}
+                  disabled={crumb.id == null}
+                  title={crumb.path}
+                >
+                  {crumb.label}
+                </button>
+              </span>
+            ))
+          )}
+        </div>
 
+        <div className="library-toolbar-right">
           <div className="search-field">
             <Search size={14} />
             <input
@@ -1009,66 +1203,7 @@ export function LibraryView({
             disabled={!similarity}
             onClick={() => setSemanticOpen((open) => !open)}
           >
-            语义搜索
-          </Button>
-
-          <Button
-            size="sm"
-            variant="secondary"
-            icon={<ScanSearch size={14} />}
-            disabled={!onOpenSimilarityGroups}
-            title="按 pHash 或 embedding 扫描全库相似组"
-            onClick={() => onOpenSimilarityGroups?.()}
-          >
-            相似分组
-          </Button>
-
-          <span className="library-loaded">
-            {similarityActive && similarity?.busy
-              ? similarMode
-                ? "正在查找相似图片…"
-                : "正在计算语义相似度…"
-              : status === "loading"
-                ? "正在读取…"
-                : `${items.length.toLocaleString()} 张已载入`}
-          </span>
-          {hasMore ? <span className="library-loaded-hint">继续滚动载入更多</span> : null}
-        </div>
-
-        <div className="library-toolbar-right">
-          {selected.size > 0 ? (
-            <div className="selection-summary">
-              {selectingAll ? <Spinner size={13} /> : <CheckSquare size={14} />}
-              <span>已选择 {selected.size.toLocaleString()} 张</span>
-              <IconButton label="清除选择" onClick={clearSelection}>
-                <X size={13} />
-              </IconButton>
-            </div>
-          ) : null}
-
-          <IconButton
-            label={inspectorOpen ? "隐藏详情侧栏" : "显示详情侧栏"}
-            className={inspectorOpen && selected.size > 0 ? "is-active" : ""}
-            disabled={selected.size === 0}
-            onClick={() => setInspectorOpen((value) => !value)}
-          >
-            <PanelRight size={14} />
-          </IconButton>
-
-          <Button
-            size="sm"
-            variant="secondary"
-            icon={<Sparkles size={14} />}
-            disabled={!onOpenAiTasks}
-            title={aiOnline ? "AI 服务在线" : "AI 服务离线；任务会提示连接状态"}
-            onClick={() =>
-              onOpenAiTasks?.({
-                selectedIds: [...selected],
-                query: similarityActive ? null : query,
-              })
-            }
-          >
-            AI 任务
+            语义
           </Button>
 
           <div className="filter-anchor" ref={filterAnchorRef}>
@@ -1139,9 +1274,58 @@ export function LibraryView({
             </IconButton>
           </div>
 
-          <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} onClick={retry}>
-            刷新
-          </Button>
+          <div className="segmented" role="group" aria-label="视图模式">
+            <button
+              type="button"
+              className={viewMode === "grid" ? "is-active" : ""}
+              title="网格视图"
+              aria-label="网格视图"
+              onClick={() => setViewMode("grid")}
+            >
+              <LayoutGrid size={15} />
+            </button>
+            <button
+              type="button"
+              className={viewMode === "list" ? "is-active" : ""}
+              title="列表视图"
+              aria-label="列表视图"
+              onClick={() => setViewMode("list")}
+            >
+              <List size={15} />
+            </button>
+          </div>
+
+          <div className="segmented" role="group" aria-label="缩略图填充">
+            {THUMB_FITS.map(({ value, label, icon: Icon }) => (
+              <button
+                key={value}
+                type="button"
+                className={thumbFit === value ? "is-active" : ""}
+                title={
+                  viewMode === "list"
+                    ? `${label}（列表视图不裁剪缩略图）`
+                    : `${label}：${value === "cover" ? "裁掉超出方格的部分" : "长图也能完整看到"}`
+                }
+                aria-label={label}
+                disabled={viewMode === "list"}
+                onClick={() => persistUi({ thumbFit: value })}
+              >
+                <Icon size={15} />
+              </button>
+            ))}
+          </div>
+
+          <IconButton
+            label={inspectorOpen ? "隐藏详情侧栏" : "显示详情侧栏"}
+            className={inspectorOpen ? "is-active" : ""}
+            onClick={() => setInspectorOpen((value) => !value)}
+          >
+            <PanelRight size={14} />
+          </IconButton>
+
+          <IconButton label="重新读取当前视图" onClick={retry}>
+            <RefreshCw size={14} />
+          </IconButton>
         </div>
       </div>
 
@@ -1181,9 +1365,7 @@ export function LibraryView({
           </Button>
           <span className="semantic-hint">
             {similarity.error ??
-              (similarity.busy
-                ? "正在请求文本 embedding 并扫描本地向量…"
-                : "文本只用于生成查询向量，不写入图库。")}
+              (similarity.busy ? "正在理解描述…" : "描述只用于这次搜索，不会写入图库。")}
           </span>
           <IconButton label="关闭语义搜索" onClick={() => setSemanticOpen(false)}>
             <X size={13} />
@@ -1201,8 +1383,6 @@ export function LibraryView({
                 }`
               : `语义搜索「${similarity.text}」`}{" "}
             · {similarity.total.toLocaleString()} 张结果
-            {!similarMode && similarity.model ? ` · ${similarity.model}` : ""} ·{" "}
-            {similarity.elapsedMs}ms
           </span>
           <button type="button" className="text-button" onClick={() => similarity.clear()}>
             退出相似结果
@@ -1235,15 +1415,11 @@ export function LibraryView({
                 {similarityActive
                   ? similarMode
                     ? "正在查找相似图片"
-                    : "正在计算语义相似度"
+                    : "正在理解描述"
                   : "正在读取图片"}
               </strong>
               <span>
-                {similarityActive
-                  ? similarMode
-                    ? "正在扫描本地 pHash、主色或特征包…"
-                    : "正在生成文本 embedding 并扫描本地向量包…"
-                  : "正在查询首屏元数据…"}
+                {similarityActive ? "正在搜索…" : "正在读取…"}
               </span>
             </div>
           ) : null}
@@ -1276,8 +1452,8 @@ export function LibraryView({
               <span>
                 {similarityActive
                   ? similarMode
-                    ? "这张图片可能还没有可比较的数据（主色/embedding/姿势），或者阈值过严。"
-                    : "换一种描述，或者先为图片生成 embedding 后再试。"
+                    ? "这张图片还没有可比较的特征，或者库里没有足够相似的图片。"
+                    : "换一种说法再试。"
                   : hasActiveQuery(browse)
                     ? "调整搜索或筛选条件，或者清除后查看全部图片。"
                     : effectiveView === "trash"
@@ -1307,6 +1483,7 @@ export function LibraryView({
               ref={viewRef}
               items={items}
               thumbPx={thumbPx}
+              thumbFit={thumbFit}
               resetKey={resetSignature}
               selected={selected}
               activeId={activeId}
@@ -1345,7 +1522,7 @@ export function LibraryView({
           ) : null}
         </div>
 
-        {inspectorOpen && selectedIds.length > 0 ? (
+        {inspectorOpen ? (
           <InspectorPanel
             selectedIds={selectedIds}
             version={dataVersion}
@@ -1374,10 +1551,6 @@ export function LibraryView({
             const item = contextMenu.items[0];
             setContextMenu(null);
             if (item) activateItem(item);
-          }}
-          onShowDetails={() => {
-            setInspectorOpen(true);
-            setContextMenu(null);
           }}
           onCopyPaths={() => void copyPaths()}
           onCopyHashes={() => void copyHashes()}
@@ -1422,11 +1595,42 @@ export function LibraryView({
         />
       ) : null}
 
+      <CreateCollectionDialog
+        open={createCollectionOpen}
+        collections={collections}
+        selectionIds={selectedIds}
+        viewLabel={similarityActive ? "相似结果" : "当前视图"}
+        viewCount={viewCount}
+        resolveViewIds={resolveResultIds}
+        presetCollection={createPreset}
+        resolveCollectionIds={resolveCollectionIds}
+        onCreated={handleCollectionCreated}
+        onClose={() => {
+          setCreateCollectionOpen(false);
+          setCreatePreset(null);
+        }}
+      />
+      <RenameCollectionDialog
+        collection={renameTarget}
+        onRenamed={() => {
+          setRenameTarget(null);
+          notify("集合已重命名", "success");
+          void reloadCollections();
+        }}
+        onClose={() => setRenameTarget(null)}
+      />
+      <CombineCollectionsDialog
+        open={combineOpen}
+        collections={collections}
+        onCombined={() => {
+          void reloadCollections();
+          refreshData();
+        }}
+        onClose={() => setCombineOpen(false)}
+      />
       <CollectionManagerDialog
         open={collectionManagerOpen}
         collections={collections}
-        currentLabel={similarityActive ? "相似结果" : "当前筛选结果"}
-        onCreateFromCurrent={createCollectionFromCurrent}
         onClose={() => setCollectionManagerOpen(false)}
         onChanged={() => void reloadCollections()}
       />

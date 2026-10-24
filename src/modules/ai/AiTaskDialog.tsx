@@ -364,7 +364,7 @@ export function AiTaskDialog({
                 onChange={(event) => setPrompt(event.target.value)}
               />
             </Field>
-            <Field label="最大长度" hint="16-512 tokens。">
+            <Field label="最大长度">
               <input
                 className="input"
                 type="number"

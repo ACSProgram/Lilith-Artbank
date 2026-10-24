@@ -3,6 +3,7 @@ import { appApi } from "./api";
 import { useNotices } from "./noticeContext";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
+import { setThumbCacheLimit } from "../shared/thumbCache";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
 import { errorMessage } from "../shared/errors";
 
@@ -57,6 +58,11 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setThemeMode(settings?.ui.theme ?? "system");
   }, [settings?.ui.theme]);
 
+  // 缩略图缓存按张数计，改设置后立即收缩到新上限。
+  useEffect(() => {
+    setThumbCacheLimit(settings?.ui.thumbCacheCount ?? 1024);
+  }, [settings?.ui.thumbCacheCount]);
+
   const run = useCallback(
     async <T,>(label: string, operation: () => Promise<T>): Promise<T> => {
       setBusy(label);
@@ -106,10 +112,10 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   );
 
   const saveSettings = useCallback(
-    async (next: Settings) => {
+    async (next: Settings, options?: { silent?: boolean }) => {
       const updated = await run("正在保存设置", () => appApi.saveSettings(next));
       setSettings(updated);
-      notify("设置已保存", "success");
+      if (!options?.silent) notify("设置已保存", "success");
       return updated;
     },
     [notify, run],

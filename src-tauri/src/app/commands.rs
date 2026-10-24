@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
     ai::{
@@ -118,14 +118,89 @@ pub fn window_toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
 pub struct AppInfo {
     pub version: String,
     pub settings_path: String,
+    pub log_path: String,
+}
+
+/// 日志文件名与 `lib.rs` 里 `TargetKind::LogDir` 的 `file_name` 一致。
+const LOG_FILE_STEM: &str = "lilith-artbank";
+
+fn log_file_path(app: &AppHandle) -> String {
+    let Ok(dir) = app.path().app_log_dir() else {
+        return String::new();
+    };
+    // 插件按给定文件名落盘，不同版本对扩展名的处理不一致，两个候选都试一次。
+    for candidate in [
+        dir.join(format!("{LOG_FILE_STEM}.log")),
+        dir.join(LOG_FILE_STEM),
+    ] {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    dir.join(format!("{LOG_FILE_STEM}.log"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[tauri::command]
-pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
+pub fn get_app_info(app: AppHandle, state: State<'_, AppState>) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         settings_path: state.settings.path().to_string_lossy().into_owned(),
+        log_path: log_file_path(&app),
     }
+}
+
+/// 在系统文件管理器里定位一个文件（选中它）或直接打开一个目录。
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    if target.as_os_str().is_empty() {
+        return Err("路径为空".to_owned());
+    }
+    let is_file = target.is_file();
+    let dir = if target.is_dir() {
+        target.clone()
+    } else {
+        target
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .ok_or_else(|| "路径无效".to_owned())?
+    };
+    if !dir.exists() {
+        return Err("目录不存在".to_owned());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        if is_file {
+            // /select 需要真实文件路径；文件被移走时退化为打开父目录。
+            command.arg(format!("/select,{}", target.display()));
+        } else {
+            command.arg(dir.as_os_str());
+        }
+        command.spawn().map_err(|error| error.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        if is_file {
+            command.arg("-R");
+            command.arg(target.as_os_str());
+        } else {
+            command.arg(dir.as_os_str());
+        }
+        command.spawn().map_err(|error| error.to_string())?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(dir.as_os_str())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -648,6 +723,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         window_close,
         window_toggle_fullscreen,
         get_app_info,
+        reveal_path,
         thumb_bench_prepare,
         thumb_bench_measure_read,
         thumb_bench_cleanup,

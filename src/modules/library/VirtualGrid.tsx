@@ -2,6 +2,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -16,12 +17,14 @@ import {
   formatDimensions,
 } from "./model";
 import type { ImageRow } from "./types";
+import type { ThumbFit } from "../../app/types";
 import type { MoreStatus } from "./useImageQuery";
 import type { VirtualViewHandle } from "./virtual";
 
 interface VirtualGridProps {
   items: ImageRow[];
   thumbPx: number;
+  thumbFit: ThumbFit;
   resetKey: string;
   selected: Set<number>;
   activeId: number | null;
@@ -40,13 +43,13 @@ interface VirtualGridProps {
 
 const PADDING = 18;
 const GAP = 10;
-const LABEL_HEIGHT = 38;
 const FOOTER_HEIGHT = 46;
 
 export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(function VirtualGrid(
   {
     items,
     thumbPx,
+    thumbFit,
     resetKey,
     selected,
     activeId,
@@ -67,6 +70,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [scrollTop, setScrollTop] = useState(0);
+  const scrollTopRef = useRef(0);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -86,6 +90,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
+        scrollTopRef.current = element.scrollTop;
         setScrollTop(element.scrollTop);
       });
     };
@@ -100,6 +105,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     const element = containerRef.current;
     if (!element) return;
     element.scrollTop = 0;
+    scrollTopRef.current = 0;
     setScrollTop(0);
   }, [resetKey]);
 
@@ -109,7 +115,8 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     Math.round((width - PADDING * 2 + GAP) / (thumbPx + GAP)),
   );
   const cellWidth = Math.max(72, (width - PADDING * 2 - GAP * (columns - 1)) / columns);
-  const rowHeight = cellWidth + LABEL_HEIGHT + GAP;
+  // 纯图格子：高度等于宽度，不再给文字标签留高度。
+  const rowHeight = cellWidth + GAP;
   const rows = Math.ceil(items.length / columns);
   const bodyHeight = rows * rowHeight;
   const footerHeight = items.length > 0 ? FOOTER_HEIGHT : 0;
@@ -134,6 +141,29 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     if (!hasMore || moreStatus !== "idle" || !nearEnd) return;
     onLoadMore();
   }, [hasMore, moreStatus, nearEnd, onLoadMore, items.length]);
+
+  /**
+   * 列数变化（窗口缩放、详情面板挤压）后把锚点行放回原来的视口位置。
+   * 不做这件事时，同一个 scrollTop 会落到不同行上，看起来就是“选中的图片跳走了”。
+   */
+  const layoutRef = useRef({ columns, rowHeight, scrollTop: 0 });
+
+  useLayoutEffect(() => {
+    const element = containerRef.current;
+    const previous = layoutRef.current;
+    if (element && previous.columns !== columns) {
+      const anchor = activeId == null ? -1 : items.findIndex((item) => item.id === activeId);
+      if (anchor >= 0) {
+        const rowBefore = PADDING + Math.floor(anchor / previous.columns) * previous.rowHeight;
+        const offset = rowBefore - previous.scrollTop;
+        const rowAfter = PADDING + Math.floor(anchor / columns) * rowHeight;
+        element.scrollTop = Math.max(0, rowAfter - offset);
+        scrollTopRef.current = element.scrollTop;
+        setScrollTop(element.scrollTop);
+      }
+    }
+    layoutRef.current = { columns, rowHeight, scrollTop: scrollTopRef.current };
+  });
 
   const scrollToIndex = (index: number) => {
     const element = containerRef.current;
@@ -200,7 +230,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             }`}
             style={{
               width: cellWidth,
-              height: cellWidth + LABEL_HEIGHT,
+              height: cellWidth,
               transform: `translate3d(${PADDING + column * (cellWidth + GAP)}px, ${
                 PADDING + row * rowHeight
               }px, 0)`,
@@ -218,14 +248,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             onDragStart={(event) => onItemDragStart(item, event)}
           >
             <span className="grid-cell-image">
-              <LibraryThumbnail image={item} />
-            </span>
-            <span className="grid-cell-label">
-              <span>{formatDimensions(item.width, item.height)}</span>
-              <span>
-                {item.deletedAt != null ? "回收站 · " : ""}
-                {extensionLabel(item.fileExt)} · {formatBytes(item.fileSize)}
-              </span>
+              <LibraryThumbnail image={item} className={`is-${thumbFit}`} />
             </span>
             {item.score > 0 ? <span className="grid-cell-score">{item.score}</span> : null}
             {isSelected ? (
@@ -256,10 +279,8 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
               <RefreshCw size={13} />
               加载失败，点击重试
             </button>
-          ) : hasMore ? (
-            <span>向下滚动载入更多</span>
-          ) : (
-            <span>已加载 {items.length.toLocaleString()} 张</span>
+          ) : hasMore ? null : (
+            <span>没有更多了</span>
           )}
         </div>
       ) : null}

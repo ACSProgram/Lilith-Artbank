@@ -1,13 +1,13 @@
-import { Database, FolderOpen, Settings, X } from "lucide-react";
-import { Button, IconButton } from "../shared/components/Button";
+import { Database, FolderOpen, Settings } from "lucide-react";
+import { Button } from "../shared/components/Button";
 import { useAppRuntime } from "./runtimeContext";
 import { FolderTree } from "../modules/library/FolderTree";
 import type { FolderInfo } from "../modules/library/types";
 
 interface SidebarProps {
   onOpenSettings: () => void;
-  onChangeLibrary: () => void;
-  onCloseLibrary: () => void;
+  /** 只用于“还没有打开图库”时的引导按钮；换库入口在设置里。 */
+  onOpenLibrary: () => void;
   folders?: FolderInfo[];
   selectedFolderIds?: number[];
   selectedImageIds?: number[];
@@ -16,10 +16,10 @@ interface SidebarProps {
   onDataChanged?: () => void;
 }
 
+/** 侧栏：图库身份（名称 / 路径 / 计数）与文件夹树；底部只有设置一个入口。 */
 export function Sidebar({
   onOpenSettings,
-  onChangeLibrary,
-  onCloseLibrary,
+  onOpenLibrary,
   folders,
   selectedFolderIds = [],
   selectedImageIds = [],
@@ -27,25 +27,26 @@ export function Sidebar({
   onFoldersChanged,
   onDataChanged,
 }: SidebarProps) {
-  const { current, appInfo } = useAppRuntime();
+  const { current } = useAppRuntime();
   const browsing = current != null && folders != null;
 
   return (
     <aside className="sidebar">
       <div className="sidebar-heading">
         <span className="sidebar-eyebrow">LIBRARY</span>
-        <div className="sidebar-heading-row">
-          <h2 title={current?.path}>{current?.name ?? "Lilith Artbank"}</h2>
-          {current ? (
-            <IconButton label="关闭图库" onClick={onCloseLibrary}>
-              <X size={14} />
-            </IconButton>
-          ) : null}
-        </div>
+        <h2 className="sidebar-title" title={current?.path}>
+          {current?.name ?? "Lilith Artbank"}
+        </h2>
         {current ? (
-          <span className="sidebar-library-path" title={current.path}>
-            {current.path}
-          </span>
+          <>
+            <span className="sidebar-library-path" title={current.path}>
+              {current.path}
+            </span>
+            <span className="sidebar-count">
+              {current.imageCount.toLocaleString()} 张 · 回收站{" "}
+              {current.trashCount.toLocaleString()}
+            </span>
+          </>
         ) : null}
       </div>
 
@@ -67,7 +68,7 @@ export function Sidebar({
               size="sm"
               variant="primary"
               icon={<FolderOpen size={14} />}
-              onClick={onChangeLibrary}
+              onClick={onOpenLibrary}
             >
               打开或创建
             </Button>
@@ -80,13 +81,6 @@ export function Sidebar({
           <Settings size={16} />
           <span>设置</span>
         </button>
-        {current ? (
-          <button type="button" className="sidebar-footer-button" onClick={onChangeLibrary}>
-            <FolderOpen size={16} />
-            <span>更换图库</span>
-          </button>
-        ) : null}
-        <span className="sidebar-version">v{appInfo?.version ?? "—"}</span>
       </div>
     </aside>
   );

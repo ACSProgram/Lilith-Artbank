@@ -119,7 +119,7 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
     <Modal
       open={open}
       title="相似分组"
-      subtitle="pHash 用 8×32 位分段索引找候选；embedding 模式先用 pHash 候选，再用中心化余弦复核，避免全库 N² 比较。"
+      subtitle="扫描重复或高度相似的图片，结果可以存成集合。"
       width={760}
       onClose={onClose}
       footer={
@@ -182,8 +182,8 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
         </div>
         <p className="dialog-hint">
           {kind === "phash"
-            ? "阈值 0-7 时索引保证不漏候选；超过 7 请使用单张“找相似”。"
-            : "只在 pHash 距离不超过 7 的候选内复核；没有 embedding 的图片会计入缺失。"}
+            ? "0-7 内结果完整；想更宽松请用单张“找相似”。"
+            : "缺少语义特征的图片会计入缺失。"}
         </p>
         {error ? <p className="dialog-error">{error}</p> : null}
       </section>
@@ -195,8 +195,7 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
           </h3>
           <div className="dialog-inline">
             <span className="dialog-hint">
-              {SIMILAR_GROUP_LABELS[result.kind]} · {result.groups.length.toLocaleString()} 组 ·{" "}
-              {result.elapsedMs}ms
+              {SIMILAR_GROUP_LABELS[result.kind]} · {result.groups.length.toLocaleString()} 组
               {result.missing > 0 ? ` · ${result.missing.toLocaleString()} 张缺少数据` : ""}
               {result.truncated ? " · 已截断" : ""}
             </span>

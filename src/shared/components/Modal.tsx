@@ -48,6 +48,13 @@ interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   width?: number;
+  /**
+   * 固定面板高度（px）。给了就不再随内容伸缩：切换分类、增删内容时对话框不会忽大忽小。
+   * 高度会被 `.modal-panel` 的 `max-height: 88vh` 夹住，小窗口下仍然装得下。
+   */
+  height?: number;
+  /** 追加到 `.modal-body` 的类名，交给调用方决定内容区怎么滚动。 */
+  bodyClassName?: string;
   dismissible?: boolean;
   tone?: "default" | "danger";
   /**
@@ -65,6 +72,8 @@ export function Modal({
   children,
   footer,
   width = 560,
+  height,
+  bodyClassName,
   dismissible = true,
   tone = "default",
   initialFocus = "panel",
@@ -136,7 +145,7 @@ export function Modal({
       <div
         ref={panelRef}
         className={`modal-panel${tone === "danger" ? " modal-panel-danger" : ""}`}
-        style={{ width }}
+        style={{ width, height }}
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -157,7 +166,7 @@ export function Modal({
             <X size={18} />
           </button>
         </header>
-        <div className="modal-body">{children}</div>
+        <div className={`modal-body${bodyClassName ? ` ${bodyClassName}` : ""}`}>{children}</div>
         {footer ? <footer className="modal-footer">{footer}</footer> : null}
       </div>
     </div>

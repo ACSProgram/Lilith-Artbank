@@ -319,7 +319,7 @@ export function ImportDialog({
       title={view === "options" ? "导入图片" : phaseLabel(progress?.phase ?? "processing")}
       subtitle={
         view === "options"
-          ? "原图按内容哈希复制到图库，缩略图、pHash 与主色同步生成。"
+          ? "原图会复制到图库，源文件不动。"
           : view === "running"
             ? "任务在后台执行，可以继续使用其他功能。"
             : undefined
@@ -439,7 +439,7 @@ export function ImportDialog({
                 onClick={() => setPolicy("skip")}
               >
                 <strong>跳过</strong>
-                <span>内容哈希相同只保留已有图片</span>
+                <span>内容相同的只保留一张</span>
               </button>
               <button
                 type="button"
@@ -556,9 +556,7 @@ export function ImportDialog({
                 {summary.hints.map((hint) => (
                   <li key={`${hint.imageId}-${hint.similarTo}`}>
                     <span>图片 #{hint.imageId}</span>
-                    <em>
-                      与 #{hint.similarTo} 的 pHash 距离为 {hint.distance}
-                    </em>
+                    <em>与 #{hint.similarTo} 相似</em>
                   </li>
                 ))}
               </ul>
@@ -566,7 +564,7 @@ export function ImportDialog({
           ) : null}
 
           {summary?.phase === "cancelled" ? (
-            <p className="import-note">已取消：已经入库的图片保留，未完成的临时文件已清理。</p>
+            <p className="import-note">已取消：已入库的图片保留。</p>
           ) : null}
           {summary?.phase === "failed" ? (
             <p className="import-note import-note-danger">任务异常结束，请查看失败清单。</p>

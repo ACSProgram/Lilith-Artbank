@@ -129,7 +129,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
       subtitle={
         current
           ? "新图库会替换当前打开的图库；当前图库的数据不会被修改。"
-          : "图库目录保存图片本体与 .artbank 数据。已有图库会直接打开，空目录会初始化新库。"
+          : "图库目录里放图片和图库数据。已有图库会直接打开，空目录会初始化新库。"
       }
       onClose={onClose}
       width={620}
@@ -151,7 +151,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
       }
     >
       <div className="dialog-form">
-        <Field label="图库目录" hint="支持带空格和中文的绝对路径。">
+        <Field label="图库目录">
           <div className="input-row">
             <input
               className="input"

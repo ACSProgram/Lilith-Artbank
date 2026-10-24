@@ -12,7 +12,6 @@ pub const SETTINGS_VERSION: u32 = 3;
 
 const THEMES: [&str; 3] = ["light", "dark", "system"];
 const THUMB_FITS: [&str; 2] = ["cover", "contain"];
-const DETAIL_PANEL_MODES: [&str; 2] = ["overlay", "push"];
 const SORT_KEYS: [&str; 7] = [
     "importedAt",
     "modifiedAt",
@@ -134,7 +133,6 @@ pub struct UiSettings {
     pub sort: Vec<SortSpec>,
     pub sort_profiles: Vec<SortProfile>,
     pub viewer_filmstrip: bool,
-    pub detail_panel_mode: String,
 }
 
 impl Default for UiSettings {
@@ -147,7 +145,6 @@ impl Default for UiSettings {
             sort: vec![SortSpec::default()],
             sort_profiles: Vec::new(),
             viewer_filmstrip: true,
-            detail_panel_mode: "overlay".into(),
         }
     }
 }
@@ -211,9 +208,6 @@ impl Settings {
         }
         if !(256..=8192).contains(&self.ui.thumb_cache_count) {
             return Err(AppError::message("缩略图缓存张数必须在 256-8192 之间"));
-        }
-        if !DETAIL_PANEL_MODES.contains(&self.ui.detail_panel_mode.as_str()) {
-            return Err(AppError::message("详情面板模式只能是 overlay 或 push"));
         }
         validate_sort(&self.ui.sort)?;
         if self.ui.sort_profiles.len() > MAX_SORT_PROFILES {
@@ -430,7 +424,6 @@ mod tests {
         assert_eq!(loaded.ui.theme, "system");
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
-        assert_eq!(loaded.ui.detail_panel_mode, "overlay");
         assert_eq!(loaded.ui.sort, vec![SortSpec::default()]);
     }
 
@@ -516,7 +509,6 @@ mod tests {
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
         assert!(loaded.ui.viewer_filmstrip);
-        assert_eq!(loaded.ui.detail_panel_mode, "overlay");
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));

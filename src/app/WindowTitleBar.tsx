@@ -5,7 +5,7 @@ import { appApi, browserPreview } from "./api";
 import { useAppRuntime } from "./runtimeContext";
 
 export function WindowTitleBar() {
-  const { current, busy } = useAppRuntime();
+  const { busy } = useAppRuntime();
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
@@ -29,14 +29,6 @@ export function WindowTitleBar() {
         <span className="brand-mark">A</span>
         <span className="brand-name">Lilith Artbank</span>
         {browserPreview ? <span className="titlebar-badge">浏览器预览</span> : null}
-        {current ? (
-          <>
-            <span className="titlebar-separator">/</span>
-            <span className="titlebar-library" title={current.path}>
-              {current.name}
-            </span>
-          </>
-        ) : null}
         {busy ? <span className="titlebar-busy">{busy}…</span> : null}
       </div>
       <div className="titlebar-drag" data-tauri-drag-region onDoubleClick={toggleMaximize} />

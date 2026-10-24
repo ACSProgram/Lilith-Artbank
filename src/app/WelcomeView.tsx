@@ -33,7 +33,7 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
         <article>
           <Images size={18} />
           <h3>为大规模设计</h3>
-          <p>页面只取可见条目，元数据不整库载入内存；分页使用键集游标，深翻不退化。</p>
+          <p>滚动只加载看得见的部分，几十万张也能立刻翻到。</p>
         </article>
         <article>
           <Gauge size={18} />
@@ -43,7 +43,7 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
         <article>
           <ShieldCheck size={18} />
           <h3>原图不动</h3>
-          <p>导入只复制到图库目录并按内容哈希命名；编辑产生新文件，旧版本不会被悄悄覆盖。</p>
+          <p>导入只复制不移动；编辑会另存为新文件，原图不会被悄悄覆盖。</p>
         </article>
       </div>
     </div>

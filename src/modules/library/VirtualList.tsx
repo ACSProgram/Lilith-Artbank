@@ -234,10 +234,8 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
               <RefreshCw size={13} />
               加载失败，点击重试
             </button>
-          ) : hasMore ? (
-            <span>向下滚动载入更多</span>
-          ) : (
-            <span>已加载 {items.length.toLocaleString()} 张</span>
+          ) : hasMore ? null : (
+            <span>没有更多了</span>
           )}
         </div>
       ) : null}

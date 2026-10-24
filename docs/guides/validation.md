@@ -7,17 +7,17 @@
 - `npm run typecheck`、`npm run build`；
 - `cargo fmt --check`、`cargo check`、`cargo test`；
 - `git diff --check`；
-- 用浏览器预览（`npm run dev`）或无头 Chromium 做静态渲染、DOM 结构、布局与性能检查；
 - 对真实图库目录做**只读**清点（`ls`、文件数、尺寸），不写入。
 
 禁止：
 
 - 输入注入：`SendInput`、鼠标/键盘模拟、`pyautogui`、注入式消息，或任何驱动真实应用窗口的自动化；
-- 未经用户明确安排执行 `cargo build --release` / `npm run tauri build`；
+- **UI 调试**：启动 `npm run dev` / `npm run tauri dev`、浏览器预览或无头 Chromium，截图、抓 DOM、量布局、看渲染性能都算；
+- **编译 release**：`cargo build --release` / `npm run tauri build`，也不为了“确认能打包”而全量编译；需要时由用户自己执行；
 - 修改 `G:\Lilith Image Library` 下的任何文件（包括“测试性改名/删除/写入”）；
 - 把真实图库路径写进测试或基准；测试一律用 `tempfile` 临时目录。
 
-界面视觉、手感与真实窗口行为由用户在阶段验收时手工检查。代理只能报告构建、类型、单测、基准与无头渲染的结论。
+界面视觉、手感与真实窗口行为全部由用户在阶段验收时手工检查。代理只报告构建、类型、单测与基准的结论，并把验收步骤写清楚交给用户。
 
 ## 日常检查
 
@@ -33,11 +33,11 @@ git diff --check
 - 前端改动至少跑 typecheck；涉及构建配置时跑 build。
 - Rust 改动至少跑 cargo check 与 cargo test。
 - 导入改动跑 `cargo test`：包含混合格式入库、精确重复、合并策略、取消一致性与 pack 缺失；性能门槛单独跑 `perf_import_1000`。
-- 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端在浏览器预览中检查 DOM 数量、筛选/排序/搜索重置与缩略图占位。
+- 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
-- 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端另跑 typecheck/build，并在浏览器预览中检查查看器布局、缩放、裁剪拖拽映射与上下张。
+- 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端另跑 typecheck/build，查看器布局、缩放、裁剪拖拽映射与上下张由用户手工验收。
 - AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
-- 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口手工验收；浏览器预览不会验证 WebView2 解码、系统剪贴板、模型推理或真实向量包。
+- 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 
 ## 数据库与文件

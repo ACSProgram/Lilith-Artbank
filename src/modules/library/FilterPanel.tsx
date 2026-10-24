@@ -124,9 +124,25 @@ export function FilterPanel({
     ? counts.extensions.map((item) => item.value)
     : filters.extensions;
 
-  const visibleTags = tags.filter((tag) =>
-    tagQuery.trim() ? tag.name.toLowerCase().includes(tagQuery.trim().toLowerCase()) : true,
-  );
+  /**
+   * 分面只显示“有内容”的项：计数为 0 且未被选中的不渲染，已选中的即使为 0 也保留
+   * （否则用户没法取消选择）。计数还没回来时按“未过滤”处理，避免打开面板瞬间闪一下。
+   */
+  const scoreValues = useMemo(() => {
+    if (!counts) return [0, 1, 2, 3, 4, 5];
+    const values = new Set(counts.scores.map((item) => Number(item.value)));
+    for (const score of filters.scores) values.add(score);
+    return [...values].sort((a, b) => a - b);
+  }, [counts, filters.scores]);
+
+  const tagOptions = useMemo(() => {
+    const keyword = tagQuery.trim().toLowerCase();
+    return tags.filter((tag) => {
+      if (keyword && !tag.name.toLowerCase().includes(keyword)) return false;
+      if (!counts) return true;
+      return filters.tagIds.includes(tag.id) || (tagCounts.get(tag.id) ?? 0) > 0;
+    });
+  }, [counts, filters.tagIds, tagCounts, tagQuery, tags]);
 
   if (!open) return null;
 
@@ -230,25 +246,27 @@ export function FilterPanel({
           </div>
         </section>
 
-        <section className="filter-section">
-          <h4>评分</h4>
-          <div className="filter-chips">
-            {[0, 1, 2, 3, 4, 5].map((score) => {
-              const active = filters.scores.includes(score);
-              return (
-                <button
-                  key={score}
-                  type="button"
-                  className={`filter-chip${active ? " is-active" : ""}`}
-                  onClick={() => patch({ scores: toggleValue(filters.scores, score) })}
-                >
-                  {score === 0 ? "未评分" : "★".repeat(score)}
-                  <em>{scoreCounts.get(String(score)) ?? "—"}</em>
-                </button>
-              );
-            })}
-          </div>
-        </section>
+        {scoreValues.length > 0 ? (
+          <section className="filter-section">
+            <h4>评分</h4>
+            <div className="filter-chips">
+              {scoreValues.map((score) => {
+                const active = filters.scores.includes(score);
+                return (
+                  <button
+                    key={score}
+                    type="button"
+                    className={`filter-chip${active ? " is-active" : ""}`}
+                    onClick={() => patch({ scores: toggleValue(filters.scores, score) })}
+                  >
+                    {score === 0 ? "未评分" : "★".repeat(score)}
+                    <em>{scoreCounts.get(String(score)) ?? 0}</em>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
 
         <section className="filter-section">
           <h4>导入时间</h4>
@@ -368,13 +386,19 @@ export function FilterPanel({
             onChange={(event) => setTagQuery(event.target.value)}
           />
           <div className="filter-option-list filter-tag-list">
-            {visibleTags.length === 0 ? (
+            {tagOptions.length === 0 ? (
               <span className="filter-loading">
-                {optionsLoading ? <Spinner size={12} /> : null}
-                {optionsLoading ? "载入标签…" : tagQuery.trim() ? "没有匹配的标签" : "还没有标签"}
+                {optionsLoading || countsLoading ? <Spinner size={12} /> : null}
+                {optionsLoading
+                  ? "载入标签…"
+                  : tagQuery.trim()
+                    ? "没有匹配的标签"
+                    : tags.length === 0
+                      ? "还没有标签"
+                      : "当前范围内没有带标签的图片"}
               </span>
             ) : (
-              visibleTags.map((tag) => {
+              tagOptions.map((tag) => {
                 const active = filters.tagIds.includes(tag.id);
                 const count = counts ? (tagCounts.get(tag.id) ?? 0) : tag.imageCount;
                 return (

@@ -1,15 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  Activity,
-  Database,
-  FolderOpen,
-  Images,
-  Sparkles,
-  Trash2,
-  Upload,
-  X,
-} from "lucide-react";
-import { Button, IconButton } from "../shared/components/Button";
+import { FolderOpen, Images, Trash2, Upload } from "lucide-react";
+import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
@@ -30,16 +21,14 @@ import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 
-const upcoming = [["Stage 8", "维护、批量工作流与体验补全"]];
-
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
   onChangeLibrary: () => void;
 }
 
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
-  const { current, refreshStatus, closeLibrary } = useAppRuntime();
-  const { notify, confirm } = useNotices();
+  const { current, refreshStatus } = useAppRuntime();
+  const { notify } = useNotices();
   const [benchOpen, setBenchOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
@@ -178,20 +167,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     }
   };
 
-  const handleClose = async () => {
-    const accepted = await confirm({
-      title: "关闭图库？",
-      message: "关闭只释放数据库连接，不会修改图库内容。",
-      confirmLabel: "关闭",
-    });
-    if (!accepted) return;
-    try {
-      await closeLibrary();
-    } catch (error) {
-      notify("关闭图库失败", "error", errorMessage(error));
-    }
-  };
-
   const openImport = (paths: string[] = []) => {
     if (browserPreview) {
       notify("导入需要 Tauri 桌面窗口", "info", "浏览器预览不会读写真实图库。");
@@ -210,8 +185,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     <div className="app-body">
       <Sidebar
         onOpenSettings={onOpenSettings}
-        onChangeLibrary={onChangeLibrary}
-        onCloseLibrary={() => void handleClose()}
+        onOpenLibrary={onChangeLibrary}
         folders={folders}
         selectedFolderIds={browse.browse.filters.folderIds}
         selectedImageIds={selectedImageIds}
@@ -221,58 +195,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       />
       <main className="app-main">
         <div className={`workspace${hasImages ? " workspace-browse" : ""}`}>
-          <header className="workspace-toolbar">
-            <div className="workspace-heading">
-              <span className="workspace-eyebrow">LIBRARY</span>
-              <div className="workspace-title-row">
-                <h1>{current.name}</h1>
-                <span className="workspace-count">
-                  {current.imageCount.toLocaleString()} 张 · 回收站{" "}
-                  {current.trashCount.toLocaleString()}
-                </span>
-                <span className="workspace-path" title={current.path}>
-                  {current.path}
-                </span>
-              </div>
-            </div>
-            <div className="workspace-actions">
-              <button
-                type="button"
-                className={`ai-status-pill${aiStatus?.online ? " is-online" : ""}`}
-                title={aiStatus?.process.message ?? "打开 AI 任务"}
-                onClick={() => setAiTasks({ selectedIds: [], query: null })}
-              >
-                <Sparkles size={13} />
-                {aiStatus?.online
-                  ? "AI 在线"
-                  : aiStatus?.process.state === "starting"
-                    ? "AI 启动中"
-                    : "AI 离线"}
-              </button>
-              {import.meta.env.DEV && !browserPreview ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  icon={<Activity size={14} />}
-                  onClick={() => setBenchOpen(true)}
-                >
-                  缩略图基准
-                </Button>
-              ) : null}
-              <Button
-                size="sm"
-                variant="primary"
-                icon={<Upload size={14} />}
-                onClick={() => openImport()}
-              >
-                导入图片
-              </Button>
-              <IconButton label="关闭图库" onClick={() => void handleClose()}>
-                <X size={16} />
-              </IconButton>
-            </div>
-          </header>
-
           {hasImages ? (
             <LibraryView
               key={current.id}
@@ -286,6 +208,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               refreshToken={refreshToken}
               onOpenViewer={setViewerSession}
               onCopyImage={(imageId) => void handleCopyImage(imageId)}
+              onOpenImport={() => openImport()}
+              onOpenBench={import.meta.env.DEV ? () => setBenchOpen(true) : undefined}
               similarity={similarity}
               onFindSimilar={(kind, imageId) => similarity.findSimilar(kind, imageId)}
               onOpenSimilarityGroups={() => setSimilarityGroupsOpen(true)}
@@ -311,13 +235,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                   </div>
                 </div>
                 <div className="stat-card">
-                  <span className="stat-icon"><Database size={18} /></span>
-                  <div>
-                    <span className="stat-value">v{current.schemaVersion}</span>
-                    <span className="stat-label">Schema</span>
-                  </div>
-                </div>
-                <div className="stat-card">
                   <span className="stat-icon"><FolderOpen size={18} /></span>
                   <div>
                     <span className="stat-value stat-value-small" title={current.path}>{current.path}</span>
@@ -332,22 +249,14 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 </div>
                 <h2>把图片拖进来</h2>
                 <p>
-                  把图片或文件夹拖进窗口，或者从本地选择。原图复制入库，缩略图、pHash 与主色同步生成。
+                  把图片或文件夹拖进窗口，或者从本地选择。原图会复制入库，源文件不受影响。
                 </p>
                 <div className="workspace-empty-actions">
                   <Button variant="primary" icon={<Upload size={15} />} onClick={() => openImport()}>
                     导入图片
                   </Button>
                 </div>
-                <div className="stage-list">
-                  {upcoming.map(([stage, text]) => (
-                    <div key={stage} className="stage-item">
-                      <span className="stage-badge">{stage}</span>
-                      <span>{text}</span>
-                    </div>
-                  ))}
-                </div>
-                {browserPreview ? (
+                {import.meta.env.DEV && browserPreview ? (
                   <p className="workspace-note">
                     浏览器预览模式不会创建真实数据库；请用 <code>npm run tauri dev</code> 验证导入与图库读写。
                   </p>

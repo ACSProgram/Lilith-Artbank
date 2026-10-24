@@ -11,7 +11,7 @@ export interface AppRuntime {
   openLibrary: (path: string) => Promise<LibraryInfo>;
   closeLibrary: () => Promise<void>;
   renameLibrary: (name: string) => Promise<void>;
-  saveSettings: (next: Settings) => Promise<Settings>;
+  saveSettings: (next: Settings, options?: { silent?: boolean }) => Promise<Settings>;
   refreshStatus: () => Promise<void>;
 }
 
