@@ -786,7 +786,7 @@ mod tests {
         root: &Path,
         dir: &Path,
     ) -> ImportJob {
-        let job = Arc::new(ImportJob::new("test-job"));
+        let job = Arc::new(ImportJob::new("test-job", "测试样本"));
         run(source(session, root), job.clone(), request(dir)).unwrap();
         job.finish(ImportPhase::Completed);
         Arc::try_unwrap(job).ok().unwrap()
@@ -853,7 +853,7 @@ mod tests {
             assert!(content.is_file(), "缺少原图 {}", content.display());
         }
 
-        let second = Arc::new(ImportJob::new("duplicate-job"));
+        let second = Arc::new(ImportJob::new("duplicate-job", "测试样本"));
         run(
             source(&session, &library_root),
             second.clone(),
@@ -889,7 +889,7 @@ mod tests {
             second.to_string_lossy().into_owned(),
         ];
         preserve.folder_mode = FolderMode::Preserve;
-        let job = Arc::new(ImportJob::new("preserve-job"));
+        let job = Arc::new(ImportJob::new("preserve-job", "测试样本"));
         run(source(&session, &library_root), job.clone(), preserve).unwrap();
         job.finish(ImportPhase::Completed);
         assert_eq!(job.snapshot().progress.imported, 2);
@@ -924,7 +924,7 @@ mod tests {
         merge_request.duplicate_policy = DuplicatePolicy::Merge;
         merge_request.tags = vec!["第二次".into()];
         merge_request.score = 5;
-        let job = Arc::new(ImportJob::new("merge-job"));
+        let job = Arc::new(ImportJob::new("merge-job", "测试样本"));
         run(source(&session, &library_root), job.clone(), merge_request).unwrap();
         job.finish(ImportPhase::Completed);
         let snapshot = job.snapshot();
@@ -959,7 +959,7 @@ mod tests {
         let mut cancel_request = request(&source_dir);
         cancel_request.worker_threads = Some(4);
         cancel_request.cancel_after = Some(20);
-        let job = Arc::new(ImportJob::new("cancel-job"));
+        let job = Arc::new(ImportJob::new("cancel-job", "测试样本"));
         run(source(&session, &library_root), job.clone(), cancel_request).unwrap();
         assert!(job.should_cancel());
         job.finish(ImportPhase::Cancelled);
@@ -1013,7 +1013,7 @@ mod tests {
         let library_root = temp.path().join("library");
         let session = open_library(&library_root);
 
-        let job = Arc::new(ImportJob::new("perf-job"));
+        let job = Arc::new(ImportJob::new("perf-job", "测试样本"));
         let start = Instant::now();
         run(
             source(&session, &library_root),

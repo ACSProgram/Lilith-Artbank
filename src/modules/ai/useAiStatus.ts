@@ -36,16 +36,10 @@ export function useAiStatus(enabled: boolean): AiStatusController {
     if (!enabled) return;
     let disposed = false;
     void refresh();
+    // 服务启动中需要快速轮询；任务进度走任务中心事件，不靠这里。
     const timer = window.setInterval(() => {
       if (disposed) return;
-      const current = statusRef.current;
-      const active =
-        current?.process.state === "starting" ||
-        current?.job?.phase === "preparing" ||
-        current?.job?.phase === "running";
-      if (active) {
-        void refresh();
-      }
+      if (statusRef.current?.process.state === "starting") void refresh();
     }, 1500);
     const slow = window.setInterval(() => {
       if (!disposed) void refresh();

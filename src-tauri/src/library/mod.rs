@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod collections;
 pub mod content;
 pub mod db;
@@ -24,4 +25,22 @@ pub(crate) fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// 批量文件操作的进度与取消回调；由 app 层的任务句柄实现，测试用 `NoopReporter`。
+pub trait BatchReporter: Send + Sync {
+    fn report(&self, completed: usize, total: usize);
+    fn cancelled(&self) -> bool;
+}
+
+#[cfg(test)]
+pub struct NoopReporter;
+
+#[cfg(test)]
+impl BatchReporter for NoopReporter {
+    fn report(&self, _completed: usize, _total: usize) {}
+
+    fn cancelled(&self) -> bool {
+        false
+    }
 }

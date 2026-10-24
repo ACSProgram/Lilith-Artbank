@@ -1,16 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AiDescriptionResult,
-  AiJobRequest,
-  AiJobSnapshot,
   AiStatus,
   ImageSimilarityResult,
   PoseData,
   SemanticSearchResult,
-  SimilarityGroupsResult,
   SimilarityPage,
 } from "./types";
-import type { SimilarGroupKind, SimilarKind } from "../../shared/similarity";
+import type { SimilarKind } from "../../shared/similarity";
 
 export const aiBrowserPreview =
   typeof window === "undefined" || !("__TAURI_INTERNALS__" in window);
@@ -40,7 +37,6 @@ function offlineStatus(): AiStatus {
       count: 0,
       message: "浏览器预览没有图库 embedding",
     },
-    job: null,
   };
 }
 
@@ -63,21 +59,6 @@ export const aiApi = {
   async stopService(): Promise<void> {
     requireTauri("进程托管");
     return invoke("ai_stop_service");
-  },
-
-  async startJob(request: AiJobRequest): Promise<AiJobSnapshot> {
-    requireTauri("AI 任务");
-    return invoke<AiJobSnapshot>("start_ai_job", { request });
-  },
-
-  async cancelJob(jobId: string): Promise<void> {
-    if (aiBrowserPreview) return;
-    return invoke("cancel_ai_job", { jobId });
-  },
-
-  async getJobStatus(jobId: string): Promise<AiJobSnapshot | null> {
-    if (aiBrowserPreview) return null;
-    return invoke<AiJobSnapshot | null>("get_ai_job_status", { jobId });
   },
 
   async describeImage(
@@ -118,19 +99,6 @@ export const aiApi = {
       targetId,
       threshold: threshold ?? null,
       limit: limit ?? null,
-    });
-  },
-
-  async findSimilarGroups(
-    kind: SimilarGroupKind,
-    threshold?: number,
-    similarityThreshold?: number,
-  ): Promise<SimilarityGroupsResult> {
-    requireTauri("相似分组");
-    return invoke<SimilarityGroupsResult>("find_similar_groups", {
-      kind,
-      threshold: threshold ?? null,
-      similarityThreshold: similarityThreshold ?? null,
     });
   },
 

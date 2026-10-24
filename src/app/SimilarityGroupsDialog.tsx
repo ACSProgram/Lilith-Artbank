@@ -1,57 +1,140 @@
 import { useEffect, useState } from "react";
-import { ScanSearch, Layers, Plus } from "lucide-react";
+import { Layers, Plus, ScanSearch, Square } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Modal } from "../shared/components/Modal";
+import { Spinner } from "../shared/components/Spinner";
 import { aiApi } from "../modules/ai/api";
 import { libraryApi } from "../modules/library/api";
 import type { SimilarityGroupsResult } from "../modules/ai/types";
-import type { SimilarGroupKind } from "../shared/similarity";
-import { SIMILAR_GROUP_LABELS } from "../shared/similarity";
 import { errorMessage } from "../shared/errors";
+import { thumbnailUrl } from "../shared/thumbUrl";
 import { useNotices } from "./noticeContext";
+import { useTaskCenter } from "./taskContext";
+import { taskApi } from "./taskApi";
+import { TASK_PHASE_LABELS, isTaskActive, taskPercent } from "./taskTypes";
 
 interface SimilarityGroupsDialogProps {
   open: boolean;
   onClose: () => void;
   onChanged: () => void;
+  /** 已经启动的扫描；打开时直接接管它的进度与结果。 */
+  initialTaskId?: string | null;
+  /** 在对话框里启动扫描后把任务 id 交给上层，关掉再打开仍能接回进度。 */
+  onTaskStarted?: (taskId: string) => void;
 }
 
 const VISIBLE_GROUPS = 200;
 
-export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityGroupsDialogProps) {
+function metricLabel(result: SimilarityGroupsResult): string {
+  if (result.phash && result.embedding) return "pHash + 语义";
+  return result.phash ? "pHash" : "语义";
+}
+
+export function SimilarityGroupsDialog({
+  open,
+  onClose,
+  onChanged,
+  initialTaskId = null,
+  onTaskStarted,
+}: SimilarityGroupsDialogProps) {
   const { notify } = useNotices();
-  const [kind, setKind] = useState<SimilarGroupKind>("phash");
-  const [phashThreshold, setPhashThreshold] = useState("6");
-  const [similarityThreshold, setSimilarityThreshold] = useState("0.97");
+  const { start, cancel, find } = useTaskCenter();
+  const [phashOn, setPhashOn] = useState(true);
+  const [phashThreshold, setPhashThreshold] = useState(6);
+  const [embeddingOn, setEmbeddingOn] = useState(false);
+  const [embeddingThreshold, setEmbeddingThreshold] = useState(0.97);
   const [baseName, setBaseName] = useState("相似组");
-  const [busy, setBusy] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SimilarityGroupsResult | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [embeddingCount, setEmbeddingCount] = useState<number | null>(null);
 
   useEffect(() => {
-    if (open) return;
-    setBusy(false);
+    if (!open) return;
+    setStarting(false);
     setSaving(false);
     setError(null);
+    setResult(null);
+    setTaskId(initialTaskId);
+  }, [open, initialTaskId]);
+
+  useEffect(() => {
+    if (!open) return;
+    let disposed = false;
+    void aiApi
+      .getStatus()
+      .then((status) => {
+        if (!disposed) setEmbeddingCount(status.mean.count);
+      })
+      .catch(() => {
+        if (!disposed) setEmbeddingCount(0);
+      });
+    return () => {
+      disposed = true;
+    };
   }, [open]);
 
+  const task = taskId ? find(taskId) : null;
+  const running = task ? isTaskActive(task) : false;
+  const percent = task ? taskPercent(task) : 0;
+  const embeddingAvailable = (embeddingCount ?? 0) > 0;
+  const ready = phashOn || (embeddingOn && embeddingAvailable);
+
+  useEffect(() => {
+    if (!task || isTaskActive(task)) return;
+    if (task.phase === "failed") {
+      setError(task.message || "扫描失败");
+      return;
+    }
+    if (task.phase !== "completed") return;
+    let disposed = false;
+    void taskApi
+      .similarityGroupsResult(task.taskId)
+      .then((value) => {
+        if (disposed) return;
+        if (value) setResult(value);
+        else setError("扫描结果已失效，请重新扫描");
+      })
+      .catch((cause: unknown) => {
+        if (!disposed) setError(errorMessage(cause));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [task]);
+
   const scan = async () => {
-    if (busy) return;
-    setBusy(true);
+    if (running || starting || !ready) return;
+    setStarting(true);
     setError(null);
+    setResult(null);
     try {
-      const next = await aiApi.findSimilarGroups(
-        kind,
-        kind === "phash" ? Number(phashThreshold) : undefined,
-        kind === "embedding" ? Number(similarityThreshold) : undefined,
-      );
-      setResult(next);
+      const started = await start({
+        kind: "similarityGroups",
+        scope: { type: "library" },
+        overwrite: false,
+        recalcVisuals: false,
+        prompt: null,
+        maxTokens: null,
+        groupPhash: phashOn,
+        phashThreshold: phashOn ? phashThreshold : null,
+        groupEmbedding: embeddingOn && embeddingAvailable,
+        embeddingThreshold:
+          embeddingOn && embeddingAvailable ? embeddingThreshold : null,
+        conflict: "queue",
+      });
+      if (started.status === "conflict") {
+        setError("暂时无法开始扫描，请稍后再试");
+        return;
+      }
+      setTaskId(started.task.taskId);
+      onTaskStarted?.(started.task.taskId);
     } catch (cause) {
       setError(errorMessage(cause));
-      setResult(null);
     } finally {
-      setBusy(false);
+      setStarting(false);
     }
   };
 
@@ -130,61 +213,124 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
     >
       <section className="dialog-section">
         <h3>
-          <ScanSearch size={14} /> 扫描范围
+          <ScanSearch size={14} /> 比较方式
         </h3>
-        <div className="dialog-inline">
-          <select
-            className="input"
-            value={kind}
-            disabled={busy}
-            onChange={(event) => setKind(event.target.value as SimilarGroupKind)}
-          >
-            <option value="phash">pHash 相似组</option>
-            <option value="embedding">embedding 复核组</option>
-          </select>
-          {kind === "phash" ? (
-            <label className="dialog-field">
-              Hamming 阈值
+
+        <div className="similarity-metrics">
+          <div className={`similarity-metric${phashOn ? "" : " is-off"}`}>
+            <label className="similarity-metric-head">
               <input
-                className="input"
-                type="number"
+                type="checkbox"
+                checked={phashOn}
+                disabled={running}
+                onChange={(event) => setPhashOn(event.target.checked)}
+              />
+              <span>
+                <strong>pHash</strong>
+                <small>画面结构</small>
+              </span>
+            </label>
+            <label className="similarity-metric-control">
+              <span>差异上限</span>
+              <input
+                type="range"
                 min={0}
                 max={7}
+                step={1}
                 value={phashThreshold}
-                disabled={busy}
-                onChange={(event) => setPhashThreshold(event.target.value)}
+                disabled={!phashOn || running}
+                onChange={(event) => setPhashThreshold(Number(event.target.value))}
               />
+              <em>{phashThreshold}</em>
             </label>
-          ) : (
-            <label className="dialog-field">
-              余弦阈值
+          </div>
+
+          <div className={`similarity-metric${embeddingOn ? "" : " is-off"}`}>
+            <label
+              className="similarity-metric-head"
+              title={
+                embeddingAvailable
+                  ? undefined
+                  : "还没有图片 embedding，可以先在批量任务里生成。"
+              }
+            >
               <input
-                className="input"
-                type="number"
+                type="checkbox"
+                checked={embeddingOn}
+                disabled={running || !embeddingAvailable}
+                onChange={(event) => setEmbeddingOn(event.target.checked)}
+              />
+              <span>
+                <strong>语义</strong>
+                <small>画面内容</small>
+              </span>
+            </label>
+            <label className="similarity-metric-control">
+              <span>相似度下限</span>
+              <input
+                type="range"
                 min={0.5}
                 max={1}
                 step={0.01}
-                value={similarityThreshold}
-                disabled={busy}
-                onChange={(event) => setSimilarityThreshold(event.target.value)}
+                value={embeddingThreshold}
+                disabled={!embeddingOn || !embeddingAvailable || running}
+                onChange={(event) => setEmbeddingThreshold(Number(event.target.value))}
               />
+              <em>{embeddingThreshold.toFixed(2)}</em>
             </label>
-          )}
-          <Button
-            size="sm"
-            variant="primary"
-            icon={<ScanSearch size={13} />}
-            loading={busy}
-            onClick={() => void scan()}
-          >
-            扫描
-          </Button>
+          </div>
         </div>
-        <p className="dialog-hint">
-          {kind === "phash"
-            ? "0-7 内结果完整；想更宽松请用单张“找相似”。"
-            : "缺少语义特征的图片会计入缺失。"}
-        </p>
+
+        <div className="dialog-inline">
+          <p className="dialog-hint">
+            {phashOn && embeddingOn
+              ? "同时开启时，两个条件都满足才归为一组。"
+              : phashOn
+                ? "按画面结构分组。"
+                : embeddingAvailable
+                  ? "按画面内容分组。"
+                  : "还需要图片的语义特征才能按内容分组。"}
+          </p>
+          {running ? (
+            <Button
+              size="sm"
+              variant="danger"
+              icon={<Square size={12} />}
+              onClick={() => taskId && void cancel(taskId)}
+            >
+              取消扫描
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="primary"
+              icon={<ScanSearch size={13} />}
+              loading={starting}
+              disabled={!ready}
+              title={ready ? undefined : "至少开启一种比较方式"}
+              onClick={() => void scan()}
+            >
+              扫描
+            </Button>
+          )}
+        </div>
+
+        {task ? (
+          <div className="similarity-scan-progress">
+            <div className="similarity-scan-head">
+              <span>
+                {isTaskActive(task) ? <Spinner size={12} /> : null}
+                {TASK_PHASE_LABELS[task.phase]}
+                {task.message ? ` · ${task.message}` : ""}
+              </span>
+              <em>{percent}%</em>
+            </div>
+            <div className="task-progress">
+              <span style={{ width: `${percent}%` }} />
+            </div>
+          </div>
+        ) : null}
+
         {error ? <p className="dialog-error">{error}</p> : null}
       </section>
 
@@ -195,7 +341,7 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
           </h3>
           <div className="dialog-inline">
             <span className="dialog-hint">
-              {SIMILAR_GROUP_LABELS[result.kind]} · {result.groups.length.toLocaleString()} 组
+              {metricLabel(result)} · {result.groups.length.toLocaleString()} 组
               {result.missing > 0 ? ` · ${result.missing.toLocaleString()} 张缺少数据` : ""}
               {result.truncated ? " · 已截断" : ""}
             </span>
@@ -241,9 +387,11 @@ export function SimilarityGroupsDialog({ open, onClose, onChanged }: SimilarityG
                 <div className="similarity-group-row" key={`${index}-${ids[0]}`}>
                   <span className="similarity-group-index">第 {index + 1} 组</span>
                   <span className="similarity-group-count">{ids.length.toLocaleString()} 张</span>
-                  <span className="similarity-group-ids">
-                    {ids.slice(0, 12).map((id) => `#${id}`).join("、")}
-                    {ids.length > 12 ? " …" : ""}
+                  <span className="similarity-group-thumbs">
+                    {ids.slice(0, 6).map((id) => (
+                      <img key={id} src={thumbnailUrl(id)} alt="" loading="lazy" />
+                    ))}
+                    {ids.length > 6 ? <em>+{ids.length - 6}</em> : null}
                   </span>
                   <Button
                     size="sm"

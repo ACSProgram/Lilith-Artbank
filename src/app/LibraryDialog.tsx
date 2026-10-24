@@ -178,7 +178,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
               <CheckCircle2 size={18} />
               <div>
                 <strong>已有图库：{inspection.manifest.name}</strong>
-                <span>格式 v{inspection.manifest.formatVersion} · 将直接打开</span>
+                <span>将直接打开</span>
               </div>
             </>
           ) : inspection?.kind === "empty" ? (
@@ -186,7 +186,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
               <Library size={18} />
               <div>
                 <strong>空目录</strong>
-                <span>将在目录内创建 .artbank、SQLite 元数据库与缩略图包目录。</span>
+                <span>将在这里创建图库数据，目录里已有的图片不会被改动。</span>
               </div>
             </>
           ) : inspection?.kind === "invalid" ? (
@@ -206,7 +206,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
         </div>
 
         {inspection?.kind !== "library" ? (
-          <Field label="图库名称" hint="只影响窗口标题与清单名称，不会重命名目录。">
+          <Field label="图库名称" hint="只影响显示名称，不会重命名目录。">
             <input
               className="input"
               value={name}

@@ -854,8 +854,8 @@ export function ImageViewer({
             {source && imageFailed ? (
               <div className="viewer-state viewer-state-error">
                 <AlertTriangle size={24} />
-                <strong>图片解码失败</strong>
-                <span>请确认原图仍存在，或检查输出格式是否被 WebView2 支持。</span>
+                <strong>这张图片打不开</strong>
+                <span>原图可能已被移动或删除，也可能是当前不支持的格式。</span>
                 <Button
                   size="sm"
                   variant="primary"

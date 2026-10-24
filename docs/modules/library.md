@@ -163,6 +163,9 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `save_image_edit` | `{ request }` | `EditResult` |
 | `get_image_pose` | `{ imageId }` | `PoseData \| null`（feature pack） |
 | `copy_image` | `{ imageId }` | `null` |
+| `get_image_capabilities` | `{ imageIds }` | `ImageCapabilities[]`（pose / embedding / colors / phash） |
+| `get_feature_summary` | — | `FeatureSummary`（全库描述 / embedding / 姿势 / pHash / 主色数量） |
+| `start_batch_task` / `list_tasks` / `cancel_task` | 见 [AI 服务](ai-service.md) | 统一任务入口、任务列表与取消；事件 `task-progress` / `task-finished` |
 | AI 命令（status/ensure/任务/描述/pose/语义搜索） | 见 [AI 服务](ai-service.md) | — |
 | `window_toggle_fullscreen` | — | `boolean` |
 | `copy_text` | `{ text }` | `null` |
@@ -185,8 +188,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
 
 - 元数据写入都走单写连接；批量操作按 400 个 id 分块。
-- 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除先删行再删文件。
-- 文件操作（图片移动、文件夹操作、永久删除、清空回收站）与导入、图库切换共用 `maintenance` 守卫；长任务当前没有进度事件与取消。
+- 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除与清空回收站按 400 张一块先提交删行事务、再删文件。
+- 文件操作（图片移动、永久删除、清空回收站）挂任务总线的 write lane，有进度与取消；导入、创建/打开图库要求任务总线空闲，关闭图库只拒绝 write lane（ai/scan 任务会被取消并等待退出）。
 - 集合只引用图片 id；集合运算新建集合，不修改源集合。
 
 ## 文件夹
@@ -212,13 +215,13 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - `close_library`：释放连接、清空 AI 运行时状态与 `libraryPath`，不动文件。
 - `rename_library`：更新清单名称与当前 `LibraryInfo.name`；不改目录名，也不写设置。
 - 应用内没有多库列表与“移除图库”操作；换库由“打开另一个图库”完成。
-- 导入/AI 任务/文件操作运行时，关闭、切换与创建图库都会被拒绝；需要先取消或等待任务结束。
+- 导入/AI 任务/文件操作运行时，创建与打开图库会被拒绝；关闭图库在 write 任务进行时拒绝，只有 ai/scan 任务时先取消再关闭。
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v3（含 v1→v2→v3 迁移）、连接池、设置 v3（含 v1→v2→v3 迁移）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹与路径校验；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v3（含 v1→v2→v3 迁移）、连接池、设置 v3（含 v1→v2→v3 迁移）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹与路径校验；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
-未实现（后续阶段）：拖出到资源管理器（OLE）、维护类长任务进度/取消（S8）、体验整改 P1–P4（见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
+未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）、体验整改 P3–P4（见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
 ## 测试
 

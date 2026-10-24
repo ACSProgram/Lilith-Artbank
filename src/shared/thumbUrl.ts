@@ -39,8 +39,3 @@ export function thumbnailUrl(
   const url = `${thumbOrigin}/${imageId}?v=${version}`;
   return retry > 0 ? `${url}&retry=${retry}` : url;
 }
-
-/** 开发基准样本；同一 `run` 复用浏览器缓存。 */
-export function benchThumbnailUrl(index: number, run: number): string {
-  return `${thumbOrigin}/bench/${index}?run=${run}`;
-}

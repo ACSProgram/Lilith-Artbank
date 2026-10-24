@@ -222,7 +222,7 @@ fn perf_metadata_200k() {
         similar.len()
     );
     let started = Instant::now();
-    let groups = index.phash_groups(6).expect("phash groups");
+    let groups = index.phash_groups(6, None).expect("phash groups");
     println!(
         "[perf] pHash group scan (warm index, {IMAGE_COUNT} rows): {:.2}ms, groups={}, truncated={}",
         ms(started.elapsed()),

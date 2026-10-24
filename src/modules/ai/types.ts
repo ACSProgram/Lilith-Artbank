@@ -1,12 +1,5 @@
-import type { SimilarGroupKind, SimilarKind } from "../../shared/similarity";
+import type { SimilarKind } from "../../shared/similarity";
 
-export type AiJobKind = "embedding" | "pose" | "description";
-export type AiJobPhase =
-  | "preparing"
-  | "running"
-  | "completed"
-  | "cancelled"
-  | "failed";
 export type AiProcessState =
   | "stopped"
   | "starting"
@@ -42,30 +35,6 @@ export interface AiMeanStatus {
   message: string | null;
 }
 
-export interface AiJobFailure {
-  imageId: number | null;
-  reason: string;
-}
-
-export interface AiJobProgress {
-  jobId: string;
-  kind: AiJobKind;
-  phase: AiJobPhase;
-  total: number;
-  completed: number;
-  failed: number;
-  skipped: number;
-  currentImageId: number | null;
-  message: string;
-  elapsedMs: number;
-}
-
-export interface AiJobSnapshot extends AiJobProgress {
-  startedAt: number;
-  finishedAt: number | null;
-  failures: AiJobFailure[];
-}
-
 export interface AiStatus {
   baseUrl: string;
   autoStart: boolean;
@@ -74,17 +43,6 @@ export interface AiStatus {
   process: AiProcessStatus;
   health: AiHealth | null;
   mean: AiMeanStatus;
-  job: AiJobSnapshot | null;
-}
-
-export interface AiJobRequest {
-  kind: AiJobKind;
-  imageIds: number[];
-  /** 图库查询条件（不透明透传，由后端反序列化）；AI 模块不依赖图库类型。 */
-  query: object | null;
-  overwrite: boolean;
-  prompt?: string | null;
-  maxTokens?: number | null;
 }
 
 export interface SemanticSearchResult {
@@ -110,7 +68,8 @@ export interface ImageSimilarityResult {
 }
 
 export interface SimilarityGroupsResult {
-  kind: SimilarGroupKind;
+  phash: boolean;
+  embedding: boolean;
   groups: number[][];
   truncated: boolean;
   missing: number;

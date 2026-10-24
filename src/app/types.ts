@@ -70,17 +70,3 @@ export interface AppInfo {
   settingsPath: string;
   logPath: string;
 }
-
-export interface ThumbBenchInfo {
-  count: number;
-  thumbBytes: number;
-  buildMs: number;
-  readP50Ms: number;
-  readP95Ms: number;
-}
-
-export interface ThumbReadStats {
-  p50Ms: number;
-  p95Ms: number;
-  totalBytes: number;
-}

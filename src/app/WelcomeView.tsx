@@ -14,8 +14,8 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
           收进一个真正快的图库
         </h1>
         <p className="welcome-lede">
-          Lilith Artbank 面向数十万张图片、数百 GB 的美术素材仓库。一个图库、一棵真实文件夹树；
-          元数据走 SQLite，缩略图走追加式包文件，原图保持内容寻址。
+          Lilith Artbank 面向数十万张图片、数百 GB 的美术素材仓库。一个图库、一棵真实文件夹树，
+          原图留在原处，浏览和搜索都在本地完成。
         </p>
         <div className="welcome-actions">
           <Button variant="primary" size="md" icon={<FolderPlus size={17} />} onClick={onAddLibrary}>
@@ -33,12 +33,12 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
         <article>
           <Images size={18} />
           <h3>为大规模设计</h3>
-          <p>滚动只加载看得见的部分，几十万张也能立刻翻到。</p>
+          <p>几十万张素材也能顺畅翻看，打开就能用。</p>
         </article>
         <article>
           <Gauge size={18} />
-          <h3>按加载路径优化</h3>
-          <p>缩略图包顺序写、按偏移读；浏览器只解码当前页的图片，缓存可随时重建。</p>
+          <h3>翻到哪都有图</h3>
+          <p>停下的地方立刻出缩略图，不需要等整页加载。</p>
         </article>
         <article>
           <ShieldCheck size={18} />

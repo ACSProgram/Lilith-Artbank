@@ -1,11 +1,81 @@
 # 当前阶段状态
 
 日期：2026-10-24
-阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 旧库全量迁移已完成（主库 390 542 张、独立测试库 9 455 张、247 条失败内容移出库外），两库自动验证通过；E 自动检查已运行，真实窗口待用户验收；S7 相似度检索与相似分组已实现并通过自动验收，真实窗口与 20 万级基准待验收；体验整改 P0 基础层已完成并通过用户手工验收，P1 浏览主界面已完成（真实窗口观感待验收），P2–P4 待执行**
+阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 旧库全量迁移已完成（主库 390 542 张、独立测试库 9 455 张、247 条失败内容移出库外），两库自动验证通过；E 自动检查已运行，真实窗口待用户验收；S7 相似度检索与相似分组已实现并通过自动验收，20 万级基准待验收；体验整改 P0 基础层、P1 浏览主界面、P2 任务总线已完成，P2 已通过用户手工验收，P3–P4 待执行**
 
 历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
 
-## 当前批次：体验整改 P1 浏览主界面（2026-10-24）
+## 当前批次：体验整改 P2 任务总线（2026-10-24）
+
+来源与批次划分见 [迁移后体验整改计划](2026-10-24-体验整改计划.md)。P2 把导入、AI 批量任务、相似分组与批量文件操作收敛到一条任务总线，前端新增统一任务中心；用户已在真实窗口手工验收通过。改动已暂存，未提交。
+
+Rust：
+
+- `app/tasks.rs`（新）：`TaskKind` / `TaskLane`（write / ai / scan）/ `TaskScope` / `TaskHandle` / `TaskBus`。write 独占；ai 与 scan 可以并行，但都不能和 write 并行。冲突返回 `TaskStartResult::Conflict { active }`，支持 `fail` / `queue` / `cancelActive`；排队任务按 200ms 轮询取消标记。事件统一为 `task-progress` / `task-finished`（150ms 节流），任务表保留最近 50 条。
+- `TaskScope` 只传语义（selected / folder / collection / view / library），id 集合在 Rust 侧解析，几十万 id 不过 IPC。
+- `import/job.rs`、`ai/job.rs` 改为持有 `Arc<TaskHandle>`，导入与三种 AI 任务迁到总线；删除 `maintenance` 布尔守卫与 `job_running` 一类散落状态。
+- 相似分组改异步任务：`runtime::start_groups_task`（scan lane），`GroupProgress` 把 pHash 扫描与语义复核映射到 0–1000；结果按 taskId 缓存在内存（最多 5 份），由 `get_similarity_groups_result` 取回。
+- 相似分组支持 pHash 与语义两个独立指标：只开 pHash 走分段索引分组；只开语义时 pHash 只产生候选、不参与筛选；两个都开时先按 pHash 阈值收窄候选，再在组内按中心化余弦拆分。
+- `library/thumbs.rs::rebuild`：重建单张缩略图，可选重算 pHash / 主色；追加写入 pack 后在一个事务里更新指针与段尺寸。批量任务连续失败 5 张自动停止。
+- `library/capability.rs`（新）：`get_image_capabilities(ids)`（最多 500 张，200 一块 EXISTS）与 `get_feature_summary()`；右键按单图、筛选面板按全库汇总置灰。
+- 批量文件操作挂 write lane：`move_images` / `delete_images` / `empty_trash` 接收 `BatchReporter`；永久删除与清空回收站改为每 400 张一块「先提交删行事务，再删文件」，块边界检查取消。
+- 关闭图库：write lane 忙则拒绝；只有 ai/scan 忙时先取消并等待退出（最多 10 秒）。创建与打开图库仍要求没有任何任务在跑。
+
+前端：
+
+- `src/app/taskTypes.ts` / `taskApi.ts` / `taskContext.ts` / `TaskCenterProvider.tsx` / `TaskCapsule.tsx`（新）：统一任务中心。右下角胶囊显示活跃任务与总进度，展开可看阶段、x/y、耗时、失败清单（前 20 条）与取消；任务结束后保留 12 秒。任务完成时递增 `dataVersion`，主界面自动刷新网格、文件夹与状态。
+- `src/app/BatchTaskDialog.tsx`（新）：类型（重建缩略图 / Embedding / 姿势 / 描述）→ 范围五选一（带数量与禁用原因）→ 选项 → 开始；冲突时列出正在运行的任务，并提供「排队等待 / 取消现有并开始」。
+- `SimilarityGroupsDialog.tsx`：改为 pHash 与语义两个独立指标（各自开关 + 滑块，同时开启为 AND）；结果按缩略图预览展示，可合并保存或每组一个集合；关闭后再打开能接回同一任务的进度与结果。
+- `src/shared/capability.ts`（新）：统一可用性与原因；右键「找相似」、筛选面板「有 …」、工具栏语义搜索、批量任务选项全部接入。多选时右键「找相似」整组置灰，不再取首张。
+- 删除 `src/modules/ai/AiTaskDialog.tsx` 与旧 AI 任务命令（`start_ai_job` / `cancel_ai_job` / `get_ai_job_status` / `find_similar_groups`）。
+- 删除缩略图基准：`ThumbBenchOverlay.tsx`、`app/bench.rs`、`thumb://bench/*` 路由、3 个命令与相关样式。
+- 文案：清掉「尚未滚动加载」「SQLite / 追加式包文件 / 按偏移读」「WebView2」等实现说明；复制路径提示改为「另有 N 张未复制」；「未加载」改为「未就绪」。
+
+### 验证结果（P2）
+
+```text
+npx tsc --noEmit
+npm run build
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets     # 0 警告
+cargo test --lib               # 136 passed, 0 failed, 4 ignored
+git diff --check
+```
+
+用户已在 `npm run tauri dev` 下手工验收：任务胶囊与取消、冲突排队 / 取消现有、范围五选一、相似分组双指标与结果回看、能力置灰、多选找相似置灰、移动 / 永久删除 / 清空回收站的进度与取消、关闭图库的拒绝与自动取消。
+
+### 提交前整理与修复（P2）
+
+Rust：
+
+- `TaskBus::launch` 直接返回 `AppResult<TaskStartResult>`，删掉 `TaskConflict` 与三处“Err 转 Conflict”的重复转换；新增 `TaskBus::spawn_worker`，线程起不来时把任务标成失败——原先 `std::thread::spawn(...).ok()` 会让任务永久停在“准备中”，既不出进度也一直占着 `active()`（阻塞关库与导入）。
+- `TaskHandle::finish_from` 改成泛型，删除 `commands.rs` 里的 `finish_task` 副本；`move_images_to_folder` / `delete_images_permanently` / `empty_trash` 收敛成 `run_write_task` 一个 helper（占用 write lane、进度、终态一处完成）。
+- **AI 任务不再自带一套状态**：删除 `AiJob` / `AiJobPhase` / `AiJobProgress` / `AiJobSnapshot` / `AiJobFailure`、`Inner.job` 槽位、`current_job`、`AiStatus.job` 与 `ai-job-progress` / `ai-job-finished` 事件；`job::execute` 直接写 `TaskHandle`，进度只走任务总线。
+- 修掉一处范围 bug：`AiJobRequest` 去掉 `query` 与 `resolve_ids` 的“id 为空就全库”回退。范围解析结果为空（例如空文件夹）时，原来会把整个图库当成任务范围。
+- 导入进度：失败项先 `inc_processed` 再 `inc_failed`，任务胶囊会把同一张算两次；改为 `completed = processed - failed`。AI 任务与缩略图重建本来就不重复计数。
+- 永久删除按块统计数据库真实删除行数（原来直接加块长度）。
+- 相似分组：`TaskProgress` 的区间换算改为 `saturating_mul` + `checked_div`；失败收尾不再先 `set_message` 再 `finish_from` 重设一遍。
+- `capability.rs` / `state.rs` 去掉函数内的全限定路径与内联 `HashSet` 导入；缩略图重建改成走 `spawn_worker`。
+
+前端：
+
+- `TaskCenterProvider` 复用 `isTaskActive`；`SimilarityGroupsDialog` 的取结果副作用依赖收敛到 `task`；`aiTaskAvailability` 去掉没用到的 kind 参数；`BatchTaskContextInfo` 删除没用的 `folderDirect`。
+- 删除 `modules/ai/types.ts` 里失效的任务 DTO（`AiJobKind` / `AiJobPhase` / `AiJobSnapshot` 等）与 `AiStatus.job`；`useAiStatus` 只在进程启动中做快速轮询，任务进度不再影响它。
+
+设置页固定尺寸（用户反馈仍未稳定）：
+
+- `.settings-body` 由 grid 改成 flex：grid 的单行 auto 在内容超高时按 max-content 撑开，外框 `overflow: hidden` 会把内容裁掉，看起来像“框没变但布局在动”；现在导航定宽 156、内容列 `flex: 1 / min-width: 0`。
+- `.settings-content` 加 `scrollbar-gutter: stable`：分类之间切换时滚动条出现/消失不再把内容横向挤一下。
+- 对话框固定 700×560；切换分类时内容列滚回顶部，不再沿用上一个分类的滚动位置。
+- 内容列限宽 460→560，与导航的 padding 对齐，右侧不再留一大块空白。
+
+遗留：
+
+- 20 万级真实库上的相似分组耗时与内存峰值仍未实测（见 [待办](todo.md)）。
+- 界面观感（任务胶囊、批量任务对话框、相似分组指标卡片、设置页固定尺寸）由用户手工验收，代理未做 UI 调试。
+
+## 此前批次：体验整改 P1 浏览主界面（2026-10-24）
 
 来源与批次划分见 [迁移后体验整改计划](2026-10-24-体验整改计划.md)。P0 的实现记录已归档：[体验整改 P0 基础层记录](archive/2026-10-24-体验整改P0记录.md)。本批改的是主界面本身：去掉重复信息、重排工具栏、缩略图返工、右键菜单分组、集合入口拆开、筛选隐藏零值、设置改分类导航。
 
@@ -22,7 +92,7 @@ Rust：
 
 浏览主界面（`LibraryView.tsx`）：
 
-- 工具栏改两行：第一行返回 + `ViewBar` + 选择摘要 + `导入` + `任务` 菜单（AI 任务、相似分组，开发构建多一项缩略图基准）；第二行面包屑 + 搜索（含当前视图/全库）+ 语义 + 筛选 + 排序指标与方向 + 网格/列表 + 裁剪/适应 + 详情侧栏开关 + 刷新。面包屑单行横向滚动并带右端渐隐。
+- 工具栏改两行：第一行返回 + `ViewBar` + 选择摘要 + `导入` + `任务` 菜单（AI 任务、相似分组，开发构建多一项缩略图基准；缩略图基准已在 P2 删除）；第二行面包屑 + 搜索（含当前视图/全库）+ 语义 + 筛选 + 排序指标与方向 + 网格/列表 + 裁剪/适应 + 详情侧栏开关 + 刷新。面包屑单行横向滚动并带右端渐隐。
 - 缩略图返工（`VirtualGrid.tsx`）：删掉 `LABEL_HEIGHT` 与格子下方文字标签，格子高度等于宽度；尺寸/格式/大小只进 `title`。`thumb.is-contain` 走 `object-fit: contain`，“裁剪 / 适应”切换写 `ui.thumbFit`（`saveSettings` 带 `silent`，不弹“设置已保存”）。
 - 列数锚定：列数变化（窗口缩放、详情面板开关）后用 `useLayoutEffect` 按 `activeId` 把锚点行放回原视口位置；只在列数真的变化时才查一次索引。
 - 详情侧栏：单击只选中，不再自动打开；空选时显示占位提示；右键菜单删掉“在侧栏查看详情”（原本就是空操作），`LibraryView` 不再传 `onShowDetails`。
@@ -35,7 +105,7 @@ Rust：
 设置：
 
 - `SettingsDialog.tsx` 改成左侧分类导航（通用 / 外观 / 图库 / AI 服务 / 性能 / 关于）+ 右侧内容，记住上次分类；AI 状态与 capability 用中文标签展示，原始键名不再出现；关于页给出设置文件与日志文件的“打开文件夹”。
-- 固定尺寸：`Modal` 新增 `height` 与 `bodyClassName`，设置对话框固定 560px 高、`.modal-body-fixed` 不滚动、只有内容列滚动。切换分类、AI 状态刷新、错误提示出现时对话框不再忽大忽小。
+- 固定尺寸：`Modal` 新增 `height` 与 `bodyClassName`，设置对话框固定高度、`.modal-body-fixed` 不滚动、只有内容列滚动。切换分类、AI 状态刷新、错误提示出现时对话框不再忽大忽小（P2 提交前又改成 flex 布局并定宽 700×560，见上）。
 
 ### 提交前复核
 
@@ -45,7 +115,7 @@ Rust：
 - `LibraryView` 去掉 `similarMode ? "正在搜索…" : "正在搜索…"` 的重复分支；语义提示改成“正在理解描述…”。
 - `CollectionDialogs` 的“不需要先滚动加载，按当前条件全部写入”改成“按当前筛选条件全部写入”（按 `AGENTS.md` 的界面文案约定，不解释实现）。
 - 设置页去掉缩略图缓存的 MB 估算：按“张 × 512×512×4 字节”会显示 1024 张 ≈ 1 GB，与实际占用不符；滑块右侧的“N 张”已经够用。
-- 删除失效样式：`.library-item*`、`.recent-*`、`.welcome-stage`、`.sidebar-version`、`.ai-status-pill`、`.selectable`；其余未被直接引用的类名都是动态拼装（`button-${variant}`、`is-${thumbFit}`、`toast-${tone}`、`thumb-bench-result-${grade}`）。
+- 删除失效样式：`.library-item*`、`.recent-*`、`.welcome-stage`、`.sidebar-version`、`.ai-status-pill`、`.selectable`；其余未被直接引用的类名都是动态拼装（`button-${variant}`、`is-${thumbFit}`、`toast-${tone}`）。
 
 ### 验证结果（P1）
 
@@ -66,6 +136,7 @@ git diff --check
 - 两行工具栏在 1040×640 下的具体断行、面包屑渐隐、右键菜单在真实 WebView2 上的观感由用户手工确认。
 
 本批已作为一个提交落地（见 `git log`），未推送。
+
 ## 此前批次：相似度检索与相似分组（S7）
 
 2026-10-24 完成，与 D 迁移并行；只改应用代码，未触碰 `G:\Lilith Image Library`。
@@ -77,8 +148,8 @@ Rust：
 - `ai/embedding.rs`：`target` 读目标向量、`similar_to` 减均值扫描 top-K、`refine_groups` 用中心化余弦把 pHash 候选拆成语义一致的小组。
 - `ai/pose.rs`：`similar` 每个包 mmap 一次后顺序切片打分。
 - `ai/pack.rs`：`record_slice` 上移，embedding 与 pose 共用。
-- `app/runtime.rs`：`find_similar_images`（5 种 kind）与 `find_similar_groups`（pHash / embedding 复核）；`SemanticCache` 改为 `ResultCache`，语义搜索与找相似共用同一个 token 槽；`invalidate_semantic` 改名 `invalidate_similarity` 并同时清掉视觉索引。
-- 新命令：`find_similar_images`、`find_similar_groups`。
+- `app/runtime.rs`：`find_similar_images`（5 种 kind）与 `find_similar_groups`（pHash / embedding 复核；P2 已改为任务总线上的异步扫描，见当前批次）；`SemanticCache` 改为 `ResultCache`，语义搜索与找相似共用同一个 token 槽；`invalidate_semantic` 改名 `invalidate_similarity` 并同时清掉视觉索引。
+- 新命令：`find_similar_images`、`find_similar_groups`（后者 P2 已移除，改走 `start_batch_task`）。
 
 前端：
 

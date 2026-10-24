@@ -5,8 +5,6 @@ import type {
   LibraryInfo,
   LibraryInspection,
   Settings,
-  ThumbBenchInfo,
-  ThumbReadStats,
 } from "./types";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -147,21 +145,6 @@ export const appApi = {
   async revealPath(path: string): Promise<void> {
     if (!isTauri()) return;
     return invoke<void>("reveal_path", { path });
-  },
-
-  async thumbBenchPrepare(): Promise<ThumbBenchInfo> {
-    if (!isTauri()) throw new Error("缩略图基准只在 Tauri 开发构建中可用");
-    return invoke<ThumbBenchInfo>("thumb_bench_prepare");
-  },
-
-  async thumbBenchMeasureRead(): Promise<ThumbReadStats> {
-    if (!isTauri()) throw new Error("缩略图基准只在 Tauri 开发构建中可用");
-    return invoke<ThumbReadStats>("thumb_bench_measure_read");
-  },
-
-  async thumbBenchCleanup(): Promise<void> {
-    if (!isTauri()) return;
-    return invoke<void>("thumb_bench_cleanup");
   },
 
   async windowMinimize(): Promise<void> {

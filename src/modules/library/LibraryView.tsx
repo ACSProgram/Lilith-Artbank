@@ -70,11 +70,13 @@ import {
   type BrowseState,
   type SimilarityBrowseState,
 } from "./model";
+import type { BatchTaskContextInfo } from "../../shared/batchTaskContext";
 import type {
   CollectionInfo,
+  FeatureSummary,
   FolderInfo,
+  ImageCapabilities,
   ImageRow,
-  LibraryQuery,
   LibraryView as LibraryViewType,
   SortKey,
   SortSpec,
@@ -100,13 +102,13 @@ interface LibraryViewProps {
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
   onOpenImport?: () => void;
-  onOpenBench?: () => void;
   similarity?: SimilarityBrowseState;
   onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
   onOpenSimilarityGroups?: () => void;
-  onOpenAiTasks?: (context: { selectedIds: number[]; query: LibraryQuery | null }) => void;
+  onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
-  aiOnline?: boolean;
+  /** 语义搜索不可用的原因；为空表示可用。 */
+  semanticBlockedReason?: string | null;
 }
 
 /** 涉及文件（文件夹移动、永久删除）的批量上限，与 Rust `MAX_FILE_BATCH_IDS` 保持一致。 */
@@ -144,13 +146,12 @@ export function LibraryView({
   onOpenViewer,
   onCopyImage,
   onOpenImport,
-  onOpenBench,
   similarity,
   onFindSimilar,
   onOpenSimilarityGroups,
-  onOpenAiTasks,
+  onOpenBatchTasks,
   onGenerateDescription,
-  aiOnline = false,
+  semanticBlockedReason = null,
 }: LibraryViewProps) {
   const { settings, current, refreshStatus, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
@@ -181,8 +182,11 @@ export function LibraryView({
   const [viewBusy, setViewBusy] = useState(false);
   const [semanticOpen, setSemanticOpen] = useState(false);
   const [semanticDraft, setSemanticDraft] = useState("");
+  const [contextCaps, setContextCaps] = useState<ImageCapabilities | null>(null);
+  const [featureSummary, setFeatureSummary] = useState<FeatureSummary | null>(null);
 
   const viewRef = useRef<VirtualViewHandle>(null);
+  const contextCapsTarget = useRef<number | null>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
   const taskAnchorRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -285,6 +289,22 @@ export function LibraryView({
   useEffect(() => {
     void reloadCollections();
   }, [reloadCollections, refreshToken, dataVersion]);
+
+  // 全库特征覆盖情况只随数据变化重查；用于筛选面板与工具栏置灰。
+  useEffect(() => {
+    let disposed = false;
+    void libraryApi
+      .getFeatureSummary()
+      .then((summary) => {
+        if (!disposed) setFeatureSummary(summary);
+      })
+      .catch(() => {
+        // 统计失败时不置灰，避免把暂时读不到当成“没有特征”。
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [refreshToken, dataVersion]);
 
   useEffect(() => {
     setSelected(new Set());
@@ -484,6 +504,19 @@ export function LibraryView({
         items: targetItems.length > 0 ? targetItems : [item],
         ids: ids.length > 0 ? ids : [item.id],
       });
+      // 菜单先出现，能力随后补齐；只在目标仍是同一张图时写回。
+      setContextCaps(null);
+      contextCapsTarget.current = item.id;
+      void libraryApi
+        .getImageCapabilities([item.id])
+        .then((caps) => {
+          if (contextCapsTarget.current === item.id) {
+            setContextCaps(caps[0] ?? null);
+          }
+        })
+        .catch(() => {
+          // 查询失败时按“未知”处理，菜单项保持可用。
+        });
     },
     [items, selected],
   );
@@ -492,6 +525,50 @@ export function LibraryView({
     setContextMenu(null);
     clearSelection();
   }, [clearSelection]);
+
+  /** 打开批量任务前先算好各范围的数量；id 集合仍由 Rust 侧解析。 */
+  const openBatchTasks = useCallback(async () => {
+    setTaskMenuOpen(false);
+    if (!onOpenBatchTasks) return;
+    const folderId =
+      browse.filters.folderIds.length === 1 ? browse.filters.folderIds[0] : null;
+    const folder = folderId != null ? folders.find((item) => item.id === folderId) : undefined;
+    const collection =
+      effectiveView === "collection"
+        ? collections.find((item) => item.id === effectiveCollectionId)
+        : undefined;
+    let viewTotal: number | null = null;
+    if (!similarityActive) {
+      try {
+        viewTotal = (await libraryApi.getFilterCounts(query)).total;
+      } catch {
+        viewTotal = null;
+      }
+    }
+    onOpenBatchTasks({
+      selectedIds: [...selected],
+      query: similarityActive ? null : query,
+      viewTotal,
+      folderId,
+      folderName: folder?.path ?? null,
+      folderTotal: folder?.totalImageCount ?? null,
+      collectionId: effectiveView === "collection" ? effectiveCollectionId : null,
+      collectionName: collection?.name ?? null,
+      collectionTotal: collection?.imageCount ?? null,
+      libraryTotal: current?.imageCount ?? 0,
+    });
+  }, [
+    browse.filters.folderIds,
+    collections,
+    current?.imageCount,
+    effectiveCollectionId,
+    effectiveView,
+    folders,
+    onOpenBatchTasks,
+    query,
+    selected,
+    similarityActive,
+  ]);
 
   const resolveResultIds = useCallback(async () => {
     if (similarityActive && similarity) return similarity.ids();
@@ -523,21 +600,13 @@ export function LibraryView({
       const first = ids[0] ?? null;
       setAnchorId(first);
       setActiveId(first);
-      notify(
-        `已选择 ${ids.length.toLocaleString()} 张`,
-        "info",
-        ids.length === 0
-          ? "当前条件没有图片"
-          : similarityActive
-            ? "包含相似结果中尚未滚动加载的图片"
-            : "包含尚未滚动加载的图片",
-      );
+      notify(`已选择 ${ids.length.toLocaleString()} 张`, "info");
     } catch (cause) {
       notify("全选失败", "error", errorMessage(cause));
     } finally {
       setSelectingAll(false);
     }
-  }, [notify, resolveResultIds, selectingAll, similarityActive]);
+  }, [notify, resolveResultIds, selectingAll]);
 
   const copyPaths = useCallback(async () => {
     const targets = contextMenu?.items ?? [];
@@ -551,7 +620,7 @@ export function LibraryView({
         `已复制 ${targets.length.toLocaleString()} 条文件路径`,
         "success",
         hidden > 0
-          ? `另有 ${hidden.toLocaleString()} 张未加载，仅复制了已加载项`
+          ? `另有 ${hidden.toLocaleString()} 张未复制`
           : undefined,
       );
     } catch (cause) {
@@ -1057,22 +1126,15 @@ export function LibraryView({
             onClose={() => setTaskMenuOpen(false)}
             minWidth={190}
           >
-            <MenuSection title="批量任务">
+            <MenuSection title="工具">
               <button
                 type="button"
                 className="context-menu-item"
-                disabled={!onOpenAiTasks}
-                onClick={() => {
-                  setTaskMenuOpen(false);
-                  onOpenAiTasks?.({
-                    selectedIds: [...selected],
-                    query: similarityActive ? null : query,
-                  });
-                }}
+                disabled={!onOpenBatchTasks}
+                onClick={() => void openBatchTasks()}
               >
                 <Sparkles size={14} />
-                <span>AI 任务…</span>
-                <em>{aiOnline ? "在线" : "离线"}</em>
+                <span>批量任务…</span>
               </button>
               <button
                 type="button"
@@ -1086,19 +1148,6 @@ export function LibraryView({
                 <ScanSearch size={14} />
                 <span>相似分组…</span>
               </button>
-              {import.meta.env.DEV && onOpenBench ? (
-                <button
-                  type="button"
-                  className="context-menu-item"
-                  onClick={() => {
-                    setTaskMenuOpen(false);
-                    onOpenBench();
-                  }}
-                >
-                  <RefreshCw size={14} />
-                  <span>缩略图基准</span>
-                </button>
-              ) : null}
             </MenuSection>
           </Popover>
         </div>
@@ -1200,7 +1249,8 @@ export function LibraryView({
             size="sm"
             variant={similarityActive ? "primary" : "secondary"}
             icon={<Sparkles size={14} />}
-            disabled={!similarity}
+            disabled={!similarity || Boolean(semanticBlockedReason)}
+            title={!similarity ? "当前不可用" : (semanticBlockedReason ?? undefined)}
             onClick={() => setSemanticOpen((open) => !open)}
           >
             语义
@@ -1222,6 +1272,7 @@ export function LibraryView({
               filters={browse.filters}
               query={query}
               dataVersion={dataVersion}
+              featureSummary={featureSummary}
               onFiltersChange={(filters) =>
                 applyBrowse({ ...browseRef.current, filters })
               }
@@ -1384,9 +1435,14 @@ export function LibraryView({
               : `语义搜索「${similarity.text}」`}{" "}
             · {similarity.total.toLocaleString()} 张结果
           </span>
-          <button type="button" className="text-button" onClick={() => similarity.clear()}>
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={<X size={12} />}
+            onClick={() => similarity.clear()}
+          >
             退出相似结果
-          </button>
+          </Button>
         </div>
       ) : null}
 
@@ -1394,14 +1450,14 @@ export function LibraryView({
         <div className="filter-summary">
           <span>{filterSummary.join(" · ")}</span>
           {hasActiveFilters(browse.filters) ? (
-            <button type="button" className="text-button" onClick={resetFilters}>
+            <Button size="sm" variant="ghost" onClick={resetFilters}>
               清除筛选
-            </button>
+            </Button>
           ) : null}
           {browse.search ? (
-            <button type="button" className="text-button" onClick={() => setSearchDraft("")}>
+            <Button size="sm" variant="ghost" onClick={() => setSearchDraft("")}>
               清除搜索
-            </button>
+            </Button>
           ) : null}
         </div>
       ) : null}
@@ -1462,11 +1518,7 @@ export function LibraryView({
                         ? "把选中的图片加入这个集合后，它们会出现在这里。"
                         : "导入图片后会显示在这里。"}
               </span>
-              {similarityActive ? (
-                <Button size="sm" variant="primary" onClick={() => similarity?.clear()}>
-                  退出相似结果
-                </Button>
-              ) : hasActiveFilters(browse.filters) ? (
+              {similarityActive ? null : hasActiveFilters(browse.filters) ? (
                 <Button size="sm" variant="primary" onClick={resetFilters}>
                   清除筛选
                 </Button>
@@ -1543,6 +1595,7 @@ export function LibraryView({
       {contextMenu ? (
         <LibraryContextMenu
           menu={contextMenu}
+          capabilities={contextCaps}
           inCollection={effectiveView === "collection"}
           hasActive={contextHasActive}
           hasDeleted={contextHasDeleted}

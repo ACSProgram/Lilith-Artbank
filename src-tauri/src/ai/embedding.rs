@@ -209,6 +209,7 @@ pub fn duplicate_groups(
         similarity_threshold,
         candidates.groups,
         candidates.truncated,
+        None,
     )
 }
 
@@ -223,10 +224,20 @@ pub fn refine_groups(
     similarity_threshold: f32,
     candidates: Vec<Vec<i64>>,
     mut truncated: bool,
+    progress: Option<&dyn library_similarity::GroupProgress>,
 ) -> AppResult<DuplicateGroups> {
     let mut groups = Vec::new();
     let mut missing = 0_usize;
-    for group in candidates {
+    let total = candidates.len();
+    for (index, group) in candidates.into_iter().enumerate() {
+        if let Some(progress) = progress
+            && index % 32 == 0
+        {
+            progress.report(index, total);
+            if progress.cancelled() {
+                return Err(AppError::message("扫描已取消"));
+            }
+        }
         if group.len() > library_similarity::MAX_GROUP_SIZE {
             truncated = true;
             continue;

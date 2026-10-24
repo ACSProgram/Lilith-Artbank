@@ -4,21 +4,20 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
-    ai::{
-        job::{AiJobRequest, AiJobSnapshot},
-        runtime::{
-            AiDescriptionResult, AiStatus, ImageSimilarityResult, SemanticSearchResult,
-            SimilarityGroupsResult, SimilarityPage,
-        },
+    ai::runtime::{
+        AiDescriptionResult, AiStatus, ImageSimilarityResult, SemanticSearchResult,
+        SimilarityGroupsResult, SimilarityPage,
     },
     app::{
-        bench::{self, ThumbBenchInfo, ThumbReadStats},
-        error::AppError,
+        error::{AppError, AppResult},
         settings::Settings,
         state::AppState,
+        tasks::{BatchTaskRequest, LaneGuard, TaskKind, TaskPhase, TaskSnapshot, TaskStartResult},
     },
     import::{ImportRequest, job::ImportSnapshot},
     library::{
+        BatchReporter,
+        capability::{FeatureSummary, ImageCapabilities},
         collections::{CollectionInfo, CombineMode},
         edit::{self, EditRequest, EditResult},
         manifest::LibraryInspection,
@@ -204,38 +203,6 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn thumb_bench_prepare(state: State<'_, AppState>) -> Result<ThumbBenchInfo, String> {
-    if !cfg!(debug_assertions) {
-        return Err("缩略图基准只在开发构建中可用".to_owned());
-    }
-    let (bench, info) = tauri::async_runtime::spawn_blocking(bench::prepare)
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())?;
-    state.set_thumb_bench(Some(bench));
-    Ok(info)
-}
-
-#[tauri::command]
-pub async fn thumb_bench_measure_read(
-    state: State<'_, AppState>,
-) -> Result<ThumbReadStats, String> {
-    let bench = state
-        .thumb_bench()
-        .ok_or_else(|| "请先生成基准样本".to_owned())?;
-    tauri::async_runtime::spawn_blocking(move || bench.measure_read(bench::READ_ROUNDS))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn thumb_bench_cleanup(state: State<'_, AppState>) -> Result<(), String> {
-    state.set_thumb_bench(None);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn start_import(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -402,13 +369,46 @@ pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<u64, String
     AppError::command(state.delete_tag(tag_id))
 }
 
+/// 在 write lane 上跑一个有进度的批量操作：占用、进度、终态都交给任务总线。
+async fn run_write_task<T, F>(
+    app: AppHandle,
+    kind: TaskKind,
+    scope: String,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState, &dyn BatchReporter) -> AppResult<T> + Send + 'static,
+{
+    let (handle, guard) = {
+        let state = app.state::<AppState>();
+        state
+            .begin_write_task(&app, kind, scope)
+            .map_err(|error| error.to_string())?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard: LaneGuard = guard;
+        handle.set_phase(TaskPhase::Running);
+        let state = app.state::<AppState>();
+        let result = work(&state, &*handle);
+        handle.finish_from(&result);
+        result.map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
-pub fn move_images_to_folder(
-    state: State<'_, AppState>,
+pub async fn move_images_to_folder(
+    app: AppHandle,
     image_ids: Vec<i64>,
     folder_path: String,
 ) -> Result<MoveReport, String> {
-    AppError::command(state.move_images(&image_ids, &folder_path))
+    let scope = format!("{} 张", image_ids.len());
+    run_write_task(app, TaskKind::FolderMove, scope, move |state, reporter| {
+        state.move_images(&image_ids, &folder_path, reporter)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -422,16 +422,29 @@ pub fn restore_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result
 }
 
 #[tauri::command]
-pub fn delete_images_permanently(
-    state: State<'_, AppState>,
+pub async fn delete_images_permanently(
+    app: AppHandle,
     image_ids: Vec<i64>,
 ) -> Result<DeleteReport, String> {
-    AppError::command(state.delete_images(&image_ids))
+    let scope = format!("{} 张", image_ids.len());
+    run_write_task(
+        app,
+        TaskKind::PermanentDelete,
+        scope,
+        move |state, reporter| state.delete_images(&image_ids, reporter),
+    )
+    .await
 }
 
 #[tauri::command]
-pub fn empty_trash(state: State<'_, AppState>) -> Result<DeleteReport, String> {
-    AppError::command(state.empty_trash())
+pub async fn empty_trash(app: AppHandle) -> Result<DeleteReport, String> {
+    run_write_task(
+        app,
+        TaskKind::EmptyTrash,
+        "回收站".to_owned(),
+        |state, reporter| state.empty_trash(reporter),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -573,30 +586,43 @@ pub async fn ai_stop_service(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn start_ai_job(
+pub fn start_batch_task(
     app: AppHandle,
     state: State<'_, AppState>,
-    request: AiJobRequest,
-) -> Result<AiJobSnapshot, String> {
-    let settings = state.settings.snapshot().ai;
-    let request = request.normalized().map_err(|error| error.to_string())?;
-    state
-        .ai
-        .start_job(app, &settings, request)
-        .map_err(|error| error.to_string())
+    request: BatchTaskRequest,
+) -> Result<TaskStartResult, String> {
+    AppError::command(state.start_batch_task(app, request))
 }
 
 #[tauri::command]
-pub fn cancel_ai_job(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
-    AppError::command(state.ai.cancel_job(&job_id))
+pub fn list_tasks(state: State<'_, AppState>) -> Vec<TaskSnapshot> {
+    state.tasks_snapshot()
 }
 
 #[tauri::command]
-pub fn get_ai_job_status(
+pub fn cancel_task(state: State<'_, AppState>, task_id: String) -> Result<(), String> {
+    AppError::command(state.cancel_task(&task_id))
+}
+
+#[tauri::command]
+pub fn get_similarity_groups_result(
     state: State<'_, AppState>,
-    job_id: String,
-) -> Result<Option<AiJobSnapshot>, String> {
-    Ok(state.ai.job_status(&job_id))
+    task_id: String,
+) -> Option<SimilarityGroupsResult> {
+    state.similarity_groups_result(&task_id)
+}
+
+#[tauri::command]
+pub fn get_image_capabilities(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+) -> Result<Vec<ImageCapabilities>, String> {
+    AppError::command(state.image_capabilities(&image_ids))
+}
+
+#[tauri::command]
+pub fn get_feature_summary(state: State<'_, AppState>) -> Result<FeatureSummary, String> {
+    AppError::command(state.feature_summary())
 }
 
 #[tauri::command]
@@ -661,22 +687,6 @@ pub async fn find_similar_images(
 }
 
 #[tauri::command]
-pub async fn find_similar_groups(
-    state: State<'_, AppState>,
-    kind: String,
-    threshold: Option<u32>,
-    similarity_threshold: Option<f32>,
-) -> Result<SimilarityGroupsResult, String> {
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        runtime.find_similar_groups(&kind, threshold, similarity_threshold)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub async fn get_similarity_page(
     state: State<'_, AppState>,
     token: String,
@@ -724,9 +734,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         window_toggle_fullscreen,
         get_app_info,
         reveal_path,
-        thumb_bench_prepare,
-        thumb_bench_measure_read,
-        thumb_bench_cleanup,
         start_import,
         cancel_import,
         get_import_status,
@@ -771,14 +778,16 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ai_ensure_models,
         ai_start_service,
         ai_stop_service,
-        start_ai_job,
-        cancel_ai_job,
-        get_ai_job_status,
+        start_batch_task,
+        list_tasks,
+        cancel_task,
+        get_similarity_groups_result,
+        get_image_capabilities,
+        get_feature_summary,
         ai_describe_image,
         ai_generate_pose,
         semantic_search,
         find_similar_images,
-        find_similar_groups,
         get_similarity_page,
         get_similarity_ids
     ]

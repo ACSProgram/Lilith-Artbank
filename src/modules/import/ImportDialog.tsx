@@ -48,7 +48,7 @@ function phaseLabel(phase: ImportPhase): string {
     case "processing":
       return "正在导入";
     case "finishing":
-      return "正在写入剩余结果";
+      return "正在收尾";
     case "completed":
       return "导入完成";
     case "cancelled":
@@ -446,7 +446,7 @@ export function ImportDialog({
                 className={`import-policy-option${policy === "merge" ? " is-active" : ""}`}
                 onClick={() => setPolicy("merge")}
               >
-                <strong>合并元数据</strong>
+                <strong>合并标签与评分</strong>
                 <span>标签取并集，评分取较高值</span>
               </button>
             </div>

@@ -4,19 +4,20 @@ import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type { FolderInfo, LibraryQuery } from "../modules/library/types";
+import type { FolderInfo } from "../modules/library/types";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
 import { aiApi } from "../modules/ai/api";
-import { AiTaskDialog } from "../modules/ai/AiTaskDialog";
 import { useAiStatus } from "../modules/ai/useAiStatus";
 import { viewerApi } from "../modules/viewer/api";
 import { browserPreview } from "./api";
 import { useSimilarityBrowse } from "./useSimilarityBrowse";
 import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
+import { BatchTaskDialog } from "./BatchTaskDialog";
+import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
+import { useTaskCenter } from "./taskContext";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { Sidebar } from "./Sidebar";
-import { ThumbBenchOverlay } from "./ThumbBenchOverlay";
 import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
@@ -29,7 +30,6 @@ interface LibraryWorkspaceProps {
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
   const { current, refreshStatus } = useAppRuntime();
   const { notify } = useNotices();
-  const [benchOpen, setBenchOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -39,12 +39,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [foldersLoaded, setFoldersLoaded] = useState(false);
   const [selectedImageIds, setSelectedImageIds] = useState<number[]>([]);
   const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
-  const [aiTasks, setAiTasks] = useState<{
-    selectedIds: number[];
-    query: LibraryQuery | null;
-  } | null>(null);
+  const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
+  const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
   const browse = useLibraryBrowse();
   const similarity = useSimilarityBrowse();
+  const { dataVersion: taskDataVersion } = useTaskCenter();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
@@ -118,13 +117,16 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     };
   }, []);
 
-  const handleAiFinished = useCallback(() => {
+  /** 任务改变图库数据后刷新网格、文件夹计数与图库状态。 */
+  useEffect(() => {
+    if (taskDataVersion === 0) return;
     setRefreshToken((value) => value + 1);
+    void reloadFolders();
     void refreshStatus().catch((error: unknown) => {
       notify("刷新图库状态失败", "error", errorMessage(error));
     });
     void refreshAi();
-  }, [notify, refreshAi, refreshStatus]);
+  }, [taskDataVersion, notify, refreshAi, refreshStatus, reloadFolders]);
 
   const generateDescription = useCallback(async (imageId: number) => {
     const result = await aiApi.describeImage(imageId);
@@ -138,6 +140,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   if (!current) return null;
 
   const hasImages = current.imageCount > 0 || current.trashCount > 0;
+  const semanticBlockedReason = !aiStatus?.online
+    ? "AI 服务离线，语义搜索需要文本模型"
+    : aiStatus.mean.count === 0
+      ? "还没有图片 embedding，可在批量任务里生成"
+      : null;
 
   const handleImportFinished = () => {
     setRefreshToken((value) => value + 1);
@@ -209,13 +216,14 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               onOpenViewer={setViewerSession}
               onCopyImage={(imageId) => void handleCopyImage(imageId)}
               onOpenImport={() => openImport()}
-              onOpenBench={import.meta.env.DEV ? () => setBenchOpen(true) : undefined}
               similarity={similarity}
               onFindSimilar={(kind, imageId) => similarity.findSimilar(kind, imageId)}
-              onOpenSimilarityGroups={() => setSimilarityGroupsOpen(true)}
-              onOpenAiTasks={setAiTasks}
+              onOpenSimilarityGroups={() => {
+                setSimilarityGroupsOpen(true);
+              }}
+              onOpenBatchTasks={setBatchContext}
               onGenerateDescription={generateDescription}
-              aiOnline={aiStatus?.online ?? false}
+              semanticBlockedReason={semanticBlockedReason}
             />
           ) : (
             <>
@@ -266,7 +274,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
           )}
         </div>
 
-        <ThumbBenchOverlay open={benchOpen} onClose={() => setBenchOpen(false)} />
         <div className="workspace-host">
           {viewerSession ? (
             <ViewerHost
@@ -277,14 +284,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               onGeneratePose={generatePose}
             />
           ) : null}
-          <AiTaskDialog
-            open={aiTasks !== null}
-            onClose={() => setAiTasks(null)}
-            selectedIds={aiTasks?.selectedIds ?? []}
-            query={aiTasks?.query ?? null}
+          <BatchTaskDialog
+            open={batchContext !== null}
+            onClose={() => setBatchContext(null)}
+            context={batchContext}
             status={aiStatus}
             onRefreshStatus={refreshAi}
-            onFinished={handleAiFinished}
           />
           <ImportDialog
             open={importOpen}
@@ -295,8 +300,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
           />
           <SimilarityGroupsDialog
             open={similarityGroupsOpen}
-            onClose={() => setSimilarityGroupsOpen(false)}
+            onClose={() => {
+              setSimilarityGroupsOpen(false);
+            }}
             onChanged={() => setRefreshToken((value) => value + 1)}
+            initialTaskId={similarityGroupsTaskId}
+            onTaskStarted={setSimilarityGroupsTaskId}
           />
 
           {dragging && !importOpen ? (

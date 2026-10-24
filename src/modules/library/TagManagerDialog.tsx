@@ -117,7 +117,7 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
         />
         {tags.length >= TAG_LIMIT ? (
           <p className="dialog-hint">
-            标签较多，只载入图片最多的 {TAG_LIMIT} 个；搜索只在这个范围内过滤。
+            标签较多，列表只显示图片最多的 {TAG_LIMIT} 个，搜索也只在这个范围内。
           </p>
         ) : null}
       </section>

@@ -54,7 +54,6 @@ git diff --check
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
 cargo test --manifest-path src-tauri/Cargo.toml --lib ai::embedding::perf_tests -- --ignored --nocapture
 ```
@@ -71,11 +70,11 @@ node tools/perf/thumb_bench/server.mjs
 # 打开 http://127.0.0.1:18767/?format=jpg 与 ?format=webp，看页面右下角结果
 ```
 
-真实 WebView2 的缩略图基准通过开发构建的应用内入口执行，由用户手工点击：
+真实 WebView2 的缩略图观感与加载速度直接在主界面验收（缩略图基准已在 P2 删除）：
 
 ```bash
 npm run tauri dev
-# 打开图库 → 工作区右上角“缩略图基准” → 生成样本 → 冷加载 / 热加载
+# 打开图库 → 网格/列表滚动，观察缩略图出现速度与缓存命中
 ```
 
 浏览界面与导入界面同样只在真实 Tauri 窗口中做最终验收：

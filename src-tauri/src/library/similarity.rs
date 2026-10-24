@@ -43,6 +43,17 @@ pub struct PhashGroups {
     pub truncated: bool,
 }
 
+/// 全库扫描的进度与取消回调。任务总线提供一个适配器；其他调用方传 `None`。
+pub trait GroupProgress {
+    /// 当前阶段已完成 `done` / `total` 个工作单元。
+    fn report(&self, done: usize, total: usize);
+
+    fn cancelled(&self) -> bool;
+
+    /// 切换到新阶段，并声明它在总进度里的区间（0-1000）。
+    fn stage(&self, _label: &str, _base: usize, _span: usize) {}
+}
+
 #[derive(Clone, Copy)]
 struct VisualRow {
     id: i64,
@@ -152,7 +163,11 @@ impl VisualIndex {
     }
 
     /// 全库 pHash 相似对分组；索引已常驻，不再读库。
-    pub fn phash_groups(&self, threshold: u32) -> AppResult<PhashGroups> {
+    pub fn phash_groups(
+        &self,
+        threshold: u32,
+        progress: Option<&dyn GroupProgress>,
+    ) -> AppResult<PhashGroups> {
         if threshold > MAX_INDEXED_PHASH_THRESHOLD {
             return Err(AppError::message(
                 "全库 pHash 分组只支持 0-7；更大阈值请使用目标图相似",
@@ -197,9 +212,21 @@ impl VisualIndex {
         let mut checks = 0_usize;
         let mut truncated = false;
         let mut start = 0;
-        while start < bands.len() {
+        let total_bands = bands.len();
+        if let Some(progress) = progress {
+            progress.report(0, total_bands);
+        }
+        while start < total_bands {
+            if let Some(progress) = progress
+                && start % 256 == 0
+            {
+                progress.report(start, total_bands);
+                if progress.cancelled() {
+                    return Err(AppError::message("扫描已取消"));
+                }
+            }
             let mut end = start + 1;
-            while end < bands.len()
+            while end < total_bands
                 && bands[end].0 == bands[start].0
                 && bands[end].1 == bands[start].1
             {
@@ -219,6 +246,12 @@ impl VisualIndex {
                                 truncated = true;
                                 break 'pairs;
                             }
+                            if checks.is_multiple_of(16_384)
+                                && let Some(progress) = progress
+                                && progress.cancelled()
+                            {
+                                return Err(AppError::message("扫描已取消"));
+                            }
                             if phash::distance_words(&words[a], &words[b]) <= threshold {
                                 union.union(a, b);
                             }
@@ -227,6 +260,9 @@ impl VisualIndex {
                 }
             }
             start = end;
+        }
+        if let Some(progress) = progress {
+            progress.report(total_bands, total_bands);
         }
 
         let mut grouped: std::collections::HashMap<usize, Vec<i64>> =
@@ -364,7 +400,7 @@ pub fn similar_by_color(
 /// 全库 pHash 相似对分组；分段索引见 `VisualIndex::phash_groups`。
 #[cfg(test)]
 pub fn phash_groups(database: &LibraryDb, threshold: u32) -> AppResult<PhashGroups> {
-    VisualIndex::load(database)?.phash_groups(threshold)
+    VisualIndex::load(database)?.phash_groups(threshold, None)
 }
 
 /// 并查集；pHash 分组与 embedding 复核共用同一实现。

@@ -1,13 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::Arc,
 };
 
-use parking_lot::Mutex;
 use rusqlite::{params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
@@ -15,15 +11,9 @@ use crate::{
     app::{
         error::{AppError, AppResult},
         settings::AiSettings,
+        tasks::{TaskHandle, TaskKind, TaskPhase},
     },
-    library::{
-        content,
-        db::LibraryDb,
-        metadata, placeholders,
-        query::{self, LibraryQuery},
-        service::now_ms,
-        thumbs::ThumbPack,
-    },
+    library::{content, db::LibraryDb, metadata, placeholders, thumbs::ThumbPack},
 };
 
 use super::{
@@ -33,8 +23,6 @@ use super::{
     pose,
 };
 
-const MAX_FAILURES: usize = 200;
-const MAX_IDS: usize = 1_000_000;
 /// 连续失败达到该数量即判定服务不可用，停止任务，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const CHUNK: usize = 400;
@@ -60,63 +48,28 @@ impl AiJobKind {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Embedding => "embedding",
             Self::Pose => "姿势",
             Self::Description => "描述",
         }
     }
+
+    pub fn task_kind(self) -> TaskKind {
+        match self {
+            Self::Embedding => TaskKind::AiEmbedding,
+            Self::Pose => TaskKind::AiPose,
+            Self::Description => TaskKind::AiDescription,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AiJobPhase {
-    Preparing,
-    Running,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiJobFailure {
-    pub image_id: Option<i64>,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiJobProgress {
-    pub job_id: String,
-    pub kind: AiJobKind,
-    pub phase: AiJobPhase,
-    pub total: usize,
-    pub completed: usize,
-    pub failed: usize,
-    pub skipped: usize,
-    pub current_image_id: Option<i64>,
-    pub message: String,
-    pub elapsed_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiJobSnapshot {
-    #[serde(flatten)]
-    pub progress: AiJobProgress,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-    pub failures: Vec<AiJobFailure>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+/// 已解析成图片 id 的 AI 批量任务参数；范围由 `TaskScope` 解析后填入。
+#[derive(Debug, Clone, Default)]
 pub struct AiJobRequest {
     pub kind: AiJobKind,
     pub image_ids: Vec<i64>,
-    pub query: Option<LibraryQuery>,
     pub overwrite: bool,
     pub prompt: Option<String>,
     pub max_tokens: Option<u32>,
@@ -124,15 +77,6 @@ pub struct AiJobRequest {
 
 impl AiJobRequest {
     pub fn normalized(mut self) -> AppResult<Self> {
-        self.image_ids.retain(|id| *id > 0);
-        self.image_ids.sort_unstable();
-        self.image_ids.dedup();
-        if self.image_ids.len() > MAX_IDS {
-            return Err(AppError::message("单次 AI 任务最多处理 100 万张图片"));
-        }
-        if !self.image_ids.is_empty() {
-            self.query = None;
-        }
         if let Some(prompt) = &mut self.prompt {
             *prompt = prompt.trim().to_owned();
             if prompt.chars().count() > 2_000 {
@@ -156,175 +100,61 @@ pub struct JobContext {
     pub settings: AiSettings,
 }
 
-pub struct AiJob {
-    id: String,
-    kind: AiJobKind,
-    cancel: AtomicBool,
-    running: AtomicBool,
-    phase: Mutex<AiJobPhase>,
-    total: AtomicUsize,
-    completed: AtomicUsize,
-    failed: AtomicUsize,
-    skipped: AtomicUsize,
-    current: Mutex<Option<i64>>,
-    message: Mutex<String>,
-    failures: Mutex<Vec<AiJobFailure>>,
-    started_at: i64,
-    finished_at: Mutex<Option<i64>>,
-}
-
-impl AiJob {
-    pub fn new(id: impl Into<String>, kind: AiJobKind) -> Self {
-        Self {
-            id: id.into(),
-            kind,
-            cancel: AtomicBool::new(false),
-            running: AtomicBool::new(true),
-            phase: Mutex::new(AiJobPhase::Preparing),
-            total: AtomicUsize::new(0),
-            completed: AtomicUsize::new(0),
-            failed: AtomicUsize::new(0),
-            skipped: AtomicUsize::new(0),
-            current: Mutex::new(None),
-            message: Mutex::new(String::new()),
-            failures: Mutex::new(Vec::new()),
-            started_at: now_ms(),
-            finished_at: Mutex::new(None),
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn kind(&self) -> AiJobKind {
-        self.kind
-    }
-
-    pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-
-    pub fn should_cancel(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst)
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    fn set_phase(&self, phase: AiJobPhase) {
-        *self.phase.lock() = phase;
-    }
-
-    pub fn set_message(&self, message: impl Into<String>) {
-        *self.message.lock() = message.into();
-    }
-
-    fn set_total(&self, total: usize) {
-        self.total.store(total, Ordering::Relaxed);
-    }
-
-    fn set_current(&self, image_id: Option<i64>) {
-        *self.current.lock() = image_id;
-    }
-
-    fn inc_completed(&self) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn inc_failed(&self) {
-        self.failed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn inc_skipped(&self) {
-        self.skipped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn add_failure(&self, image_id: Option<i64>, reason: impl Into<String>) {
-        let mut failures = self.failures.lock();
-        if failures.len() < MAX_FAILURES {
-            failures.push(AiJobFailure {
-                image_id,
-                reason: reason.into(),
-            });
-        }
-    }
-
-    pub fn finish(&self, phase: AiJobPhase) {
-        self.set_phase(phase);
-        self.set_current(None);
-        *self.finished_at.lock() = Some(now_ms());
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    pub fn progress(&self) -> AiJobProgress {
-        AiJobProgress {
-            job_id: self.id.clone(),
-            kind: self.kind,
-            phase: *self.phase.lock(),
-            total: self.total.load(Ordering::Relaxed),
-            completed: self.completed.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
-            skipped: self.skipped.load(Ordering::Relaxed),
-            current_image_id: *self.current.lock(),
-            message: self.message.lock().clone(),
-            elapsed_ms: now_ms().saturating_sub(self.started_at),
-        }
-    }
-
-    pub fn snapshot(&self) -> AiJobSnapshot {
-        AiJobSnapshot {
-            progress: self.progress(),
-            started_at: self.started_at,
-            finished_at: *self.finished_at.lock(),
-            failures: self.failures.lock().clone(),
-        }
-    }
-}
-
-/// 任务主流程：探活并确保能力 → 解析范围 → 过滤缺失项 → 逐张处理。
+/// 任务主流程：探活并确保能力 → 过滤缺失项 → 逐张处理。
 /// 取消只在图片之间生效；单张失败记入清单，连续失败达到上限才中止。
-pub fn execute(context: &JobContext, job: &AiJob, request: &AiJobRequest) -> AppResult<()> {
+/// 进度、取消与失败清单都由 `TaskHandle` 承载，这里不再保留第二套状态。
+pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) -> AppResult<()> {
     let client = AiClient::new(&context.settings.base_url);
-    job.set_phase(AiJobPhase::Preparing);
-    job.set_message(format!("正在准备{}模型…", job.kind().label()));
+    task.set_phase(TaskPhase::Preparing);
+    task.set_message(format!("正在准备{}模型…", request.kind.label()));
     let health = client
         .health()
         .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
     let capability =
-        ensure_capability(&client, &health, job.kind().capability()).map_err(|error| {
-            AppError::message(format!("无法加载{}模型：{error}", job.kind().label()))
+        ensure_capability(&client, &health, request.kind.capability()).map_err(|error| {
+            AppError::message(format!("无法加载{}模型：{error}", request.kind.label()))
         })?;
 
-    let ids = resolve_ids(&context.database, request)?;
-    let ids = filter_missing(&context.database, ids, request, job.kind(), &capability)?;
-    job.set_total(ids.len());
-    job.set_phase(AiJobPhase::Running);
-    job.set_message(String::new());
+    let ids = filter_missing(
+        &context.database,
+        request.image_ids.clone(),
+        request,
+        request.kind,
+        &capability,
+    )?;
+    task.set_total(ids.len());
+    task.set_phase(TaskPhase::Running);
+    task.set_message("");
     if ids.is_empty() {
         return Ok(());
     }
 
     let mut consecutive_failures = 0_usize;
     for image_id in ids {
-        if job.should_cancel() {
+        if task.should_cancel() {
             return Ok(());
         }
-        job.set_current(Some(image_id));
-        let result = process_one(context, job.kind(), &client, &capability, request, image_id);
+        task.set_current(Some(image_id));
+        let result = process_one(
+            context,
+            request.kind,
+            &client,
+            &capability,
+            request,
+            image_id,
+        );
         match result {
             Ok(Outcome::Done) => {
-                job.inc_completed();
+                task.inc_completed();
                 consecutive_failures = 0;
             }
             Ok(Outcome::Skipped) => {
-                job.inc_skipped();
+                task.inc_skipped();
                 consecutive_failures = 0;
             }
             Err(error) => {
-                job.inc_failed();
-                job.add_failure(Some(image_id), error.to_string());
+                task.inc_failed();
+                task.add_failure(Some(image_id), "", error.to_string());
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     return Err(AppError::message(format!(
@@ -441,28 +271,6 @@ pub(crate) fn ensure_capability(
     Err(AiError {
         message: format!("服务没有可用的 {name} 能力"),
         retryable: false,
-    })
-}
-
-fn resolve_ids(database: &LibraryDb, request: &AiJobRequest) -> AppResult<Vec<i64>> {
-    if !request.image_ids.is_empty() {
-        return Ok(request.image_ids.clone());
-    }
-    if let Some(query) = &request.query {
-        return query::query_ids(database, query.clone());
-    }
-    database.with_reader(|connection| {
-        let mut statement = connection
-            .prepare("SELECT id FROM images WHERE deleted_at IS NULL ORDER BY id LIMIT ?1")?;
-        let ids = statement
-            .query_map([MAX_IDS as i64 + 1], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if ids.len() > MAX_IDS {
-            return Err(AppError::message(
-                "图库图片超过 100 万张，请先筛选后再运行 AI 任务",
-            ));
-        }
-        Ok(ids)
     })
 }
 

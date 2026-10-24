@@ -761,7 +761,7 @@ function BatchInspector({
   return (
     <div className="inspector-body">
       <div className="batch-summary">
-        批量操作会作用于全部 {count.toLocaleString()} 张已选图片，包括尚未滚动加载的条目。
+        批量操作会作用于全部 {count.toLocaleString()} 张已选图片。
       </div>
 
       <section className="inspector-section">

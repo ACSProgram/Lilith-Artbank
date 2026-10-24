@@ -143,11 +143,14 @@ fn request(kind: AiJobKind) -> AiJobRequest {
     AiJobRequest {
         kind,
         image_ids: vec![1],
-        query: None,
         overwrite: false,
         prompt: None,
         max_tokens: None,
     }
+}
+
+fn task(name: &str, kind: AiJobKind, scope: &str) -> std::sync::Arc<TaskHandle> {
+    TaskHandle::new(name, kind.task_kind(), scope)
 }
 
 #[test]
@@ -156,9 +159,9 @@ fn runs_embedding_pose_and_description_jobs() {
     let server = mock_server();
     let context = context(&session, &root, store, server.url());
 
-    let job = AiJob::new("embed", AiJobKind::Embedding);
+    let job = task("embed", AiJobKind::Embedding, "选中 1 张");
     execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
-    assert_eq!(job.progress().completed, 1);
+    assert_eq!(job.snapshot().completed, 1);
     let embedding = session
         .db
         .with_reader(|connection| {
@@ -171,9 +174,9 @@ fn runs_embedding_pose_and_description_jobs() {
         .unwrap();
     assert_eq!(embedding, ("siglip2-test".into(), 4));
 
-    let job = AiJob::new("pose", AiJobKind::Pose);
+    let job = task("pose", AiJobKind::Pose, "选中 1 张");
     execute(&context, &job, &request(AiJobKind::Pose)).unwrap();
-    assert_eq!(job.progress().completed, 1);
+    assert_eq!(job.snapshot().completed, 1);
     let pose_dim: u32 = session
         .db
         .with_reader(|connection| {
@@ -186,9 +189,9 @@ fn runs_embedding_pose_and_description_jobs() {
         .unwrap();
     assert_eq!(pose_dim, 33);
 
-    let job = AiJob::new("desc", AiJobKind::Description);
+    let job = task("desc", AiJobKind::Description, "选中 1 张");
     execute(&context, &job, &request(AiJobKind::Description)).unwrap();
-    assert_eq!(job.progress().completed, 1);
+    assert_eq!(job.snapshot().completed, 1);
     let description = session
         .db
         .with_reader(|connection| {
@@ -227,11 +230,11 @@ fn never_overwrites_handwritten_description() {
         .unwrap();
     let server = mock_server();
     let context = context(&session, &root, store, server.url());
-    let job = AiJob::new("desc", AiJobKind::Description);
+    let job = task("desc", AiJobKind::Description, "选中 1 张");
     let mut value = request(AiJobKind::Description);
     value.overwrite = true;
     execute(&context, &job, &value).unwrap();
-    assert_eq!(job.progress().total, 0);
+    assert_eq!(job.snapshot().total, 0);
     let description: String = session
         .db
         .with_reader(|connection| {
@@ -243,20 +246,6 @@ fn never_overwrites_handwritten_description() {
         })
         .unwrap();
     assert_eq!(description, "手写描述");
-}
-
-#[test]
-fn request_normalizes_ids_and_query() {
-    let query = LibraryQuery::default();
-    let request = AiJobRequest {
-        image_ids: vec![3, 1, 3],
-        query: Some(query),
-        ..AiJobRequest::default()
-    }
-    .normalized()
-    .unwrap();
-    assert_eq!(request.image_ids, vec![1, 3]);
-    assert!(request.query.is_none());
 }
 
 #[test]

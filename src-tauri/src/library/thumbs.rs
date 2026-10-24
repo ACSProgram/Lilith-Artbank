@@ -11,7 +11,9 @@ use rusqlite::OptionalExtension;
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::db::LibraryDb,
+    imageops::{colors, phash, thumbnail},
+    import::decode,
+    library::{content, db::LibraryDb, import as repository, paths::LibraryPaths, service::now_ms},
 };
 
 const HEADER_MAGIC: &[u8; 8] = b"ARTBTHM1";
@@ -260,6 +262,91 @@ pub fn load_pointer(database: &LibraryDb, image_id: i64) -> AppResult<Option<Thu
     })
 }
 
+/// 重新编码单张缩略图并更新指针；可选重算 pHash 与主色。
+///
+/// 返回 `false` 表示跳过（回收站图片，或已有缩略图且只补缺失项）。
+/// 追加写入，旧 blob 留给后续整理，不在这里回收。
+pub fn rebuild(
+    database: &LibraryDb,
+    pack: &ThumbPack,
+    root: &Path,
+    image_id: i64,
+    only_missing: bool,
+    recalc_visuals: bool,
+) -> AppResult<bool> {
+    let row = content::load(database, image_id)?;
+    if row.deleted_at.is_some() {
+        return Ok(false);
+    }
+    if only_missing && load_pointer(database, image_id)?.is_some() {
+        return Ok(false);
+    }
+
+    let source = row.path(&LibraryPaths::new(root))?;
+    let decoded = decode::decode(&source)?;
+    let thumb = thumbnail::encode(&decoded.image)?;
+    let visuals = recalc_visuals.then(|| {
+        (
+            phash::compute(&decoded.image),
+            colors::dominant(&decoded.image),
+        )
+    });
+    let location = pack.append(&thumb.bytes)?;
+    let offset = i64::try_from(location.offset)
+        .map_err(|_| AppError::message("缩略图偏移超出数据库范围"))?;
+    let now = now_ms();
+
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        let changed = match &visuals {
+            Some((hash, (colors4, colors8))) => transaction.execute(
+                "UPDATE images SET
+                    thumb_segment = ?1, thumb_offset = ?2, thumb_length = ?3,
+                    thumb_format = 'webp', thumb_width = ?4, thumb_height = ?5,
+                    thumb_version = thumb_version + 1,
+                    phash = ?6, colors4 = ?7, colors8 = ?8
+                 WHERE id = ?9",
+                rusqlite::params![
+                    location.segment,
+                    offset,
+                    location.length,
+                    thumb.width,
+                    thumb.height,
+                    hash.as_slice(),
+                    colors4.as_slice(),
+                    colors8.as_slice(),
+                    image_id
+                ],
+            )?,
+            None => transaction.execute(
+                "UPDATE images SET
+                    thumb_segment = ?1, thumb_offset = ?2, thumb_length = ?3,
+                    thumb_format = 'webp', thumb_width = ?4, thumb_height = ?5,
+                    thumb_version = thumb_version + 1
+                 WHERE id = ?6",
+                rusqlite::params![
+                    location.segment,
+                    offset,
+                    location.length,
+                    thumb.width,
+                    thumb.height,
+                    image_id
+                ],
+            )?,
+        };
+        if changed == 0 {
+            return Err(AppError::message("图片不存在或已被删除"));
+        }
+        repository::ensure_thumb_segment(&transaction, location.segment, now)?;
+        if let Ok(size) = pack.segment_size_bytes(location.segment) {
+            repository::update_thumb_segment_size(&transaction, location.segment, size)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 #[cfg(windows)]
 fn read_exact_at(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -434,5 +521,63 @@ mod tests {
             b"thumbnail-bytes"
         );
         assert!(load_pointer(&session.db, 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebuilds_thumbnail_and_updates_pointer() {
+        use rusqlite::params;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _manifest) = crate::library::service::create(&root, "重建测试", 1).unwrap();
+
+        let image = image::RgbImage::from_fn(120, 80, |x, y| {
+            image::Rgb([(x * 2) as u8, (y * 3) as u8, 90])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        std::fs::write(root.join(format!("{hash}.png")), &bytes).unwrap();
+
+        let image_id = session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO images(
+                        content_hash, file_ext, folder_id, file_size, width, height, format,
+                        has_alpha, phash, colors4, colors8, score, description, imported_at,
+                        modified_at
+                     ) VALUES (?1, 'png', 1, ?2, 120, 80, 'png', 0,
+                        zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                    params![hash, bytes.len() as i64],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+
+        assert!(rebuild(&session.db, &session.thumbs, &root, image_id, true, true).unwrap());
+        let pointer = load_pointer(&session.db, image_id).unwrap().unwrap();
+        assert_eq!(pointer.format, "webp");
+        assert_eq!((pointer.width, pointer.height), (120, 80));
+        assert_eq!(pointer.version, 2);
+        let decoded =
+            image::load_from_memory(&session.thumbs.read(pointer.location).unwrap()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (120, 80));
+
+        // 只补缺失项时，已有缩略图的图片直接跳过。
+        assert!(!rebuild(&session.db, &session.thumbs, &root, image_id, true, false).unwrap());
+        assert!(rebuild(&session.db, &session.thumbs, &root, image_id, false, false).unwrap());
+        assert_eq!(
+            load_pointer(&session.db, image_id)
+                .unwrap()
+                .unwrap()
+                .version,
+            3
+        );
     }
 }

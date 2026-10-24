@@ -1,9 +1,15 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::library::service::now_ms;
+use crate::{
+    app::tasks::{TaskHandle, TaskKind, TaskPhase},
+    library::service::now_ms,
+};
 
 const MAX_FAILURES: usize = 200;
 const MAX_HINTS: usize = 100;
@@ -71,11 +77,10 @@ pub struct ImportSnapshot {
     pub preview_ids: Vec<i64>,
 }
 
-/// 可跨线程共享的导入任务状态。计数器只增不减，快照按需读取。
+/// 可跨线程共享的导入任务状态。进度与取消由通用任务句柄统一承载，
+/// 这里保留导入独有的计数（新增/重复/合并/疑似重复）与预览 id。
 pub struct ImportJob {
-    id: String,
-    cancel: AtomicBool,
-    running: AtomicBool,
+    handle: Arc<TaskHandle>,
     phase: Mutex<ImportPhase>,
     total: AtomicUsize,
     processed: AtomicUsize,
@@ -92,12 +97,23 @@ pub struct ImportJob {
     finished_at: Mutex<Option<i64>>,
 }
 
+fn task_phase(phase: ImportPhase) -> TaskPhase {
+    match phase {
+        ImportPhase::Scanning | ImportPhase::Processing | ImportPhase::Finishing => {
+            TaskPhase::Running
+        }
+        ImportPhase::Completed => TaskPhase::Completed,
+        ImportPhase::Cancelled => TaskPhase::Cancelled,
+        ImportPhase::Failed => TaskPhase::Failed,
+    }
+}
+
 impl ImportJob {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>, scope: impl Into<String>) -> Self {
+        let id = id.into();
+        let handle = TaskHandle::new(id.clone(), TaskKind::Import, scope);
         Self {
-            id: id.into(),
-            cancel: AtomicBool::new(false),
-            running: AtomicBool::new(true),
+            handle,
             phase: Mutex::new(ImportPhase::Scanning),
             total: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
@@ -115,20 +131,24 @@ impl ImportJob {
         }
     }
 
+    pub fn handle(&self) -> Arc<TaskHandle> {
+        self.handle.clone()
+    }
+
     pub fn id(&self) -> &str {
-        &self.id
+        self.handle.id()
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.handle.request_cancel();
     }
 
     pub fn should_cancel(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst)
+        self.handle.should_cancel()
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.handle.is_running()
     }
 
     pub fn phase(&self) -> ImportPhase {
@@ -137,10 +157,12 @@ impl ImportJob {
 
     pub fn set_phase(&self, phase: ImportPhase) {
         *self.phase.lock() = phase;
+        self.handle.set_phase(task_phase(phase));
     }
 
     pub fn set_total(&self, total: usize) {
         self.total.store(total, Ordering::Relaxed);
+        self.handle.set_total(total);
     }
 
     #[cfg(test)]
@@ -150,6 +172,7 @@ impl ImportJob {
 
     pub fn inc_processed(&self) {
         self.processed.fetch_add(1, Ordering::Relaxed);
+        self.sync_task_progress();
     }
 
     pub fn inc_imported(&self, count: usize) {
@@ -166,6 +189,15 @@ impl ImportJob {
 
     pub fn inc_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
+        self.handle.inc_failed();
+        self.sync_task_progress();
+    }
+
+    /// 失败项也算“已处理”，但只计入失败数：任务条的 `已完成 + 失败` 不能把同一张图算两次。
+    fn sync_task_progress(&self) {
+        let processed = self.processed.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        self.handle.set_completed(processed.saturating_sub(failed));
     }
 
     pub fn inc_similar(&self, count: usize) {
@@ -173,16 +205,18 @@ impl ImportJob {
     }
 
     pub fn set_current(&self, current: impl Into<String>) {
-        *self.current.lock() = current.into();
+        let current = current.into();
+        self.handle.set_message(current.clone());
+        *self.current.lock() = current;
     }
 
     pub fn add_failure(&self, path: impl Into<String>, reason: impl Into<String>) {
+        let path = path.into();
+        let reason = reason.into();
+        self.handle.add_failure(None, path.clone(), reason.clone());
         let mut failures = self.failures.lock();
         if failures.len() < MAX_FAILURES {
-            failures.push(ImportFailure {
-                path: path.into(),
-                reason: reason.into(),
-            });
+            failures.push(ImportFailure { path, reason });
         }
     }
 
@@ -202,15 +236,15 @@ impl ImportJob {
     }
 
     pub fn finish(&self, phase: ImportPhase) {
-        self.set_phase(phase);
+        *self.phase.lock() = phase;
         *self.finished_at.lock() = Some(now_ms());
         self.set_current("");
-        self.running.store(false, Ordering::SeqCst);
+        self.handle.finish(task_phase(phase));
     }
 
     pub fn progress(&self) -> ImportProgress {
         ImportProgress {
-            job_id: self.id.clone(),
+            job_id: self.handle.id().to_owned(),
             phase: self.phase(),
             total: self.total.load(Ordering::Relaxed),
             processed: self.processed.load(Ordering::Relaxed),
@@ -242,7 +276,7 @@ mod tests {
 
     #[test]
     fn snapshot_serializes_flat_camel_case_fields() {
-        let job = ImportJob::new("job-1");
+        let job = ImportJob::new("job-1", "1 个路径");
         job.set_total(10);
         job.inc_imported(3);
         job.add_failure("a.png", "无法解码");

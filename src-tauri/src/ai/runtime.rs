@@ -1,26 +1,31 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::{
     app::{
         error::{AppError, AppResult},
         settings::AiSettings,
+        tasks::{
+            ConflictPolicy, LaneGuard, TaskBus, TaskHandle, TaskKind, TaskPhase, TaskScope,
+            TaskStartResult,
+        },
     },
     library::{
         db::LibraryDb,
         paths::LibraryPaths,
         query::{self, ImageRow},
-        similarity as library_similarity,
+        similarity::{self as library_similarity, GroupProgress},
         thumbs::ThumbPack,
         viewer::PoseData,
     },
@@ -29,7 +34,7 @@ use crate::{
 use super::{
     client::{AiClient, Health},
     embedding,
-    job::{self, AiJob, AiJobRequest, AiJobSnapshot, JobContext},
+    job::{self, AiJobRequest, JobContext},
     pack::FeatureStore,
     pose,
     process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus},
@@ -134,7 +139,6 @@ pub struct AiStatus {
     pub process: ProcessStatus,
     pub health: Option<Health>,
     pub mean: MeanStatus,
-    pub job: Option<AiJobSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,10 +169,20 @@ pub struct ImageSimilarityResult {
     pub elapsed_ms: i64,
 }
 
+/// 相似分组的两种指标；可以单独启用，也可以同时启用（同时满足才归组）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupOptions {
+    pub phash: bool,
+    pub phash_threshold: Option<u32>,
+    pub embedding: bool,
+    pub embedding_threshold: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimilarityGroupsResult {
-    pub kind: String,
+    pub phash: bool,
+    pub embedding: bool,
     pub groups: Vec<Vec<i64>>,
     pub truncated: bool,
     pub missing: usize,
@@ -203,7 +217,7 @@ struct Inner {
     mean: RwLock<MeanSlot>,
     results: Mutex<Option<ResultCache>>,
     visuals: RwLock<Option<Arc<library_similarity::VisualIndex>>>,
-    job: Mutex<Option<Arc<AiJob>>>,
+    groups_results: Mutex<HashMap<String, SimilarityGroupsResult>>,
     store: Arc<FeatureStore>,
     library: RwLock<Option<LibraryHandles>>,
     generation: AtomicU64,
@@ -231,7 +245,7 @@ impl AiRuntime {
                 mean: RwLock::new(MeanSlot::missing("尚未打开图库")),
                 results: Mutex::new(None),
                 visuals: RwLock::new(None),
-                job: Mutex::new(None),
+                groups_results: Mutex::new(HashMap::new()),
                 store: Arc::new(FeatureStore::new()),
                 library: RwLock::new(None),
                 generation: AtomicU64::new(0),
@@ -260,6 +274,7 @@ impl AiRuntime {
         });
         *self.inner.results.lock() = None;
         *self.inner.visuals.write() = None;
+        self.inner.groups_results.lock().clear();
         *self.inner.mean.write() = MeanSlot::computing(None, None);
         self.spawn_mean(generation, database);
     }
@@ -270,23 +285,13 @@ impl AiRuntime {
         self.inner.store.clear();
         *self.inner.results.lock() = None;
         *self.inner.visuals.write() = None;
+        self.inner.groups_results.lock().clear();
         *self.inner.mean.write() = MeanSlot::missing("尚未打开图库");
-        if let Some(job) = self.inner.job.lock().as_ref() {
-            job.request_cancel();
-        }
     }
 
     pub fn invalidate_similarity(&self) {
         *self.inner.results.lock() = None;
         *self.inner.visuals.write() = None;
-    }
-
-    pub fn job_running(&self) -> bool {
-        self.inner
-            .job
-            .lock()
-            .as_ref()
-            .is_some_and(|job| job.is_running())
     }
 
     pub fn status(&self, settings: &AiSettings) -> AiStatus {
@@ -329,12 +334,7 @@ impl AiRuntime {
             process: self.inner.process.lock().status(),
             health,
             mean: self.inner.mean.read().status(),
-            job: self.current_job(),
         }
-    }
-
-    pub fn current_job(&self) -> Option<AiJobSnapshot> {
-        self.inner.job.lock().as_ref().map(|job| job.snapshot())
     }
 
     pub fn start_service(&self, settings: &AiSettings) -> AppResult<()> {
@@ -464,18 +464,19 @@ impl AiRuntime {
     pub fn start_job(
         &self,
         app: AppHandle,
+        bus: &TaskBus,
         settings: &AiSettings,
         request: AiJobRequest,
-    ) -> AppResult<AiJobSnapshot> {
+        scope: TaskScope,
+        policy: ConflictPolicy,
+    ) -> AppResult<TaskStartResult> {
         let handles = self.handles()?;
-        let mut slot = self.inner.job.lock();
-        if slot.as_ref().is_some_and(|job| job.is_running()) {
-            return Err(AppError::message("已有 AI 任务在运行"));
+        // 范围在 Rust 侧解析：全库几十万张也不会走 IPC。
+        let request = AiJobRequest {
+            image_ids: scope.resolve(&handles.database)?,
+            ..request
         }
-        let job = Arc::new(AiJob::new(uuid::Uuid::new_v4().to_string(), request.kind));
-        *slot = Some(job.clone());
-        drop(slot);
-
+        .normalized()?;
         let context = JobContext {
             database: handles.database.clone(),
             thumbs: handles.thumbs.clone(),
@@ -483,63 +484,31 @@ impl AiRuntime {
             store: self.inner.store.clone(),
             settings: settings.clone(),
         };
-        spawn_job_progress(app.clone(), job.clone());
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            request.kind.task_kind(),
+            scope.label(),
+        );
+        let worker_handle = handle.clone();
         let runtime = self.clone();
-        let fallback_app = app.clone();
-        let worker_job = job.clone();
-        let spawn = std::thread::Builder::new()
-            .name(format!("ai-job-{}", job.id()))
-            .spawn(move || {
+        let bus_worker = bus.clone();
+        bus.launch(app, handle, policy, move |guard| {
+            let name = format!("ai-job-{}", worker_handle.id());
+            let task = worker_handle.clone();
+            let _ = bus_worker.spawn_worker(name, worker_handle, move || {
+                // AI lane 由任务线程持有，直到批量执行结束。
+                let _guard: LaneGuard = guard;
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    job::execute(&context, &worker_job, &request)
+                    job::execute(&context, &task, &request)
                 }));
-                let phase = if worker_job.should_cancel() {
-                    job::AiJobPhase::Cancelled
-                } else {
-                    match outcome {
-                        Ok(Ok(())) => job::AiJobPhase::Completed,
-                        Ok(Err(error)) => {
-                            worker_job.set_message(error.to_string());
-                            job::AiJobPhase::Failed
-                        }
-                        Err(_) => {
-                            worker_job.set_message("AI 任务异常终止");
-                            job::AiJobPhase::Failed
-                        }
-                    }
+                let result = match outcome {
+                    Ok(result) => result,
+                    Err(_) => Err(AppError::message("AI 任务异常终止")),
                 };
-                worker_job.finish(phase);
+                task.finish_from(&result);
                 *runtime.inner.results.lock() = None;
-                let _ = app.emit("ai-job-progress", worker_job.progress());
-                let _ = app.emit("ai-job-finished", worker_job.snapshot());
             });
-        if let Err(error) = spawn {
-            log::error!("无法启动 AI 任务线程：{error}");
-            job.set_message(format!("无法启动 AI 任务：{error}"));
-            job.finish(job::AiJobPhase::Failed);
-            let _ = fallback_app.emit("ai-job-finished", job.snapshot());
-            return Err(AppError::message("无法启动 AI 任务"));
-        }
-        Ok(job.snapshot())
-    }
-
-    pub fn cancel_job(&self, job_id: &str) -> AppResult<()> {
-        let slot = self.inner.job.lock();
-        let job = slot
-            .as_ref()
-            .filter(|job| job.id() == job_id)
-            .ok_or_else(|| AppError::message("AI 任务不存在或已被替换"))?;
-        job.request_cancel();
-        Ok(())
-    }
-
-    pub fn job_status(&self, job_id: &str) -> Option<AiJobSnapshot> {
-        self.inner
-            .job
-            .lock()
-            .as_ref()
-            .filter(|job| job.id() == job_id)
-            .map(|job| job.snapshot())
+        })
     }
 
     /// 语义搜索：text embedding → 与同 model/dim 的图片向量做中心化余弦扫描。
@@ -741,56 +710,124 @@ impl AiRuntime {
         .collect())
     }
 
-    /// 全库相似对分组：pHash 分段索引，或 pHash 候选 + embedding 复核。
-    pub fn find_similar_groups(
+    /// 全库相似分组：两种指标可以单独启用，也可以同时启用（同时满足才归组）。
+    fn find_similar_groups_with(
         &self,
-        kind: &str,
-        threshold: Option<u32>,
-        similarity_threshold: Option<f32>,
+        options: GroupOptions,
+        progress: &dyn GroupProgress,
     ) -> AppResult<SimilarityGroupsResult> {
+        let GroupOptions {
+            phash: phash_enabled,
+            phash_threshold,
+            embedding: embedding_enabled,
+            embedding_threshold,
+        } = options;
+        if !phash_enabled && !embedding_enabled {
+            return Err(AppError::message("至少选择一种比较方式"));
+        }
         let handles = self.handles()?;
         let started = Instant::now();
-        let (groups, truncated, missing) = match kind {
-            "phash" => {
-                let index = self.visual_index(&handles)?;
-                let result = index.phash_groups(
-                    threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD),
-                )?;
-                (result.groups, result.truncated, 0)
-            }
-            "embedding" => {
-                let groups = embedding::distinct_groups(&handles.database)?;
-                let Some((model, dim, _)) = groups.into_iter().next() else {
-                    return Err(AppError::message("还没有图片 embedding，请先运行 AI 任务"));
-                };
-                let mean = self.ensure_mean(&handles, &model, dim)?;
-                let index = self.visual_index(&handles)?;
-                let candidates = index.phash_groups(
-                    threshold.unwrap_or(library_similarity::MAX_INDEXED_PHASH_THRESHOLD),
-                )?;
-                let result = embedding::refine_groups(
-                    &handles.database,
-                    &self.inner.store,
-                    &model,
-                    dim,
-                    &mean.vector,
-                    similarity_threshold.unwrap_or(0.97).clamp(0.5, 1.0),
-                    candidates.groups,
-                    candidates.truncated,
-                )?;
-                (result.groups, result.truncated, result.missing)
-            }
-            other => {
-                return Err(AppError::message(format!("未知的分组类型：{other}")));
-            }
+        let (groups, truncated, missing) = if embedding_enabled {
+            let model_rows = embedding::distinct_groups(&handles.database)?;
+            let Some((model, dim, _)) = model_rows.into_iter().next() else {
+                return Err(AppError::message("还没有图片 embedding，请先运行 AI 任务"));
+            };
+            let mean = self.ensure_mean(&handles, &model, dim)?;
+            // 只开语义时，pHash 仅用来产生候选，不参与筛选；同时开启时按用户阈值收窄候选。
+            let candidate_threshold = if phash_enabled {
+                phash_threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD)
+            } else {
+                library_similarity::MAX_INDEXED_PHASH_THRESHOLD
+            };
+            progress.stage("正在建立候选分组", 0, 700);
+            let index = self.visual_index(&handles)?;
+            let candidates = index.phash_groups(candidate_threshold, Some(progress))?;
+            progress.stage("正在按语义复核", 700, 300);
+            let result = embedding::refine_groups(
+                &handles.database,
+                &self.inner.store,
+                &model,
+                dim,
+                &mean.vector,
+                embedding_threshold.unwrap_or(0.97).clamp(0.5, 1.0),
+                candidates.groups,
+                candidates.truncated,
+                Some(progress),
+            )?;
+            (result.groups, result.truncated, result.missing)
+        } else {
+            progress.stage("正在建立候选分组", 0, 1000);
+            let index = self.visual_index(&handles)?;
+            let result = index.phash_groups(
+                phash_threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD),
+                Some(progress),
+            )?;
+            (result.groups, result.truncated, 0)
         };
         Ok(SimilarityGroupsResult {
-            kind: kind.to_owned(),
+            phash: phash_enabled,
+            embedding: embedding_enabled,
             groups,
             truncated,
             missing,
             elapsed_ms: started.elapsed().as_millis() as i64,
         })
+    }
+
+    /// 相似分组扫描走任务总线：进度按阶段推进，取消在当前分段/分组结束后生效。
+    pub fn start_groups_task(
+        &self,
+        app: AppHandle,
+        bus: &TaskBus,
+        options: GroupOptions,
+        policy: ConflictPolicy,
+    ) -> AppResult<TaskStartResult> {
+        if !options.phash && !options.embedding {
+            return Err(AppError::message("至少选择一种比较方式"));
+        }
+        // 先确认图库可用；真正的扫描在线程里跑。
+        let _ = self.handles()?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::SimilarityGroups,
+            "整个图库",
+        );
+        let worker = handle.clone();
+        let runtime = self.clone();
+        let bus_worker = bus.clone();
+        bus.launch(app, handle, policy, move |guard| {
+            let _ = bus_worker.spawn_worker(
+                "similarity-groups".to_owned(),
+                worker.clone(),
+                move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Running);
+                    worker.set_total(1000);
+                    let progress = TaskProgress::new(worker.clone());
+                    match runtime.find_similar_groups_with(options, &progress) {
+                        Ok(result) => {
+                            runtime.store_groups(worker.id(), result);
+                            worker.set_message("");
+                            worker.set_completed(1000);
+                            worker.finish_from(&Ok(()));
+                        }
+                        Err(error) => worker.finish_from::<()>(&Err(error)),
+                    }
+                },
+            );
+        })
+    }
+
+    fn store_groups(&self, task_id: &str, result: SimilarityGroupsResult) {
+        let mut results = self.inner.groups_results.lock();
+        if results.len() >= 5 {
+            results.clear();
+        }
+        results.insert(task_id.to_owned(), result);
+    }
+
+    pub fn groups_result(&self, task_id: &str) -> Option<SimilarityGroupsResult> {
+        self.inner.groups_results.lock().get(task_id).cloned()
     }
 
     /// 按 token 分页回填完整行；token 不属于当前图库代次时要求重新搜索。
@@ -1015,6 +1052,44 @@ impl AiRuntime {
     }
 }
 
+/// 把“阶段内进度”映射到任务条上的 0-1000。
+struct TaskProgress {
+    handle: Arc<TaskHandle>,
+    base: AtomicUsize,
+    span: AtomicUsize,
+}
+
+impl TaskProgress {
+    fn new(handle: Arc<TaskHandle>) -> Self {
+        Self {
+            handle,
+            base: AtomicUsize::new(0),
+            span: AtomicUsize::new(1000),
+        }
+    }
+}
+
+impl GroupProgress for TaskProgress {
+    fn report(&self, done: usize, total: usize) {
+        let base = self.base.load(Ordering::Relaxed);
+        let span = self.span.load(Ordering::Relaxed);
+        let scaled = done.min(total).saturating_mul(span);
+        let value = base + scaled.checked_div(total).unwrap_or(0);
+        self.handle.set_completed(value.min(1000));
+    }
+
+    fn cancelled(&self) -> bool {
+        self.handle.should_cancel()
+    }
+
+    fn stage(&self, label: &str, base: usize, span: usize) {
+        self.base.store(base, Ordering::Relaxed);
+        self.span.store(span, Ordering::Relaxed);
+        self.handle.set_message(label);
+        self.handle.set_completed(base.min(1000));
+    }
+}
+
 /// 监督线程的存活标记；Drop 时按代次释放，不覆盖新一代线程。
 struct SupervisorGuard {
     inner: Arc<Inner>,
@@ -1027,16 +1102,4 @@ impl Drop for SupervisorGuard {
             self.inner.supervising.store(false, Ordering::SeqCst);
         }
     }
-}
-
-fn spawn_job_progress(app: AppHandle, job: Arc<AiJob>) {
-    std::thread::spawn(move || {
-        loop {
-            let _ = app.emit("ai-job-progress", job.progress());
-            if !job.is_running() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    });
 }

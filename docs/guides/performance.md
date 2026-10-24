@@ -60,21 +60,9 @@ node tools/perf/thumb_bench/server.mjs
 # 浏览器打开 http://127.0.0.1:18767/?format=jpg 和 ?format=webp
 ```
 
-### 应用内缩略图基准（S1 前半）
+### 应用内缩略图基准（已删除）
 
-开发构建的工作区工具栏有“缩略图基准”。它用 Rust 生成 150 张 512px 确定性图片，经正式管线编码为 WebP q80、写入临时追加式 pack，然后让 WebView2 通过 `thumb://` 加载：
-
-- 冷加载：每次使用新的 `?run=<n>`，浏览器缓存必然未命中；
-- 热加载：复用同一 URL，测浏览器缓存路径；
-- 计时从创建 `<img>` 到 150 张全部 `decode()` 完成后再等两帧 rAF；
-- 同时显示 Rust 侧 pack 读取 p50/p95 与包体积。
-
-```bash
-npm run tauri dev
-# 打开任意图库 → 工作区右上角“缩略图基准” → 生成样本 → 冷加载 / 热加载
-```
-
-真实 WebView2 的数字由用户在本机手工验收；用户已确认冷/热加载满足 ≤1s 门槛，具体数字尚未记录。浏览器预览不支持该基准。
+P2 已删除应用内“缩略图基准”（`app/bench.rs`、`thumb://bench/*` 与 3 个命令）。真实 WebView2 的 150 张冷/热加载此前由用户手工确认满足 ≤1s 门槛，历史数字见下方的“应用内 pack 与 WebP”一节；现在可复现的基准只剩 `perf_thumb_pack_read` 与浏览器解码。
 
 ### 导入吞吐（S1 后半）
 
@@ -192,11 +180,7 @@ python tools/perf/pe_imports.py src-tauri/target/debug/lilith-artbank.exe
 | 同一 pack 内 150 张定位读，20 轮 | p50 2.27 ms / p95 2.80 ms（约 4 GB/s，OS 缓存命中） |
 | debug exe 导入 DLL | 仅系统 DLL；无 libwebp / vcruntime / WebView2Loader |
 
-前三项由 `perf_thumb_bench_build` 输出：
-
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
-```
+这些数字由 P2 已删除的应用内缩略图基准输出，仅作历史基线；当前可复现的 pack 基准是 `perf_thumb_pack_read`。
 
 WebView2 中的 150 张冷/热加载已由用户手工确认满足 ≤1s 门槛，具体耗时未记录。
 

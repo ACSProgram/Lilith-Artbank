@@ -172,3 +172,21 @@ export interface CollectionInfo {
   createdAt: number;
   updatedAt: number;
 }
+
+/** 单张图片具备哪些可比较特征；只在右键菜单/详情里按需查询。 */
+export interface ImageCapabilities {
+  imageId: number;
+  pose: boolean;
+  embedding: boolean;
+  colors: boolean;
+  phash: boolean;
+}
+
+/** 全库特征覆盖情况，用于筛选面板与工具栏置灰。 */
+export interface FeatureSummary {
+  description: number;
+  embedding: number;
+  pose: number;
+  phash: number;
+  colors: number;
+}

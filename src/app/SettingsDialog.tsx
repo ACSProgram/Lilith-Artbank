@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Database,
@@ -131,6 +131,7 @@ export function SettingsDialog({
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -150,6 +151,8 @@ export function SettingsDialog({
     } catch {
       // 忽略无法持久化分类偏好的情况。
     }
+    // 切换分类从头开始读，避免沿用上一个分类的滚动位置。
+    if (contentRef.current) contentRef.current.scrollTop = 0;
   }, [tab]);
 
   // 主题即时预览：改选项马上生效，取消则退回已保存的值。
@@ -227,7 +230,7 @@ export function SettingsDialog({
   const closeCurrentLibrary = async () => {
     const accepted = await confirm({
       title: "关闭图库？",
-      message: "关闭只释放数据库连接，不会修改图库内容。",
+      message: "关闭后可以随时重新打开，不会修改图库内容。",
       confirmLabel: "关闭图库",
     });
     if (!accepted) return;
@@ -315,8 +318,8 @@ export function SettingsDialog({
       open={isOpen}
       title="设置"
       onClose={onClose}
-      width={660}
-      // 固定高度 + 内容区自己滚动：切换分类时对话框不会跟着内容忽大忽小。
+      width={700}
+      // 固定尺寸 + 内容区自己滚动：切换分类、状态刷新、报错都不改变对话框大小。
       height={560}
       bodyClassName="modal-body-fixed"
       dismissible={!saving}
@@ -347,7 +350,7 @@ export function SettingsDialog({
           ))}
         </nav>
 
-        <div className="settings-content">
+        <div className="settings-content" ref={contentRef}>
           {!draft ? (
             <p className="form-note">正在读取设置…</p>
           ) : (
@@ -479,7 +482,7 @@ export function SettingsDialog({
                       </Button>
                     ) : null}
                   </div>
-                  <div className="settings-note">关闭不会删除任何图片或元数据。</div>
+                  <div className="settings-note">关闭不会删除任何图片或标签、评分等信息。</div>
                 </Panel>
               ) : null}
 
@@ -554,7 +557,7 @@ export function SettingsDialog({
                     />
                     <span>
                       <strong>随应用启动 AI 服务</strong>
-                      <small>需要已填写可执行文件；启动失败会重试 3 次。</small>
+                      <small>需要先填写可执行文件。</small>
                     </span>
                   </label>
                   <div className="ai-settings-status">
@@ -578,7 +581,7 @@ export function SettingsDialog({
                             .map(
                               ([name, capability]) =>
                                 `${CAPABILITY_LABELS[name] ?? name}${
-                                  capability.ready ? "就绪" : "未加载"
+                                  capability.ready ? "就绪" : "未就绪"
                                 }`,
                             )
                             .join(" · ")}

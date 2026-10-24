@@ -169,8 +169,9 @@ Content-Type: application/octet-stream
 
 ### 队列与进度
 
-- 任务有 `jobId`、`kind`、`total`、`completed`、`failed`、`skipped`、`currentImageId`、`message`。
-- 进度事件约 150ms 一次；完成事件带失败清单（imageId + 原因，最多保留 200 条）。
+- 批量任务挂在 `app/tasks.rs` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
+- 范围由 `TaskScope` 在 Rust 侧解析成 id 集合（选中 / 文件夹 / 集合 / 当前视图 / 全库）；`AiJobRequest` 只接收已解析的 id，不再有“id 与 query 都为空就退回全库”的隐式分支。
+- 冲突：AI 任务占 `ai` lane，同 lane 串行，与 `write` lane 互斥；`start_batch_task` 返回 `{ status: "conflict", active }`，由前端选排队或取消现有任务。
 - 取消：停止调度新请求；在途请求允许完成并保存结果；已保存结果不回滚。
 - 熔断：连续 5 张失败视为服务不可用，任务以失败结束，避免把整库都记成失败。
 - 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。
@@ -223,21 +224,26 @@ Content-Type: application/octet-stream
 
 | 命令 | 说明 |
 | --- | --- |
-| `get_ai_status` | 探活、进程状态、health、均值状态、当前任务；`autoStart` 的拉起也由它触发 |
+| `get_ai_status` | 探活、进程状态、health、均值状态；`autoStart` 的拉起也由它触发（任务进度不在这里，看 `list_tasks` 与 `task-progress`） |
 | `ai_ensure_models` | 调用 `/v1/models/ensure` |
 | `ai_start_service` / `ai_stop_service` | 托管进程；外部服务也可直接连接 |
-| `start_ai_job` / `cancel_ai_job` / `get_ai_job_status` | embedding / pose / description 批量任务 |
+| `start_ai_job` / `cancel_ai_job` / `get_ai_job_status` | 已删除；批量任务统一走 `start_batch_task` |
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
 | `find_similar_images` | 目标图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，可选 `threshold`、`limit`（默认 2000，上限 10000） |
-| `find_similar_groups` | 全库相似组：`kind` 为 `phash`/`embedding`；`threshold` 是 pHash 阈值（0-7），`similarityThreshold` 是余弦阈值（0.5-1，默认 0.97） |
+| `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、全库相似分组；返回 `{ status: "started", task }` 或 `{ status: "conflict", active }` |
+| `list_tasks` / `cancel_task` | 任务列表与取消；进度通过 `task-progress` / `task-finished` 推送 |
+| `get_similarity_groups_result` | 按 taskId 取回相似分组结果 |
 | `get_similarity_page` / `get_similarity_ids` | 相似结果分页与全选（语义搜索与找相似共用） |
 | `get_image_pose` | 读取 feature pack 中的 33 点姿势 |
+
+相似分组请求字段：`groupPhash` / `phashThreshold`（0–7）与 `groupEmbedding` / `embeddingThreshold`（0.5–1，默认 0.97）可以单独或同时启用；同时启用时两个条件都满足才归组。只开语义时，pHash 分段索引只用于产生候选，不参与筛选。结果结构 `{ phash, embedding, groups, truncated, missing, elapsedMs }`。
 
 实现位置：
 
 - `src-tauri/src/ai/client.rs`：`/v1` 客户端、超时、重试、响应校验。
-- `src-tauri/src/ai/process.rs` + `runtime.rs`：进程启动/探活/退避重启/退出；`--port <port>`；`find_similar_images` / `find_similar_groups` 与结果缓存。
+- `src-tauri/src/ai/process.rs` + `runtime.rs`：进程启动/探活/退避重启/退出；`--port <port>`；`find_similar_images` 与结果缓存；相似分组任务（`start_groups_task`）与扫描结果缓存。
+- `src-tauri/src/app/tasks.rs`：任务总线、lane 规则、冲突/排队/取消与统一事件。
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
@@ -245,8 +251,7 @@ Content-Type: application/octet-stream
 - `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、全库 pHash 分组。
 - `src-tauri/src/ai/job.rs`：批量任务、缺失项过滤、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
-- `src/modules/ai/`：类型、API、服务状态、任务对话框。
-- `src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/app/SimilarityGroupsDialog.tsx`：全库相似组扫描与存为集合；`src/shared/similarity.ts`：kind 与中文标签。
+- `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/shared/similarity.ts`：kind 与中文标签。
 
 限制：
 
@@ -254,7 +259,7 @@ Content-Type: application/octet-stream
 - 新增 embedding 不会实时更新均值；按用户决定，重开图库才刷新。
 - feature pack 采用追加写入，重算会留下旧字节；压缩/回收留到 S8。
 - 相似模式（语义或找相似）不叠加图库筛选条件；进入后筛选与排序控件禁用。
-- 结果缓存只保留最近一次查询；换一次搜索/找相似后旧 token 失效。
+- 结果缓存只保留最近一次查询；换一次搜索/找相似后旧 token 失效。相似分组结果按 taskId 在内存里最多保留 5 份，关库即清空。
 - 全库 pHash 分组的阈值只支持 0-7；更大阈值只能用单张“找相似”。
 - 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。

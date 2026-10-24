@@ -14,12 +14,14 @@ import {
   toggleValue,
 } from "./model";
 import type {
+  FeatureSummary,
   FilterCounts,
   LibraryFilters,
   LibraryQuery,
   PresenceFilter,
   TagInfo,
 } from "./types";
+import { presenceAvailability } from "../../shared/capability";
 import { errorMessage } from "../../shared/errors";
 
 interface FilterPanelProps {
@@ -27,6 +29,8 @@ interface FilterPanelProps {
   filters: LibraryFilters;
   query: LibraryQuery;
   dataVersion: number;
+  /** 全库特征覆盖情况；为空时不做置灰。 */
+  featureSummary?: FeatureSummary | null;
   onFiltersChange: (filters: LibraryFilters) => void;
   onClose: () => void;
   onReset: () => void;
@@ -38,6 +42,7 @@ export function FilterPanel({
   filters,
   query,
   dataVersion,
+  featureSummary = null,
   onFiltersChange,
   onClose,
   onReset,
@@ -334,23 +339,31 @@ export function FilterPanel({
               { key: "description" as const, label: "描述" },
               { key: "embedding" as const, label: "Embedding" },
               { key: "pose" as const, label: "Pose" },
-            ].map((field) => (
-              <div key={field.key} className="filter-presence-row">
-                <span>{field.label}</span>
-                <div className="filter-mode">
-                  {presenceOptions.map((option) => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      className={filters[field.key] === option.value ? "is-active" : ""}
-                      onClick={() => patch({ [field.key]: option.value })}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
+            ].map((field) => {
+              const availability = presenceAvailability(field.key, featureSummary);
+              return (
+                <div key={field.key} className="filter-presence-row">
+                  <span>{field.label}</span>
+                  <div className="filter-mode">
+                    {presenceOptions.map((option) => {
+                      const disabled = option.value === "has" && !availability.enabled;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={filters[field.key] === option.value ? "is-active" : ""}
+                          disabled={disabled}
+                          title={disabled ? availability.reason : undefined}
+                          onClick={() => patch({ [field.key]: option.value })}
+                        >
+                          {option.label}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
 

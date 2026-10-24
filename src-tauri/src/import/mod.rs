@@ -9,7 +9,10 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    app::error::{AppError, AppResult},
+    app::{
+        error::{AppError, AppResult},
+        tasks::LaneGuard,
+    },
     library::{db::LibraryDb, paths::normalize_folder, thumbs::ThumbPack},
 };
 
@@ -110,7 +113,14 @@ pub struct ImportSource {
 }
 
 /// 启动后台导入；立即返回，进度与最终结果通过事件推送。
-pub fn start(app: AppHandle, source: ImportSource, job: Arc<ImportJob>, request: ImportRequest) {
+/// `guard` 是任务总线上的 write lane 占用权，随导入线程一起释放。
+pub fn start(
+    app: AppHandle,
+    source: ImportSource,
+    job: Arc<ImportJob>,
+    request: ImportRequest,
+    guard: LaneGuard,
+) {
     spawn_progress(app.clone(), job.clone());
 
     let fallback_app = app.clone();
@@ -118,6 +128,7 @@ pub fn start(app: AppHandle, source: ImportSource, job: Arc<ImportJob>, request:
     let spawn = std::thread::Builder::new()
         .name(format!("import-{}", job.id()))
         .spawn(move || {
+            let _guard = guard;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline::run(source, job.clone(), request)
             }));

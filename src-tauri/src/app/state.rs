@@ -1,25 +1,32 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
+use tauri::AppHandle;
 
 use crate::{
-    ai::runtime::AiRuntime,
+    ai::{
+        job::{AiJobKind, AiJobRequest},
+        runtime::{AiRuntime, GroupOptions, SimilarityGroupsResult},
+    },
     app::{
-        bench::ThumbBench,
         error::{AppError, AppResult},
         settings::SettingsStore,
+        tasks::{
+            BatchTaskKind, BatchTaskRequest, ConflictPolicy, LaneGuard, TaskBus, TaskHandle,
+            TaskKind, TaskLane, TaskPhase, TaskSnapshot, TaskStartResult, TaskSummary,
+        },
     },
     import::{
         ImportRequest, ImportSource,
         job::{ImportJob, ImportSnapshot},
     },
     library::{
+        BatchReporter,
+        capability::{self, FeatureSummary, ImageCapabilities},
         collections::{self, CollectionInfo, CombineMode},
         content,
         db::LibraryDb,
@@ -28,37 +35,30 @@ use crate::{
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
-        thumbs::ThumbPack,
+        thumbs::{self, ThumbPack},
         viewer::PoseData,
     },
 };
 
-pub(crate) struct MaintenanceGuard(Arc<AtomicBool>);
-
-impl Drop for MaintenanceGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 pub struct AppState {
     pub settings: SettingsStore,
     pub ai: AiRuntime,
+    pub tasks: TaskBus,
     library: Mutex<Option<LibrarySession>>,
-    thumb_bench: Mutex<Option<Arc<ThumbBench>>>,
     import_job: Mutex<Option<Arc<ImportJob>>>,
-    maintenance: Arc<AtomicBool>,
 }
+
+/// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
+const MAX_CONSECUTIVE_FAILURES: usize = 5;
 
 impl AppState {
     pub fn new(settings: SettingsStore) -> Self {
         Self {
             settings,
             ai: AiRuntime::new(),
+            tasks: TaskBus::new(),
             library: Mutex::new(None),
-            thumb_bench: Mutex::new(None),
             import_job: Mutex::new(None),
-            maintenance: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,14 +83,6 @@ impl AppState {
         })
     }
 
-    pub fn thumb_bench(&self) -> Option<std::sync::Arc<ThumbBench>> {
-        self.thumb_bench.lock().clone()
-    }
-
-    pub fn set_thumb_bench(&self, bench: Option<std::sync::Arc<ThumbBench>>) {
-        *self.thumb_bench.lock() = bench;
-    }
-
     pub fn status(&self) -> AppResult<Option<LibraryInfo>> {
         let snapshot = self
             .library
@@ -106,52 +98,38 @@ impl AppState {
         Ok(Some(info))
     }
 
-    pub fn import_running(&self) -> bool {
-        self.import_job
-            .lock()
-            .as_ref()
-            .is_some_and(|job| job.is_running())
-    }
-
     pub fn start_import(
         &self,
-        app: tauri::AppHandle,
+        app: AppHandle,
         request: ImportRequest,
     ) -> AppResult<ImportSnapshot> {
         self.ensure_no_activity()?;
         let mut request = request.normalized()?;
         request.worker_threads = self.settings.snapshot().performance.worker_threads;
 
-        let (database, thumbs, root) = {
-            let library = self.library.lock();
-            let session = library
-                .as_ref()
-                .ok_or_else(|| AppError::message("尚未打开图库"))?;
-            (
-                session.db.clone(),
-                session.thumbs.clone(),
-                PathBuf::from(&session.info.path),
-            )
+        let (database, thumbs, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+
+        let scope = format!("{} 个路径", request.paths.len());
+        let job = Arc::new(ImportJob::new(uuid::Uuid::new_v4().to_string(), scope));
+        let handle = job.handle();
+        let runner_job = job.clone();
+        let runner_app = app.clone();
+        let source = ImportSource {
+            database,
+            thumbs,
+            root,
         };
-
-        let mut slot = self.import_job.lock();
-        if slot.as_ref().is_some_and(|job| job.is_running()) {
-            return Err(AppError::message("已有导入任务在运行"));
+        let started = self
+            .tasks
+            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+                crate::import::start(runner_app, source, runner_job, request, guard);
+            })?;
+        if let TaskStartResult::Conflict { active } = started {
+            return Err(conflict_error(&active));
         }
-        let job = std::sync::Arc::new(ImportJob::new(uuid::Uuid::new_v4().to_string()));
-        *slot = Some(job.clone());
-        drop(slot);
-
-        crate::import::start(
-            app,
-            ImportSource {
-                database,
-                thumbs,
-                root,
-            },
-            job.clone(),
-            request,
-        );
+        *self.import_job.lock() = Some(job.clone());
         Ok(job.snapshot())
     }
 
@@ -174,24 +152,21 @@ impl AppState {
     }
 
     fn ensure_no_activity(&self) -> AppResult<()> {
-        if self.maintenance.load(Ordering::Acquire) {
-            return Err(AppError::message("文件操作进行中，请等待完成"));
+        if !self.tasks.any_busy() {
+            return Ok(());
         }
-        if self.import_running() {
-            return Err(AppError::message("导入进行中，请等待完成或取消导入"));
+        if let Some(task) = self.tasks.active().into_iter().next() {
+            return Err(AppError::message(format!(
+                "「{}」正在进行，请等待完成或取消",
+                task.label
+            )));
         }
-        if self.ai.job_running() {
-            return Err(AppError::message("AI 任务进行中，请等待完成或取消任务"));
-        }
-        Ok(())
+        Err(AppError::message("有操作正在进行，请等待完成"))
     }
 
-    fn begin_maintenance(&self) -> AppResult<MaintenanceGuard> {
+    fn begin_maintenance(&self) -> AppResult<LaneGuard> {
         self.ensure_no_activity()?;
-        if self.maintenance.swap(true, Ordering::AcqRel) {
-            return Err(AppError::message("已有文件操作在运行"));
-        }
-        Ok(MaintenanceGuard(self.maintenance.clone()))
+        self.tasks.acquire_immediate(TaskLane::Write)
     }
 
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
@@ -237,7 +212,23 @@ impl AppState {
     }
 
     pub fn close_library(&self) -> AppResult<()> {
-        self.ensure_no_activity()?;
+        // 写任务不能中途关库；AI/扫描任务先取消，等它们真正退出后再释放句柄。
+        if self.tasks.lane_busy(TaskLane::Write) {
+            let label = self
+                .tasks
+                .active()
+                .into_iter()
+                .find(|task| task.lane == TaskLane::Write)
+                .map(|task| task.label)
+                .unwrap_or_else(|| "文件任务".to_owned());
+            return Err(AppError::message(format!(
+                "「{label}」正在进行，请等待完成或取消后再关闭图库"
+            )));
+        }
+        self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
+        if !self.tasks.wait_idle(Duration::from_secs(10)) {
+            return Err(AppError::message("任务正在停止，请稍后再关闭图库"));
+        }
         self.ai.library_closed();
         *self.library.lock() = None;
         self.settings.set_library_path(None)?;
@@ -367,10 +358,14 @@ impl AppState {
         metadata::delete_tag(&database, tag_id)
     }
 
-    pub fn move_images(&self, image_ids: &[i64], folder_path: &str) -> AppResult<MoveReport> {
-        let _guard = self.begin_maintenance()?;
+    pub fn move_images(
+        &self,
+        image_ids: &[i64],
+        folder_path: &str,
+        reporter: &dyn BatchReporter,
+    ) -> AppResult<MoveReport> {
         let (database, root) = self.query_source()?;
-        metadata::move_images(&database, &root, image_ids, folder_path)
+        metadata::move_images(&database, &root, image_ids, folder_path, reporter)
     }
 
     pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
@@ -387,18 +382,20 @@ impl AppState {
         Ok(changed)
     }
 
-    pub fn delete_images(&self, image_ids: &[i64]) -> AppResult<DeleteReport> {
-        let _guard = self.begin_maintenance()?;
+    pub fn delete_images(
+        &self,
+        image_ids: &[i64],
+        reporter: &dyn BatchReporter,
+    ) -> AppResult<DeleteReport> {
         let (database, root) = self.query_source()?;
-        let report = metadata::delete_images(&database, &root, image_ids)?;
+        let report = metadata::delete_images(&database, &root, image_ids, reporter)?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
 
-    pub fn empty_trash(&self) -> AppResult<DeleteReport> {
-        let _guard = self.begin_maintenance()?;
+    pub fn empty_trash(&self, reporter: &dyn BatchReporter) -> AppResult<DeleteReport> {
         let (database, root) = self.query_source()?;
-        let report = metadata::empty_trash(&database, &root)?;
+        let report = metadata::empty_trash(&database, &root, reporter)?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
@@ -460,7 +457,7 @@ impl AppState {
         self.ai.read_pose(image_id)
     }
 
-    pub(crate) fn begin_edit(&self) -> AppResult<MaintenanceGuard> {
+    pub(crate) fn begin_edit(&self) -> AppResult<LaneGuard> {
         let guard = self.begin_maintenance()?;
         self.ai.invalidate_similarity();
         Ok(guard)
@@ -475,4 +472,161 @@ impl AppState {
         let (database, root) = self.query_source()?;
         content::original_path(&database, &root, image_id)
     }
+
+    /// 启动一个会修改文件/缩略图的后台任务（写入 lane，独占）。
+    pub fn begin_write_task(
+        &self,
+        app: &AppHandle,
+        kind: TaskKind,
+        scope: String,
+    ) -> AppResult<(Arc<TaskHandle>, LaneGuard)> {
+        let handle = TaskHandle::new(uuid::Uuid::new_v4().to_string(), kind, scope);
+        let guard = self.tasks.begin_now(app, handle.clone())?;
+        Ok((handle, guard))
+    }
+
+    pub fn cancel_task(&self, task_id: &str) -> AppResult<()> {
+        self.tasks.cancel(task_id)
+    }
+
+    pub fn image_capabilities(&self, image_ids: &[i64]) -> AppResult<Vec<ImageCapabilities>> {
+        let (database, _) = self.query_source()?;
+        capability::image_capabilities(&database, image_ids)
+    }
+
+    pub fn feature_summary(&self) -> AppResult<FeatureSummary> {
+        let (database, _) = self.query_source()?;
+        capability::feature_summary(&database)
+    }
+
+    /// 统一批量任务入口：缩略图重建、三种 AI 任务、全库相似分组。
+    pub fn start_batch_task(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        match request.kind {
+            BatchTaskKind::Thumbnail => self.start_thumbnail_task(app, request),
+            BatchTaskKind::AiEmbedding | BatchTaskKind::AiPose | BatchTaskKind::AiDescription => {
+                let kind = match request.kind {
+                    BatchTaskKind::AiEmbedding => AiJobKind::Embedding,
+                    BatchTaskKind::AiPose => AiJobKind::Pose,
+                    _ => AiJobKind::Description,
+                };
+                let ai_request = AiJobRequest {
+                    kind,
+                    image_ids: Vec::new(),
+                    overwrite: request.overwrite,
+                    prompt: if matches!(kind, AiJobKind::Description) {
+                        request.prompt.clone()
+                    } else {
+                        None
+                    },
+                    max_tokens: if matches!(kind, AiJobKind::Description) {
+                        request.max_tokens
+                    } else {
+                        None
+                    },
+                };
+                let settings = self.settings.snapshot().ai;
+                self.ai.start_job(
+                    app,
+                    &self.tasks,
+                    &settings,
+                    ai_request,
+                    request.scope,
+                    request.conflict,
+                )
+            }
+            BatchTaskKind::SimilarityGroups => self.ai.start_groups_task(
+                app,
+                &self.tasks,
+                GroupOptions {
+                    phash: request.group_phash,
+                    phash_threshold: request.phash_threshold,
+                    embedding: request.group_embedding,
+                    embedding_threshold: request.embedding_threshold,
+                },
+                request.conflict,
+            ),
+        }
+    }
+
+    fn start_thumbnail_task(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        let (database, thumbs, root) = self.edit_handles()?;
+        let ids = request.scope.resolve(&database)?;
+        let only_missing = !request.overwrite;
+        let recalc_visuals = request.recalc_visuals;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::Thumbnail,
+            request.scope.label(),
+        );
+        let tasks = self.tasks.clone();
+        let worker = handle.clone();
+        self.tasks
+            .launch(app, handle, request.conflict, move |guard| {
+                let _ =
+                    tasks.spawn_worker("thumbnail-rebuild".to_owned(), worker.clone(), move || {
+                        // 写入 lane 由这个线程持有，直到所有图片处理结束。
+                        let _guard: LaneGuard = guard;
+                        worker.set_phase(TaskPhase::Running);
+                        worker.set_total(ids.len());
+                        let mut consecutive_failures = 0_usize;
+                        for image_id in ids {
+                            if worker.should_cancel() {
+                                break;
+                            }
+                            worker.set_current(Some(image_id));
+                            match thumbs::rebuild(
+                                &database,
+                                &thumbs,
+                                &root,
+                                image_id,
+                                only_missing,
+                                recalc_visuals,
+                            ) {
+                                Ok(true) => {
+                                    worker.inc_completed();
+                                    consecutive_failures = 0;
+                                }
+                                Ok(false) => {
+                                    worker.inc_skipped();
+                                    consecutive_failures = 0;
+                                }
+                                Err(error) => {
+                                    worker.inc_failed();
+                                    worker.add_failure(Some(image_id), "", error.to_string());
+                                    consecutive_failures += 1;
+                                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                        worker.set_message("连续多张缩略图处理失败，任务已停止");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        worker.finish_from(&Ok(()));
+                    });
+            })
+    }
+
+    pub fn tasks_snapshot(&self) -> Vec<TaskSnapshot> {
+        self.tasks.list()
+    }
+
+    pub fn similarity_groups_result(&self, task_id: &str) -> Option<SimilarityGroupsResult> {
+        self.ai.groups_result(task_id)
+    }
+}
+
+fn conflict_error(active: &[TaskSummary]) -> AppError {
+    let label = active
+        .first()
+        .map(|task| task.label.as_str())
+        .unwrap_or("其他任务");
+    AppError::message(format!("「{label}」正在进行，请等待完成或取消"))
 }

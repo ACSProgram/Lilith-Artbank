@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::{
     app::error::{AppError, AppResult},
     library::{
+        BatchReporter,
         db::LibraryDb,
         import::{ensure_folder, ensure_tags},
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
@@ -427,11 +428,14 @@ pub fn move_images(
     root: &Path,
     image_ids: &[i64],
     folder_path: &str,
+    reporter: &dyn BatchReporter,
 ) -> AppResult<MoveReport> {
     let ids = validate_ids_for_files(image_ids)?;
     let folder_path = normalize_folder(folder_path)?;
     let paths = LibraryPaths::new(root);
     let mut report = MoveReport::default();
+    let total = ids.len();
+    reporter.report(0, total);
 
     database.with_writer(|connection| {
         let transaction = connection.transaction()?;
@@ -447,7 +451,11 @@ pub fn move_images(
         ensure_dir_inside_root(&paths.root, &target_dir)?;
 
         let now = now_ms();
+        let mut done = 0_usize;
         for chunk in ids.chunks(SQL_CHUNK) {
+            if reporter.cancelled() {
+                break;
+            }
             let marks = placeholders(chunk.len());
             let mut statement = transaction.prepare(&format!(
                 "SELECT images.id, images.content_hash, images.file_ext, folders.path
@@ -467,6 +475,11 @@ pub fn move_images(
             drop(statement);
 
             for (image_id, content_hash, file_ext, old_folder) in rows {
+                if reporter.cancelled() {
+                    break;
+                }
+                done += 1;
+                reporter.report(done, total);
                 if old_folder == folder_path {
                     report.skipped += 1;
                     continue;
@@ -555,34 +568,37 @@ pub fn delete_images(
     database: &LibraryDb,
     root: &Path,
     image_ids: &[i64],
+    reporter: &dyn BatchReporter,
 ) -> AppResult<DeleteReport> {
     let ids = validate_ids_for_files(image_ids)?;
-    delete_internal(database, root, Some(&ids), false)
+    delete_internal(database, root, Some(&ids), false, reporter)
 }
 
-pub fn empty_trash(database: &LibraryDb, root: &Path) -> AppResult<DeleteReport> {
-    delete_internal(database, root, None, true)
+pub fn empty_trash(
+    database: &LibraryDb,
+    root: &Path,
+    reporter: &dyn BatchReporter,
+) -> AppResult<DeleteReport> {
+    delete_internal(database, root, None, true, reporter)
 }
 
+/// 按块删除：每块先删数据库行并提交，再删除对应原图。
+/// 取消发生在块边界，已完成的块保持“行与文件都已删除”，不会留下半删状态。
 fn delete_internal(
     database: &LibraryDb,
     root: &Path,
     image_ids: Option<&[i64]>,
     only_trashed: bool,
+    reporter: &dyn BatchReporter,
 ) -> AppResult<DeleteReport> {
     let paths = LibraryPaths::new(root);
-    let mut files = Vec::new();
-    let mut deleted = 0_u64;
 
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        // 清空回收站会一次取出全部待删行：回收站规模远小于全库，
-        // 且必须在同一个写事务里删除，暂不按块流式处理。
+    let selected = database.with_reader(|connection| {
         let mut selected = Vec::new();
         if let Some(ids) = image_ids {
             for chunk in ids.chunks(SQL_CHUNK) {
                 let marks = placeholders(chunk.len());
-                let mut statement = transaction.prepare(&format!(
+                let mut statement = connection.prepare(&format!(
                     "SELECT images.id, images.content_hash, images.file_ext, folders.path
                      FROM images JOIN folders ON folders.id = images.folder_id
                      WHERE images.id IN ({marks})"
@@ -601,7 +617,7 @@ fn delete_internal(
                 );
             }
         } else if only_trashed {
-            let mut statement = transaction.prepare(
+            let mut statement = connection.prepare(
                 "SELECT images.id, images.content_hash, images.file_ext, folders.path
                  FROM images JOIN folders ON folders.id = images.folder_id
                  WHERE images.deleted_at IS NOT NULL",
@@ -619,43 +635,55 @@ fn delete_internal(
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
         }
-
-        for (image_id, content_hash, file_ext, folder_path) in selected {
-            match content_path(&paths, &folder_path, &content_hash, &file_ext) {
-                Ok(path) => files.push((image_id, path)),
-                // 路径未通过校验时保留数据库行：此时无法定位原图，删行只会留下无人追踪的文件。
-                // 正常导入的数据不会出现这种情况，告警用于暴露被外部改坏的库。
-                Err(error) => log::warn!("跳过无效图片路径 image={image_id}: {error}"),
-            }
-        }
-
-        let ids: Vec<i64> = files.iter().map(|(id, _)| *id).collect();
-        for chunk in ids.chunks(SQL_CHUNK) {
-            let marks = placeholders(chunk.len());
-            deleted += transaction.execute(
-                &format!("DELETE FROM images WHERE id IN ({marks})"),
-                params_from_iter(chunk.iter()),
-            )? as u64;
-        }
-        transaction.commit()?;
-        Ok(())
+        Ok(selected)
     })?;
 
-    let mut report = DeleteReport {
-        deleted,
-        ..Default::default()
-    };
-    for (image_id, path) in files {
-        if !path.exists() {
-            continue;
+    let mut files = Vec::with_capacity(selected.len());
+    for (image_id, content_hash, file_ext, folder_path) in selected {
+        match content_path(&paths, &folder_path, &content_hash, &file_ext) {
+            Ok(path) => files.push((image_id, path)),
+            // 路径未通过校验时保留数据库行：此时无法定位原图，删行只会留下无人追踪的文件。
+            // 正常导入的数据不会出现这种情况，告警用于暴露被外部改坏的库。
+            Err(error) => log::warn!("跳过无效图片路径 image={image_id}: {error}"),
         }
-        match remove_content_file(&paths.root, &path) {
-            Ok(()) => report.files_removed += 1,
-            Err(error) => report.failures.push(BatchFailure {
-                image_id: Some(image_id),
-                path: path.to_string_lossy().into_owned(),
-                reason: error.to_string(),
-            }),
+    }
+
+    let total = files.len();
+    reporter.report(0, total);
+    let mut report = DeleteReport::default();
+    let mut done = 0_usize;
+
+    for chunk in files.chunks(SQL_CHUNK) {
+        if reporter.cancelled() {
+            break;
+        }
+        let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+        let deleted = database.with_writer(|connection| {
+            let transaction = connection.transaction()?;
+            let marks = placeholders(ids.len());
+            let deleted = transaction.execute(
+                &format!("DELETE FROM images WHERE id IN ({marks})"),
+                params_from_iter(ids.iter()),
+            )?;
+            transaction.commit()?;
+            Ok(deleted as u64)
+        })?;
+        report.deleted += deleted;
+
+        // 行已经删除；这一块的文件必须一并清理，取消只在块边界生效。
+        for (image_id, path) in chunk {
+            if path.exists() {
+                match remove_content_file(&paths.root, path) {
+                    Ok(()) => report.files_removed += 1,
+                    Err(error) => report.failures.push(BatchFailure {
+                        image_id: Some(*image_id),
+                        path: path.to_string_lossy().into_owned(),
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            done += 1;
+            reporter.report(done, total);
         }
     }
     Ok(report)
@@ -830,7 +858,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::service;
+    use crate::library::{NoopReporter, service};
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -1010,6 +1038,7 @@ mod tests {
             &fixture.root,
             &[image_id],
             "风景/子目录",
+            &NoopReporter,
         )
         .unwrap();
         assert_eq!(report.moved, 1);
@@ -1024,6 +1053,7 @@ mod tests {
             &fixture.root,
             &[image_id],
             "风景/子目录",
+            &NoopReporter,
         )
         .unwrap();
         assert_eq!(report.skipped, 1);
@@ -1039,6 +1069,7 @@ mod tests {
             &fixture.root,
             &[blocked],
             "风景/子目录",
+            &NoopReporter,
         )
         .unwrap();
         assert_eq!(report.moved, 0);
@@ -1104,7 +1135,13 @@ mod tests {
                 .is_none()
         );
 
-        let report = delete_images(&fixture.session.db, &fixture.root, &[image_id]).unwrap();
+        let report = delete_images(
+            &fixture.session.db,
+            &fixture.root,
+            &[image_id],
+            &NoopReporter,
+        )
+        .unwrap();
         assert_eq!(report.deleted, 1);
         assert_eq!(report.files_removed, 1);
         assert!(!path.exists());
@@ -1139,7 +1176,7 @@ mod tests {
         write_content(&fixture, "人物", "b", "jpg");
         set_trashed(&fixture.session.db, &[trashed], true).unwrap();
 
-        let report = empty_trash(&fixture.session.db, &fixture.root).unwrap();
+        let report = empty_trash(&fixture.session.db, &fixture.root, &NoopReporter).unwrap();
         assert_eq!(report.deleted, 1);
         assert_eq!(report.files_removed, 1);
         assert!(image_details(&fixture.session.db, &fixture.root, active).is_ok());
@@ -1153,7 +1190,25 @@ mod tests {
         assert!(update_score(&fixture.session.db, image_id, 6).is_err());
         assert!(update_description(&fixture.session.db, image_id, &"x".repeat(50_001)).is_err());
         assert!(rename_tag(&fixture.session.db, 1, "").is_err());
-        assert!(move_images(&fixture.session.db, &fixture.root, &[], "目标").is_err());
-        assert!(move_images(&fixture.session.db, &fixture.root, &[image_id], "../外面").is_err());
+        assert!(
+            move_images(
+                &fixture.session.db,
+                &fixture.root,
+                &[],
+                "目标",
+                &NoopReporter
+            )
+            .is_err()
+        );
+        assert!(
+            move_images(
+                &fixture.session.db,
+                &fixture.root,
+                &[image_id],
+                "../外面",
+                &NoopReporter
+            )
+            .is_err()
+        );
     }
 }

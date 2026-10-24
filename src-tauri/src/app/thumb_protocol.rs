@@ -47,24 +47,6 @@ fn respond(app: &AppHandle<Wry>, path: &str, responder: UriSchemeResponder) {
 }
 
 fn route(app: &AppHandle<Wry>, path: &str) -> Result<Response<Vec<u8>>, ThumbError> {
-    if let Some(raw_index) = path.strip_prefix("bench/") {
-        let index = raw_index
-            .parse::<usize>()
-            .map_err(|_| ThumbError::BadRequest("基准索引无效"))?;
-        let state = app.state::<AppState>();
-        let bench = state
-            .thumb_bench()
-            .ok_or(ThumbError::NotFound("基准样本尚未生成"))?;
-        let location = bench
-            .location(index)
-            .ok_or(ThumbError::NotFound("基准索引越界"))?;
-        let bytes = bench
-            .pack()
-            .read(location)
-            .map_err(|error| ThumbError::Internal(error.to_string()))?;
-        return Ok(image_response(bytes, "webp", 0));
-    }
-
     let image_id = path
         .parse::<i64>()
         .map_err(|_| ThumbError::BadRequest("图片 id 无效"))?;

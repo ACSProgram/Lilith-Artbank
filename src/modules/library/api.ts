@@ -14,6 +14,7 @@ import {
   mockFilterCounts,
   mockFolders,
   mockImageDetail,
+  mockLibraryCounts,
   mockMoveFolder,
   mockMoveImages,
   mockQueryIds,
@@ -38,7 +39,9 @@ import type {
   CombineMode,
   DeleteReport,
   FilterCounts,
+  FeatureSummary,
   FolderInfo,
+  ImageCapabilities,
   ImageDetails,
   ImagePage,
   LibraryQuery,
@@ -227,5 +230,26 @@ export const libraryApi = {
   ): Promise<CollectionInfo> {
     if (!isTauri()) return mockCombineCollections(mode, collectionIds, name);
     return invoke<CollectionInfo>("combine_collections", { mode, collectionIds, name });
+  },
+
+  async getImageCapabilities(imageIds: number[]): Promise<ImageCapabilities[]> {
+    if (!isTauri()) {
+      return imageIds.map((imageId) => ({
+        imageId,
+        pose: true,
+        embedding: true,
+        colors: true,
+        phash: true,
+      }));
+    }
+    return invoke<ImageCapabilities[]>("get_image_capabilities", { imageIds });
+  },
+
+  async getFeatureSummary(): Promise<FeatureSummary> {
+    if (!isTauri()) {
+      const total = mockLibraryCounts().imageCount;
+      return { description: total, embedding: total, pose: total, phash: total, colors: total };
+    }
+    return invoke<FeatureSummary>("get_feature_summary");
   },
 };

@@ -14,7 +14,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { MenuSection } from "../../shared/components/MenuSection";
-import type { ImageRow } from "./types";
+import { similarKindAvailability, type ActionAvailability } from "../../shared/capability";
+import type { ImageCapabilities, ImageRow } from "./types";
 import type { SimilarKind } from "../../shared/similarity";
 
 export interface ContextMenuState {
@@ -28,6 +29,8 @@ export interface ContextMenuState {
 
 interface LibraryContextMenuProps {
   menu: ContextMenuState;
+  /** 首张图的特征能力；查询返回前为 null，按“可用”处理。 */
+  capabilities: ImageCapabilities | null;
   inCollection: boolean;
   hasActive: boolean;
   hasDeleted: boolean;
@@ -51,6 +54,7 @@ const CONTEXT_MENU_MAX_HEIGHT = 600;
 
 export function LibraryContextMenu({
   menu,
+  capabilities,
   inCollection,
   hasActive,
   hasDeleted,
@@ -129,6 +133,17 @@ export function LibraryContextMenu({
   const top = Math.min(menu.y, Math.max(8, window.innerHeight - CONTEXT_MENU_MAX_HEIGHT));
   const multiple = menu.items.length > 1 ? menu.items.length : null;
   const canFindSimilar = menu.items[0]?.deletedAt == null;
+  // 找相似只针对一张图；多选时整组置灰，不再悄悄用第一张。
+  const similarBlocker: ActionAvailability | null =
+    menu.ids.length > 1 ? { enabled: false, reason: "只能对单张图片找相似" } : null;
+  const availability = (base: ActionAvailability): ActionAvailability =>
+    similarBlocker ?? base;
+  const phashAvailability = availability(similarKindAvailability("phash", capabilities));
+  const colorAvailability = availability(similarKindAvailability("color8", capabilities));
+  const embeddingAvailability = availability(
+    similarKindAvailability("embedding", capabilities),
+  );
+  const poseAvailability = availability(similarKindAvailability("pose", capabilities));
 
   return (
     <div
@@ -176,10 +191,12 @@ export function LibraryContextMenu({
       </MenuSection>
 
       {canFindSimilar ? (
-        <MenuSection title="找相似" aside={multiple ? "首张" : null}>
+        <MenuSection title="找相似">
           <button
             type="button"
             className="context-menu-item"
+            disabled={!phashAvailability.enabled}
+            title={phashAvailability.reason}
             onClick={() => onFindSimilar("phash")}
           >
             <ScanSearch size={14} />
@@ -188,6 +205,8 @@ export function LibraryContextMenu({
           <button
             type="button"
             className="context-menu-item"
+            disabled={!colorAvailability.enabled}
+            title={colorAvailability.reason}
             onClick={() => onFindSimilar("color8")}
           >
             <Palette size={14} />
@@ -196,6 +215,8 @@ export function LibraryContextMenu({
           <button
             type="button"
             className="context-menu-item"
+            disabled={!colorAvailability.enabled}
+            title={colorAvailability.reason}
             onClick={() => onFindSimilar("color4")}
           >
             <Palette size={14} />
@@ -204,6 +225,8 @@ export function LibraryContextMenu({
           <button
             type="button"
             className="context-menu-item"
+            disabled={!embeddingAvailability.enabled}
+            title={embeddingAvailability.reason}
             onClick={() => onFindSimilar("embedding")}
           >
             <Sparkles size={14} />
@@ -212,6 +235,8 @@ export function LibraryContextMenu({
           <button
             type="button"
             className="context-menu-item"
+            disabled={!poseAvailability.enabled}
+            title={poseAvailability.reason}
             onClick={() => onFindSimilar("pose")}
           >
             <PersonStanding size={14} />
