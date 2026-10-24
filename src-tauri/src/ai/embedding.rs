@@ -2,15 +2,18 @@ use std::collections::BTreeMap;
 
 use half::{f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::db::LibraryDb,
-    library::service::now_ms,
+    library::{
+        db::LibraryDb,
+        service::now_ms,
+        similarity::{self as library_similarity, UnionFind},
+    },
 };
 
-use super::pack::{FeatureDtype, FeatureKind, FeatureStore};
+use super::pack::{FeatureDtype, FeatureKind, FeatureStore, record_slice};
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 2_000;
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -105,6 +108,250 @@ pub fn rows(database: &LibraryDb, model: &str, dim: u32) -> AppResult<Vec<Embedd
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
+}
+
+pub struct TargetEmbedding {
+    pub model: String,
+    pub dim: u32,
+    pub vector: Vec<f32>,
+}
+
+/// 读取某张图片的 embedding；没有记录或记录损坏时返回 `None`。
+pub fn target(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    image_id: i64,
+) -> AppResult<Option<TargetEmbedding>> {
+    let pointer = database.with_reader(|connection| {
+        let pointer = connection
+            .query_row(
+                "SELECT feature_blobs.model, feature_blobs.dim,
+                        feature_blobs.pack_name, feature_blobs.pack_offset, feature_blobs.pack_length
+                 FROM feature_blobs
+                 JOIN images ON images.id = feature_blobs.image_id
+                 WHERE feature_blobs.image_id = ?1
+                   AND feature_blobs.kind = 'embedding'
+                   AND images.deleted_at IS NULL",
+                [image_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, u32>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(pointer)
+    })?;
+    let Some((model, dim, pack_name, offset, length)) = pointer else {
+        return Ok(None);
+    };
+    if dim == 0 || length as usize != dim as usize * 2 {
+        return Ok(None);
+    }
+    Ok(
+        read_vector(store, &pack_name, offset, dim)?.map(|vector| TargetEmbedding {
+            model,
+            dim,
+            vector,
+        }),
+    )
+}
+
+/// 目标图 embedding 相似：中心化余弦降序，排除目标图自身。
+#[allow(clippy::too_many_arguments)]
+pub fn similar_to(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    target: &[f32],
+    mean: &[f32],
+    exclude: i64,
+    limit: usize,
+) -> AppResult<Vec<(i64, f32)>> {
+    let mut results = search(database, store, model, dim, target, mean, limit + 1)?;
+    results.retain(|(id, _)| *id != exclude);
+    results.truncate(limit);
+    Ok(results)
+}
+
+pub struct DuplicateGroups {
+    pub groups: Vec<Vec<i64>>,
+    pub truncated: bool,
+    pub missing: usize,
+}
+
+/// 以 pHash 分段索引产生候选组，再用中心化 embedding 余弦复核，避免全库 O(n²)。
+///
+/// pHash 负责“看起来很像”的候选，embedding 负责确认语义一致并把组内不一致的图片拆开。
+/// 两只图片如果 pHash 距离超过 `phash_threshold`，不会进入候选。
+#[cfg(test)]
+pub fn duplicate_groups(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    mean: &[f32],
+    similarity_threshold: f32,
+    phash_threshold: u32,
+) -> AppResult<DuplicateGroups> {
+    let candidates = library_similarity::phash_groups(database, phash_threshold)?;
+    refine_groups(
+        database,
+        store,
+        model,
+        dim,
+        mean,
+        similarity_threshold,
+        candidates.groups,
+        candidates.truncated,
+    )
+}
+
+/// 对已生成的候选组做 embedding 余弦复核；供常驻 pHash 索引直接复用。
+#[allow(clippy::too_many_arguments)]
+pub fn refine_groups(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    mean: &[f32],
+    similarity_threshold: f32,
+    candidates: Vec<Vec<i64>>,
+    mut truncated: bool,
+) -> AppResult<DuplicateGroups> {
+    let mut groups = Vec::new();
+    let mut missing = 0_usize;
+    for group in candidates {
+        if group.len() > library_similarity::MAX_GROUP_SIZE {
+            truncated = true;
+            continue;
+        }
+        let vectors = vectors_for(database, store, model, dim, &group)?;
+        missing += group.len() - vectors.len();
+        if vectors.len() < 2 {
+            continue;
+        }
+        let mut union = UnionFind::new(vectors.len());
+        for left in 0..vectors.len() - 1 {
+            for right in left + 1..vectors.len() {
+                if centered_cosine(&vectors[left].1, &vectors[right].1, mean)
+                    >= similarity_threshold
+                {
+                    union.union(left, right);
+                }
+            }
+        }
+        let mut by_root: std::collections::HashMap<usize, Vec<i64>> =
+            std::collections::HashMap::new();
+        for (index, (id, _)) in vectors.iter().enumerate() {
+            by_root.entry(union.find(index)).or_default().push(*id);
+        }
+        for mut ids in by_root.into_values() {
+            if ids.len() >= 2 {
+                ids.sort_unstable();
+                groups.push(ids);
+            }
+        }
+    }
+    groups.sort_by(|left, right| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left[0].cmp(&right[0]))
+    });
+    if groups.len() > library_similarity::MAX_GROUPS {
+        groups.truncate(library_similarity::MAX_GROUPS);
+        truncated = true;
+    }
+    Ok(DuplicateGroups {
+        groups,
+        truncated,
+        missing,
+    })
+}
+
+fn vectors_for(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    ids: &[i64],
+) -> AppResult<Vec<(i64, Vec<f32>)>> {
+    let mut pointers = Vec::new();
+    for chunk in ids.chunks(400) {
+        let placeholders = crate::library::placeholders(chunk.len());
+        let sql = format!(
+            "SELECT image_id, pack_name, pack_offset
+             FROM feature_blobs
+             WHERE kind = 'embedding' AND model = ?1 AND dim = ?2
+               AND image_id IN ({placeholders})"
+        );
+        let mut values = vec![
+            Value::Text(model.to_owned()),
+            Value::Integer(i64::from(dim)),
+        ];
+        values.extend(chunk.iter().map(|id| Value::Integer(*id)));
+        let rows = database.with_reader(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        pointers.extend(rows);
+    }
+    let mut vectors = Vec::with_capacity(pointers.len());
+    for (id, pack_name, offset) in pointers {
+        if let Some(vector) = read_vector(store, &pack_name, offset, dim)? {
+            vectors.push((id, vector));
+        }
+    }
+    vectors.sort_by_key(|(id, _)| *id);
+    Ok(vectors)
+}
+
+/// 按指针读取一条向量并转成 fp32；包含非有限值时返回 `None`。
+fn read_vector(
+    store: &FeatureStore,
+    pack_name: &str,
+    offset: u64,
+    dim: u32,
+) -> AppResult<Option<Vec<f32>>> {
+    let bytes = store.read(pack_name, offset, dim * 2)?;
+    let mut vector = vec![0.0_f32; dim as usize];
+    decode_f16(&bytes, &mut vector);
+    Ok(vector
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(vector))
+}
+
+fn centered_cosine(left: &[f32], right: &[f32], mean: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for index in 0..left.len().min(right.len()).min(mean.len()) {
+        let a = left[index] - mean[index];
+        let b = right[index] - mean[index];
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+    if left_norm <= 1e-12 || right_norm <= 1e-12 {
+        return 0.0;
+    }
+    (dot / (left_norm * right_norm).sqrt()).clamp(-1.0, 1.0)
 }
 
 /// 全库 embedding 按 (model, dim) 分组的条数，最多的一组排在最前；打开图库时用它挑均值模型。
@@ -297,12 +544,6 @@ fn group_by_pack(rows: Vec<EmbeddingRow>) -> BTreeMap<String, Vec<EmbeddingRow>>
     grouped
 }
 
-fn record_slice(map: &[u8], offset: u64, length: usize) -> Option<&[u8]> {
-    let start = usize::try_from(offset).ok()?;
-    let end = start.checked_add(length)?;
-    map.get(start..end)
-}
-
 fn decode_f16(bytes: &[u8], output: &mut [f32]) {
     if bytes.len() == output.len() * 2 && (bytes.as_ptr() as usize).is_multiple_of(2) {
         // 包内记录按 2 字节对齐；批量转换比逐元素 from_bits 快数倍。
@@ -439,6 +680,58 @@ mod tests {
             })
             .unwrap();
         assert!(rows(&session.db, "model", 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn target_similarity_excludes_self_and_orders_by_centered_cosine() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=3 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+
+        let target = target(&session.db, &packs, 1).unwrap().unwrap();
+        assert_eq!(target.model, "model");
+        assert_eq!(target.dim, 4);
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        let results = similar_to(
+            &session.db,
+            &packs,
+            &target.model,
+            target.dim,
+            &target.vector,
+            &mean.vector,
+            1,
+            10,
+        )
+        .unwrap();
+        assert_eq!(results[0].0, 2);
+        assert!(results[0].1 > 0.99);
+        assert_eq!(results[1].0, 3);
+        assert!(results[1].1 < 0.0);
+    }
+
+    #[test]
+    fn duplicate_groups_split_phash_candidates_with_embeddings() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=4 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        let groups =
+            duplicate_groups(&session.db, &packs, "model", 4, &mean.vector, 0.9, 0).unwrap();
+        assert_eq!(groups.groups, vec![vec![1, 2]]);
+        assert_eq!(groups.missing, 1);
+        assert!(!groups.truncated);
     }
 }
 

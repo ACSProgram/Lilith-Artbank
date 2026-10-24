@@ -169,6 +169,58 @@ fn palette(sample_count: usize, clusters: &[Cluster]) -> Vec<([u8; 3], u8)> {
         .collect()
 }
 
+/// OKLab 预转换的主色，供常驻相似度索引复用，避免每次查询重复转换。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LabColor {
+    pub l: f32,
+    pub a: f32,
+    pub b: f32,
+    pub weight: f32,
+}
+
+/// 把 4/8 色 `(r, g, b, weight)` 记录预先转成 OKLab；权重归一到 0-1。
+pub fn prepare_palette<const N: usize>(palette: &[u8]) -> [LabColor; N] {
+    let mut out = [LabColor::default(); N];
+    for (slot, entry) in out.iter_mut().zip(palette.chunks_exact(4)) {
+        let [l, a, b] = oklab_from_srgb(entry[0], entry[1], entry[2]);
+        *slot = LabColor {
+            l,
+            a,
+            b,
+            weight: f32::from(entry[3]) / 255.0,
+        };
+    }
+    out
+}
+
+/// 两套已预转换主色的对称加权距离，0 表示一致。
+///
+/// 每个色项匹配对方 OKLab 空间里最近的一项，按自身权重求平均，再对两个方向取均值。
+pub fn prepared_distance(left: &[LabColor], right: &[LabColor]) -> f32 {
+    ((nearest_prepared(left, right) + nearest_prepared(right, left)) * 0.5).min(1.0)
+}
+
+fn nearest_prepared(source: &[LabColor], target: &[LabColor]) -> f32 {
+    let total: f32 = source.iter().map(|entry| entry.weight).sum();
+    if total <= f32::EPSILON {
+        return 0.0;
+    }
+    let mut sum = 0.0_f32;
+    for entry in source {
+        let mut nearest = f32::INFINITY;
+        for other in target {
+            let dl = entry.l - other.l;
+            let da = entry.a - other.a;
+            let db = entry.b - other.b;
+            nearest = nearest.min((dl * dl + da * da + db * db).sqrt());
+        }
+        if nearest.is_finite() {
+            sum += entry.weight * nearest;
+        }
+    }
+    sum / total
+}
+
 fn distance_squared(left: &[f32; 3], right: &[f32; 3]) -> f64 {
     left.iter()
         .zip(right.iter())
@@ -335,5 +387,30 @@ mod tests {
         let first = dominant(&two_color());
         let second = dominant(&two_color());
         assert_eq!(first, second);
+    }
+
+    /// 测试里直接走线上实现（`prepare_palette` + `prepared_distance`），避免出现第二套距离算法。
+    fn distance4(left: &[u8; COLORS4_BYTES], right: &[u8; COLORS4_BYTES]) -> f32 {
+        prepared_distance(&prepare_palette::<4>(left), &prepare_palette::<4>(right))
+    }
+
+    #[test]
+    fn palette_distance_is_zero_for_identical_palettes() {
+        let (colors4, colors8) = dominant(&two_color());
+        assert_eq!(distance4(&colors4, &colors4), 0.0);
+        let prepared = prepare_palette::<8>(&colors8);
+        assert_eq!(prepared_distance(&prepared, &prepared), 0.0);
+    }
+
+    #[test]
+    fn palette_distance_grows_with_color_difference() {
+        let (red, _) = dominant(&solid([200, 30, 30]));
+        let (near_red, _) = dominant(&solid([190, 40, 40]));
+        let (blue, _) = dominant(&solid([30, 40, 200]));
+        let near = distance4(&red, &near_red);
+        let far = distance4(&red, &blue);
+        assert!(near < far, "near={near} far={far}");
+        assert!(far > 0.1);
+        assert_eq!(near, distance4(&near_red, &red));
     }
 }

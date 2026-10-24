@@ -20,6 +20,7 @@ import {
   List,
   PanelRight,
   RefreshCw,
+  ScanSearch,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -55,7 +56,7 @@ import {
   selectionRange,
   sortOptionsFor,
   type BrowseState,
-  type SemanticBrowseState,
+  type SimilarityBrowseState,
 } from "./model";
 import type {
   CollectionInfo,
@@ -72,6 +73,8 @@ import { VirtualGrid } from "./VirtualGrid";
 import { VirtualList } from "./VirtualList";
 import type { VirtualViewHandle } from "./virtual";
 import type { ViewerSession } from "../../shared/viewerSession";
+import type { SimilarKind } from "../../shared/similarity";
+import { SIMILAR_LABELS } from "../../shared/similarity";
 
 interface LibraryViewProps {
   browse: BrowseState;
@@ -84,7 +87,9 @@ interface LibraryViewProps {
   refreshToken: number;
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
-  semantic?: SemanticBrowseState;
+  similarity?: SimilarityBrowseState;
+  onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
+  onOpenSimilarityGroups?: () => void;
   onOpenAiTasks?: (context: { selectedIds: number[]; query: LibraryQuery | null }) => void;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
   aiOnline?: boolean;
@@ -119,7 +124,9 @@ export function LibraryView({
   refreshToken,
   onOpenViewer,
   onCopyImage,
-  semantic,
+  similarity,
+  onFindSimilar,
+  onOpenSimilarityGroups,
   onOpenAiTasks,
   onGenerateDescription,
   aiOnline = false,
@@ -168,21 +175,23 @@ export function LibraryView({
 
   const query = useMemo(() => buildQuery(browse), [browse]);
   const imageQuery = useImageQuery(query, refreshToken + dataVersion);
-  const semanticActive = semantic?.active === true;
-  // 语义模式下网格换成语义结果源；两者共享 items/status/error/hasMore 契约。
-  const listSource = semanticActive && semantic ? semantic : imageQuery;
+  const similarityActive = similarity?.active === true;
+  // 结果来自“找相似”而不是文本语义搜索；状态文案按它分支。
+  const similarMode = similarity?.mode === "similar";
+  // 相似模式下网格换成结果数据源；两者共享 items/status/error/hasMore 契约。
+  const listSource = similarityActive && similarity ? similarity : imageQuery;
   const { items, status, error, moreStatus, moreError, hasMore } = listSource;
   const loadMore = listSource.loadMore;
   const retry = listSource.retry;
-  const retryMore = semanticActive && semantic ? semantic.loadMore : imageQuery.retryMore;
-  const semanticKey = semanticActive ? `semantic:${semantic?.token ?? ""}` : "";
+  const retryMore = similarityActive && similarity ? similarity.loadMore : imageQuery.retryMore;
+  const similarityKey = similarityActive ? `similarity:${similarity?.token ?? ""}` : "";
   const resetSignature = useMemo(
-    () => `${queryKey(query)}|${refreshToken}|${semanticKey}`,
-    [query, refreshToken, semanticKey],
+    () => `${queryKey(query)}|${refreshToken}|${similarityKey}`,
+    [query, refreshToken, similarityKey],
   );
   const selectionResetSignature = useMemo(
-    () => `${filterKey(query)}|${refreshToken}|${semanticKey}`,
-    [query, refreshToken, semanticKey],
+    () => `${filterKey(query)}|${refreshToken}|${similarityKey}`,
+    [query, refreshToken, similarityKey],
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
 
@@ -241,14 +250,14 @@ export function LibraryView({
     setContextMenu(null);
   }, [selectionResetSignature]);
 
-  // 外部刷新（导入、批处理完成、元数据变化）会让语义结果过期，直接退出语义模式。
-  const semanticClear = semantic?.clear;
-  const semanticRefreshRef = useRef(refreshToken + dataVersion);
+  // 外部刷新（导入、批处理完成、元数据变化）会让相似结果过期，直接退出相似模式。
+  const similarityClear = similarity?.clear;
+  const similarityRefreshRef = useRef(refreshToken + dataVersion);
   useEffect(() => {
-    if (semanticRefreshRef.current === refreshToken + dataVersion) return;
-    semanticRefreshRef.current = refreshToken + dataVersion;
-    semanticClear?.();
-  }, [refreshToken, dataVersion, semanticClear]);
+    if (similarityRefreshRef.current === refreshToken + dataVersion) return;
+    similarityRefreshRef.current = refreshToken + dataVersion;
+    similarityClear?.();
+  }, [refreshToken, dataVersion, similarityClear]);
 
   useEffect(() => {
     try {
@@ -300,8 +309,8 @@ export function LibraryView({
 
   const goBack = useCallback(() => {
     onGoBack();
-    semanticClear?.();
-  }, [onGoBack, semanticClear]);
+    similarityClear?.();
+  }, [onGoBack, similarityClear]);
 
   // 切换固定视图时搜索范围回到“当前视图”，集合内顺序排序在离开集合时回退到默认排序。
   const showAll = useCallback(() => {
@@ -312,8 +321,8 @@ export function LibraryView({
       searchScope: "view",
       sort: sortForView("all", browseRef.current.sort),
     });
-    semanticClear?.();
-  }, [applyBrowse, semanticClear]);
+    similarityClear?.();
+  }, [applyBrowse, similarityClear]);
 
   const showTrash = useCallback(() => {
     applyBrowse({
@@ -323,8 +332,8 @@ export function LibraryView({
       searchScope: "view",
       sort: sortForView("trash", browseRef.current.sort),
     });
-    semanticClear?.();
-  }, [applyBrowse, semanticClear]);
+    similarityClear?.();
+  }, [applyBrowse, similarityClear]);
 
   const showCollection = useCallback(
     (collectionId: number) => {
@@ -339,9 +348,9 @@ export function LibraryView({
             ? currentState.sort
             : COLLECTION_SORT,
       });
-      semanticClear?.();
+      similarityClear?.();
     },
-    [applyBrowse, semanticClear],
+    [applyBrowse, similarityClear],
   );
 
   const setSearchScope = (scope: BrowseState["searchScope"]) => {
@@ -429,8 +438,8 @@ export function LibraryView({
     setSelectingAll(true);
     try {
       const ids =
-        semanticActive && semantic
-          ? await semantic.ids()
+        similarityActive && similarity
+          ? await similarity.ids()
           : await libraryApi.queryImageIds(query);
       setSelected(new Set(ids));
       const first = ids[0] ?? null;
@@ -442,8 +451,8 @@ export function LibraryView({
         "info",
         ids.length === 0
           ? "当前条件没有图片"
-          : semanticActive
-            ? "包含语义搜索结果中尚未滚动加载的图片"
+          : similarityActive
+            ? "包含相似结果中尚未滚动加载的图片"
             : "包含尚未滚动加载的图片",
       );
     } catch (cause) {
@@ -451,7 +460,21 @@ export function LibraryView({
     } finally {
       setSelectingAll(false);
     }
-  }, [notify, query, selectingAll, semantic, semanticActive]);
+  }, [notify, query, selectingAll, similarity, similarityActive]);
+
+  const createCollectionFromCurrent = useCallback(
+    async (name: string) => {
+      const ids =
+        similarityActive && similarity
+          ? await similarity.ids()
+          : await libraryApi.queryImageIds(query);
+      if (ids.length === 0) throw new Error("当前结果没有图片");
+      const collection = await libraryApi.createCollection(name);
+      await libraryApi.addImagesToCollection(collection.id, ids);
+      await reloadCollections();
+    },
+    [query, reloadCollections, similarity, similarityActive],
+  );
 
   const copyPaths = useCallback(async () => {
     const targets = contextMenu?.items ?? [];
@@ -952,7 +975,7 @@ export function LibraryView({
               value={searchDraft}
               placeholder="搜索描述、标签、文件夹"
               aria-label="搜索图片"
-              disabled={semanticActive}
+              disabled={similarityActive}
               onChange={(event) => setSearchDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
@@ -990,17 +1013,30 @@ export function LibraryView({
 
           <Button
             size="sm"
-            variant={semanticActive ? "primary" : "secondary"}
+            variant={similarityActive ? "primary" : "secondary"}
             icon={<Sparkles size={14} />}
-            disabled={!semantic}
+            disabled={!similarity}
             onClick={() => setSemanticOpen((open) => !open)}
           >
             语义搜索
           </Button>
 
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={<ScanSearch size={14} />}
+            disabled={!onOpenSimilarityGroups}
+            title="按 pHash 或 embedding 扫描全库相似组"
+            onClick={() => onOpenSimilarityGroups?.()}
+          >
+            相似分组
+          </Button>
+
           <span className="library-loaded">
-            {semanticActive && semantic?.busy
-              ? "正在计算语义相似度…"
+            {similarityActive && similarity?.busy
+              ? similarMode
+                ? "正在查找相似图片…"
+                : "正在计算语义相似度…"
               : status === "loading"
                 ? "正在读取…"
                 : `${items.length.toLocaleString()} 张已载入`}
@@ -1037,7 +1073,7 @@ export function LibraryView({
             onClick={() =>
               onOpenAiTasks?.({
                 selectedIds: [...selected],
-                query: semanticActive ? null : query,
+                query: similarityActive ? null : query,
               })
             }
           >
@@ -1049,7 +1085,7 @@ export function LibraryView({
               size="sm"
               variant={filterCount > 0 ? "primary" : "secondary"}
               icon={<SlidersHorizontal size={14} />}
-              disabled={semanticActive}
+              disabled={similarityActive}
               onClick={() => setFilterOpen((open) => !open)}
             >
               筛选
@@ -1074,7 +1110,7 @@ export function LibraryView({
               className="input sort-select"
               value={browse.sort.key}
               aria-label="排序方式"
-              disabled={semanticActive}
+              disabled={similarityActive}
               onChange={(event) => {
                 const key = event.target.value as SortKey;
                 const descending =
@@ -1097,7 +1133,7 @@ export function LibraryView({
             </select>
             <IconButton
               label={browse.sort.descending ? "降序，点击切换为升序" : "升序，点击切换为降序"}
-              disabled={semanticActive}
+              disabled={similarityActive}
               onClick={() =>
                 applyBrowse(
                   {
@@ -1118,7 +1154,7 @@ export function LibraryView({
         </div>
       </div>
 
-      {semanticOpen && semantic ? (
+      {semanticOpen && similarity ? (
         <div className="semantic-search-bar">
           <Sparkles size={14} />
           <input
@@ -1131,7 +1167,7 @@ export function LibraryView({
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 event.preventDefault();
-                semantic.search(semanticDraft);
+                similarity.search(semanticDraft);
                 setSemanticOpen(false);
               }
               if (event.key === "Escape") {
@@ -1143,18 +1179,18 @@ export function LibraryView({
           <Button
             size="sm"
             variant="primary"
-            loading={semantic.busy}
+            loading={similarity.busy}
             disabled={!semanticDraft.trim()}
             onClick={() => {
-              semantic.search(semanticDraft);
+              similarity.search(semanticDraft);
               setSemanticOpen(false);
             }}
           >
             搜索
           </Button>
           <span className="semantic-hint">
-            {semantic.error ??
-              (semantic.busy
+            {similarity.error ??
+              (similarity.busy
                 ? "正在请求文本 embedding 并扫描本地向量…"
                 : "文本只用于生成查询向量，不写入图库。")}
           </span>
@@ -1164,20 +1200,26 @@ export function LibraryView({
         </div>
       ) : null}
 
-      {semanticActive && semantic ? (
+      {similarityActive && similarity ? (
         <div className="filter-summary semantic-summary">
-          <Sparkles size={14} />
+          {similarMode ? <ScanSearch size={14} /> : <Sparkles size={14} />}
           <span>
-            语义搜索「{semantic.text}」 · {semantic.total.toLocaleString()} 张结果 ·{" "}
-            {semantic.model} · {semantic.elapsedMs}ms
+            {similarMode
+              ? `相似于 ${similarity.text} · ${
+                  similarity.kind ? SIMILAR_LABELS[similarity.kind] : "相似"
+                }`
+              : `语义搜索「${similarity.text}」`}{" "}
+            · {similarity.total.toLocaleString()} 张结果
+            {!similarMode && similarity.model ? ` · ${similarity.model}` : ""} ·{" "}
+            {similarity.elapsedMs}ms
           </span>
-          <button type="button" className="text-button" onClick={() => semantic.clear()}>
-            退出语义搜索
+          <button type="button" className="text-button" onClick={() => similarity.clear()}>
+            退出相似结果
           </button>
         </div>
       ) : null}
 
-      {filterSummary.length > 0 && !semanticActive ? (
+      {filterSummary.length > 0 && !similarityActive ? (
         <div className="filter-summary">
           <span>{filterSummary.join(" · ")}</span>
           {hasActiveFilters(browse.filters) ? (
@@ -1198,10 +1240,18 @@ export function LibraryView({
           {status === "loading" && items.length === 0 ? (
             <div className="library-state">
               <Spinner size={22} />
-              <strong>{semanticActive ? "正在计算语义相似度" : "正在读取图片"}</strong>
+              <strong>
+                {similarityActive
+                  ? similarMode
+                    ? "正在查找相似图片"
+                    : "正在计算语义相似度"
+                  : "正在读取图片"}
+              </strong>
               <span>
-                {semanticActive
-                  ? "正在生成文本 embedding 并扫描本地向量包…"
+                {similarityActive
+                  ? similarMode
+                    ? "正在扫描本地 pHash、主色或特征包…"
+                    : "正在生成文本 embedding 并扫描本地向量包…"
                   : "正在查询首屏元数据…"}
               </span>
             </div>
@@ -1222,8 +1272,10 @@ export function LibraryView({
             <div className="library-state">
               <ImageOff size={24} />
               <strong>
-                {semanticActive
-                  ? "没有语义匹配的图片"
+                {similarityActive
+                  ? similarMode
+                    ? "没有找到相似的图片"
+                    : "没有语义匹配的图片"
                   : effectiveView === "trash"
                     ? "回收站是空的"
                     : hasActiveQuery(browse)
@@ -1231,8 +1283,10 @@ export function LibraryView({
                       : "当前视图没有可显示的图片"}
               </strong>
               <span>
-                {semanticActive
-                  ? "换一种描述，或者先为图片生成 embedding 后再试。"
+                {similarityActive
+                  ? similarMode
+                    ? "这张图片可能还没有可比较的数据（主色/embedding/姿势），或者阈值过严。"
+                    : "换一种描述，或者先为图片生成 embedding 后再试。"
                   : hasActiveQuery(browse)
                     ? "调整搜索或筛选条件，或者清除后查看全部图片。"
                     : effectiveView === "trash"
@@ -1241,9 +1295,9 @@ export function LibraryView({
                         ? "把选中的图片加入这个集合后，它们会出现在这里。"
                         : "导入图片后会显示在这里。"}
               </span>
-              {semanticActive ? (
-                <Button size="sm" variant="primary" onClick={() => semantic?.clear()}>
-                  退出语义搜索
+              {similarityActive ? (
+                <Button size="sm" variant="primary" onClick={() => similarity?.clear()}>
+                  退出相似结果
                 </Button>
               ) : hasActiveFilters(browse.filters) ? (
                 <Button size="sm" variant="primary" onClick={resetFilters}>
@@ -1341,6 +1395,11 @@ export function LibraryView({
             setContextMenu(null);
             if (item) onCopyImage(item.id);
           }}
+          onFindSimilar={(kind) => {
+            const item = contextMenu.items[0];
+            setContextMenu(null);
+            if (item) onFindSimilar?.(kind, item.id);
+          }}
           onAddToCollection={() => {
             setContextMenu(null);
             setCollectionPickerOpen(true);
@@ -1375,6 +1434,8 @@ export function LibraryView({
       <CollectionManagerDialog
         open={collectionManagerOpen}
         collections={collections}
+        currentLabel={similarityActive ? "相似结果" : "当前筛选结果"}
+        onCreateFromCurrent={createCollectionFromCurrent}
         onClose={() => setCollectionManagerOpen(false)}
         onChanged={() => void reloadCollections()}
       />

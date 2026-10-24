@@ -193,6 +193,15 @@ impl FeatureStore {
     }
 }
 
+/// 从映射好的包里切出一条记录；越界返回 `None`。
+///
+/// 批量扫描（embedding 均值/检索、pose 相似度）共用：mmap 一次，逐条切片，不重复开文件。
+pub(crate) fn record_slice(map: &[u8], offset: u64, length: usize) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let end = start.checked_add(length)?;
+    map.get(start..end)
+}
+
 fn expected_record_len(dtype: FeatureDtype, dim: u32) -> usize {
     match dtype {
         FeatureDtype::F16 => dim as usize * 2,

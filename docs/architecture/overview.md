@@ -21,12 +21,11 @@ src/modules/ai/              AI 状态、任务对话框与设置入口
 src/shared/                  无领域语义的控件、错误文案、缩略图/原图 URL、剪贴板与查看器会话契约
 
 src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 与 img:// 协议
-src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、文件夹服务、缩略图 pack、导入仓储、键集查询、查看器源与编辑保存
+src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、文件夹服务、缩略图 pack、导入仓储、键集查询、查看器源与编辑保存、pHash/主色相似索引与分组
 src-tauri/src/import/        BLAKE3、解码/EXIF、扫描、pHash/主色调度、导入后台任务
-src-tauri/src/imageops/      缩略图编码、pHash、主色、几何编辑；色彩/LUT/DFT/卷积已取消（见 S5 取消记录）
+src-tauri/src/imageops/      缩略图编码、pHash、主色（含 OKLab 预转换）、几何编辑；色彩/LUT/DFT/卷积已取消（见 S5 取消记录）
 src-tauri/src/platform/      剪贴板等平台差异（文本与图片写入）
-src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管、feature pack、语义检索
-src-tauri/src/features/      pHash/颜色/姿势相似度（S7；S6 的向量检索在 ai/）
+src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管、feature pack、embedding 检索、姿势相似度
 ```
 
 Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数、把错误转成稳定字符串。业务逻辑不写在命令里。
@@ -96,7 +95,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 启动：打开库只读清单、schema 版本与计数；不遍历图片、不载入全量元数据。
 - 首屏：一次取 150 条元数据；缩略图按可见顺序读取包文件，前端预取前后一屏。
 - 查询：常见筛选/排序走索引；文本搜索走 FTS5 trigram，2 字以内回退 `LIKE`。
-- 相似度：pHash 常驻为紧凑数组做线性扫描；SigLIP2/pose 从 mmap 特征包分块扫描，不整体载入、不逐条查库。向量检索使用打开图库时算出的全库均值做中心化余弦。
+- 相似度：pHash 与 4/8 主色常驻为紧凑数组（`library/similarity.rs`）做线性扫描，全库相似对先用 8×32 位分段索引收窄候选；embedding/pose 从 mmap 特征包分块扫描，不整体载入、不逐条查库。向量检索使用打开图库时算出的全库均值做中心化余弦。
 - 所有性能结论必须有本机实测，方法与门槛见 [性能基准](../guides/performance.md)。
 
 ## 关键取舍记录
@@ -134,4 +133,6 @@ S6 已实现：AI 服务进程托管（启动/探活/启动失败退避重试/�
 
 2026-10-24 单库与多级文件夹已实现：设置 v2（单一 `libraryPath`）与 v1 迁移、schema v2（`folders.path` NOCASE 唯一索引）、单库生命周期与命令清理、文件夹创建/重命名/移动/删除空文件夹、子树筛选与树计数、导入“平铺/保留源目录”、前端单库外壳与文件夹树/面包屑/选择器/拖放。自动测试覆盖迁移、路径校验、文件夹 CRUD、子树查询与导入层级；真实窗口交互待手工验收。
 
-尚未实现：S7 的 pHash/颜色/向量/pose 相似度排序与高级集合；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。
+S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。
+
+尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图重建/压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

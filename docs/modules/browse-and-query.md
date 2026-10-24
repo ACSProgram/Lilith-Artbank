@@ -200,6 +200,7 @@ src/modules/library/
   LibraryThumbnail.tsx      占位、失败与重试
 ```
 
+- 相似结果不经过图库查询：`src/app/useSimilarityBrowse.ts` 提供 `SimilarityBrowseState`（`mode: "semantic" | "similar"`、`token`、`findSimilar`、`loadMore`、`ids`），与 `useImageQuery` 共享 `items/status/error/hasMore` 契约，`LibraryView` 只切换数据源；全库相似组在 `src/app/SimilarityGroupsDialog.tsx`。
 - 网格列数由容器宽度和设置里的 `ui.gridThumbPx` 决定；只挂载视口前后各一屏的行。
 - 列表固定 44px 行高，32px 粘性表头；窄窗口隐藏“导入时间/文件夹”列。
 - 缩略图只挂载当前可见 + 前后一屏的单元格；`<img decoding="async">` 指向 `thumb://`。失败显示占位，点击重试会给 URL 加 `retry` 参数绕过失败缓存；缓存命中时挂载后补查 `img.complete`。
@@ -219,10 +220,17 @@ src/modules/library/
 - 方向键移动活动项（网格按列数上下移动），Shift+方向键扩展区间；PageUp/PageDown、Home/End 滚动。
 - Enter 或双击调用查看器入口；查看器本身在 S4，当前只提示占位。
 - Delete/Backspace：普通视图移入回收站，回收站视图永久删除选中项。
-- 右键菜单：打开查看器（占位）、复制文件路径、选择全部匹配项、移入回收站/恢复、加入集合、从当前集合移出。
+- 右键菜单：打开查看器、在侧栏查看详情、找相似（pHash / 主色 8 色 / 主色 4 色 / 语义 embedding / 姿势；多选时取首张，回收站图片不提供）、复制文件路径/内容哈希/图片、加入集合、从当前集合移出、移入回收站/恢复/永久删除、选择全部匹配项。
 - 详情侧栏在 980px 以下变为覆盖层；选中单张显示详情，多选显示批量编辑。
 - 复制路径走 Rust `copy_text`（`arboard`），浏览器预览回退到 clipboard API / `execCommand`。
 - 拖出到资源管理器（Windows OLE）仍未实现；复制图片留到 S4。
+
+## 找相似与相似分组
+
+- 入口：网格/列表右键“找相似 · …”（取右键时首张图片，回收站图片不显示这一组），或工具栏“相似分组”扫描全库。
+- 找相似直接进入相似模式：结果覆盖当前视图，不叠加筛选与搜索；工具栏显示“相似于 #id · pHash · N 张结果”，`Ctrl+A` 经 `get_similarity_ids` 取全部结果 id，退出按钮清空结果源。编辑、回收站操作、导入完成会让结果过期并自动退出。
+- 相似分组对话框：选 `pHash` 或 `embedding`（pHash 候选 + 中心化余弦复核），调阈值后扫描；可以把每组各存一个集合、全部合并成一个集合，或一次创建最多 100 个集合。集合名与现有集合重名时自动加后缀。
+- 相似结果只以 token 留在 Rust 侧，前端拿 id 与该页行数据；接口与阈值细节见 [AI 服务](ai-service.md)。
 
 ## 详情与批量编辑
 
@@ -270,7 +278,7 @@ src/modules/library/
 
 - 列表列头点击排序、列隐藏；当前用工具栏排序。
 - 拖出到资源管理器（Windows OLE）；复制图片到剪贴板已在 S4 实现。
-- 颜色 / pHash / CLIP / pose 相似度筛选与排序（S7）。
+- 相似度作为筛选条件与排序键：S7 只做了“找相似”结果视图与全库相似组，筛选面板与列表排序没有接 pHash/主色/embedding/pose 分数。
 - 原始文件名：当前不入库；如需按文件名识别，需要 schema 变更与导入记录。
 - 已加载页的窗口回收；长时间滚动到 20 万末尾时前端内存会随已加载行增长。
 - 长任务进度/取消、已移出当前筛选的图片仍可能保持选中。

@@ -376,14 +376,14 @@ impl AppState {
     pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
         let changed = metadata::set_trashed(&database, image_ids, true)?;
-        self.ai.invalidate_semantic();
+        self.ai.invalidate_similarity();
         Ok(changed)
     }
 
     pub fn restore_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
         let changed = metadata::set_trashed(&database, image_ids, false)?;
-        self.ai.invalidate_semantic();
+        self.ai.invalidate_similarity();
         Ok(changed)
     }
 
@@ -391,7 +391,7 @@ impl AppState {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         let report = metadata::delete_images(&database, &root, image_ids)?;
-        self.ai.invalidate_semantic();
+        self.ai.invalidate_similarity();
         Ok(report)
     }
 
@@ -399,7 +399,7 @@ impl AppState {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         let report = metadata::empty_trash(&database, &root)?;
-        self.ai.invalidate_semantic();
+        self.ai.invalidate_similarity();
         Ok(report)
     }
 
@@ -462,7 +462,7 @@ impl AppState {
 
     pub(crate) fn begin_edit(&self) -> AppResult<MaintenanceGuard> {
         let guard = self.begin_maintenance()?;
-        self.ai.invalidate_semantic();
+        self.ai.invalidate_similarity();
         Ok(guard)
     }
 

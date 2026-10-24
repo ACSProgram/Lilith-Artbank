@@ -20,7 +20,8 @@ import { AiTaskDialog } from "../modules/ai/AiTaskDialog";
 import { useAiStatus } from "../modules/ai/useAiStatus";
 import { viewerApi } from "../modules/viewer/api";
 import { browserPreview } from "./api";
-import { useSemanticSearch } from "./useSemanticSearch";
+import { useSimilarityBrowse } from "./useSimilarityBrowse";
+import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { Sidebar } from "./Sidebar";
@@ -29,7 +30,7 @@ import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 
-const upcoming = [["Stage 7", "相似度检索与高级集合"]];
+const upcoming = [["Stage 8", "维护、批量工作流与体验补全"]];
 
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
@@ -48,20 +49,21 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
   const [selectedImageIds, setSelectedImageIds] = useState<number[]>([]);
+  const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
   const [aiTasks, setAiTasks] = useState<{
     selectedIds: number[];
     query: LibraryQuery | null;
   } | null>(null);
   const browse = useLibraryBrowse();
-  const semantic = useSemanticSearch();
+  const similarity = useSimilarityBrowse();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
 
   useEffect(() => {
-    semantic.clear();
-    // 图库切换时丢弃旧库的语义结果；clear 是稳定回调。
-  }, [current?.id, semantic.clear]);
+    similarity.clear();
+    // 图库切换时丢弃旧库的相似结果；clear 是稳定回调。
+  }, [current?.id, similarity.clear]);
 
   const foldersGeneration = useRef(0);
   const reloadFolders = useCallback(async () => {
@@ -284,7 +286,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               refreshToken={refreshToken}
               onOpenViewer={setViewerSession}
               onCopyImage={(imageId) => void handleCopyImage(imageId)}
-              semantic={semantic}
+              similarity={similarity}
+              onFindSimilar={(kind, imageId) => similarity.findSimilar(kind, imageId)}
+              onOpenSimilarityGroups={() => setSimilarityGroupsOpen(true)}
               onOpenAiTasks={setAiTasks}
               onGenerateDescription={generateDescription}
               aiOnline={aiStatus?.online ?? false}
@@ -379,6 +383,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             folders={folders}
             onClose={closeImport}
             onFinished={handleImportFinished}
+          />
+          <SimilarityGroupsDialog
+            open={similarityGroupsOpen}
+            onClose={() => setSimilarityGroupsOpen(false)}
+            onChanged={() => setRefreshToken((value) => value + 1)}
           />
 
           {dragging && !importOpen ? (

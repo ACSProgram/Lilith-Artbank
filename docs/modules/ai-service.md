@@ -194,12 +194,19 @@ Content-Type: application/octet-stream
 
 ## 本地检索
 
+相似度有三类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding）、feature pack（pose）。三者都只返回 id + 分数，按 token 分页后再回填元数据。
+
+- **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行，pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。
+- **pHash 相似**：目标图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。
+- **主色相似**：目标图 4/8 色与索引逐项做对称加权 OKLab 距离（每项匹配对方最近色、按自身权重平均，两个方向再取均值），距离升序。
 - **均值中心化**：打开图库后在后台扫描当前 model/dim 的全部 image embeddings，求 fp32 均值并保存在内存；会话内不随新增/编辑更新。关闭并重新打开图库刷新。
 - **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。
-- **相似图片（S7）**：目标图片的 image embedding 同样减均值后扫描；没有 embedding 时先调用服务生成。
+- **相似 embedding**：目标图的 image embedding 同样减均值后扫描。目标图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
+- **姿势相似**：按原程序 `MediaPipePoseData::similarity` 1:1 移植（`ai/pose_similarity.rs`），33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。原实现源码见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md` 的记录路径。
+- **全库相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。
 - **扫描实现**：feature pack mmap + rayon 分块顺序扫描，收集分数后用部分选择取 top-K（不整体排序）。不把 30 万-50 万条向量读进堆，也不逐条查 SQLite。20 万条 1536 维的查询预算由本机基准记录在 `docs/guides/performance.md`。
-- **姿势相似（S7）**：按原程序 `MediaPipePoseData::similarity` 1:1 移植；扫描 pose pack。原实现源码见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md` 的记录路径。
-- 语义/姿势排序只返回 id + 分数，再按页取元数据；不要把向量发给前端。
+- **结果缓存**：语义搜索与找相似共用**一个**结果槽（token + 图库代次 + 图库 id），后一次查询覆盖前一次；`get_similarity_page` / `get_similarity_ids` 代次不符时报“相似结果已失效，请重新搜索”。切换图库、编辑、回收站操作、AI 任务结束都会清空它。
+- 相似结果只返回 id + 分数，再按页取元数据；不要把向量发给前端。
 
 ## 离线与失败
 
@@ -208,7 +215,7 @@ Content-Type: application/octet-stream
 - 模型不兼容：语义搜索提示“需要重算 embedding”，不混用不同模型向量。
 - 日志不得写入图片内容、完整描述或向量；只记录 id、耗时、状态与错误摘要。
 
-## 当前实现（S6 客户端）
+## 当前实现（S6 客户端 + S7 本地相似度）
 
 本仓库只实现客户端；服务端与模型环境不在仓库内。
 
@@ -222,27 +229,34 @@ Content-Type: application/octet-stream
 | `start_ai_job` / `cancel_ai_job` / `get_ai_job_status` | embedding / pose / description 批量任务 |
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
-| `get_similarity_page` / `get_similarity_ids` | 语义结果分页与全选 |
+| `find_similar_images` | 目标图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，可选 `threshold`、`limit`（默认 2000，上限 10000） |
+| `find_similar_groups` | 全库相似组：`kind` 为 `phash`/`embedding`；`threshold` 是 pHash 阈值（0-7），`similarityThreshold` 是余弦阈值（0.5-1，默认 0.97） |
+| `get_similarity_page` / `get_similarity_ids` | 相似结果分页与全选（语义搜索与找相似共用） |
 | `get_image_pose` | 读取 feature pack 中的 33 点姿势 |
 
 实现位置：
 
 - `src-tauri/src/ai/client.rs`：`/v1` 客户端、超时、重试、响应校验。
-- `src-tauri/src/ai/process.rs` + `runtime.rs`：进程启动/探活/退避重启/退出；`--port <port>`。
-- `src-tauri/src/ai/pack.rs`：追加式 feature pack 与包头校验。
-- `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描。
-- `src-tauri/src/ai/pose.rs`：33 点 f32 存取。
+- `src-tauri/src/ai/process.rs` + `runtime.rs`：进程启动/探活/退避重启/退出；`--port <port>`；`find_similar_images` / `find_similar_groups` 与结果缓存。
+- `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
+- `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
+- `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
+- `src-tauri/src/ai/pose_similarity.rs`：原程序姿势相似度 1:1 移植，附 golden 值测试。
+- `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、全库 pHash 分组。
 - `src-tauri/src/ai/job.rs`：批量任务、缺失项过滤、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
 - `src/modules/ai/`：类型、API、服务状态、任务对话框。
-- 语义搜索界面在 `src/app/useSemanticSearch.ts` 与图库工具栏编排；结果只传 id，不传向量。
+- `src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/app/SimilarityGroupsDialog.tsx`：全库相似组扫描与存为集合；`src/shared/similarity.ts`：kind 与中文标签。
 
 限制：
 
 - 任务状态不持久化；关库/退出后重跑会重新计算缺失项。
 - 新增 embedding 不会实时更新均值；按用户决定，重开图库才刷新。
 - feature pack 采用追加写入，重算会留下旧字节；压缩/回收留到 S8。
-- 语义搜索当前不叠加图库筛选条件；进入语义模式时筛选与排序控件禁用。
+- 相似模式（语义或找相似）不叠加图库筛选条件；进入后筛选与排序控件禁用。
+- 结果缓存只保留最近一次查询；换一次搜索/找相似后旧 token 失效。
+- 全库 pHash 分组的阈值只支持 0-7；更大阈值只能用单张“找相似”。
+- 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。
 - 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。
 - 真实服务、真实模型与 WebView2 界面待用户手工验收。
@@ -253,4 +267,7 @@ Content-Type: application/octet-stream
 - 真实服务接入后：单张 embedding/pose/description 成功；批量任务进度可见；断网/关服务时 UI 正确降级。
 - 描述只填空模式不会覆盖用户手写描述。
 - 语义搜索只用同一 model/dim 的向量，并且 image/text 两侧都减去同一均值；结果 id 能正确分页。
+- 找相似：`phash`/`color4`/`color8`/`embedding`/`pose` 都能排除目标图并按分数排序；目标图缺数据时给出可行动的提示，而不是返回空列表。
+- 全库相似组：20 万条库上不 O(n²) 卡死；`truncated` 与 `missing` 计数正确；embedding 复核能把 pHash 命中但语义不一致的图片拆开。
+- 姿势相似度与原程序同输入的分数在浮点误差内一致（golden 值测试覆盖）。
 - 旧模型（如 1024 维 CLIP）的向量不参与检索；维护页可重算或清理。

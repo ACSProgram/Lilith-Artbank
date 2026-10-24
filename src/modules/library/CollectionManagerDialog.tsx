@@ -10,6 +10,8 @@ import { errorMessage } from "../../shared/errors";
 interface CollectionManagerDialogProps {
   open: boolean;
   collections: CollectionInfo[];
+  currentLabel?: string;
+  onCreateFromCurrent?: (name: string) => Promise<void>;
   onClose: () => void;
   onChanged: () => void;
 }
@@ -17,6 +19,8 @@ interface CollectionManagerDialogProps {
 export function CollectionManagerDialog({
   open,
   collections,
+  currentLabel = "当前结果",
+  onCreateFromCurrent,
   onClose,
   onChanged,
 }: CollectionManagerDialogProps) {
@@ -27,6 +31,7 @@ export function CollectionManagerDialog({
   const [combineMode, setCombineMode] = useState<CombineMode>("union");
   const [combineIds, setCombineIds] = useState<number[]>([]);
   const [combineName, setCombineName] = useState("");
+  const [currentName, setCurrentName] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -36,6 +41,7 @@ export function CollectionManagerDialog({
       setEditingName("");
       setCombineIds([]);
       setCombineName("");
+      setCurrentName("");
       setBusy(false);
     }
   }, [open]);
@@ -66,6 +72,14 @@ export function CollectionManagerDialog({
       await libraryApi.createCollection(newName);
       setNewName("");
     }, "集合已创建");
+  };
+
+  const createFromCurrent = () => {
+    if (!currentName.trim() || !onCreateFromCurrent) return;
+    void run(async () => {
+      await onCreateFromCurrent(currentName);
+      setCurrentName("");
+    }, `集合已从${currentLabel}创建`);
   };
 
   const rename = (collection: CollectionInfo) => {
@@ -160,6 +174,43 @@ export function CollectionManagerDialog({
           </Button>
         </div>
       </section>
+
+      {onCreateFromCurrent ? (
+        <section className="dialog-section">
+          <h3>
+            <Layers size={14} /> 从{currentLabel}创建
+          </h3>
+          <p className="dialog-hint">
+            把当前结果的全部 id 写入新集合；不需要先滚动加载，也不会改变当前选择。
+          </p>
+          <div className="dialog-inline">
+            <input
+              className="input"
+              value={currentName}
+              placeholder="集合名称"
+              maxLength={120}
+              disabled={busy}
+              onChange={(event) => setCurrentName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  createFromCurrent();
+                }
+              }}
+            />
+            <Button
+              size="sm"
+              variant="primary"
+              icon={<Plus size={13} />}
+              loading={busy}
+              disabled={!currentName.trim()}
+              onClick={createFromCurrent}
+            >
+              创建
+            </Button>
+          </div>
+        </section>
+      ) : null}
 
       <section className="dialog-section">
         <h3>

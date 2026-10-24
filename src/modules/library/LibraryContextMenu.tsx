@@ -6,11 +6,16 @@ import {
   Hash,
   Image as ImageIcon,
   Layers,
+  Palette,
   PanelRight,
+  PersonStanding,
   RotateCcw,
+  ScanSearch,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import type { ImageRow } from "./types";
+import type { SimilarKind } from "../../shared/similarity";
 
 export interface ContextMenuState {
   x: number;
@@ -29,6 +34,7 @@ interface LibraryContextMenuProps {
   onClose: () => void;
   onOpenViewer: () => void;
   onShowDetails: () => void;
+  onFindSimilar: (kind: SimilarKind) => void;
   onCopyPaths: () => void;
   onCopyHashes: () => void;
   onCopyImage: () => void;
@@ -42,7 +48,7 @@ interface LibraryContextMenuProps {
 
 /** 右键菜单尺寸上限，用于把菜单夹在视口内（`.context-menu` 为 min-width 214px + 内边距）。 */
 const CONTEXT_MENU_MAX_WIDTH = 264;
-const CONTEXT_MENU_MAX_HEIGHT = 380;
+const CONTEXT_MENU_MAX_HEIGHT = 540;
 
 export function LibraryContextMenu({
   menu,
@@ -52,6 +58,7 @@ export function LibraryContextMenu({
   onClose,
   onOpenViewer,
   onShowDetails,
+  onFindSimilar,
   onCopyPaths,
   onCopyHashes,
   onCopyImage,
@@ -80,6 +87,7 @@ export function LibraryContextMenu({
   const left = Math.min(menu.x, Math.max(8, window.innerWidth - CONTEXT_MENU_MAX_WIDTH));
   const top = Math.min(menu.y, Math.max(8, window.innerHeight - CONTEXT_MENU_MAX_HEIGHT));
   const multiple = menu.items.length > 1 ? menu.items.length : null;
+  const canFindSimilar = menu.items[0]?.deletedAt == null;
 
   return (
     <div
@@ -96,6 +104,57 @@ export function LibraryContextMenu({
         <PanelRight size={14} />
         <span>在侧栏查看详情</span>
       </button>
+      {canFindSimilar ? (
+        <>
+          <div className="context-menu-separator" />
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => onFindSimilar("phash")}
+          >
+            <ScanSearch size={14} />
+            <span>找相似 · pHash</span>
+            {multiple ? <em>首张</em> : null}
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => onFindSimilar("color8")}
+          >
+            <Palette size={14} />
+            <span>找相似 · 主色（8 色）</span>
+            {multiple ? <em>首张</em> : null}
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => onFindSimilar("color4")}
+          >
+            <Palette size={14} />
+            <span>找相似 · 主色（4 色）</span>
+            {multiple ? <em>首张</em> : null}
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => onFindSimilar("embedding")}
+          >
+            <Sparkles size={14} />
+            <span>找相似 · 语义 embedding</span>
+            {multiple ? <em>首张</em> : null}
+          </button>
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => onFindSimilar("pose")}
+          >
+            <PersonStanding size={14} />
+            <span>找相似 · 姿势</span>
+            {multiple ? <em>首张</em> : null}
+          </button>
+        </>
+      ) : null}
+      <div className="context-menu-separator" />
       <button type="button" className="context-menu-item" onClick={onCopyPaths}>
         <Copy size={14} />
         <span>复制文件路径</span>

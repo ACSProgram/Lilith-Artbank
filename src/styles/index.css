@@ -2957,6 +2957,23 @@ textarea:focus-visible {
   font-size: 11.5px;
 }
 
+.dialog-field {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.dialog-field .input {
+  width: 78px;
+  min-width: 78px;
+  height: 29px;
+  font-size: 11.5px;
+}
+
 .dialog-empty {
   margin: 4px 0;
   color: var(--text-faint);
@@ -4233,6 +4250,52 @@ textarea:focus-visible {
 
 .semantic-summary > svg {
   flex-shrink: 0;
+}
+
+/* 相似分组对话框：每组一行，id 列表只做单行省略，不换行撑高对话框。 */
+
+.similarity-group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 280px;
+  margin-top: 10px;
+  overflow-y: auto;
+}
+
+.similarity-group-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.similarity-group-index {
+  flex-shrink: 0;
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.similarity-group-count {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.similarity-group-ids {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ai-dialog {

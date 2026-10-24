@@ -96,10 +96,24 @@ fn seed(connection: &mut Connection) -> AppResult<Duration> {
         )?;
         let mut tag_link_statement =
             transaction.prepare("INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)")?;
-        let phash = vec![0x5a_u8; 32];
-        let colors4 = vec![200_u8; 16];
-        let colors8 = vec![180_u8; 32];
         for index in 0..IMAGE_COUNT {
+            // 相似度基准需要分布开的哈希与主色；全部相同会让分段索引退化成单一大组。
+            let mut phash = [0_u8; 32];
+            let mut state = index as u64 + 0x9e37_79b9_7f4a_7c15;
+            for chunk in phash.chunks_exact_mut(8) {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut mixed = state;
+                mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                mixed ^= mixed >> 31;
+                chunk.copy_from_slice(&mixed.to_le_bytes());
+            }
+            let colors4: Vec<u8> = (0..16)
+                .map(|byte| ((index as u64 * 7 + byte * 13) % 256) as u8)
+                .collect();
+            let colors8: Vec<u8> = (0..32)
+                .map(|byte| ((index as u64 * 11 + byte * 19) % 256) as u8)
+                .collect();
             let content_hash = format!("{index:064x}");
             let folder_id = leaf_folder_ids[(index % TREE_FOLDERS) as usize];
             let file_size = 100_000 + (index % 1_000) * 1_000;
@@ -113,9 +127,9 @@ fn seed(connection: &mut Connection) -> AppResult<Duration> {
                 content_hash,
                 folder_id,
                 file_size,
-                phash,
-                colors4,
-                colors8,
+                phash.as_slice(),
+                colors4.as_slice(),
+                colors8.as_slice(),
                 score,
                 description,
                 index,
@@ -171,6 +185,62 @@ fn perf_metadata_200k() {
         counts.0,
         counts.1,
         ms(open_elapsed)
+    );
+
+    let target_id: i64 = database
+        .with_reader(|connection| {
+            Ok(
+                connection.query_row("SELECT id FROM images ORDER BY id LIMIT 1", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .expect("target id");
+    let target = crate::library::similarity::target_visuals(&database, target_id).expect("target");
+    let build_started = Instant::now();
+    let index = crate::library::similarity::VisualIndex::load(&database).expect("visual index");
+    println!(
+        "[perf] visual index build ({IMAGE_COUNT} rows): {:.2}ms",
+        ms(build_started.elapsed())
+    );
+    let stamp_started = Instant::now();
+    assert!(index.is_current(&database).expect("stamp check"));
+    println!(
+        "[perf] visual index stamp check: {:.2}ms",
+        ms(stamp_started.elapsed())
+    );
+    let started = Instant::now();
+    let similar = index.similar_phash(
+        crate::imageops::phash::words(&target.phash),
+        6,
+        2_000,
+        target_id,
+    );
+    println!(
+        "[perf] pHash target scan (warm index, {IMAGE_COUNT} rows): {:.2}ms, results={}",
+        ms(started.elapsed()),
+        similar.len()
+    );
+    let started = Instant::now();
+    let groups = index.phash_groups(6).expect("phash groups");
+    println!(
+        "[perf] pHash group scan (warm index, {IMAGE_COUNT} rows): {:.2}ms, groups={}, truncated={}",
+        ms(started.elapsed()),
+        groups.groups.len(),
+        groups.truncated
+    );
+    let target_colors = crate::imageops::colors::prepare_palette::<8>(&target.colors8);
+    let started = Instant::now();
+    let colors = index.similar_color(
+        &target_colors,
+        crate::library::similarity::ColorPalette::Colors8,
+        2_000,
+        target_id,
+    );
+    println!(
+        "[perf] color target scan (warm index, {IMAGE_COUNT} rows): {:.2}ms, results={}",
+        ms(started.elapsed()),
+        colors.len()
     );
 
     database

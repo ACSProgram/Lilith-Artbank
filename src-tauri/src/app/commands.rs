@@ -6,7 +6,10 @@ use tauri::{AppHandle, State, WebviewWindow};
 use crate::{
     ai::{
         job::{AiJobRequest, AiJobSnapshot},
-        runtime::{AiDescriptionResult, AiStatus, SemanticSearchResult, SimilarityPage},
+        runtime::{
+            AiDescriptionResult, AiStatus, ImageSimilarityResult, SemanticSearchResult,
+            SimilarityGroupsResult, SimilarityPage,
+        },
     },
     app::{
         bench::{self, ThumbBenchInfo, ThumbReadStats},
@@ -566,6 +569,39 @@ pub async fn semantic_search(
 }
 
 #[tauri::command]
+pub async fn find_similar_images(
+    state: State<'_, AppState>,
+    kind: String,
+    target_id: i64,
+    threshold: Option<u32>,
+    limit: Option<usize>,
+) -> Result<ImageSimilarityResult, String> {
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.find_similar_images(&kind, target_id, threshold, limit)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn find_similar_groups(
+    state: State<'_, AppState>,
+    kind: String,
+    threshold: Option<u32>,
+    similarity_threshold: Option<f32>,
+) -> Result<SimilarityGroupsResult, String> {
+    let runtime = state.ai.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.find_similar_groups(&kind, threshold, similarity_threshold)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn get_similarity_page(
     state: State<'_, AppState>,
     token: String,
@@ -665,6 +701,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ai_describe_image,
         ai_generate_pose,
         semantic_search,
+        find_similar_images,
+        find_similar_groups,
         get_similarity_page,
         get_similarity_ids
     ]

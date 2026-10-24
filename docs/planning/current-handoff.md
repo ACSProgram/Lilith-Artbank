@@ -1,9 +1,53 @@
 # 当前阶段状态
 
 日期：2026-10-24
-阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 迁移器与试点已完成并通过自动/逐条对比，等待用户人工验收；全量迁移与旧内容清理未执行；E 自动检查已运行，真实窗口待用户验收**
+阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 迁移器与试点已完成并通过自动/逐条对比，等待用户人工验收；全量迁移与旧内容清理未执行；E 自动检查已运行，真实窗口待用户验收；S7 相似度检索与相似分组已实现并通过自动验收，真实窗口与 20 万级基准待验收**
 
 历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
+
+## 本阶段：相似度检索与相似分组（S7）
+
+2026-10-24 完成，与 D 迁移并行；只改应用代码，未触碰 `G:\Lilith Image Library`。
+
+Rust：
+
+- `library/similarity.rs`：`VisualIndex` 常驻 pHash（4×u64）与 4/8 色 OKLab（20 万行约 46 MB），用 `count(*) + max(id)` 判断是否过期；`similar_phash`（Hamming 升序）、`similar_color`（对称加权 OKLab 距离）、`phash_groups`（8×32 位分段索引 + 并查集；阈值 ≤7 不漏候选，组过大/检查超限/组数超限只标记 `truncated`）；`target_visuals` 只接受未删除且哈希、主色完整的图片。
+- `ai/pose_similarity.rs`：原程序 `MediaPipePoseData::similarity` 1:1 移植（躯干、四肢 2D/3D、PCA、径向签名、凸包面积、镜像取较大值），9 组 golden 值与 MSVC 编译的原实现相差 <1e-12。
+- `ai/embedding.rs`：`target` 读目标向量、`similar_to` 减均值扫描 top-K、`refine_groups` 用中心化余弦把 pHash 候选拆成语义一致的小组。
+- `ai/pose.rs`：`similar` 每个包 mmap 一次后顺序切片打分。
+- `ai/pack.rs`：`record_slice` 上移，embedding 与 pose 共用。
+- `app/runtime.rs`：`find_similar_images`（5 种 kind）与 `find_similar_groups`（pHash / embedding 复核）；`SemanticCache` 改为 `ResultCache`，语义搜索与找相似共用同一个 token 槽；`invalidate_semantic` 改名 `invalidate_similarity` 并同时清掉视觉索引。
+- 新命令：`find_similar_images`、`find_similar_groups`。
+
+前端：
+
+- `src/app/useSimilarityBrowse.ts`（原 `useSemanticSearch.ts`）：`mode: semantic | similar`，共用分页、全选与重试。
+- `src/app/SimilarityGroupsDialog.tsx`：pHash/embedding 扫描、阈值、截断与缺失提示、每组存集合与合并保存（≤100 组）。
+- 右键菜单新增“找相似”五项（回收站图片不显示）；工具栏新增“相似分组”；结果条按模式切换文案与图标。
+- `CollectionManagerDialog` 新增“从当前结果创建集合”；`src/shared/similarity.ts` 收敛 kind 与中文标签。
+
+### 验证结果（S7）
+
+```text
+npm run typecheck
+npm run build
+cargo fmt --check
+cargo check
+cargo clippy --all-targets   # 无警告
+cargo test --lib             # 126 passed, 0 failed, 5 ignored
+```
+
+本轮收尾整理（不改行为契约）：
+
+- `ai/pose_similarity.rs`：删掉遗留的 `POSE_DEBUG` 调试输出；`denom23` 与 `limb_total` 的重复定义收敛为一个；golden 值测试的说明移到属性之前。
+- `imageops/colors.rs`：删掉测试专用的 `palette_distance` / `palette_lab` / `nearest_weighted` 第二套距离实现，测试直接走 `prepare_palette` + `prepared_distance`。
+- `library/similarity.rs`：删除 `palette_bytes` 别名；`MAX_GROUPS` / `MAX_GROUP_SIZE` 提为模块常量供 embedding 复用；`UnionFind` 提为 `pub(crate)`；新增 `ensure_visible`，pose 找相似不再要求目标图有完整主色。
+- `ai/embedding.rs`：`vectors_for` 的分段查询改成 `types::Value` 绑定（原先 dim/id 以文本绑定，靠 SQLite 亲和性隐式转换）；新增 `read_vector` 供 `target` 与 `vectors_for` 共用。
+- `ai/pose.rs`：pose 相似度从“每条记录打开一次文件”改成每个包 mmap 一次再切片；上限常量复用 `library::similarity::MAX_LIMIT`。
+- `ai/runtime.rs`：`color4` / `color8` 两个分支合并。
+- 前端：`LibraryView` 去掉 `const semantic = similarity` 别名，`semanticActive` / `semanticKey` / `semanticClear` 统一为 `similarity*`，加载与空态文案按 `similarMode` 分支；`useSimilarityBrowse` 复用图库 `PAGE_SIZE`；`ImageSimilarityResult.kind` / `SimilarityGroupsResult.kind` 改为联合类型，结果标签改用 `result.kind`（切换下拉不再沿用上一次的标签）。
+- `src/styles/index.css`：补 `.dialog-field` 与 `.similarity-group-*` 样式（原先这些类没有任何规则，分组列表会挤成一列）。
+- 文档：`ai-service.md` 补本地检索与命令表、删除“没有 embedding 时先调用服务生成”的错误描述；`overview.md` 删掉不存在的 `src-tauri/src/features/`；`browse-and-query.md` 补找相似入口与限制；`roadmap.md` 标记 S7 已实现；`todo.md` 换成收尾项。
 
 ## 当前批次：旧库迁移器与试点（D）
 
@@ -222,6 +266,10 @@ S4 新增测试覆盖：
 - 深分页中打开查看器后保存会刷新回第一页，上下张上下文会重置（已知限制）。
 - 真实 AI 服务：health/ensure/embed/pose/describe 全链路、模型维度校验与失败文案。
 - 真实窗口 AI 任务进度、取消、失败清单与手写描述保护；语义搜索分页与 Ctrl+A。
+- 真实窗口找相似（五种 kind）与相似分组（pHash/embedding、阈值、截断与缺失提示、存为集合）。
+- 相似度基准：视觉索引构建与失效重建、20 万 pHash 目标扫描、全库分组、主色扫描（基准代码已就绪，未运行）。
+- 真实美术图上的 pHash 阈值（6/256）、embedding 余弦阈值（0.97）与主色距离阈值标定。
+- 常驻视觉索引在 20/50 万行下的内存占用（按结构估算 20 万约 46 MB、50 万约 116 MB）。
 - 真实窗口查看器姿势生成/叠加与详情侧栏 AI 描述。
 - 文件夹移动、永久删除、清空回收站仍无进度事件与取消（S8/S9 前补齐）。
 - 20 万行滚动、150 张缩略图从请求到可见、冷/热缓存与 WebView2 内存行为。
@@ -232,7 +280,8 @@ S4 新增测试覆盖：
 1. 用户人工验收试点：`npm run tauri dev` → 打开 `F:\Programs\Lilith Artbank\research\library-migration\data\pilot` → 按 `research/library-migration/docs/03-pilot-validation.md` 的清单检查。
 2. 试点通过后，按 `04-full-migration-runbook.md` 对 `G:\Lilith Image Library` 执行 dry-run 与全量迁移（排除 `迁移测试`）。
 3. 全量迁移后运行 `verify --hash`，用户打开统一库检查；确认后再执行 `cleanup` 删除旧 `.data`/缩略图/embeddings/`recycle`/`output`/`temp` 与隔离区。
-4. 真实窗口验收 A–C 的单库外壳、文件夹树、导入、浏览、编辑、查看器、AI 任务与语义搜索；待决策项见 [待办与待决策](todo.md)。
+4. 真实窗口验收 A–C 的单库外壳、文件夹树、导入、浏览、编辑、查看器、AI 任务、语义搜索与 S7 找相似/相似分组；待决策项见 [待办与待决策](todo.md)。
+5. 需要在真实库上定阈值时，用复制出来的小样本跑相似度基准，不要对 `G:\Lilith Image Library` 直接调参。
 
 ## 约束
 

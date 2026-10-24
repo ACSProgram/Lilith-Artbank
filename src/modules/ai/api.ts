@@ -4,10 +4,13 @@ import type {
   AiJobRequest,
   AiJobSnapshot,
   AiStatus,
+  ImageSimilarityResult,
   PoseData,
   SemanticSearchResult,
+  SimilarityGroupsResult,
   SimilarityPage,
 } from "./types";
+import type { SimilarGroupKind, SimilarKind } from "../../shared/similarity";
 
 export const aiBrowserPreview =
   typeof window === "undefined" || !("__TAURI_INTERNALS__" in window);
@@ -100,6 +103,34 @@ export const aiApi = {
     return invoke<SemanticSearchResult>("semantic_search", {
       text,
       limit: limit ?? null,
+    });
+  },
+
+  async findSimilarImages(
+    kind: SimilarKind,
+    targetId: number,
+    threshold?: number,
+    limit?: number,
+  ): Promise<ImageSimilarityResult> {
+    requireTauri("找相似");
+    return invoke<ImageSimilarityResult>("find_similar_images", {
+      kind,
+      targetId,
+      threshold: threshold ?? null,
+      limit: limit ?? null,
+    });
+  },
+
+  async findSimilarGroups(
+    kind: SimilarGroupKind,
+    threshold?: number,
+    similarityThreshold?: number,
+  ): Promise<SimilarityGroupsResult> {
+    requireTauri("相似分组");
+    return invoke<SimilarityGroupsResult>("find_similar_groups", {
+      kind,
+      threshold: threshold ?? null,
+      similarityThreshold: similarityThreshold ?? null,
     });
   },
 

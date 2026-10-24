@@ -1,3 +1,5 @@
+import type { SimilarGroupKind, SimilarKind } from "../../shared/similarity";
+
 export type AiJobKind = "embedding" | "pose" | "description";
 export type AiJobPhase =
   | "preparing"
@@ -98,6 +100,21 @@ export interface SimilarityPage<T> {
   items: T[];
   nextOffset: number | null;
   total: number;
+}
+
+export interface ImageSimilarityResult {
+  token: string;
+  kind: SimilarKind;
+  total: number;
+  elapsedMs: number;
+}
+
+export interface SimilarityGroupsResult {
+  kind: SimilarGroupKind;
+  groups: number[][];
+  truncated: boolean;
+  missing: number;
+  elapsedMs: number;
 }
 
 export interface AiDescriptionResult {

@@ -9,6 +9,7 @@
 | 网格/列表、分页、搜索、筛选、排序、集合、回收站、元数据编辑 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/query.rs`、`metadata.rs`、`collections.rs` |
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
 | description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/` |
+| 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts` |
 | 清理、缩略图重建、描述导入导出 | `docs/modules/maintenance.md` | `src-tauri/src/` 对应领域模块 |
 | 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
 | 当前阶段/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |

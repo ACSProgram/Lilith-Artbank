@@ -20,6 +20,7 @@ use crate::{
         db::LibraryDb,
         paths::LibraryPaths,
         query::{self, ImageRow},
+        similarity as library_similarity,
         thumbs::ThumbPack,
         viewer::PoseData,
     },
@@ -157,6 +158,25 @@ pub struct SimilarityPage {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImageSimilarityResult {
+    pub token: String,
+    pub kind: String,
+    pub total: usize,
+    pub elapsed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarityGroupsResult {
+    pub kind: String,
+    pub groups: Vec<Vec<i64>>,
+    pub truncated: bool,
+    pub missing: usize,
+    pub elapsed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiDescriptionResult {
     pub image_id: i64,
     pub model: String,
@@ -171,7 +191,7 @@ struct LibraryHandles {
     root: PathBuf,
 }
 
-struct SemanticCache {
+struct ResultCache {
     token: String,
     generation: u64,
     library_id: String,
@@ -181,7 +201,8 @@ struct SemanticCache {
 struct Inner {
     process: Mutex<AiProcess>,
     mean: RwLock<MeanSlot>,
-    semantic: Mutex<Option<SemanticCache>>,
+    results: Mutex<Option<ResultCache>>,
+    visuals: RwLock<Option<Arc<library_similarity::VisualIndex>>>,
     job: Mutex<Option<Arc<AiJob>>>,
     store: Arc<FeatureStore>,
     library: RwLock<Option<LibraryHandles>>,
@@ -208,7 +229,8 @@ impl AiRuntime {
             inner: Arc::new(Inner {
                 process: Mutex::new(AiProcess::default()),
                 mean: RwLock::new(MeanSlot::missing("尚未打开图库")),
-                semantic: Mutex::new(None),
+                results: Mutex::new(None),
+                visuals: RwLock::new(None),
                 job: Mutex::new(None),
                 store: Arc::new(FeatureStore::new()),
                 library: RwLock::new(None),
@@ -236,7 +258,8 @@ impl AiRuntime {
             thumbs,
             root,
         });
-        *self.inner.semantic.lock() = None;
+        *self.inner.results.lock() = None;
+        *self.inner.visuals.write() = None;
         *self.inner.mean.write() = MeanSlot::computing(None, None);
         self.spawn_mean(generation, database);
     }
@@ -245,15 +268,17 @@ impl AiRuntime {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
         *self.inner.library.write() = None;
         self.inner.store.clear();
-        *self.inner.semantic.lock() = None;
+        *self.inner.results.lock() = None;
+        *self.inner.visuals.write() = None;
         *self.inner.mean.write() = MeanSlot::missing("尚未打开图库");
         if let Some(job) = self.inner.job.lock().as_ref() {
             job.request_cancel();
         }
     }
 
-    pub fn invalidate_semantic(&self) {
-        *self.inner.semantic.lock() = None;
+    pub fn invalidate_similarity(&self) {
+        *self.inner.results.lock() = None;
+        *self.inner.visuals.write() = None;
     }
 
     pub fn job_running(&self) -> bool {
@@ -484,7 +509,7 @@ impl AiRuntime {
                     }
                 };
                 worker_job.finish(phase);
-                *runtime.inner.semantic.lock() = None;
+                *runtime.inner.results.lock() = None;
                 let _ = app.emit("ai-job-progress", worker_job.progress());
                 let _ = app.emit("ai-job-finished", worker_job.snapshot());
             });
@@ -579,7 +604,7 @@ impl AiRuntime {
         )?;
         let token = uuid::Uuid::new_v4().to_string();
         let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
-        *self.inner.semantic.lock() = Some(SemanticCache {
+        *self.inner.results.lock() = Some(ResultCache {
             token: token.clone(),
             generation: handles.generation,
             library_id: handles.library_id.clone(),
@@ -595,6 +620,179 @@ impl AiRuntime {
         })
     }
 
+    /// 目标图相似：`phash`、`color4`、`color8`、`embedding`、`pose`。
+    ///
+    /// 结果写入统一的 token 缓存，后续分页与全选复用 `get_similarity_page` / `get_similarity_ids`。
+    pub fn find_similar_images(
+        &self,
+        kind: &str,
+        target_id: i64,
+        threshold: Option<u32>,
+        limit: Option<usize>,
+    ) -> AppResult<ImageSimilarityResult> {
+        let handles = self.handles()?;
+        let started = Instant::now();
+        let limit = limit
+            .unwrap_or(library_similarity::DEFAULT_LIMIT)
+            .clamp(1, library_similarity::MAX_LIMIT);
+        let ids: Vec<i64> = match kind {
+            "phash" => {
+                let target = library_similarity::target_visuals(&handles.database, target_id)?;
+                let threshold = threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD);
+                if threshold > library_similarity::MAX_PHASH_THRESHOLD {
+                    return Err(AppError::message("pHash 阈值超出 0-256"));
+                }
+                let index = self.visual_index(&handles)?;
+                index
+                    .similar_phash(
+                        crate::imageops::phash::words(&target.phash),
+                        threshold,
+                        limit,
+                        target_id,
+                    )
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+            "color4" | "color8" => {
+                let target = library_similarity::target_visuals(&handles.database, target_id)?;
+                let index = self.visual_index(&handles)?;
+                let (palette, prepared) = if kind == "color4" {
+                    (
+                        library_similarity::ColorPalette::Colors4,
+                        crate::imageops::colors::prepare_palette::<4>(&target.colors4).to_vec(),
+                    )
+                } else {
+                    (
+                        library_similarity::ColorPalette::Colors8,
+                        crate::imageops::colors::prepare_palette::<8>(&target.colors8).to_vec(),
+                    )
+                };
+                index
+                    .similar_color(&prepared, palette, limit, target_id)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+            "embedding" => self.similar_ids_by_embedding(&handles, target_id, limit)?,
+            "pose" => {
+                // pose 记录没有自己的可见性标记，只确认目标图未被移入回收站。
+                library_similarity::ensure_visible(&handles.database, target_id)?;
+                pose::similar(&handles.database, &self.inner.store, target_id, limit)?
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+            other => {
+                return Err(AppError::message(format!("未知的相似度类型：{other}")));
+            }
+        };
+        let total = ids.len();
+        let token = uuid::Uuid::new_v4().to_string();
+        *self.inner.results.lock() = Some(ResultCache {
+            token: token.clone(),
+            generation: handles.generation,
+            library_id: handles.library_id.clone(),
+            ids,
+        });
+        Ok(ImageSimilarityResult {
+            token,
+            kind: kind.to_owned(),
+            total,
+            elapsed_ms: started.elapsed().as_millis() as i64,
+        })
+    }
+
+    fn visual_index(
+        &self,
+        handles: &LibraryHandles,
+    ) -> AppResult<Arc<library_similarity::VisualIndex>> {
+        if let Some(index) = self.inner.visuals.read().as_ref()
+            && index.is_current(&handles.database)?
+        {
+            return Ok(index.clone());
+        }
+        let index = Arc::new(library_similarity::VisualIndex::load(&handles.database)?);
+        *self.inner.visuals.write() = Some(index.clone());
+        Ok(index)
+    }
+
+    fn similar_ids_by_embedding(
+        &self,
+        handles: &LibraryHandles,
+        target_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<i64>> {
+        let target = embedding::target(&handles.database, &self.inner.store, target_id)?
+            .ok_or_else(|| AppError::message("这张图片还没有 embedding，请先运行 AI 任务"))?;
+        let mean = self.ensure_mean(handles, &target.model, target.dim)?;
+        Ok(embedding::similar_to(
+            &handles.database,
+            &self.inner.store,
+            &target.model,
+            target.dim,
+            &target.vector,
+            &mean.vector,
+            target_id,
+            limit,
+        )?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect())
+    }
+
+    /// 全库相似对分组：pHash 分段索引，或 pHash 候选 + embedding 复核。
+    pub fn find_similar_groups(
+        &self,
+        kind: &str,
+        threshold: Option<u32>,
+        similarity_threshold: Option<f32>,
+    ) -> AppResult<SimilarityGroupsResult> {
+        let handles = self.handles()?;
+        let started = Instant::now();
+        let (groups, truncated, missing) = match kind {
+            "phash" => {
+                let index = self.visual_index(&handles)?;
+                let result = index.phash_groups(
+                    threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD),
+                )?;
+                (result.groups, result.truncated, 0)
+            }
+            "embedding" => {
+                let groups = embedding::distinct_groups(&handles.database)?;
+                let Some((model, dim, _)) = groups.into_iter().next() else {
+                    return Err(AppError::message("还没有图片 embedding，请先运行 AI 任务"));
+                };
+                let mean = self.ensure_mean(&handles, &model, dim)?;
+                let index = self.visual_index(&handles)?;
+                let candidates = index.phash_groups(
+                    threshold.unwrap_or(library_similarity::MAX_INDEXED_PHASH_THRESHOLD),
+                )?;
+                let result = embedding::refine_groups(
+                    &handles.database,
+                    &self.inner.store,
+                    &model,
+                    dim,
+                    &mean.vector,
+                    similarity_threshold.unwrap_or(0.97).clamp(0.5, 1.0),
+                    candidates.groups,
+                    candidates.truncated,
+                )?;
+                (result.groups, result.truncated, result.missing)
+            }
+            other => {
+                return Err(AppError::message(format!("未知的分组类型：{other}")));
+            }
+        };
+        Ok(SimilarityGroupsResult {
+            kind: kind.to_owned(),
+            groups,
+            truncated,
+            missing,
+            elapsed_ms: started.elapsed().as_millis() as i64,
+        })
+    }
+
     /// 按 token 分页回填完整行；token 不属于当前图库代次时要求重新搜索。
     pub fn similarity_page(
         &self,
@@ -603,7 +801,7 @@ impl AiRuntime {
         limit: Option<usize>,
     ) -> AppResult<SimilarityPage> {
         let handles = self.handles()?;
-        let cache = self.inner.semantic.lock();
+        let cache = self.inner.results.lock();
         let cache = cache
             .as_ref()
             .filter(|cache| {
@@ -611,7 +809,7 @@ impl AiRuntime {
                     && cache.generation == handles.generation
                     && cache.library_id == handles.library_id
             })
-            .ok_or_else(|| AppError::message("语义搜索结果已失效，请重新搜索"))?;
+            .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))?;
         let limit = limit.unwrap_or(150).clamp(1, 300);
         let start = offset.min(cache.ids.len());
         let end = (start + limit).min(cache.ids.len());
@@ -626,7 +824,7 @@ impl AiRuntime {
 
     pub fn similarity_ids(&self, token: &str) -> AppResult<Vec<i64>> {
         let handles = self.handles()?;
-        let cache = self.inner.semantic.lock();
+        let cache = self.inner.results.lock();
         let cache = cache
             .as_ref()
             .filter(|cache| {
@@ -634,7 +832,7 @@ impl AiRuntime {
                     && cache.generation == handles.generation
                     && cache.library_id == handles.library_id
             })
-            .ok_or_else(|| AppError::message("语义搜索结果已失效，请重新搜索"))?;
+            .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))?;
         Ok(cache.ids.clone())
     }
 

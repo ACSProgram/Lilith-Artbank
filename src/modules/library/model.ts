@@ -7,6 +7,7 @@ import type {
   SortKey,
   SortSpec,
 } from "./types";
+import type { SimilarKind } from "../../shared/similarity";
 
 /** 与 Rust `query::DEFAULT_LIMIT` 保持一致。 */
 export const PAGE_SIZE = 150;
@@ -228,10 +229,13 @@ export function bytesToMbInput(bytes: number | null): string {
   return String(Math.round((bytes / (1024 * 1024)) * 10) / 10);
 }
 
-/** 语义搜索结果的数据源契约；由 src/app 的控制器实现，LibraryView 只消费。 */
-export interface SemanticBrowseState {
+/** 语义搜索与目标图相似度的结果数据源；由 src/app 的控制器实现，LibraryView 只消费。 */
+export interface SimilarityBrowseState {
   active: boolean;
+  mode: "semantic" | "similar";
   text: string;
+  kind: SimilarKind | null;
+  targetId: number | null;
   token: string | null;
   model: string;
   total: number;
@@ -244,6 +248,11 @@ export interface SemanticBrowseState {
   moreError: string | null;
   hasMore: boolean;
   search: (text: string) => void;
+  findSimilar: (
+    kind: SimilarKind,
+    targetId: number,
+    threshold?: number,
+  ) => void;
   clear: () => void;
   loadMore: () => void;
   retry: () => void;
