@@ -4,7 +4,10 @@
 
 ## 进行中的重构
 
-- [ ] 单库与多级文件夹的阶段 D：旧库迁移器与试点，见 [计划](2026-10-23-single-library-multilevel-folders-plan.md)。阶段 A–C 已实现并通过自动验证。
+- [ ] 单库与多级文件夹：阶段 A–C 已实现并通过自动验证。阶段 D 迁移器与试点已完成，等待用户人工验收试点；全量迁移、验证与旧内容清理未执行。见 [计划](2026-10-23-single-library-multilevel-folders-plan.md)。
+- [ ] **试点人工验收**：打开 `research/library-migration/data/pilot`，按 `research/library-migration/docs/03-pilot-validation.md` 检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述。
+- [ ] **全量迁移**：试点通过后按 `04-full-migration-runbook.md` 执行 dry-run、迁移、`verify --hash`；确认后再 cleanup。
+- [ ] 全量迁移的真实重复内容与集合迁移（旧集合全空；试点无重复，当前只有单元测试覆盖）。
 
 ## 待验收
 
@@ -55,7 +58,7 @@
 - [ ] 导入：HEIC/AVIF 解码评估（需要纯 Rust 解码器，不引入 DLL）。
 - [ ] 原始文件名：当前不保存/不显示；若后续需要按文件名识别，需 schema 变更与导入记录。
 - [ ] `ai::job` 的端到端测试偶发失败（本地 mock 服务的端口与线程时序），单独复跑通过；全量并发跑时需留意。
-- [ ] 独立的旧 `.data` 一次性迁移脚本（不在应用内；当前不开始）。
+- [x] 旧 `.data` 一次性迁移器：已实现于仓库外 `research/library-migration/tools/migrator`；应用仍不读旧 `.data`。试点通过，待全量执行。
 
 ## 待决策
 

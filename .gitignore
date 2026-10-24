@@ -15,6 +15,10 @@ src-tauri/gen/
 *.pdb
 *.ilk
 
+# Research sandbox: each project under /research/ is its own repository with
+# its own docs, tools and history. It is kept out of product history and CI.
+/research/
+
 # Test and benchmark scratch data
 /tmp/
 /perf-data/

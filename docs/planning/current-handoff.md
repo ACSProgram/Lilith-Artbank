@@ -1,11 +1,27 @@
 # 当前阶段状态
 
 日期：2026-10-24
-阶段：**单库与多级文件夹（计划阶段 A–C）已实现，自动验收通过；迁移器未开始，真实窗口待用户手工验收**
+阶段：**单库与多级文件夹 A–C 已实现并通过自动验收；D 迁移器与试点已完成并通过自动/逐条对比，等待用户人工验收；全量迁移与旧内容清理未执行；E 自动检查已运行，真实窗口待用户验收**
 
 历史批次（S0–S3）的实现与验证记录已移入 [归档](archive/2026-10-23-S0-S3-实现记录.md)；查询引擎与缩略图基线仍以 [性能基准](../guides/performance.md) 为准。
 
-## 当前批次：单库与多级文件夹（A–C）
+## 当前批次：旧库迁移器与试点（D）
+
+迁移器不属于产品代码，位于仓库外 `research/library-migration/tools/migrator`（主仓库 `.gitignore` 排除 `/research/`）。真实库 `G:\Lilith Image Library` 未修改。
+
+- 旧格式：读取 zstd 压缩的 `image_data.bin` / `saved_lists.dat`，解析旧 pHash、扩展名、一级 folder、秒级导入时间、评分、BGR 主色、标签、描述、可选 33 点 f64 pose；颜色与 pHash 不迁移，按新算法重算。
+- 迁移：BLAKE3 内容寻址；按“库名、folder、导入时间、文件名”确定性选主记录；标签并集、评分取高、导入时间取早、描述保留首个非空并报告冲突；pose 转 f32 写入 feature pack；缩略图重建为 512px WebP。
+- 去重：重复内容的主记录保留，其余文件移入 `.artbank/migration/duplicates/` 并写 `duplicates.jsonl`；旧 hash → content hash 映射写入 ledger。
+- 可恢复：rename 前写 `rename-journal.jsonl`；DB 提交后写 `ledger.jsonl`；支持 `--resume`、`verify --hash`、`rollback`、`cleanup`。
+- 孤儿：未登记用户文件移入 `.artbank/migration/orphans/` 并报告；试点 30 个，未删除。
+- 试点：`G:\Lilith Image Library\迁移测试` 的完整副本（与 `测试` 元数据 MD5 相同），根为 `research/library-migration/data/pilot`。
+- 试点结果：9 455 条记录全部迁移，0 失败/缺失，0 重复，87 条 pose，30 个孤儿隔离；`verify --hash` 全部通过；逐条对比文件夹、评分、导入时间、描述、标签、文件大小与 pose 数值全部一致。
+- 扩展名：546 个旧文件扩展名与实际格式不符，已按解码格式改名（512 `.jpg`→`.png`、33 →`.webp`、1 →`.bmp`）。
+- 试点耗时 286.9 秒（约 33 张/秒）；全量 402 606 条，预计 3–6 小时。
+- 六个旧库的 `saved_lists.dat` 全为空，集合迁移仅由单元测试覆盖；试点 BLAKE3 全部唯一，真实重复路径待全量验证。
+- 详细结果与人工检查清单：`research/library-migration/docs/03-pilot-validation.md`；全量步骤：`04-full-migration-runbook.md`。
+
+## 已完成批次：单库与多级文件夹（A–C）
 
 Rust：
 
@@ -24,7 +40,7 @@ Rust：
 - `BrowseState` 提升到 `LibraryWorkspace`；树、网格、面包屑、选择器共享 `filters.folderIds`；筛选面板移除文件夹分面。
 - 导入与详情批量移动复用树选择器；浏览器 mock 支持文件夹 CRUD、空文件夹、子树筛选与拖放。
 
-## 验证结果（当前批次）
+## 验证结果（A–C）
 
 ```text
 npm run typecheck
@@ -38,6 +54,23 @@ git diff --check
 ```
 
 新增测试覆盖：设置 v1 迁移与后端路径保护；schema v1→v2 与大小写冲突；文件夹路径校验、多级创建、重命名/移动子树、仅大小写重命名、空文件夹删除；子树查询与相似前缀不误匹配；直接/子树计数；导入 `preserve` 同名子目录合并。
+
+## 验证结果（D 试点）
+
+```text
+cargo fmt                          # research 迁移器
+cargo clippy --all-targets         # 无警告
+cargo test                         # 12 passed
+migrate --dry-run                  # 9455 条、0 重复、30 孤儿、87 pose
+migrate                            # 9455 张、0 失败、286.9s、约 33 张/秒
+verify --hash                      # integrity=ok，全部异常计数为 0
+逐条对比                            # 9455/9455 文件夹/评分/时间/描述/标签/文件大小一致
+pose 对比                           # 87/87，f32 与旧 f64 误差 ≤ 1e-6
+migrate --resume                   # 9455 条全部跳过，未重复写入
+```
+
+试点报告：`research/library-migration/data/pilot/.artbank/migration/report.md`；
+验证报告：同目录 `verify.json`。
 
 浏览器预览已完成静态/交互检查（mock 数据）：单库创建、树计数、子树筛选、多选、文件夹 CRUD、图片/文件夹拖放、面包屑、Inspector 选择器。未取得截图，真实 WebView2 布局与交互待用户验收。
 
@@ -174,6 +207,10 @@ S4 新增测试覆盖：
 
 ## 未验证
 
+- **试点人工验收**：应用打开 `research/library-migration/data/pilot`，检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述。
+- **全量迁移**：对 `G:\Lilith Image Library` 的 402 606 条记录执行 dry-run、迁移、`verify --hash`；真实重复内容、真实吞吐与磁盘占用待实测。
+- **旧内容清理**：`.data`、缩略图、embeddings、`recycle`、`output`、`temp`、孤儿/重复隔离区尚未删除。
+- **真实集合迁移**：六个旧库 `saved_lists.dat` 全为空，只有单元测试覆盖。
 - 真实 Tauri 窗口的单库流程：欢迎页创建/打开、启动自动打开、设置页更换图库、关闭图库。
 - 真实窗口文件夹树、面包屑、右键菜单、拖放、空文件夹与子树计数；导入“保留源目录”。
 - 文件夹操作在磁盘占用、权限、目标已存在等异常下的失败与回滚。
@@ -192,13 +229,13 @@ S4 新增测试覆盖：
 
 ## 下一步
 
-1. 用户手工验收当前批次：`npm run tauri dev` → 创建或打开图库 → 文件夹树新建/重命名/移动/删除空文件夹 → 拖放图片与文件夹 → 子树筛选与面包屑 → 导入时切换“平铺 / 保留源目录” → 设置页更换图库。
-2. 复验 S1–S4 的真实窗口流程（导入、浏览、编辑、查看器保存、剪贴板）与 S6 的 AI 服务/语义搜索。
-3. 当前批次验收通过后，再决定是否执行计划阶段 D（旧库迁移器与试点）。
-4. 待决策项见 [待办与待决策](todo.md)，尤其是 AI 服务崩溃是否自动重启、语义搜索是否叠加筛选、OLE 拖出与编辑上限的进度/取消。
+1. 用户人工验收试点：`npm run tauri dev` → 打开 `F:\Programs\Lilith Artbank\research\library-migration\data\pilot` → 按 `research/library-migration/docs/03-pilot-validation.md` 的清单检查。
+2. 试点通过后，按 `04-full-migration-runbook.md` 对 `G:\Lilith Image Library` 执行 dry-run 与全量迁移（排除 `迁移测试`）。
+3. 全量迁移后运行 `verify --hash`，用户打开统一库检查；确认后再执行 `cleanup` 删除旧 `.data`/缩略图/embeddings/`recycle`/`output`/`temp` 与隔离区。
+4. 真实窗口验收 A–C 的单库外壳、文件夹树、导入、浏览、编辑、查看器、AI 任务与语义搜索；待决策项见 [待办与待决策](todo.md)。
 
 ## 约束
 
-- `G:\Lilith Image Library` 未修改；所有测试、基准与样本使用临时目录。
-- 不读旧 `.data`；迁移脚本不在本仓库。
+- `G:\Lilith Image Library` 未修改；试点只写 `research/library-migration/data/pilot`。
+- 应用不读旧 `.data`；迁移器在仓库外 `research/library-migration`，不进入 `src-tauri` 与产品提交历史。
 - 不做 PinBoard/PasteBoard/调色盘/色彩测试/截屏。
