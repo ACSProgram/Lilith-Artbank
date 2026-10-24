@@ -12,6 +12,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  Film,
   Maximize,
   Minimize,
   PanelRight,
@@ -28,22 +29,26 @@ import { errorMessage } from "../../shared/errors";
 import type { ViewerSession, ViewerSessionItem } from "../../shared/viewerSession";
 import { viewerApi, withRetry } from "./api";
 import {
-  baseOutputSize,
+  buildEditRequest,
   clampCrop,
   cropToOriginal,
   fitZoom,
+  flipGeometry,
   formatBytes,
   formatDimensions,
-  hasGeometryEdits,
   hasPixelChanges,
   initialGeometry,
   outputSize,
   rectBetween,
+  rotateGeometry,
   transformedSize,
   type GeometryState,
 } from "./model";
-import { hasVisiblePose, PoseOverlay } from "./PoseOverlay";
+import { Filmstrip } from "./Filmstrip";
+import { hasVisiblePose, PoseOverlay, visiblePoseCount } from "./PoseOverlay";
 import type { CropRect, PoseData, ViewerFallback, ViewerSource } from "./types";
+import { useEditEstimate } from "./useEditEstimate";
+import { useEditHistory } from "./useEditHistory";
 import { ViewerTools } from "./ViewerTools";
 
 interface ImageViewerProps {
@@ -55,6 +60,21 @@ interface ImageViewerProps {
   onActiveChange?: (imageId: number) => void;
   onSaved?: (imageId: number) => void;
   onGeneratePose?: () => Promise<PoseData>;
+  filmstripOpen: boolean;
+  onToggleFilmstrip: () => void;
+  fullscreen: boolean;
+  onToggleFullscreen: () => void;
+}
+
+const POSE_OPACITY_KEY = "lilith.poseOpacity";
+
+function initialPoseOpacity(): number {
+  try {
+    const value = Number(localStorage.getItem(POSE_OPACITY_KEY));
+    return Number.isFinite(value) && value >= 0.2 && value <= 1 ? value : 0.9;
+  } catch {
+    return 0.9;
+  }
 }
 
 type SourceStatus = "loading" | "ready" | "error";
@@ -98,11 +118,18 @@ export function ImageViewer({
   onActiveChange,
   onSaved,
   onGeneratePose,
+  filmstripOpen,
+  onToggleFilmstrip,
+  fullscreen,
+  onToggleFullscreen,
 }: ImageViewerProps) {
   const { notify } = useNotices();
   const items = useSyncExternalStore(session.subscribe, session.getItems, session.getItems);
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  const history = useEditHistory();
+  const geometry = history.geometry;
+  const resetHistory = history.reset;
 
   const [activeId, setActiveId] = useState(session.initialId);
   const activeIdRef = useRef(activeId);
@@ -110,16 +137,15 @@ export function ImageViewer({
   const [source, setSource] = useState<ViewerSource | null>(null);
   const [sourceStatus, setSourceStatus] = useState<SourceStatus>("loading");
   const [sourceError, setSourceError] = useState<string | null>(null);
-  const [geometry, setGeometry] = useState<GeometryState | null>(null);
   const [pose, setPose] = useState<PoseData | null>(null);
   const [poseOpen, setPoseOpen] = useState(false);
   const [poseBusy, setPoseBusy] = useState(false);
+  const [poseOpacity, setPoseOpacity] = useState(initialPoseOpacity);
   const [reloadToken, setReloadToken] = useState(0);
   const [retry, setRetry] = useState(0);
   const [imageLoaded, setImageLoaded] = useState(false);
   const [imageFailed, setImageFailed] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [fullscreen, setFullscreen] = useState(false);
 
   const [zoom, setZoom] = useState(1);
   const [fitActive, setFitActive] = useState(true);
@@ -147,8 +173,25 @@ export function ImageViewer({
   const index = items.findIndex((item) => item.id === activeId);
 
   const hasChanges = source && geometry ? hasPixelChanges(source, geometry) : false;
-  const geometryEdits = source && geometry ? hasGeometryEdits(source, geometry) : false;
   const hasPose = hasVisiblePose(pose);
+
+  const applyHistoryGeometry = useCallback((next: GeometryState | null) => {
+    if (!next) return;
+    setCropMode(false);
+    setCropDraft(next.crop);
+  }, []);
+  const undoHistory = useCallback(() => {
+    applyHistoryGeometry(history.undo());
+  }, [applyHistoryGeometry, history.undo]);
+  const redoHistory = useCallback(() => {
+    applyHistoryGeometry(history.redo());
+  }, [applyHistoryGeometry, history.redo]);
+  const { estimate, loading: estimating } = useEditEstimate(
+    activeId,
+    source,
+    geometry,
+    Boolean(source?.editable && !source.deleted && hasChanges && !cropMode),
+  );
 
   // 源图加载：过期请求直接丢弃；大图预览由 Rust 生成并缓存。
   useEffect(() => {
@@ -165,7 +208,7 @@ export function ImageViewer({
     setFitActive(true);
     setPan({ x: 0, y: 0 });
     setSource(null);
-    setGeometry(null);
+    resetHistory(null);
 
     viewerApi
       .getViewerSource(
@@ -178,7 +221,7 @@ export function ImageViewer({
       .then((next) => {
         if (disposed) return;
         setSource(next);
-        setGeometry(initialGeometry(next));
+        resetHistory(initialGeometry(next));
         setSourceStatus("ready");
       })
       .catch((cause: unknown) => {
@@ -199,12 +242,21 @@ export function ImageViewer({
     return () => {
       disposed = true;
     };
-  }, [activeId, reloadToken, retry]);
+  }, [activeId, reloadToken, resetHistory, retry]);
 
   useEffect(() => {
     session.onActiveChange(activeId);
     onActiveChange?.(activeId);
   }, [activeId, onActiveChange, session]);
+
+  // 姿势骨架不透明度是查看器偏好，不进入图库设置文件。
+  useEffect(() => {
+    try {
+      localStorage.setItem(POSE_OPACITY_KEY, String(poseOpacity));
+    } catch {
+      // 忽略无法持久化的浏览器限制。
+    }
+  }, [poseOpacity]);
 
   // 把焦点从网格移进查看器：网格的键盘处理挂在容器上，焦点留在网格会让
   // ←/→、Esc 同时作用于网格和查看器。
@@ -304,20 +356,24 @@ export function ImageViewer({
     }
   }, [activeId, items, pendingStep, session]);
 
-  const toggleFullscreen = useCallback(async () => {
-    try {
-      const next = await viewerApi.toggleFullscreen();
-      setFullscreen(next);
-    } catch (cause) {
-      notify("切换全屏失败", "error", errorMessage(cause));
-    }
-  }, [notify]);
-
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (document.querySelector(".modal-backdrop")) return;
+      // 滑块聚焦时快捷键仍然生效；文本框与下拉保留浏览器原生行为。
       const target = event.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      const editingText =
+        target != null &&
+        !(target instanceof HTMLInputElement && target.type === "range") &&
+        ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+      const modified = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+      if (!editingText && modified && (key === "z" || key === "y")) {
+        event.preventDefault();
+        if (key === "y" || event.shiftKey) redoHistory();
+        else undoHistory();
+        return;
+      }
+      if (editingText) return;
 
       switch (event.key) {
         case "Escape":
@@ -327,6 +383,8 @@ export function ImageViewer({
             setCropDraft(geometry?.crop ?? null);
           } else if (poseOpen) {
             setPoseOpen(false);
+          } else if (fullscreen) {
+            onToggleFullscreen();
           } else {
             onClose();
           }
@@ -342,7 +400,7 @@ export function ImageViewer({
         case "f":
         case "F":
           event.preventDefault();
-          void toggleFullscreen();
+          onToggleFullscreen();
           break;
         case "0":
           event.preventDefault();
@@ -368,28 +426,25 @@ export function ImageViewer({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    actualSize,
     cropMode,
+    fitView,
+    fullscreen,
     geometry?.crop,
     onClose,
+    onToggleFullscreen,
     poseOpen,
+    redoHistory,
     step,
-    toggleFullscreen,
-    actualSize,
-    fitView,
+    undoHistory,
     zoomBy,
   ]);
 
   const rotateBy = (delta: number) => {
-    setGeometry((previous) =>
-      previous
-        ? {
-            ...previous,
-            rotate: ((previous.rotate + delta) % 4 + 4) % 4,
-            crop: null,
-            resize: null,
-          }
-        : previous,
-    );
+    if (!source || !geometry) return;
+    history.commit(rotateGeometry(geometry, source, delta), {
+      label: delta > 0 ? "旋转 90°" : "旋转 -90°",
+    });
     setCropDraft(null);
     setCropMode(false);
     setFitActive(true);
@@ -397,21 +452,20 @@ export function ImageViewer({
   };
 
   const flip = (axis: "horizontal" | "vertical") => {
-    setGeometry((previous) =>
-      previous
-        ? {
-            ...previous,
-            flipHorizontal:
-              axis === "horizontal" ? !previous.flipHorizontal : previous.flipHorizontal,
-            flipVertical:
-              axis === "vertical" ? !previous.flipVertical : previous.flipVertical,
-            crop: null,
-            resize: null,
-          }
-        : previous,
-    );
-    setCropDraft(null);
+    if (!source || !geometry) return;
+    const next = flipGeometry(geometry, source, axis);
+    history.commit(next, { label: axis === "horizontal" ? "水平翻转" : "垂直翻转" });
+    setCropDraft(next.crop);
     setCropMode(false);
+  };
+
+  const commitGeometry = (
+    updater: (previous: GeometryState) => GeometryState,
+    label: string,
+    mergeKey?: string,
+  ) => {
+    if (!geometry) return;
+    history.commit(updater(geometry), { label, mergeKey });
   };
 
   const enterCrop = () => {
@@ -429,22 +483,24 @@ export function ImageViewer({
     if (!source || !geometry || !cropDraft) return;
     const bounds = transformedSize(source.displayWidth, source.displayHeight, geometry.rotate);
     const crop = clampCrop(cropDraft, bounds.width, bounds.height);
-    setGeometry((previous) => (previous ? { ...previous, crop, resize: null } : previous));
-    setCropDraft(null);
-    setCropMode(false);
-  };
-
-  const clearCrop = () => {
-    setGeometry((previous) =>
-      previous ? { ...previous, crop: null, resize: null } : previous,
+    history.commit(
+      { ...geometry, crop, resize: null },
+      { label: geometry.crop ? "调整裁剪" : "裁剪" },
     );
     setCropDraft(null);
     setCropMode(false);
   };
 
+  const clearCrop = () => {
+    if (!geometry) return;
+    history.commit({ ...geometry, crop: null, resize: null }, { label: "清除裁剪" });
+    setCropDraft(null);
+    setCropMode(false);
+  };
+
   const resetGeometry = () => {
-    if (!source) return;
-    setGeometry(initialGeometry(source));
+    if (!source || !geometry) return;
+    history.commit(initialGeometry(source), { label: "重置" });
     setCropDraft(null);
     setCropMode(false);
     setFitActive(true);
@@ -455,25 +511,9 @@ export function ImageViewer({
     if (!source || !geometry || saving || !hasChanges || cropMode) return;
     setSaving(true);
     try {
-      const crop = geometry.crop
-        ? cropToOriginal(geometry.crop, geometry.rotate, source)
-        : null;
-      const base = baseOutputSize(source, geometry);
-      const resize =
-        geometry.resize &&
-        (geometry.resize.width !== base.width || geometry.resize.height !== base.height)
-          ? geometry.resize
-          : null;
-      const result = await viewerApi.saveImageEdit({
-        imageId: activeId,
-        rotate: geometry.rotate,
-        flipHorizontal: geometry.flipHorizontal,
-        flipVertical: geometry.flipVertical,
-        crop,
-        resize,
-        outputFormat: geometry.outputFormat,
-        quality: geometry.quality,
-      });
+      const result = await viewerApi.saveImageEdit(
+        buildEditRequest(activeId, source, geometry),
+      );
       if (!result.changed) {
         notify("内容没有变化", "info");
       } else {
@@ -482,9 +522,19 @@ export function ImageViewer({
           "success",
           `新内容 ${formatDimensions(result.width, result.height)} · ${formatBytes(result.fileSize)}`,
         );
+        session.onSaved(activeId, {
+          contentHash: result.contentHash,
+          fileExt: result.fileExt,
+          fileSize: result.fileSize,
+          width: result.width,
+          height: result.height,
+          format: result.format,
+          hasAlpha: result.hasAlpha,
+          thumbVersion: result.thumbVersion,
+        });
       }
+      // 重新载入查看器源图并清空撤销栈；列表本身已就地更新，不重置查询与滚动位置。
       setReloadToken((value) => value + 1);
-      session.onSaved(activeId);
       onSaved?.(activeId);
     } catch (cause) {
       notify("保存失败", "error", errorMessage(cause));
@@ -617,100 +667,105 @@ export function ImageViewer({
       aria-label="图片查看器"
       tabIndex={-1}
     >
-      <header className="viewer-topbar">
-        <div className="viewer-topbar-group">
-          <IconButton label="关闭查看器" onClick={onClose}>
-            <X size={16} />
-          </IconButton>
-          <IconButton label="上一张" disabled={index <= 0} onClick={() => step(-1)}>
-            <ChevronLeft size={16} />
-          </IconButton>
-          <IconButton
-            label="下一张"
-            disabled={index < 0 || (index >= items.length - 1 && !session.hasMore())}
-            onClick={() => step(1)}
-          >
-            <ChevronRight size={16} />
-          </IconButton>
-          <div className="viewer-title">
-            <strong>#{activeId}</strong>
-            <span>
-              {index >= 0
-                ? `${(index + 1).toLocaleString()} / ${items.length.toLocaleString()}${
-                    session.hasMore() ? "+" : ""
-                  }`
-                : "不在当前列表"}
-            </span>
-            {source ? (
+      {!fullscreen ? (
+        <header className="viewer-topbar">
+          <div className="viewer-topbar-group">
+            <IconButton label="关闭查看器" onClick={onClose}>
+              <X size={16} />
+            </IconButton>
+            <IconButton label="上一张" disabled={index <= 0} onClick={() => step(-1)}>
+              <ChevronLeft size={16} />
+            </IconButton>
+            <IconButton
+              label="下一张"
+              disabled={index < 0 || (index >= items.length - 1 && !session.hasMore())}
+              onClick={() => step(1)}
+            >
+              <ChevronRight size={16} />
+            </IconButton>
+            <div className="viewer-title">
+              <strong>#{activeId}</strong>
               <span>
-                {source.format.toUpperCase()} · {formatDimensions(source.width, source.height)}
+                {index >= 0
+                  ? `${(index + 1).toLocaleString()} / ${items.length.toLocaleString()}${
+                      session.hasMore() ? "+" : ""
+                    }`
+                  : "不在当前列表"}
               </span>
-            ) : null}
+              {source ? (
+                <span>
+                  {source.format.toUpperCase()} · {formatDimensions(source.width, source.height)}
+                </span>
+              ) : null}
+            </div>
           </div>
-        </div>
 
-        <div className="viewer-topbar-group viewer-topbar-center">
-          <IconButton label="缩小" onClick={() => zoomBy(0.8)}>
-            <ZoomOut size={15} />
-          </IconButton>
-          <button type="button" className="viewer-zoom-label" onClick={fitView} title="适应窗口">
-            {Math.round(zoom * 100)}%
-          </button>
-          <IconButton label="放大" onClick={() => zoomBy(1.25)}>
-            <ZoomIn size={15} />
-          </IconButton>
-          <Button
-            size="sm"
-            variant={fitActive ? "primary" : "ghost"}
-            onClick={fitView}
-          >
-            适应
-          </Button>
-          <Button
-            size="sm"
-            variant={!fitActive && zoom === 1 ? "primary" : "ghost"}
-            onClick={actualSize}
-          >
-            1:1
-          </Button>
-          <IconButton label={fullscreen ? "退出全屏" : "全屏"} onClick={() => void toggleFullscreen()}>
-            {fullscreen ? <Minimize size={15} /> : <Maximize size={15} />}
-          </IconButton>
-        </div>
+          <div className="viewer-topbar-group viewer-topbar-center">
+            <IconButton label="缩小" onClick={() => zoomBy(0.8)}>
+              <ZoomOut size={15} />
+            </IconButton>
+            <button type="button" className="viewer-zoom-label" onClick={fitView} title="适应窗口">
+              {Math.round(zoom * 100)}%
+            </button>
+            <IconButton label="放大" onClick={() => zoomBy(1.25)}>
+              <ZoomIn size={15} />
+            </IconButton>
+            <Button
+              size="sm"
+              variant={fitActive ? "primary" : "ghost"}
+              onClick={fitView}
+            >
+              适应
+            </Button>
+            <Button
+              size="sm"
+              variant={!fitActive && zoom === 1 ? "primary" : "ghost"}
+              onClick={actualSize}
+            >
+              1:1
+            </Button>
+            <IconButton
+              label={fullscreen ? "退出全屏" : "全屏"}
+              onClick={onToggleFullscreen}
+            >
+              {fullscreen ? <Minimize size={15} /> : <Maximize size={15} />}
+            </IconButton>
+          </div>
 
-        <div className="viewer-topbar-group">
-          {geometryEdits ? <span className="viewer-dirty">未保存</span> : null}
-          <IconButton label="复制图片" disabled={!source} onClick={() => void copyImage()}>
-            <Copy size={15} />
-          </IconButton>
-          <IconButton
-            label={
-              poseBusy
-                ? "正在识别姿势…"
-                : hasPose
-                  ? poseOpen
-                    ? "隐藏姿势骨架"
-                    : "显示姿势骨架"
-                  : "生成姿势骨架"
-            }
-            className={poseOpen ? "is-active" : ""}
-            disabled={poseBusy || (!hasPose && !onGeneratePose)}
-            onClick={() => void togglePose()}
-          >
-            {poseBusy ? <Spinner size={14} /> : <PersonStanding size={15} />}
-          </IconButton>
-          <IconButton
-            label={sidebarOpen ? "隐藏详情侧栏" : "显示详情侧栏"}
-            className={sidebarOpen ? "is-active" : ""}
-            onClick={onToggleSidebar}
-          >
-            <PanelRight size={15} />
-          </IconButton>
-        </div>
-      </header>
+          <div className="viewer-topbar-group">
+            {hasChanges ? <span className="viewer-dirty">未保存</span> : null}
+            <IconButton label="复制图片" disabled={!source} onClick={() => void copyImage()}>
+              <Copy size={15} />
+            </IconButton>
+            <IconButton
+              label={
+                poseBusy
+                  ? "正在识别姿势…"
+                  : hasPose
+                    ? poseOpen
+                      ? "隐藏姿势骨架"
+                      : "显示姿势骨架"
+                    : "生成姿势骨架"
+              }
+              className={poseOpen ? "is-active" : ""}
+              disabled={poseBusy || (!hasPose && !onGeneratePose)}
+              onClick={() => void togglePose()}
+            >
+              {poseBusy ? <Spinner size={14} /> : <PersonStanding size={15} />}
+            </IconButton>
+            <IconButton
+              label={sidebarOpen ? "隐藏详情侧栏" : "显示详情侧栏"}
+              className={sidebarOpen ? "is-active" : ""}
+              onClick={onToggleSidebar}
+            >
+              <PanelRight size={15} />
+            </IconButton>
+          </div>
+        </header>
+      ) : null}
 
       <div className="viewer-body">
-        {source && geometry ? (
+        {!fullscreen && source && geometry ? (
           <ViewerTools
             source={source}
             geometry={geometry}
@@ -718,9 +773,15 @@ export function ImageViewer({
             cropDraft={cropDraft}
             hasChanges={hasChanges}
             saving={saving}
-            onGeometryChange={(updater) =>
-              setGeometry((previous) => (previous ? updater(previous) : previous))
-            }
+            estimate={estimate}
+            estimating={estimating}
+            canUndo={history.canUndo}
+            canRedo={history.canRedo}
+            undoLabel={history.undoLabel}
+            redoLabel={history.redoLabel}
+            onCommit={commitGeometry}
+            onUndo={undoHistory}
+            onRedo={redoHistory}
             onRotate={rotateBy}
             onFlip={flip}
             onEnterCrop={enterCrop}
@@ -730,12 +791,12 @@ export function ImageViewer({
             onReset={resetGeometry}
             onSave={() => void save()}
           />
-        ) : (
+        ) : !fullscreen ? (
           <aside className="viewer-tools viewer-tools-loading">
             <Spinner size={18} />
             <span>正在准备查看器…</span>
           </aside>
-        )}
+        ) : null}
 
         <div className="viewer-canvas-wrap">
           <div
@@ -819,6 +880,8 @@ export function ImageViewer({
                           pose={pose}
                           width={source.displayWidth}
                           height={source.displayHeight}
+                          zoom={zoom}
+                          opacity={poseOpacity}
                         />
                       ) : null}
                     </div>
@@ -871,30 +934,71 @@ export function ImageViewer({
             ) : null}
           </div>
 
-          <div className="viewer-statusbar">
-            {source ? (
-              <>
-                <span>{formatDimensions(source.width, source.height)}</span>
-                <span>{formatBytes(source.fileSize)}</span>
-                <span>{source.downsampled ? "降采样预览" : source.preview ? "转换预览" : "原图"}</span>
-                <span className="mono">{source.contentHash.slice(0, 16)}…</span>
-                {dimensions ? (
-                  <span>
-                    输出 {dimensions.width.toLocaleString()} × {dimensions.height.toLocaleString()}
-                  </span>
-                ) : null}
-                {geometry?.crop ? <span>已裁剪</span> : null}
-                {geometry?.rotate ? <span>旋转 {geometry.rotate * 90}°</span> : null}
-              </>
-            ) : (
-              <span>等待图片…</span>
-            )}
-            <span className="viewer-status-spacer" />
-            <span>{source?.deleted ? "回收站" : "Esc 关闭 · ←/→ 切换 · 0 适应 · 1 原尺寸"}</span>
-          </div>
+          {!fullscreen && poseOpen && pose && hasPose ? (
+            <div className="viewer-pose-panel">
+              <span>姿势 {visiblePoseCount(pose)}/33</span>
+              <label>
+                不透明度
+                <input
+                  type="range"
+                  min={20}
+                  max={100}
+                  value={Math.round(poseOpacity * 100)}
+                  onChange={(event) => setPoseOpacity(Number(event.target.value) / 100)}
+                />
+              </label>
+            </div>
+          ) : null}
+
+          {!fullscreen && filmstripOpen && items.length > 0 ? (
+            <Filmstrip
+              items={items}
+              activeId={activeId}
+              hasMore={session.hasMore()}
+              onSelect={(imageId) => setActiveId(imageId)}
+              onLoadMore={session.loadMore}
+            />
+          ) : null}
+
+          {!fullscreen ? (
+            <div className="viewer-statusbar">
+              <button
+                type="button"
+                className={`viewer-filmstrip-toggle${filmstripOpen ? " is-active" : ""}`}
+                title={filmstripOpen ? "隐藏附近图片" : "显示附近图片"}
+                onClick={onToggleFilmstrip}
+              >
+                <Film size={12} />
+                胶片带
+              </button>
+              {source ? (
+                <>
+                  <span>{formatDimensions(source.width, source.height)}</span>
+                  <span>{formatBytes(source.fileSize)}</span>
+                  <span>{source.downsampled ? "降采样预览" : source.preview ? "转换预览" : "原图"}</span>
+                  <span className="mono">{source.contentHash.slice(0, 16)}…</span>
+                  {dimensions ? (
+                    <span>
+                      输出 {dimensions.width.toLocaleString()} × {dimensions.height.toLocaleString()}
+                    </span>
+                  ) : null}
+                  {geometry?.crop ? <span>已裁剪</span> : null}
+                  {geometry?.rotate ? <span>旋转 {geometry.rotate * 90}°</span> : null}
+                </>
+              ) : (
+                <span>等待图片…</span>
+              )}
+              <span className="viewer-status-spacer" />
+              <span>
+                {source?.deleted ? "回收站" : "Esc 关闭 · ←/→ 切换 · 0 适应 · 1 原尺寸 · F11 全屏"}
+              </span>
+            </div>
+          ) : null}
         </div>
 
-        {sidebarOpen && sidebar ? <div className="viewer-sidebar">{sidebar}</div> : null}
+        {!fullscreen && sidebarOpen && sidebar ? (
+          <div className="viewer-sidebar">{sidebar}</div>
+        ) : null}
       </div>
     </div>
   );

@@ -61,12 +61,17 @@ import {
   buildQuery,
   emptyFilters,
   filterKey,
+  folderLabel,
   hasActiveFilters,
   hasActiveQuery,
   isFormTarget,
   queryKey,
+  rowInTagScope,
   selectionRange,
+  sortForView,
   sortOptionsFor,
+  sortValueForRow,
+  tagFilterState,
   type BrowseState,
   type SimilarityBrowseState,
 } from "./model";
@@ -79,14 +84,14 @@ import type {
   ImageRow,
   LibraryView as LibraryViewType,
   SortKey,
-  SortSpec,
   ViewMode,
 } from "./types";
 import { useImageQuery } from "./useImageQuery";
 import { VirtualGrid } from "./VirtualGrid";
 import { VirtualList } from "./VirtualList";
 import type { VirtualViewHandle } from "./virtual";
-import type { ViewerSession } from "../../shared/viewerSession";
+import type { ViewerSession, ViewerSessionUpdate } from "../../shared/viewerSession";
+import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import type { SimilarKind } from "../../shared/similarity";
 import { SIMILAR_LABELS } from "../../shared/similarity";
 
@@ -125,13 +130,6 @@ function initialViewMode(): ViewMode {
   } catch {
     return "grid";
   }
-}
-
-function sortForView(view: LibraryViewType, sort: SortSpec): SortSpec {
-  if (view === "collection") {
-    return sort.key === "collectionPosition" ? sort : COLLECTION_SORT;
-  }
-  return sort.key === "collectionPosition" ? DEFAULT_SORT : sort;
 }
 
 export function LibraryView({
@@ -192,6 +190,17 @@ export function LibraryView({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const browseRef = useRef(browse);
   browseRef.current = browse;
+  const activeIdRef = useRef<number | null>(activeId);
+  activeIdRef.current = activeId;
+  // 标签筛选后保留原图选择；若不在第一页，用锚点游标跳到它所在位置。
+  const preserveTagSelectionRef = useRef(false);
+  const pendingTagFocusRef = useRef<{
+    id: number;
+    row: ImageRow;
+    sortValue: number | null;
+    jumpTried: boolean;
+    queryKey: string;
+  } | null>(null);
   const applyBrowse = onApplyBrowse;
 
   const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
@@ -204,6 +213,20 @@ export function LibraryView({
     browse.search && browse.searchScope === "library" ? "all" : browse.view;
   const effectiveCollectionId =
     effectiveView === "collection" ? browse.collectionId : null;
+
+  // 标签筛选范围菜单里的当前文件夹/当前集合名称；没有对应范围时菜单项置灰。
+  const folderScopeLabel = useMemo(() => {
+    const selected = folders.filter((folder) =>
+      browse.filters.folderIds.includes(folder.id),
+    );
+    if (selected.length === 0) return null;
+    const names = selected.map((folder) => folderLabel(folder.path));
+    return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`;
+  }, [browse.filters.folderIds, folders]);
+  const collectionScopeLabel = useMemo(() => {
+    if (effectiveCollectionId == null) return null;
+    return collections.find((collection) => collection.id === effectiveCollectionId)?.name ?? null;
+  }, [collections, effectiveCollectionId]);
 
   const query = useMemo(() => buildQuery(browse), [browse]);
   const imageQuery = useImageQuery(query, refreshToken + dataVersion);
@@ -307,11 +330,54 @@ export function LibraryView({
   }, [refreshToken, dataVersion]);
 
   useEffect(() => {
+    // 标签筛选是“从当前图片跳转”，保留选择；其它筛选/视图变化仍清空。
+    if (preserveTagSelectionRef.current) {
+      preserveTagSelectionRef.current = false;
+      return;
+    }
     setSelected(new Set());
     setActiveId(null);
     setAnchorId(null);
     setContextMenu(null);
   }, [selectionResetSignature]);
+
+  // 标签筛选完成后：回到原图；第一页没有它时，用锚点游标取它所在的一页。
+  useEffect(() => {
+    const pending = pendingTagFocusRef.current;
+    if (!pending || imageQuery.status !== "ready") return;
+    // 只认新筛选对应的结果；旧列表可能恰好命中，会误判。
+    if (imageQuery.loadedKey !== pending.queryKey) return;
+    const index = imageQuery.items.findIndex((item) => item.id === pending.id);
+    if (index >= 0) {
+      pendingTagFocusRef.current = null;
+      setSelected(new Set([pending.id]));
+      setActiveId(pending.id);
+      setAnchorId(pending.id);
+      viewRef.current?.ensureIndex(index);
+      return;
+    }
+    if (!pending.jumpTried && imageQuery.hasMore && pending.sortValue != null) {
+      pending.jumpTried = true;
+      imageQuery.jumpTo(pending.row, pending.sortValue);
+      return;
+    }
+    if (imageQuery.hasMore && pending.sortValue == null) {
+      // 集合内顺序没有行字段可当游标；保留选择，不强制清空。
+      pendingTagFocusRef.current = null;
+      return;
+    }
+    // 结果里确实没有这张图：清空选择，避免详情继续显示不在当前结果里的图。
+    pendingTagFocusRef.current = null;
+    setSelected(new Set());
+    setActiveId(null);
+    setAnchorId(null);
+  }, [
+    imageQuery.hasMore,
+    imageQuery.items,
+    imageQuery.jumpTo,
+    imageQuery.loadedKey,
+    imageQuery.status,
+  ]);
 
   // 外部刷新（导入、批处理完成、元数据变化）会让相似结果过期，直接退出相似模式。
   const similarityClear = similarity?.clear;
@@ -765,6 +831,65 @@ export function LibraryView({
     [effectiveCollectionId, effectiveView, notify, refreshData, reloadCollections, viewBusy],
   );
 
+  /** 编辑保存后只替换已加载行的字段，不重置查询、排序与滚动位置。 */
+  const patchSavedImage = useCallback(
+    (imageId: number, update: ViewerSessionUpdate) => {
+      if (similarityActive && similarity) similarity.patchItem(imageId, update);
+      else imageQuery.patchItem(imageId, update);
+    },
+    [imageQuery.patchItem, similarity, similarityActive],
+  );
+
+  const filterByTag = useCallback(
+    (tagId: number, action: TagFilterAction, scope: TagFilterScope) => {
+      const currentState = browseRef.current;
+      const nextState = tagFilterState(currentState, {
+        tagId,
+        action,
+        scope,
+        collectionId: effectiveCollectionId,
+      });
+      if (!nextState) return;
+
+      const targetId = activeIdRef.current;
+      const targetRow =
+        targetId == null ? undefined : itemsRef.current.find((item) => item.id === targetId);
+      // 取消标签会放宽结果、追加/替换会带上当前图自身的标签，只有前者无法确认目标图
+      // 仍在结果里；相似/语义结果不是图库视图，切回普通视图时同样无法确认。这两种情况
+      // 交给常规清空，避免把不在结果里的行插进列表。
+      const keepTarget =
+        action !== "remove" &&
+        !(similarityActive && action === "append") &&
+        targetRow != null &&
+        (action !== "apply" ||
+          rowInTagScope(targetRow, scope, {
+            folderPaths: folders
+              .filter((folder) => currentState.filters.folderIds.includes(folder.id))
+              .map((folder) => folder.path),
+            hasCollection: effectiveCollectionId != null,
+            similarityActive,
+          }));
+
+      const nextKey = queryKey(buildQuery(nextState));
+      if (keepTarget && targetRow && nextKey !== queryKey(buildQuery(currentState))) {
+        preserveTagSelectionRef.current = true;
+        pendingTagFocusRef.current = {
+          id: targetRow.id,
+          row: targetRow,
+          sortValue: sortValueForRow(targetRow, currentState.sort.key),
+          jumpTried: false,
+          queryKey: nextKey,
+        };
+      } else {
+        preserveTagSelectionRef.current = false;
+        pendingTagFocusRef.current = null;
+      }
+      applyBrowse(nextState);
+      similarityClear?.();
+    },
+    [applyBrowse, effectiveCollectionId, folders, similarityActive, similarityClear],
+  );
+
   const activateItem = useCallback(
     (item: ImageRow) => {
       setActiveId(item.id);
@@ -791,8 +916,12 @@ export function LibraryView({
           const position = itemsRef.current.findIndex((candidate) => candidate.id === imageId);
           if (position >= 0) viewRef.current?.ensureIndex(position);
         },
-        onSaved: () => refreshData(),
+        onSaved: (imageId, update) => patchSavedImage(imageId, update),
         refresh: () => refreshData(),
+        filterByTag,
+        folderScopeLabel,
+        collectionScopeLabel,
+        filterTagIds: browseRef.current.filters.tagIds,
         addToCollection: (ids) => {
           setSelected(new Set(ids));
           setCollectionPickerOpen(true);
@@ -805,11 +934,15 @@ export function LibraryView({
       onOpenViewer(session);
     },
     [
+      collectionScopeLabel,
       deleteSelected,
       effectiveCollectionId,
+      filterByTag,
+      folderScopeLabel,
       folders,
       loadMore,
       onOpenViewer,
+      patchSavedImage,
       refreshData,
       removeFromCurrentCollection,
       restoreSelected,
@@ -1587,6 +1720,10 @@ export function LibraryView({
             onTrash={(ids) => void trashSelected(ids)}
             onRestore={(ids) => void restoreSelected(ids)}
             onDelete={(ids) => void deleteSelected(ids)}
+            onFilterTag={filterByTag}
+            filterTagIds={browse.filters.tagIds}
+            folderScopeLabel={folderScopeLabel}
+            collectionScopeLabel={collectionScopeLabel}
             onGenerateDescription={onGenerateDescription}
           />
         ) : null}

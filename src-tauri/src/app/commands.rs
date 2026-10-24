@@ -19,7 +19,7 @@ use crate::{
         BatchReporter,
         capability::{FeatureSummary, ImageCapabilities},
         collections::{CollectionInfo, CombineMode},
-        edit::{self, EditRequest, EditResult},
+        edit::{self, EditRequest, EditResult, EditSizeEstimate},
         manifest::LibraryInspection,
         metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
@@ -103,13 +103,13 @@ pub fn window_close(window: WebviewWindow) -> Result<(), String> {
     window.close().map_err(|error| error.to_string())
 }
 
+/// 设置语义：写入后回读真实状态，系统快捷键改变全屏时前端也能同步。
 #[tauri::command]
-pub fn window_toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
-    let fullscreen = window.is_fullscreen().map_err(|error| error.to_string())?;
+pub fn window_set_fullscreen(window: WebviewWindow, value: bool) -> Result<bool, String> {
     window
-        .set_fullscreen(!fullscreen)
+        .set_fullscreen(value)
         .map_err(|error| error.to_string())?;
-    Ok(!fullscreen)
+    window.is_fullscreen().map_err(|error| error.to_string())
 }
 
 #[derive(Serialize)]
@@ -540,6 +540,20 @@ pub async fn save_image_edit(
 }
 
 #[tauri::command]
+pub async fn estimate_edit_size(
+    state: State<'_, AppState>,
+    request: EditRequest,
+) -> Result<EditSizeEstimate, String> {
+    let (database, root) = state
+        .current_library()
+        .ok_or_else(|| "尚未打开图库".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || edit::estimate(&database, &root, &request))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn get_image_pose(
     state: State<'_, AppState>,
     image_id: i64,
@@ -731,7 +745,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         window_toggle_maximize,
         window_is_maximized,
         window_close,
-        window_toggle_fullscreen,
+        window_set_fullscreen,
         get_app_info,
         reveal_path,
         start_import,
@@ -772,6 +786,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         combine_collections,
         get_viewer_source,
         save_image_edit,
+        estimate_edit_size,
         get_image_pose,
         copy_image,
         get_ai_status,

@@ -16,9 +16,15 @@ export interface ImageQueryState {
   moreStatus: MoreStatus;
   moreError: string | null;
   hasMore: boolean;
+  /** 当前 items 对应的查询键；切换筛选后到新结果返回前保持旧值或为空。 */
+  loadedKey: string | null;
   loadMore: () => void;
   retry: () => void;
   retryMore: () => void;
+  /** 就地替换已加载行（编辑保存后避免重置查询与滚动位置）。 */
+  patchItem: (imageId: number, update: Partial<ImageRow>) => void;
+  /** 从指定行之后开始取一页，并把该行放到页首；用于筛选后定位原图。 */
+  jumpTo: (anchor: ImageRow, sortValue: number) => void;
 }
 
 /**
@@ -32,6 +38,7 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
   const [moreStatus, setMoreStatus] = useState<MoreStatus>("idle");
   const [moreError, setMoreError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
 
   const queryRef = useRef(query);
   queryRef.current = query;
@@ -46,17 +53,20 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
     cursorRef.current = null;
     setItems([]);
     setHasMore(false);
+    setLoadedKey(null);
     setStatus("loading");
     setMoreStatus("idle");
     setMoreError(null);
     setError(null);
 
     try {
+      const requestKey = queryKey(queryRef.current);
       const page = await libraryApi.queryImages({ ...queryRef.current, cursor: null });
       if (currentGeneration !== generation.current) return;
       setItems(page.items);
       cursorRef.current = page.nextCursor;
       setHasMore(page.nextCursor !== null);
+      setLoadedKey(requestKey);
       setStatus("ready");
     } catch (cause) {
       if (currentGeneration !== generation.current) return;
@@ -108,6 +118,46 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
     }
   }, []);
 
+  const jumpTo = useCallback(async (anchor: ImageRow, sortValue: number) => {
+    const currentGeneration = generation.current + 1;
+    generation.current = currentGeneration;
+    inFlight.current = true;
+    setStatus("loading");
+    setError(null);
+    setMoreStatus("idle");
+    setMoreError(null);
+    try {
+      const requestKey = queryKey(queryRef.current);
+      const page = await libraryApi.queryImages({
+        ...queryRef.current,
+        cursor: { sortKey: String(sortValue), id: anchor.id },
+      });
+      if (currentGeneration !== generation.current) return;
+      // 游标是排他的：先补回锚点行，保持排序顺序，再追加它之后的一页。
+      setItems([anchor, ...page.items]);
+      cursorRef.current = page.nextCursor;
+      setHasMore(page.nextCursor !== null);
+      setLoadedKey(requestKey);
+      setStatus("ready");
+    } catch (cause) {
+      if (currentGeneration !== generation.current) return;
+      setStatus("error");
+      setError(errorMessage(cause));
+    } finally {
+      if (currentGeneration === generation.current) inFlight.current = false;
+    }
+  }, []);
+
+  const patchItem = useCallback((imageId: number, update: Partial<ImageRow>) => {
+    setItems((previous) => {
+      const index = previous.findIndex((item) => item.id === imageId);
+      if (index < 0) return previous;
+      const next = previous.slice();
+      next[index] = { ...next[index], ...update };
+      return next;
+    });
+  }, []);
+
   return {
     items,
     status,
@@ -115,8 +165,11 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
     moreStatus,
     moreError,
     hasMore,
+    loadedKey,
     loadMore,
     retry: loadFirst,
     retryMore: loadMore,
+    patchItem,
+    jumpTo,
   };
 }

@@ -9,7 +9,7 @@ import { WindowTitleBar } from "./WindowTitleBar";
 import { Spinner } from "../shared/components/Spinner";
 
 export function AppShell() {
-  const { loading, current, closeLibrary } = useAppRuntime();
+  const { loading, current, closeLibrary, fullscreen, toggleFullscreen } = useAppRuntime();
   const [libraryDialogOpen, setLibraryDialogOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -29,11 +29,16 @@ export function AppShell() {
       if (event.ctrlKey && key === "o") {
         event.preventDefault();
         setLibraryDialogOpen(true);
+        return;
+      }
+      if (key === "f11") {
+        event.preventDefault();
+        void toggleFullscreen();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [toggleFullscreen]);
 
   if (loading) {
     return (
@@ -49,8 +54,8 @@ export function AppShell() {
   }
 
   return (
-    <div className="app-frame">
-      <WindowTitleBar />
+    <div className={`app-frame${fullscreen ? " is-fullscreen" : ""}`}>
+      {fullscreen ? null : <WindowTitleBar />}
       {current ? (
         <LibraryWorkspace
           key={current.id}

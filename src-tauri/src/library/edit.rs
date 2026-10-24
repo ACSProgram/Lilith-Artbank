@@ -76,6 +76,18 @@ pub struct EditResult {
     pub old_file_removed: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSizeEstimate {
+    pub file_size: i64,
+    /// 大图按 1/4 边长编码后外推，结果只是估算。
+    pub exact: bool,
+}
+
+/// 超过此像素数时不再整图编码，避免拖滑块时反复付出全图编码成本。
+const ESTIMATE_MAX_PIXELS: u64 = 20_000_000;
+const ESTIMATE_DOWNSCALE: u32 = 4;
+
 /// 临时文件句柄：作用域结束时自动删除，成功发布后 `disarm` 交给目标文件。
 struct TempFile(Option<PathBuf>);
 
@@ -101,13 +113,11 @@ impl TempFile {
     }
 }
 
-/// 编辑保存：新内容 → 新文件 → 单事务更新行 → 提交后清理旧文件。
-pub fn save(
+/// 保存与体积预估共用的前置校验：几何参数、回收站、像素上限、输出格式与质量。
+fn resolve(
     database: &LibraryDb,
-    root: &Path,
-    thumbs: &ThumbPack,
     request: &EditRequest,
-) -> AppResult<EditResult> {
+) -> AppResult<(ContentRow, Geometry, OutputFormat, u8)> {
     let geometry = request.geometry();
     geometry.validate()?;
     let row = content::load(database, request.image_id)?;
@@ -122,14 +132,24 @@ pub fn save(
             MAX_EDIT_PIXELS / 1_000_000
         )));
     }
-
     let output_format =
         OutputFormat::parse(request.output_format.as_deref(), &row.format, row.has_alpha)?;
     let quality = request.quality.unwrap_or(edit::DEFAULT_QUALITY);
     if !(1..=100).contains(&quality) {
         return Err(AppError::message("输出质量必须在 1-100 之间"));
     }
-    if !edit::has_changes(&geometry, &row.format, output_format) {
+    Ok((row, geometry, output_format, quality))
+}
+
+/// 编辑保存：新内容 → 新文件 → 单事务更新行 → 提交后清理旧文件。
+pub fn save(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    request: &EditRequest,
+) -> AppResult<EditResult> {
+    let (row, geometry, output_format, quality) = resolve(database, request)?;
+    if !edit::has_changes(&geometry, &row.format, output_format, quality) {
         return Err(AppError::message(UNCHANGED_HINT));
     }
 
@@ -285,6 +305,68 @@ pub fn save(
         changed: true,
         old_file_removed,
     })
+}
+
+/// 保存结果体积预估：在内存里编码一次并丢弃，只返回字节数。
+pub fn estimate(
+    database: &LibraryDb,
+    root: &Path,
+    request: &EditRequest,
+) -> AppResult<EditSizeEstimate> {
+    let (row, geometry, output_format, quality) = resolve(database, request)?;
+    if !edit::has_changes(&geometry, &row.format, output_format, quality) {
+        return Ok(EditSizeEstimate {
+            file_size: row.file_size,
+            exact: true,
+        });
+    }
+
+    let paths = LibraryPaths::new(root);
+    let source = row.path(&paths)?;
+    let decoded = decode::decode(&source)?;
+    let processed = edit::apply(decoded.image, &geometry)?;
+    let (width, height) = (processed.width(), processed.height());
+    let pixels = u64::from(width) * u64::from(height);
+
+    let mut counter = CountingWriter::default();
+    let (bytes, exact) = if pixels <= ESTIMATE_MAX_PIXELS {
+        edit::encode(&processed, output_format, quality, &mut counter)?;
+        (counter.bytes, true)
+    } else {
+        let small_width = (width / ESTIMATE_DOWNSCALE).max(1);
+        let small_height = (height / ESTIMATE_DOWNSCALE).max(1);
+        let small = processed.resize_exact(
+            small_width,
+            small_height,
+            image::imageops::FilterType::Triangle,
+        );
+        edit::encode(&small, output_format, quality, &mut counter)?;
+        let area_ratio =
+            pixels as f64 / (u64::from(small_width) * u64::from(small_height)).max(1) as f64;
+        ((counter.bytes as f64 * area_ratio).round() as u64, false)
+    };
+    Ok(EditSizeEstimate {
+        file_size: i64::try_from(bytes)
+            .map_err(|_| AppError::message("预估结果大小超出可表示范围"))?,
+        exact,
+    })
+}
+
+/// 只计数不落盘；编码器要求 `Write`，不能直接用 `Vec` 以免真的占用内存。
+#[derive(Default)]
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes += buffer.len() as u64;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn unchanged(row: &ContentRow, old_file_removed: bool) -> EditResult {
@@ -533,6 +615,70 @@ mod tests {
         let bytes = fixture.session.thumbs.read(pointer.location).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert!(decoded.width() > 0 && decoded.height() > 0);
+    }
+
+    #[test]
+    fn saves_when_only_jpeg_quality_changes() {
+        use image::ImageEncoder;
+
+        let fixture = fixture();
+        let mut source = image::RgbImage::new(24, 16);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x * 9) as u8, (y * 13) as u8, 70]);
+        }
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90)
+            .write_image(source.as_raw(), 24, 16, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        fs::write(fixture.root.join(format!("{hash}.jpg")), &bytes).unwrap();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET content_hash = ?1, file_ext = 'jpg', format = 'jpeg',
+                        has_alpha = 0, file_size = ?2 WHERE id = ?3",
+                    params![hash, bytes.len() as i64, fixture.image_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let request = EditRequest {
+            rotate: 0,
+            output_format: Some("jpeg".into()),
+            quality: Some(60),
+            ..rotate_request(fixture.image_id)
+        };
+        let result = save(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            &request,
+        )
+        .unwrap();
+        assert!(result.changed);
+        assert_eq!((result.width, result.height), (24, 16));
+        assert!(result.file_size < bytes.len() as i64);
+    }
+
+    #[test]
+    fn estimate_matches_saved_size() {
+        let fixture = fixture();
+        let request = rotate_request(fixture.image_id);
+        let estimate = estimate(&fixture.session.db, &fixture.root, &request).unwrap();
+        assert!(estimate.exact);
+
+        let result = save(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            &request,
+        )
+        .unwrap();
+        assert_eq!((result.width, result.height), (16, 24));
+        assert_eq!(estimate.file_size, result.file_size);
     }
 
     #[test]

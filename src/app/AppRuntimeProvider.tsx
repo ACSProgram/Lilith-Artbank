@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { appApi } from "./api";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { appApi, browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
@@ -14,6 +14,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  const [fullscreen, setFullscreenState] = useState(false);
+  const fullscreenRef = useRef(false);
+  fullscreenRef.current = fullscreen;
 
   useEffect(() => {
     let cancelled = false;
@@ -62,6 +65,57 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setThumbCacheLimit(settings?.ui.thumbCacheCount ?? 1024);
   }, [settings?.ui.thumbCacheCount]);
+
+  // 全屏状态由窗口真实状态决定：系统快捷键（F11、Win+↑）改变时按钮图标也能同步。
+  useEffect(() => {
+    if (browserPreview) {
+      const sync = () => setFullscreenState(Boolean(document.fullscreenElement));
+      document.addEventListener("fullscreenchange", sync);
+      sync();
+      return () => document.removeEventListener("fullscreenchange", sync);
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      if (disposed) return;
+      const window = getCurrentWindow();
+      const sync = () => {
+        void window
+          .isFullscreen()
+          .then((value) => {
+            if (!disposed) setFullscreenState(value);
+          })
+          .catch(() => undefined);
+      };
+      sync();
+      const stop = await window.onResized(sync);
+      if (disposed) stop();
+      else unlisten = stop;
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const setFullscreen = useCallback(
+    async (value: boolean) => {
+      try {
+        const actual = await appApi.windowSetFullscreen(value);
+        setFullscreenState(actual);
+        return actual;
+      } catch (cause) {
+        notify("切换全屏失败", "error", errorMessage(cause));
+        return fullscreenRef.current;
+      }
+    },
+    [notify],
+  );
+
+  const toggleFullscreen = useCallback(async () => {
+    await setFullscreen(!fullscreenRef.current);
+  }, [setFullscreen]);
 
   const run = useCallback(
     async <T,>(label: string, operation: () => Promise<T>): Promise<T> => {
@@ -133,6 +187,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       appInfo,
       loading,
       busy,
+      fullscreen,
+      setFullscreen,
+      toggleFullscreen,
       createLibrary,
       openLibrary,
       closeLibrary,
@@ -146,6 +203,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       appInfo,
       loading,
       busy,
+      fullscreen,
+      setFullscreen,
+      toggleFullscreen,
       createLibrary,
       openLibrary,
       closeLibrary,

@@ -201,6 +201,16 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
     return aiApi.getSimilarityIds(token);
   }, []);
 
+  const patchItem = useCallback((imageId: number, update: Partial<ImageRow>) => {
+    setState((previous) => {
+      const index = previous.items.findIndex((item) => item.id === imageId);
+      if (index < 0) return previous;
+      const items = previous.items.slice();
+      items[index] = { ...items[index], ...update };
+      return { ...previous, items };
+    });
+  }, []);
+
   return {
     ...state,
     search,
@@ -209,5 +219,6 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
     loadMore,
     retry,
     ids,
+    patchItem,
   };
 }

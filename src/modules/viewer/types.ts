@@ -58,6 +58,12 @@ export interface SaveEditResult {
   oldFileRemoved: boolean;
 }
 
+export interface EditSizeEstimate {
+  fileSize: number;
+  /** false 表示大图按缩略编码外推，体积只是估算。 */
+  exact: boolean;
+}
+
 export interface PoseLandmark {
   x: number;
   y: number;

@@ -65,6 +65,11 @@
   --star-on: #b8892c;
   --star-off: #c9cfc9;
 
+  /* 姿势骨架叠在图片上，不随主题变；亮线 + 深色描边保证在明暗画面上都可见。 */
+  --pose-line: #6ee7b7;
+  --pose-halo: rgba(10, 24, 17, 0.85);
+  --pose-joint: #f4fffa;
+
   /* 查看器画布：浅色下用中性灰，和主界面同色系，不再是独立的深色块。 */
   --canvas: #e9ebe6;
   --checker: #dde0da;

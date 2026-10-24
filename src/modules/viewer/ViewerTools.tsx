@@ -4,6 +4,7 @@ import {
   FlipHorizontal2,
   FlipVertical2,
   Lock,
+  Redo2,
   RotateCcw,
   RotateCw,
   Save,
@@ -14,14 +15,23 @@ import { Button } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import {
   baseOutputSize,
+  clampResize,
   cropToOriginal,
+  formatBytes,
+  formatDimensions,
   normalizeResize,
   outputSize,
   resizeFromHeight,
   resizeFromWidth,
   type GeometryState,
 } from "./model";
-import type { CropRect, OutputFormat, ResizeSpec, ViewerSource } from "./types";
+import type {
+  CropRect,
+  EditSizeEstimate,
+  OutputFormat,
+  ResizeSpec,
+  ViewerSource,
+} from "./types";
 
 interface ViewerToolsProps {
   source: ViewerSource;
@@ -30,7 +40,19 @@ interface ViewerToolsProps {
   cropDraft: CropRect | null;
   hasChanges: boolean;
   saving: boolean;
-  onGeometryChange: (updater: (previous: GeometryState) => GeometryState) => void;
+  estimate: EditSizeEstimate | null;
+  estimating: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoLabel: string | null;
+  redoLabel: string | null;
+  onCommit: (
+    updater: (previous: GeometryState) => GeometryState,
+    label: string,
+    mergeKey?: string,
+  ) => void;
+  onUndo: () => void;
+  onRedo: () => void;
   onRotate: (delta: number) => void;
   onFlip: (axis: "horizontal" | "vertical") => void;
   onEnterCrop: () => void;
@@ -41,6 +63,12 @@ interface ViewerToolsProps {
   onSave: () => void;
 }
 
+const FORMAT_LABELS: Record<OutputFormat, string> = {
+  jpeg: "JPEG",
+  png: "PNG",
+  webp: "WebP",
+};
+
 export function ViewerTools({
   source,
   geometry,
@@ -48,7 +76,15 @@ export function ViewerTools({
   cropDraft,
   hasChanges,
   saving,
-  onGeometryChange,
+  estimate,
+  estimating,
+  canUndo,
+  canRedo,
+  undoLabel,
+  redoLabel,
+  onCommit,
+  onUndo,
+  onRedo,
   onRotate,
   onFlip,
   onEnterCrop,
@@ -71,10 +107,14 @@ export function ViewerTools({
   }, [output.width, output.height]);
 
   const applyResize = (resize: ResizeSpec) => {
-    onGeometryChange((previous) => ({
-      ...previous,
-      resize: normalizeResize(resize, base),
-    }));
+    onCommit(
+      (previous) => ({
+        ...previous,
+        resize: normalizeResize(clampResize(resize), base),
+      }),
+      "调整尺寸",
+      "resize",
+    );
   };
 
   const changeWidth = (value: string) => {
@@ -132,7 +172,7 @@ export function ViewerTools({
   const resetResize = () => {
     setWidthInput(String(base.width));
     setHeightInput(String(base.height));
-    onGeometryChange((previous) => ({ ...previous, resize: null }));
+    onCommit((previous) => ({ ...previous, resize: null }), "还原尺寸");
   };
 
   const cropSize = geometry.crop
@@ -141,6 +181,13 @@ export function ViewerTools({
   const draftSize = cropDraft
     ? cropToOriginal(cropDraft, geometry.rotate, source)
     : null;
+  const formatLabel = FORMAT_LABELS[geometry.outputFormat];
+  const qualityLabel =
+    geometry.outputFormat === "png" ? "无损" : `质量 ${geometry.quality}`;
+  const percentChange =
+    estimate && source.fileSize > 0
+      ? Math.round(((estimate.fileSize - source.fileSize) / source.fileSize) * 100)
+      : null;
 
   return (
     <aside className="viewer-tools" aria-label="编辑工具">
@@ -187,7 +234,6 @@ export function ViewerTools({
               size="sm"
               icon={<FlipHorizontal2 size={14} />}
               disabled={!editable}
-              className={geometry.flipHorizontal ? "is-active" : ""}
               onClick={() => onFlip("horizontal")}
             >
               水平翻转
@@ -196,7 +242,6 @@ export function ViewerTools({
               size="sm"
               icon={<FlipVertical2 size={14} />}
               disabled={!editable}
-              className={geometry.flipVertical ? "is-active" : ""}
               onClick={() => onFlip("vertical")}
             >
               垂直翻转
@@ -209,7 +254,7 @@ export function ViewerTools({
             <h4>裁剪</h4>
             {cropSize ? (
               <span>
-                {cropSize.width.toLocaleString()} × {cropSize.height.toLocaleString()}
+                {formatDimensions(cropSize.width, cropSize.height)}
               </span>
             ) : null}
           </div>
@@ -217,7 +262,7 @@ export function ViewerTools({
             <>
               <p className="viewer-tool-hint">
                 {draftSize
-                  ? `选区 ${draftSize.width.toLocaleString()} × ${draftSize.height.toLocaleString()}`
+                  ? `选区 ${formatDimensions(draftSize.width, draftSize.height)}`
                   : "在画布上拖拽画出裁剪区域。"}
               </p>
               <div className="viewer-tool-grid">
@@ -256,7 +301,9 @@ export function ViewerTools({
         <section className="viewer-tool-section">
           <div className="viewer-tool-heading">
             <h4>调整尺寸</h4>
-            <span>原图 {base.width.toLocaleString()} × {base.height.toLocaleString()}</span>
+            <span>
+              原图 {formatDimensions(base.width, base.height)}
+            </span>
           </div>
           <div className="viewer-size-row">
             <label>
@@ -306,7 +353,7 @@ export function ViewerTools({
             </button>
           </div>
           <p className="viewer-tool-hint">
-            结果尺寸 {output.width.toLocaleString()} × {output.height.toLocaleString()}
+            结果尺寸 {formatDimensions(output.width, output.height)}
           </p>
         </section>
 
@@ -318,20 +365,19 @@ export function ViewerTools({
               value={geometry.outputFormat}
               disabled={!editable}
               aria-label="输出格式"
-              onChange={(event) =>
-                onGeometryChange((previous) => ({
-                  ...previous,
-                  outputFormat: event.target.value as OutputFormat,
-                }))
-              }
+              onChange={(event) => {
+                const outputFormat = event.target.value as OutputFormat;
+                onCommit(
+                  (previous) => ({ ...previous, outputFormat }),
+                  `输出 ${FORMAT_LABELS[outputFormat]}`,
+                );
+              }}
             >
               <option value="jpeg">JPEG</option>
               <option value="png">PNG</option>
               <option value="webp">WebP</option>
             </select>
-            <span className="viewer-quality-label">
-              {geometry.outputFormat === "png" ? "无损" : `质量 ${geometry.quality}`}
-            </span>
+            <span className="viewer-quality-label">{qualityLabel}</span>
           </div>
           {geometry.outputFormat !== "png" ? (
             <input
@@ -342,16 +388,35 @@ export function ViewerTools({
               value={geometry.quality}
               disabled={!editable}
               aria-label="输出质量"
-              onChange={(event) =>
-                onGeometryChange((previous) => ({
-                  ...previous,
-                  quality: Number(event.target.value),
-                }))
-              }
+              onChange={(event) => {
+                const quality = Number(event.target.value);
+                onCommit(
+                  (previous) => ({ ...previous, quality }),
+                  `输出 ${formatLabel} q${quality}`,
+                  "quality",
+                );
+              }}
             />
           ) : null}
           {geometry.outputFormat === "jpeg" && source.hasAlpha ? (
             <p className="viewer-tool-hint">JPEG 不支持透明，透明区域会合成到白色背景。</p>
+          ) : null}
+          {hasChanges ? (
+            estimating ? (
+              <p className="viewer-tool-hint">正在估算体积…</p>
+            ) : estimate && estimate.fileSize > 0 ? (
+              <p className="viewer-tool-hint">
+                保存后{estimate.exact ? "" : "约"} {formatBytes(estimate.fileSize)}
+                {percentChange != null
+                  ? `（原 ${formatBytes(source.fileSize)}，${percentChange > 0 ? "+" : ""}${percentChange}%）`
+                  : ""}
+              </p>
+            ) : null
+          ) : null}
+          {geometry.outputFormat !== "png" && hasChanges ? (
+            <p className="viewer-tool-hint">
+              保存会重新编码，画质会下降，原始 EXIF 信息不会保留。
+            </p>
           ) : null}
         </section>
       </div>
@@ -367,12 +432,32 @@ export function ViewerTools({
         </Button>
         <Button
           variant="ghost"
-          icon={<Undo2 size={14} />}
+          icon={<RotateCcw size={14} />}
           disabled={!editable || !hasChanges}
           onClick={onReset}
         >
           重置
         </Button>
+        <div className="viewer-history-row">
+          <button
+            type="button"
+            disabled={!editable || !canUndo}
+            onClick={onUndo}
+            title={canUndo && undoLabel ? `撤销：${undoLabel}` : "没有可撤销的操作"}
+          >
+            <Undo2 size={14} />
+            {canUndo ? `撤销：${undoLabel ?? "上一步"}` : "撤销"}
+          </button>
+          <button
+            type="button"
+            disabled={!editable || !canRedo}
+            onClick={onRedo}
+            title={canRedo && redoLabel ? `重做：${redoLabel}` : "没有可重做的操作"}
+          >
+            <Redo2 size={14} />
+            {canRedo ? `重做：${redoLabel ?? "下一步"}` : "重做"}
+          </button>
+        </div>
         <p>保存会生成新文件并更新缩略图；标签、评分、描述与集合保留，AI 特征会在保存后重新生成。</p>
       </div>
     </aside>

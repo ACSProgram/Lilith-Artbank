@@ -72,6 +72,16 @@ tags: string[]
 - 计数只在筛选面板打开时请求，面板内有 160 ms 防抖与加载态；搜索/集合很大时可能超过 100 ms（见[性能](../guides/performance.md)），不会阻塞网格翻页。
 - 标签管理器提供标签搜索、计数、重命名与删除；删除前在确认框显示影响数量。管理器一次只载入图片最多的 500 个标签，搜索在该列表内过滤。
 
+## 按标签筛选
+
+详情侧栏的标签 chip 可以直接当筛选入口，不需要新后端能力：动作与范围都映射到现有的 `filters.tagIds` 与视图字段（`model.ts` 的 `tagFilterState`）。
+
+- 动作：`apply` 用这个标签替换标签条件；`append` 在当前视图里叠加/取消这一个标签；`remove` 取消它。Ctrl/Cmd 点击 chip 等于 `append`。
+- 范围：`view` 保留当前的视图、搜索与其它筛选；`folder` 只保留当前文件夹子树；`collection` 只保留当前集合；`library` 清空文件夹与集合、在整个图库内筛选。后三者会清空搜索与其它筛选条件，并把排序按新视图换算（离开集合时退回默认排序）。
+- 菜单里“当前文件夹/当前集合”两项在没有对应范围时置灰，并说明原因；已生效的标签 chip 显示选中态，菜单第一项变成“取消该标签筛选”。
+- 切换后保留原来的图片选择：新查询返回时的第一页如果包含它，滚动到它；不在第一页时用锚点游标（`useImageQuery.jumpTo`，游标 = 该行排序值 + id）取它所在的一页并把该行放到页首。取消标签会放宽结果，无法确认目标图仍在结果里，因此这种情况按常规清空选择；集合内顺序没有行字段可当游标，此时只保留选择、不强制跳转。
+- 筛选后选择不会因为 `selectionResetSignature` 变化被清空：`LibraryView` 用一个一次性标志把这次变化排除在外。
+
 ## 命令契约
 
 前端入口：`src/modules/library/api.ts`（`copy_text` 经 `src/shared/clipboard.ts`）。参数使用 camelCase。
@@ -180,9 +190,9 @@ src/modules/library/
   types.ts                  边界 DTO（含 FolderInfo）
   api.ts                    Tauri 命令入口 + 浏览器预览 mock
   mock.ts                   浏览器预览用的可变数据集与查询/编辑/文件夹实现
-  model.ts                  BrowseState、查询构造、排序选项、格式化、筛选键
+  model.ts                  BrowseState、查询构造、排序选项、格式化、筛选键、标签筛选换算
   useLibraryBrowse.ts       受控 BrowseState、浏览历史与返回
-  useImageQuery.ts          首屏/下一页、代次、查询与翻页状态类型、错误重试
+  useImageQuery.ts          首屏/下一页、代次、锚点跳转与就地替换行、查询与翻页状态类型、错误重试
   LibraryView.tsx           视图：搜索/排序/选择/键盘/右键菜单/面包屑
   LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
   ViewBar.tsx               全部/回收站标签、集合胶囊、集合管理入口、清空回收站
@@ -194,7 +204,7 @@ src/modules/library/
   VirtualList.tsx           固定行高虚拟列表（支持拖出图片 id）
   virtual.ts                两个虚拟视图共用的滚动句柄类型
   FilterPanel.tsx           范围与存在性筛选（不含文件夹分面）
-  Inspector.tsx             单张详情与批量编辑侧栏（文件夹选择器）
+  Inspector.tsx             单张详情与批量编辑侧栏（文件夹选择器、标签点击筛选菜单）
   CollectionDialogs.tsx     新建集合（预填名称 + 内容来源）、重命名、集合运算
   CollectionManagerDialog.tsx 集合重命名/删除/排序（不再管新建与运算）
   CollectionPickerDialog.tsx  把选中图片加入现有或新集合
@@ -252,8 +262,9 @@ src/modules/library/
 - `useImageQuery` 为每次首屏请求递增代次；过期结果直接丢弃，不覆盖新视图。
 - 翻页请求与首屏共享代次；筛选/排序/刷新变化后旧页不会追加到新结果。
 - 首屏失败显示整页错误与重试；翻页失败保留已加载页，在列表底部提供重试。
-- 排序变化会重新从第一页加载并清空滚动位置，但保留图片选择；搜索/筛选变化会清空选择。
+- 排序变化会重新从第一页加载并清空滚动位置，但保留图片选择；搜索/筛选变化会清空选择（按标签筛选除外，见上）。
 - 导入结束会递增 `refreshToken`，重新查询第一页并刷新图库计数；详情编辑递增本地 `dataVersion`。
+- 查看器保存编辑不重置查询：只按 `ViewerSessionUpdate` 就地替换已加载行的内容哈希/扩展名/体积/宽高/格式/alpha/`thumbVersion`（相似结果视图走 `SimilarityBrowseState.patchItem`），排序、滚动位置与深分页上下文都保留；分面计数与文件夹计数不随之刷新。
 - 切换图库时 `LibraryView` 以图库 id 为 key 重新挂载，避免复用上一库的筛选与选择。
 
 ## 性能

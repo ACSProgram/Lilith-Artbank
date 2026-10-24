@@ -24,6 +24,7 @@
 ```bash
 npm run typecheck        # tsc --noEmit
 npm run build            # tsc + vite build
+npm run test:web         # node --test：viewer 几何换算 + library 标签筛选换算
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -31,11 +32,12 @@ git diff --check
 ```
 
 - 前端改动至少跑 typecheck；涉及构建配置时跑 build。
+- 前端纯函数改动（几何换算、标签筛选范围、排序换算）跑 `npm run test:web`；它用 Node 的类型擦除直接跑 `src/**/model.test.ts`，不引入测试框架依赖。
 - Rust 改动至少跑 cargo check 与 cargo test。
 - 导入改动跑 `cargo test`：包含混合格式入库、精确重复、合并策略、取消一致性与 pack 缺失；性能门槛单独跑 `perf_import_1000`。
 - 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
-- 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端另跑 typecheck/build，查看器布局、缩放、裁剪拖拽映射与上下张由用户手工验收。
+- 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同时跑 `npm run test:web`（旋转/翻转对裁剪的映射、尺寸按新基底换算）与 typecheck/build，查看器布局、缩放、裁剪拖拽映射、撤销栈、胶片带与上下张由用户手工验收。
 - AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
 - 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
@@ -84,13 +86,14 @@ npm run tauri dev
 # 打开图库 → 导入图片/拖入图片 → 关闭导入弹窗 → 网格/列表 → 筛选 → 选择 → 复制路径
 ```
 
-S4 查看器的真实窗口验收：
+S4 查看器（含 P3 的撤销栈、体积预估、胶片带、全屏）的真实窗口验收：
 
 ```bash
 npm run tauri dev
-# 双击图片打开查看器 → 滚轮缩放/拖拽/双击/全屏 → ←/→ 或翻页 →
-# 旋转/翻转/裁剪/调尺寸 → 选择输出格式与质量 → 保存
-# 确认：原图文件替换、缩略图与查看器立即刷新、标签/评分/描述/集合保留、embedding/pose 清除
+# 双击图片打开查看器 → 滚轮缩放/拖拽/双击/全屏（F11、Esc 先退全屏）→ ←/→ 或翻页 →
+# 旋转/翻转/裁剪（先裁剪再旋转，确认选区跟着转）→ 调尺寸 → 撤销/重做 → 选择输出格式与质量
+# 确认：输出区显示“保存后约 xx（原 xx，-xx%）”；只改 JPEG 质量也能保存
+# 保存后：原图文件替换、缩略图与查看器立即刷新、网格不回到第一页、标签/评分/描述/集合保留
 # 右键“复制图片” → 粘贴到画图/聊天工具；大图与 EXIF 方向图确认显示与裁剪一致
 ```
 

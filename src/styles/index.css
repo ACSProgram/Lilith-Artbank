@@ -101,6 +101,11 @@ code {
   background: var(--bg);
 }
 
+/* 全屏时隐藏标题栏，查看器覆盖整个窗口。 */
+.app-frame.is-fullscreen {
+  --titlebar-h: 0px;
+}
+
 .app-body {
   flex: 1;
   min-height: 0;
@@ -2051,10 +2056,14 @@ textarea:focus-visible {
 }
 
 .context-menu-item em {
+  max-width: 150px;
   margin-left: auto;
+  overflow: hidden;
   color: var(--text-faint);
   font-style: normal;
   font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .context-menu-separator {
@@ -2518,11 +2527,14 @@ textarea:focus-visible {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+  max-height: 132px;
   margin-bottom: 6px;
+  overflow-y: auto;
 }
 
 .tag-chip {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 3px;
   padding: 2px 4px 2px 7px;
@@ -2531,6 +2543,7 @@ textarea:focus-visible {
   background: var(--accent-soft);
   color: var(--accent);
   font-size: 10px;
+  white-space: nowrap;
 }
 
 .tag-chip button {
@@ -2546,6 +2559,35 @@ textarea:focus-visible {
 
 .tag-chip button:hover {
   background: var(--accent-soft);
+}
+
+/* 标签名按钮：覆盖 `.tag-chip button` 的 15×15 图标尺寸，按文字宽度铺开。 */
+.tag-chip button.tag-chip-name {
+  width: auto;
+  height: auto;
+  display: inline-block;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.tag-chip button.tag-chip-name:hover {
+  background: transparent;
+  text-decoration: underline;
+}
+
+.tag-chip.is-filtering {
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.tag-chip.is-filtering button:hover {
+  background: var(--scrim-soft);
 }
 
 .tag-input-wrap {
@@ -3548,6 +3590,41 @@ textarea:focus-visible {
   background: var(--bg-soft);
 }
 
+.viewer-history-row {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px;
+}
+
+.viewer-history-row button {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid var(--control-border);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-history-row button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.viewer-history-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .viewer-tools-footer p {
   grid-column: 1 / -1;
   margin: 0;
@@ -3710,11 +3787,122 @@ textarea:focus-visible {
 }
 
 .viewer-canvas-wrap {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
   background: var(--canvas);
+}
+
+/* 姿势叠加面板：只在骨架显示时出现，控制整体不透明度。 */
+.viewer-pose-panel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 10px;
+  box-shadow: var(--shadow-sm);
+}
+
+.viewer-pose-panel label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-faint);
+}
+
+.viewer-pose-panel input[type="range"] {
+  width: 90px;
+  accent-color: var(--accent);
+}
+
+/* 胶片带：横向虚拟滚动，只渲染视口附近的缩略图。 */
+.viewer-filmstrip {
+  flex-shrink: 0;
+  height: 68px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-top: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.viewer-filmstrip-track {
+  position: relative;
+  height: 100%;
+}
+
+.viewer-filmstrip-item {
+  position: absolute;
+  top: 8px;
+  width: 46px;
+  height: 52px;
+  padding: 2px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--thumb-bg);
+}
+
+.viewer-filmstrip-item img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.viewer-filmstrip-item:hover {
+  border-color: var(--border-strong);
+}
+
+.viewer-filmstrip-item.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.viewer-filmstrip-index {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--scrim-strong);
+  color: var(--on-accent);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.viewer-filmstrip-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.viewer-filmstrip-toggle:hover {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+
+.viewer-filmstrip-toggle.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .viewer-canvas {
@@ -3784,6 +3972,27 @@ textarea:focus-visible {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+.pose-line {
+  stroke: var(--pose-line);
+}
+
+.pose-line-halo {
+  stroke: var(--pose-halo);
+}
+
+.pose-line.is-low,
+.pose-joint-group.is-low {
+  opacity: 0.55;
+}
+
+.pose-joint {
+  fill: var(--pose-joint);
+}
+
+.pose-joint-halo {
+  fill: var(--pose-halo);
 }
 
 .viewer-crop-rect {

@@ -7,6 +7,9 @@ export interface AppRuntime {
   appInfo: AppInfo | null;
   loading: boolean;
   busy: string | null;
+  fullscreen: boolean;
+  setFullscreen: (value: boolean) => Promise<boolean>;
+  toggleFullscreen: () => Promise<void>;
   createLibrary: (name: string, path: string) => Promise<LibraryInfo>;
   openLibrary: (path: string) => Promise<LibraryInfo>;
   closeLibrary: () => Promise<void>;

@@ -8,6 +8,7 @@ import type {
   SortSpec,
 } from "./types";
 import type { SimilarKind } from "../../shared/similarity";
+import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 
 /** 与 Rust `query::DEFAULT_LIMIT` 保持一致。 */
 export const PAGE_SIZE = 150;
@@ -44,6 +45,14 @@ export function sortOptionsFor(view: LibraryView): { key: SortKey; label: string
   return view === "collection"
     ? [{ key: "collectionPosition" as const, label: "集合内顺序" }, ...base]
     : base;
+}
+
+/** 集合内顺序只在集合视图有效，离开集合时退回默认排序。 */
+export function sortForView(view: LibraryView, sort: SortSpec): SortSpec {
+  if (view === "collection") {
+    return sort.key === "collectionPosition" ? sort : COLLECTION_SORT;
+  }
+  return sort.key === "collectionPosition" ? DEFAULT_SORT : sort;
 }
 
 export function emptyFilters(): LibraryFilters {
@@ -179,6 +188,95 @@ export function extensionLabel(extension: string): string {
   return extension.toUpperCase();
 }
 
+/** 当前单级排序的游标取值；集合内顺序没有行字段，返回 null 表示不跳转。 */
+export function sortValueForRow(row: ImageRow, key: SortKey): number | null {
+  switch (key) {
+    case "importedAt":
+      return row.importedAt;
+    case "score":
+      return row.score;
+    case "size":
+      return row.fileSize;
+    default:
+      return null;
+  }
+}
+
+export interface TagFilterRequest {
+  tagId: number;
+  action: TagFilterAction;
+  scope: TagFilterScope;
+  /** 当前集合；scope = collection 且为空时该范围不可用。 */
+  collectionId: number | null;
+}
+
+/**
+ * 按标签筛选后的浏览状态。`view` 范围保留当前条件；文件夹/集合/全库范围清空搜索与
+ * 其它筛选，只留下对应范围与这个标签。范围当前不可用时返回 `null`。
+ */
+export function tagFilterState(
+  state: BrowseState,
+  request: TagFilterRequest,
+): BrowseState | null {
+  const { tagId, action, scope, collectionId } = request;
+  const selected = state.filters.tagIds;
+
+  if (action === "remove") {
+    if (!selected.includes(tagId)) return state;
+    return {
+      ...state,
+      filters: { ...state.filters, tagIds: selected.filter((id) => id !== tagId) },
+    };
+  }
+  if (action === "append") {
+    const tagIds = selected.includes(tagId)
+      ? selected.filter((id) => id !== tagId)
+      : [...selected, tagId];
+    return { ...state, filters: { ...state.filters, tagIds } };
+  }
+  if (scope === "view") {
+    return { ...state, filters: { ...state.filters, tagIds: [tagId] } };
+  }
+  if (scope === "folder" && state.filters.folderIds.length === 0) return null;
+  if (scope === "collection" && collectionId == null) return null;
+
+  const view: LibraryView = scope === "collection" ? "collection" : "all";
+  return {
+    ...state,
+    view,
+    collectionId: view === "collection" ? collectionId : null,
+    search: "",
+    searchScope: "view",
+    sort: sortForView(view, state.sort),
+    filters: {
+      ...emptyFilters(),
+      folderIds: scope === "folder" ? state.filters.folderIds : [],
+      tagIds: [tagId],
+    },
+  };
+}
+
+/** 目标图是否落在标签筛选的新范围里；无法确认时按“不在”处理。 */
+export function rowInTagScope(
+  row: ImageRow,
+  scope: TagFilterScope,
+  context: { folderPaths: string[]; hasCollection: boolean; similarityActive: boolean },
+): boolean {
+  switch (scope) {
+    case "folder":
+      return context.folderPaths.some(
+        (path) =>
+          path === "" || row.folderPath === path || row.folderPath.startsWith(`${path}/`),
+      );
+    case "collection":
+      return context.hasCollection;
+    case "library":
+      return row.deletedAt == null;
+    case "view":
+      return !context.similarityActive;
+  }
+}
+
 export function selectionRange(items: ImageRow[], anchorId: number, targetId: number): Set<number> {
   const anchorIndex = items.findIndex((item) => item.id === anchorId);
   const targetIndex = items.findIndex((item) => item.id === targetId);
@@ -257,4 +355,5 @@ export interface SimilarityBrowseState {
   loadMore: () => void;
   retry: () => void;
   ids: () => Promise<number[]>;
+  patchItem: (imageId: number, update: Partial<ImageRow>) => void;
 }

@@ -166,6 +166,15 @@ export const appApi = {
     if (!isTauri()) return;
     return invoke<void>("window_close");
   },
+
+  async windowSetFullscreen(value: boolean): Promise<boolean> {
+    if (!isTauri()) {
+      if (value) await document.documentElement.requestFullscreen();
+      else if (document.fullscreenElement) await document.exitFullscreen();
+      return Boolean(document.fullscreenElement);
+    }
+    return invoke<boolean>("window_set_fullscreen", { value });
+  },
 };
 
 export const browserPreview = !isTauri();

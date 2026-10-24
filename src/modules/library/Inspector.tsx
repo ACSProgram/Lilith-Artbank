@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
+import { Popover } from "../../shared/components/Popover";
 import { Spinner } from "../../shared/components/Spinner";
 import { copyText } from "../../shared/clipboard";
 import { thumbnailUrl } from "../../shared/thumbUrl";
@@ -32,6 +33,7 @@ import {
   folderLabel,
 } from "./model";
 import type { ColorEntry, FolderInfo, ImageDetails } from "./types";
+import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import { errorMessage } from "../../shared/errors";
 
 interface InspectorPanelProps {
@@ -46,6 +48,13 @@ interface InspectorPanelProps {
   onTrash: (ids: number[]) => void;
   onRestore: (ids: number[]) => void;
   onDelete: (ids: number[]) => void;
+  /** 点击标签按选择的范围筛选；Ctrl/Cmd 点击直接在当前视图追加。 */
+  onFilterTag?: (tagId: number, action: TagFilterAction, scope: TagFilterScope) => void;
+  filterTagIds?: number[];
+  /** 当前侧栏选中的文件夹；为空表示“当前文件夹”范围不可用。 */
+  folderScopeLabel?: string | null;
+  /** 当前集合；为空表示“当前集合”范围不可用。 */
+  collectionScopeLabel?: string | null;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
 }
 
@@ -67,6 +76,10 @@ export function InspectorPanel({
   onTrash,
   onRestore,
   onDelete,
+  onFilterTag,
+  filterTagIds = [],
+  folderScopeLabel = null,
+  collectionScopeLabel = null,
   onGenerateDescription,
 }: InspectorPanelProps) {
   const single = selectedIds.length === 1 ? selectedIds[0] : null;
@@ -107,6 +120,10 @@ export function InspectorPanel({
           onTrash={() => onTrash([single])}
           onRestore={() => onRestore([single])}
           onDelete={() => onDelete([single])}
+          onFilterTag={onFilterTag}
+          filterTagIds={filterTagIds}
+          folderScopeLabel={folderScopeLabel}
+          collectionScopeLabel={collectionScopeLabel}
           onGenerateDescription={onGenerateDescription}
         />
       ) : (
@@ -137,6 +154,10 @@ interface ImageInspectorProps {
   onTrash: () => void;
   onRestore: () => void;
   onDelete: () => void;
+  onFilterTag?: (tagId: number, action: TagFilterAction, scope: TagFilterScope) => void;
+  filterTagIds: number[];
+  folderScopeLabel: string | null;
+  collectionScopeLabel: string | null;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
 }
 
@@ -151,9 +172,19 @@ function ImageInspector({
   onTrash,
   onRestore,
   onDelete,
+  onFilterTag,
+  filterTagIds,
+  folderScopeLabel,
+  collectionScopeLabel,
   onGenerateDescription,
 }: ImageInspectorProps) {
   const { notify } = useNotices();
+  const tagMenuAnchorRef = useRef<HTMLDivElement>(null);
+  const [tagMenu, setTagMenu] = useState<{
+    id: number;
+    name: string;
+    active: boolean;
+  } | null>(null);
   const [detail, setDetail] = useState<ImageDetails | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -165,6 +196,10 @@ function ImageInspector({
   const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+
+  useEffect(() => {
+    setTagMenu(null);
+  }, [imageId]);
 
   useEffect(() => {
     let disposed = false;
@@ -335,6 +370,12 @@ function ImageInspector({
     }
   };
 
+  const chooseTagFilter = (action: TagFilterAction, scope: TagFilterScope) => {
+    if (!tagMenu || !onFilterTag) return;
+    onFilterTag(tagMenu.id, action, scope);
+    setTagMenu(null);
+  };
+
   if (loading && !detail) {
     return (
       <div className="inspector-state">
@@ -414,22 +455,103 @@ function ImageInspector({
           </h4>
           <span>{detail.tags.length} 个</span>
         </div>
-        <div className="tag-chips">
-          {detail.tags.map((tag) => (
-            <span key={tag.id} className="tag-chip">
-              {tag.name}
-              <button
-                type="button"
-                aria-label={`移除标签 ${tag.name}`}
-                disabled={busy}
-                onClick={() => removeTag(tag.name)}
-              >
-                <X size={10} />
-              </button>
-            </span>
-          ))}
+        <div className="tag-chips" ref={tagMenuAnchorRef}>
+          {detail.tags.map((tag) => {
+            const active = filterTagIds.includes(tag.id);
+            return (
+              <span key={tag.id} className={`tag-chip${active ? " is-filtering" : ""}`}>
+                {onFilterTag ? (
+                  <button
+                    type="button"
+                    className="tag-chip-name"
+                    title={
+                      active
+                        ? "点击可改筛选范围或取消；Ctrl 点击取消该标签"
+                        : "点击选择筛选范围；Ctrl 点击直接叠加到当前视图"
+                    }
+                    onClick={(event) => {
+                      if (event.ctrlKey || event.metaKey) {
+                        onFilterTag(tag.id, "append", "view");
+                        return;
+                      }
+                      setTagMenu({ id: tag.id, name: tag.name, active });
+                    }}
+                  >
+                    {tag.name}
+                  </button>
+                ) : (
+                  <span className="tag-chip-name">{tag.name}</span>
+                )}
+                <button
+                  type="button"
+                  aria-label={`移除标签 ${tag.name}`}
+                  disabled={busy}
+                  onClick={() => removeTag(tag.name)}
+                >
+                  <X size={10} />
+                </button>
+              </span>
+            );
+          })}
           {detail.tags.length === 0 ? <span className="inspector-empty">还没有标签</span> : null}
         </div>
+        <Popover
+          open={tagMenu != null}
+          anchorRef={tagMenuAnchorRef}
+          onClose={() => setTagMenu(null)}
+          minWidth={220}
+        >
+          {tagMenu ? (
+            <>
+              <div className="menu-section-title">筛选「{tagMenu.name}」</div>
+              {tagMenu.active ? (
+                <button
+                  type="button"
+                  className="context-menu-item"
+                  onClick={() => chooseTagFilter("remove", "view")}
+                >
+                  取消该标签筛选
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => chooseTagFilter("apply", "view")}
+              >
+                在当前视图中筛选
+                <em>保留现有条件</em>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={!folderScopeLabel}
+                title={folderScopeLabel ?? "先在左侧选择一个文件夹"}
+                onClick={() => chooseTagFilter("apply", "folder")}
+              >
+                仅在当前文件夹中筛选
+                <em>{folderScopeLabel ?? "未选择文件夹"}</em>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={!collectionScopeLabel}
+                title={collectionScopeLabel ?? "当前不在集合视图"}
+                onClick={() => chooseTagFilter("apply", "collection")}
+              >
+                仅在当前集合中筛选
+                <em>{collectionScopeLabel ?? "当前不在集合"}</em>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => chooseTagFilter("apply", "library")}
+              >
+                在整个图库中筛选
+                <em>清除文件夹与集合</em>
+              </button>
+            </>
+          ) : null}
+        </Popover>
         <div className="tag-input-wrap">
           <input
             className="input"

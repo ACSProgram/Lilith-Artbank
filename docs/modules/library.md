@@ -112,7 +112,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - `readerConnections` 1-16；`workerThreads` 为空表示自动。
 - `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
-- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`sort` / `sortProfiles`（P4）、`viewerFilmstrip`（P3）仍只有校验，消费者随各自批次接入。
+- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` / `sortProfiles`（P4）仍只有校验，消费者随该批次接入。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
 
 ## 命令契约
@@ -161,13 +161,14 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `combine_collections` | `{ mode, collectionIds, name }` | `CollectionInfo` |
 | `get_viewer_source` | `{ imageId }` | `ViewerSource` |
 | `save_image_edit` | `{ request }` | `EditResult` |
+| `estimate_edit_size` | `{ request }` | `EditSizeEstimate`（`fileSize`、`exact`） |
 | `get_image_pose` | `{ imageId }` | `PoseData \| null`（feature pack） |
 | `copy_image` | `{ imageId }` | `null` |
 | `get_image_capabilities` | `{ imageIds }` | `ImageCapabilities[]`（pose / embedding / colors / phash） |
 | `get_feature_summary` | — | `FeatureSummary`（全库描述 / embedding / 姿势 / pHash / 主色数量） |
 | `start_batch_task` / `list_tasks` / `cancel_task` | 见 [AI 服务](ai-service.md) | 统一任务入口、任务列表与取消；事件 `task-progress` / `task-finished` |
 | AI 命令（status/ensure/任务/描述/pose/语义搜索） | 见 [AI 服务](ai-service.md) | — |
-| `window_toggle_fullscreen` | — | `boolean` |
+| `window_set_fullscreen` | `{ value }` | `boolean`（写入后回读的真实状态） |
 | `copy_text` | `{ text }` | `null` |
 | `window_minimize` / `window_toggle_maximize` / `window_is_maximized` / `window_close` | — | 窗口控制 |
 | `get_app_info` | — | `{ version, settingsPath, logPath }` |
@@ -219,7 +220,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v3（含 v1→v2→v3 迁移）、连接池、设置 v3（含 v1→v2→v3 迁移）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹与路径校验；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板、窗口全屏；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v3（含 v1→v2→v3 迁移）、连接池、设置 v3（含 v1→v2→v3 迁移）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹与路径校验；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）、体验整改 P3–P4（见 [迁移后体验整改计划](../planning/2026-10-24-体验整改计划.md)）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 

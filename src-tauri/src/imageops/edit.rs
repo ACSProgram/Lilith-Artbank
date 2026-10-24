@@ -211,9 +211,16 @@ fn validate_resize(resize: ResizeSpec) -> AppResult<()> {
     Ok(())
 }
 
-/// 是否真的需要写新内容；仅调整质量或重新编码不算修改。
-pub fn has_changes(geometry: &Geometry, original_format: &str, output: OutputFormat) -> bool {
-    !geometry.is_empty() || source_format(original_format) != Some(output)
+/// 是否真的需要写新内容；有损格式调整到非默认质量也算一次修改。
+pub fn has_changes(
+    geometry: &Geometry,
+    original_format: &str,
+    output: OutputFormat,
+    quality: u8,
+) -> bool {
+    !geometry.is_empty()
+        || source_format(original_format) != Some(output)
+        || (output != OutputFormat::Png && quality != DEFAULT_QUALITY)
 }
 
 /// 原图本身可直接对应的输出格式；GIF/TIFF/TGA/BMP 等需要转换。
@@ -361,6 +368,37 @@ mod tests {
         assert_eq!(rgb(&result, 2, 1), [30, 20, 7]);
     }
 
+    /// 前端“裁剪 → 旋转 → 水平翻转”会把裁剪矩形一起变换；这里验证等价于
+    /// “先旋转整图、再做显示空间水平翻转、最后裁同一块”。
+    #[test]
+    fn composed_rotate_then_flip_matches_display_sequence() {
+        let mut image = RgbImage::new(6, 4);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([x as u8 * 20, y as u8 * 30, 11]);
+        }
+        let source = DynamicImage::ImageRgb8(image);
+
+        // 初始裁剪 (1,1,3,2) → 顺时针 90° 后 (1,1,2,3) → 显示空间水平翻转后 (1,1,2,3)。
+        let geometry = Geometry {
+            rotate: 1,
+            flip_vertical: true,
+            crop: Some(CropRect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 3,
+            }),
+            ..Geometry::default()
+        };
+
+        let actual = apply(source.clone(), &geometry).unwrap().to_rgb8();
+        let rotated = image::imageops::rotate90(&source.to_rgb8());
+        let flipped = image::imageops::flip_horizontal(&rotated);
+        let expected = image::imageops::crop_imm(&flipped, 1, 1, 2, 3).to_image();
+        assert_eq!(actual.dimensions(), expected.dimensions());
+        assert_eq!(actual.as_raw(), expected.as_raw());
+    }
+
     #[test]
     fn resizes_after_cropping() {
         let mut image = RgbImage::new(4, 2);
@@ -459,19 +497,24 @@ mod tests {
     #[test]
     fn detects_changes() {
         let geometry = Geometry::default();
-        assert!(!has_changes(&geometry, "jpeg", OutputFormat::Jpeg));
-        assert!(has_changes(&geometry, "png", OutputFormat::Jpeg));
+        assert!(!has_changes(&geometry, "jpeg", OutputFormat::Jpeg, 90));
+        assert!(has_changes(&geometry, "png", OutputFormat::Jpeg, 90));
         // GIF 没有可直接沿用的输出格式，任何输出都算一次转换。
-        assert!(has_changes(&geometry, "gif", OutputFormat::Jpeg));
-        assert!(has_changes(&geometry, "gif", OutputFormat::WebP));
+        assert!(has_changes(&geometry, "gif", OutputFormat::Jpeg, 90));
+        assert!(has_changes(&geometry, "gif", OutputFormat::WebP, 90));
         assert!(has_changes(
             &Geometry {
                 rotate: 1,
                 ..Geometry::default()
             },
             "jpeg",
-            OutputFormat::Jpeg
+            OutputFormat::Jpeg,
+            90
         ));
+        // 有损格式只改质量也要能保存；PNG 的质量参数没有意义。
+        assert!(has_changes(&geometry, "jpeg", OutputFormat::Jpeg, 60));
+        assert!(has_changes(&geometry, "webp", OutputFormat::WebP, 60));
+        assert!(!has_changes(&geometry, "png", OutputFormat::Png, 60));
     }
 
     #[test]

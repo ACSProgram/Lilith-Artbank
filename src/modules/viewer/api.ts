@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { imageUrl } from "../../shared/imgUrl";
 import type {
+  EditSizeEstimate,
   PoseData,
   SaveEditRequest,
   SaveEditResult,
@@ -61,6 +62,11 @@ export const viewerApi = {
     return invoke<SaveEditResult>("save_image_edit", { request });
   },
 
+  async estimateEditSize(request: SaveEditRequest): Promise<EditSizeEstimate> {
+    if (!isTauri()) return { fileSize: 0, exact: false };
+    return invoke<EditSizeEstimate>("estimate_edit_size", { request });
+  },
+
   async copyImage(imageId: number): Promise<void> {
     if (!isTauri()) {
       throw new Error("浏览器预览无法复制图片到剪贴板");
@@ -71,18 +77,6 @@ export const viewerApi = {
   async getImagePose(imageId: number): Promise<PoseData | null> {
     if (!isTauri()) return null;
     return invoke<PoseData | null>("get_image_pose", { imageId });
-  },
-
-  async toggleFullscreen(): Promise<boolean> {
-    if (!isTauri()) {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen();
-        return false;
-      }
-      await document.documentElement.requestFullscreen();
-      return true;
-    }
-    return invoke<boolean>("window_toggle_fullscreen");
   },
 };
 
