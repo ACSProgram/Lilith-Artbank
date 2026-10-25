@@ -114,11 +114,7 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
     }
 }
 
-pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i64>> {
-    ensure_tags_tracked(connection, tags, &mut Vec::new())
-}
-
-/// 与 `ensure_tags` 相同，但把本次真正新建的标签 `(id, name)` 追加到 `created`。
+/// 确保标签存在，并把本次真正新建的标签 `(id, name)` 追加到 `created`。
 pub fn ensure_tags_tracked(
     connection: &Connection,
     tags: &[String],
@@ -302,7 +298,11 @@ mod tests {
             .db
             .with_writer(|connection| {
                 let folder = ensure_folder(connection, "人物", 1)?;
-                let tags = ensure_tags(connection, &["速写".into(), "参考".into()])?;
+                let tags = ensure_tags_tracked(
+                    connection,
+                    &["速写".into(), "参考".into()],
+                    &mut Vec::new(),
+                )?;
                 let id = insert_image(
                     connection,
                     folder,
@@ -339,7 +339,11 @@ mod tests {
         session
             .db
             .with_writer(|connection| {
-                let tags = ensure_tags(connection, &["速写".into(), "新标签".into()])?;
+                let tags = ensure_tags_tracked(
+                    connection,
+                    &["速写".into(), "新标签".into()],
+                    &mut Vec::new(),
+                )?;
                 assert!(
                     insert_image(
                         connection,

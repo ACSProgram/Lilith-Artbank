@@ -23,9 +23,20 @@ import { formatBytes } from "../../shared/format";
 import { libraryApi } from "./api";
 import type { HistoryEntry, HistoryPage } from "./types";
 
-// 文件夹记录按“项”计，其余（导入、移动、集合）按图片计。
+// 文件夹、集合结构与标签改名的记录按“项”计，其余（导入、移动、图片元数据）按图片计。
+const ITEM_KINDS = new Set([
+  "collectionCreate",
+  "collectionRename",
+  "collectionReorder",
+  "tagRename",
+]);
+
 function affectedUnit(kinds: string[]): string {
-  return kinds.some((kind) => kind.startsWith("folder")) ? "项" : "张";
+  return kinds.every(
+    (kind) => kind.startsWith("folder") || ITEM_KINDS.has(kind),
+  )
+    ? "项"
+    : "张";
 }
 
 function isRedoStatus(entry: HistoryEntry): boolean {

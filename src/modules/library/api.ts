@@ -7,6 +7,7 @@ import {
   mockCollections,
   mockCombineCollections,
   mockCreateCollection,
+  mockCreateCollectionsFromGroups,
   mockCreateFolder,
   mockDeleteCollection,
   mockDeleteFolder,
@@ -266,6 +267,17 @@ export const libraryApi = {
   ): Promise<CollectionInfo> {
     if (!isTauri()) return mockCombineCollections(mode, collectionIds, name);
     return invoke<CollectionInfo>("combine_collections", { mode, collectionIds, name });
+  },
+
+  async createCollectionsFromGroups(
+    groups: number[][],
+    baseName: string,
+  ): Promise<CollectionInfo[]> {
+    if (!isTauri()) return mockCreateCollectionsFromGroups(groups, baseName);
+    return invoke<CollectionInfo[]>("create_collections_from_groups", {
+      groups,
+      baseName,
+    });
   },
 
   async getImageCapabilities(imageIds: number[]): Promise<ImageCapabilities[]> {

@@ -10,12 +10,13 @@ use std::{
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::{
     app::{
         error::{AppError, AppResult},
         settings::AiSettings,
+        state::AppState,
         tasks::{
             ConflictPolicy, LaneGuard, TaskBus, TaskHandle, TaskKind, TaskPhase, TaskScope,
             TaskStartResult,
@@ -34,7 +35,7 @@ use crate::{
 use super::{
     client::{AiClient, Health},
     embedding,
-    job::{self, AiJobRequest, JobContext},
+    job::{self, AiJobKind, AiJobRequest, JobContext},
     pack::FeatureStore,
     pose,
     process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus, launch_spec},
@@ -490,6 +491,7 @@ impl AiRuntime {
             store: self.inner.store.clone(),
             settings: settings.clone(),
         };
+        let writes_history = request.kind == AiJobKind::Description;
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             request.kind.task_kind(),
@@ -498,6 +500,7 @@ impl AiRuntime {
         let worker_handle = handle.clone();
         let runtime = self.clone();
         let bus_worker = bus.clone();
+        let state_app = app.clone();
         bus.launch(app, handle, policy, move |guard| {
             let name = format!("ai-job-{}", worker_handle.id());
             let task = worker_handle.clone();
@@ -512,6 +515,10 @@ impl AiRuntime {
                     Err(_) => Err(AppError::message("AI 任务异常终止")),
                 };
                 task.finish_from(&result);
+                // 只有描述任务会产生操作记录：收尾后按最大步数裁剪并安排释放。
+                if writes_history && let Some(state) = state_app.try_state::<AppState>() {
+                    state.after_history_write();
+                }
                 *runtime.inner.results.lock() = None;
             });
         })

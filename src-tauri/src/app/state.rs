@@ -527,6 +527,15 @@ impl AppState {
         self.mutate(|| collections::combine(&database, mode, collection_ids, name))
     }
 
+    pub fn create_collections_from_groups(
+        &self,
+        groups: &[Vec<i64>],
+        base_name: &str,
+    ) -> AppResult<Vec<CollectionInfo>> {
+        let (database, _) = self.query_source()?;
+        self.mutate(|| collections::create_groups(&database, groups, base_name))
+    }
+
     pub fn history_page(&self) -> AppResult<HistoryPage> {
         let (database, _) = self.query_source()?;
         let entries = history::list(&database)?;

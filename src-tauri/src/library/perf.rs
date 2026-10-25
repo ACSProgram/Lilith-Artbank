@@ -756,6 +756,101 @@ fn perf_metadata_200k() {
     );
 }
 
+#[test]
+#[ignore = "20 万行操作记录与待释放基准；用 cargo test --lib -- --ignored --nocapture perf_history_200k 运行"]
+fn perf_history_200k() {
+    use crate::library::{NoopReporter, history};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("perf-history-library");
+    let (session, _manifest) = service::create(&root, "历史基准", 4).expect("create library");
+    let database = session.db;
+
+    let seed_start = Instant::now();
+    database.with_writer(seed).expect("seed database");
+    println!(
+        "[perf] history seed {IMAGE_COUNT} images: {:.2}s",
+        seed_start.elapsed().as_secs_f64()
+    );
+
+    let record_start = Instant::now();
+    database
+        .with_writer(|connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO operations(kind, label, created_at, status, affected, error)
+                     VALUES ('score', '评分', ?1, 'applied', 1, '')",
+                )?;
+                for index in 0..500_i64 {
+                    statement.execute([index])?;
+                    transaction.execute(
+                        "INSERT INTO operation_chunks(operation_id, seq, format, data)
+                         VALUES (?1, 0, 'triples', zeroblob(24))",
+                        [transaction.last_insert_rowid()],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .expect("seed operations");
+    println!(
+        "[perf] insert 500 operations + chunks: {:.2}ms",
+        ms(record_start.elapsed())
+    );
+
+    let list_start = Instant::now();
+    let entries = history::list(&database).expect("history list");
+    println!(
+        "[perf] history list ({} entries): {:.2}ms",
+        entries.len(),
+        ms(list_start.elapsed())
+    );
+
+    let trim_start = Instant::now();
+    let evicted = history::trim(&database, 100).expect("trim history");
+    println!(
+        "[perf] trim 500 -> 100 ({} evicted): {:.2}ms",
+        evicted.len(),
+        ms(trim_start.elapsed())
+    );
+
+    let mark_start = Instant::now();
+    database
+        .with_writer(|connection| {
+            connection.execute(
+                "UPDATE images SET deleted_at = 1, purge_operation_id = 500",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("mark purge");
+    println!(
+        "[perf] mark {IMAGE_COUNT} rows for purge: {:.2}ms",
+        ms(mark_start.elapsed())
+    );
+
+    let pending_start = Instant::now();
+    let (count, bytes) = history::pending_summary(&database).expect("pending summary");
+    println!(
+        "[perf] pending summary ({} rows, {} bytes): {:.2}ms",
+        count,
+        bytes,
+        ms(pending_start.elapsed())
+    );
+
+    let release_start = Instant::now();
+    let report =
+        crate::library::metadata::purge_by_operation(&database, &root, &[500], &NoopReporter)
+            .expect("purge rows");
+    println!(
+        "[perf] release {} rows without files: {:.2}ms",
+        report.deleted,
+        ms(release_start.elapsed())
+    );
+}
+
 fn folder_id(database: &crate::library::db::LibraryDb, path: &str) -> i64 {
     database
         .with_reader(|connection| {

@@ -5,7 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::{db::LibraryDb, placeholders, service::now_ms},
+    library::{
+        db::LibraryDb,
+        history::{
+            self, CollectionItemsRecord, CollectionOrderState, CollectionRenameRecord,
+            CollectionReorderRecord, CollectionSnapshot, HistoryKind, NewOperation,
+        },
+        placeholders,
+        service::now_ms,
+    },
 };
 
 const SQL_CHUNK: usize = 400;
@@ -59,122 +67,186 @@ pub fn list(database: &LibraryDb) -> AppResult<Vec<CollectionInfo>> {
 
 pub fn create(database: &LibraryDb, name: &str) -> AppResult<CollectionInfo> {
     let name = validate_name(name)?;
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        ensure_unique_name(&transaction, &name, None)?;
-        let sort_order: i64 = transaction.query_row(
-            "SELECT coalesce(max(sort_order), -1) + 1 FROM collections",
-            [],
-            |row| row.get(0),
-        )?;
-        let now = now_ms();
-        transaction.execute(
-            "INSERT INTO collections(name, sort_order, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)",
-            params![name, sort_order, now],
-        )?;
-        let id = transaction.last_insert_rowid();
-        transaction.commit()?;
-        Ok(CollectionInfo {
-            id,
-            name,
-            sort_order,
-            image_count: 0,
-            created_at: now,
-            updated_at: now,
-        })
-    })
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::CollectionCreate, format!("创建集合「{name}」")),
+        |transaction, draft| {
+            ensure_unique_name(transaction, &name, None)?;
+            let sort_order = next_sort_order(transaction)?;
+            let now = now_ms();
+            transaction.execute(
+                "INSERT INTO collections(name, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                params![name, sort_order, now],
+            )?;
+            let id = transaction.last_insert_rowid();
+            draft.json(&CollectionSnapshot {
+                id,
+                name: name.clone(),
+                sort_order,
+                created_at: now,
+                updated_at: now,
+                items: Vec::new(),
+            })?;
+            draft.affected(1);
+            Ok(CollectionInfo {
+                id,
+                name: name.clone(),
+                sort_order,
+                image_count: 0,
+                created_at: now,
+                updated_at: now,
+            })
+        },
+    )
 }
 
 pub fn rename(database: &LibraryDb, collection_id: i64, name: &str) -> AppResult<()> {
     validate_id(collection_id)?;
     let name = validate_name(name)?;
-    database.with_writer(|connection| {
-        ensure_unique_name(connection, &name, Some(collection_id))?;
-        let changed = connection.execute(
-            "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
-            params![name, now_ms(), collection_id],
-        )?;
-        if changed == 0 {
-            return Err(AppError::message("集合不存在"));
-        }
-        Ok(())
-    })
+    history::write(
+        database,
+        NewOperation::new(
+            HistoryKind::CollectionRename,
+            format!("重命名集合「{name}」"),
+        ),
+        |transaction, draft| {
+            ensure_unique_name(transaction, &name, Some(collection_id))?;
+            let old: Option<(String, i64)> = transaction
+                .query_row(
+                    "SELECT name, updated_at FROM collections WHERE id = ?1",
+                    [collection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((old_name, old_updated_at)) = old else {
+                return Err(AppError::message("集合不存在"));
+            };
+            if old_name == name {
+                return Ok(());
+            }
+            transaction.execute(
+                "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                params![name, now_ms(), collection_id],
+            )?;
+            draft.json(&CollectionRenameRecord {
+                id: collection_id,
+                old_name,
+                old_updated_at,
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )
 }
 
 pub fn delete(database: &LibraryDb, collection_id: i64) -> AppResult<u64> {
     validate_id(collection_id)?;
-    database.with_writer(|connection| {
-        let items: i64 = connection.query_row(
-            "SELECT count(*) FROM collection_items WHERE collection_id = ?1",
-            [collection_id],
-            |row| row.get(0),
-        )?;
-        let changed =
-            connection.execute("DELETE FROM collections WHERE id = ?1", [collection_id])?;
-        if changed == 0 {
-            return Err(AppError::message("集合不存在"));
-        }
-        Ok(items as u64)
-    })
+    let name = collection_name(database, collection_id)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::CollectionDelete, format!("删除集合「{name}」")),
+        |transaction, draft| {
+            let snapshot = history::collection_snapshot(transaction, collection_id)?
+                .ok_or_else(|| AppError::message("集合不存在"))?;
+            transaction.execute("DELETE FROM collections WHERE id = ?1", [collection_id])?;
+            let affected = snapshot.items.len() as u64;
+            draft.json(&snapshot)?;
+            draft.affected(affected);
+            Ok(affected)
+        },
+    )
 }
 
 pub fn reorder(database: &LibraryDb, collection_ids: &[i64]) -> AppResult<()> {
     let ids = validate_ids(collection_ids, 10_000)?;
-    database.with_writer(|connection| {
-        let existing: HashSet<i64> = connection
-            .prepare("SELECT id FROM collections")?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<HashSet<_>>>()?;
-        if existing.len() != ids.len() || !ids.iter().all(|id| existing.contains(id)) {
-            return Err(AppError::message("排序必须包含全部集合"));
-        }
-        let transaction = connection.transaction()?;
-        let now = now_ms();
-        for (index, id) in ids.iter().enumerate() {
-            transaction.execute(
-                "UPDATE collections SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
-                params![index as i64, now, id],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    })
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::CollectionReorder, "调整集合顺序"),
+        |transaction, draft| {
+            let existing: HashSet<i64> = transaction
+                .prepare("SELECT id FROM collections")?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            if existing.len() != ids.len() || !ids.iter().all(|id| existing.contains(id)) {
+                return Err(AppError::message("排序必须包含全部集合"));
+            }
+            let now = now_ms();
+            let mut rows = Vec::with_capacity(ids.len());
+            for (index, id) in ids.iter().enumerate() {
+                let (old_sort_order, old_updated_at): (i64, i64) = transaction.query_row(
+                    "SELECT sort_order, updated_at FROM collections WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                rows.push(CollectionOrderState {
+                    id: *id,
+                    sort_order: old_sort_order,
+                    updated_at: old_updated_at,
+                });
+                transaction.execute(
+                    "UPDATE collections SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![index as i64, now, id],
+                )?;
+            }
+            draft.json(&CollectionReorderRecord { rows })?;
+            draft.affected(ids.len() as u64);
+            Ok(())
+        },
+    )
 }
 
 pub fn add_images(database: &LibraryDb, collection_id: i64, image_ids: &[i64]) -> AppResult<u64> {
     validate_id(collection_id)?;
     let ids = validate_ids(image_ids, MAX_IMAGES)?;
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        ensure_collection(&transaction, collection_id)?;
-        let mut position: i64 = transaction.query_row(
-            "SELECT coalesce(max(position), -1) + 1 FROM collection_items WHERE collection_id = ?1",
-            [collection_id],
-            |row| row.get(0),
-        )?;
-        let mut added = 0_u64;
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO collection_items(collection_id, image_id, position)
-                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
-                 ON CONFLICT(collection_id, image_id) DO NOTHING",
+    let name = collection_name(database, collection_id)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::CollectionAdd, format!("加入集合「{name}」")),
+        |transaction, draft| {
+            ensure_collection(transaction, collection_id)?;
+            let old_updated_at: i64 = transaction.query_row(
+                "SELECT updated_at FROM collections WHERE id = ?1",
+                [collection_id],
+                |row| row.get(0),
             )?;
-            for image_id in ids {
-                let changed = statement.execute(params![collection_id, image_id, position])?;
-                position += 1;
-                added += changed as u64;
+            let mut position: i64 = transaction.query_row(
+                "SELECT coalesce(max(position), -1) + 1 FROM collection_items
+                 WHERE collection_id = ?1",
+                [collection_id],
+                |row| row.get(0),
+            )?;
+            let mut items = Vec::new();
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO collection_items(collection_id, image_id, position)
+                     SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                     ON CONFLICT(collection_id, image_id) DO NOTHING",
+                )?;
+                for image_id in &ids {
+                    let changed = statement.execute(params![collection_id, image_id, position])?;
+                    if changed > 0 {
+                        items.push((*image_id, position));
+                    }
+                    position += 1;
+                }
             }
-        }
-        if added > 0 {
+            if items.is_empty() {
+                return Ok(0);
+            }
             transaction.execute(
                 "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
                 params![now_ms(), collection_id],
             )?;
-        }
-        transaction.commit()?;
-        Ok(added)
-    })
+            draft.json(&CollectionItemsRecord {
+                collection_id,
+                items: items.clone(),
+                old_updated_at,
+            })?;
+            draft.affected(items.len() as u64);
+            Ok(items.len() as u64)
+        },
+    )
 }
 
 pub fn remove_images(
@@ -184,32 +256,66 @@ pub fn remove_images(
 ) -> AppResult<u64> {
     validate_id(collection_id)?;
     let ids = validate_ids(image_ids, MAX_IMAGES)?;
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        ensure_collection(&transaction, collection_id)?;
-        let mut removed = 0_u64;
-        for chunk in ids.chunks(SQL_CHUNK) {
-            let marks = placeholders(chunk.len());
-            removed += transaction.execute(
-                &format!(
-                    "DELETE FROM collection_items
-                     WHERE collection_id = ?1 AND image_id IN ({marks})"
-                ),
-                params_from_iter(
-                    std::iter::once(Value::Integer(collection_id))
-                        .chain(chunk.iter().map(|id| Value::Integer(*id))),
-                ),
-            )? as u64;
-        }
-        if removed > 0 {
+    let name = collection_name(database, collection_id)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::CollectionRemove, format!("移出集合「{name}」")),
+        |transaction, draft| {
+            ensure_collection(transaction, collection_id)?;
+            let old_updated_at: i64 = transaction.query_row(
+                "SELECT updated_at FROM collections WHERE id = ?1",
+                [collection_id],
+                |row| row.get(0),
+            )?;
+            let mut items = Vec::new();
+            for chunk in ids.chunks(SQL_CHUNK) {
+                let marks = placeholders(chunk.len());
+                let present: Vec<(i64, i64)> = {
+                    let mut statement = transaction.prepare(&format!(
+                        "SELECT image_id, position FROM collection_items
+                         WHERE collection_id = ?1 AND image_id IN ({marks})"
+                    ))?;
+                    statement
+                        .query_map(
+                            params_from_iter(
+                                std::iter::once(Value::Integer(collection_id))
+                                    .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                            ),
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if present.is_empty() {
+                    continue;
+                }
+                transaction.execute(
+                    &format!(
+                        "DELETE FROM collection_items
+                         WHERE collection_id = ?1 AND image_id IN ({marks})"
+                    ),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(collection_id))
+                            .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                    ),
+                )?;
+                items.extend(present);
+            }
+            if items.is_empty() {
+                return Ok(0);
+            }
             transaction.execute(
                 "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
                 params![now_ms(), collection_id],
             )?;
-        }
-        transaction.commit()?;
-        Ok(removed)
-    })
+            draft.json(&CollectionItemsRecord {
+                collection_id,
+                items: items.clone(),
+                old_updated_at,
+            })?;
+            draft.affected(items.len() as u64);
+            Ok(items.len() as u64)
+        },
+    )
 }
 
 pub fn combine(
@@ -223,63 +329,211 @@ pub fn combine(
         return Err(AppError::message("集合运算至少需要两个集合"));
     }
     let name = validate_name(name)?;
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        ensure_unique_name(&transaction, &name, None)?;
+    let mode_label = match mode {
+        CombineMode::Union => "并集",
+        CombineMode::Intersection => "交集",
+        CombineMode::Difference => "差集",
+    };
+    history::write(
+        database,
+        NewOperation::new(
+            HistoryKind::CollectionCombine,
+            format!("集合{mode_label}「{name}」"),
+        ),
+        |transaction, draft| {
+            ensure_unique_name(transaction, &name, None)?;
 
-        let mut lists = Vec::with_capacity(ids.len());
-        for collection_id in &ids {
-            ensure_collection(&transaction, *collection_id)?;
-            let mut statement = transaction.prepare(
-                "SELECT image_id FROM collection_items
-                 WHERE collection_id = ?1 ORDER BY position, image_id",
-            )?;
-            lists.push(
-                statement
-                    .query_map([collection_id], |row| row.get::<_, i64>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
-
-        let combined = combine_ids(mode, &lists);
-        let sort_order: i64 = transaction.query_row(
-            "SELECT coalesce(max(sort_order), -1) + 1 FROM collections",
-            [],
-            |row| row.get(0),
-        )?;
-        let now = now_ms();
-        transaction.execute(
-            "INSERT INTO collections(name, sort_order, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)",
-            params![name, sort_order, now],
-        )?;
-        let collection_id = transaction.last_insert_rowid();
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO collection_items(collection_id, image_id, position)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for (position, image_id) in combined.iter().enumerate() {
-                statement.execute(params![collection_id, image_id, position as i64])?;
+            let mut lists = Vec::with_capacity(ids.len());
+            for collection_id in &ids {
+                ensure_collection(transaction, *collection_id)?;
+                let mut statement = transaction.prepare(
+                    "SELECT image_id FROM collection_items
+                     WHERE collection_id = ?1 ORDER BY position, image_id",
+                )?;
+                lists.push(
+                    statement
+                        .query_map([collection_id], |row| row.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
             }
-        }
-        // imageCount 与 list() 保持同一口径：只统计未删除图片。
-        let image_count: i64 = transaction.query_row(
-            "SELECT count(*) FROM collection_items
-             JOIN images ON images.id = collection_items.image_id
-             WHERE collection_items.collection_id = ?1 AND images.deleted_at IS NULL",
-            [collection_id],
-            |row| row.get(0),
-        )?;
-        transaction.commit()?;
-        Ok(CollectionInfo {
-            id: collection_id,
-            name,
-            sort_order,
-            image_count: image_count.max(0) as u64,
-            created_at: now,
-            updated_at: now,
-        })
+
+            let combined = combine_ids(mode, &lists);
+            let sort_order = next_sort_order(transaction)?;
+            let now = now_ms();
+            transaction.execute(
+                "INSERT INTO collections(name, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                params![name, sort_order, now],
+            )?;
+            let collection_id = transaction.last_insert_rowid();
+            let items: Vec<(i64, i64)> = combined
+                .iter()
+                .enumerate()
+                .map(|(position, image_id)| (*image_id, position as i64))
+                .collect();
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO collection_items(collection_id, image_id, position)
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for (image_id, position) in &items {
+                    statement.execute(params![collection_id, image_id, position])?;
+                }
+            }
+            draft.json(&CollectionSnapshot {
+                id: collection_id,
+                name: name.clone(),
+                sort_order,
+                created_at: now,
+                updated_at: now,
+                items: items.clone(),
+            })?;
+            draft.affected(items.len() as u64);
+            // imageCount 与 list() 保持同一口径：只统计未删除图片。
+            let image_count: i64 = transaction.query_row(
+                "SELECT count(*) FROM collection_items
+                 JOIN images ON images.id = collection_items.image_id
+                 WHERE collection_items.collection_id = ?1 AND images.deleted_at IS NULL",
+                [collection_id],
+                |row| row.get(0),
+            )?;
+            Ok(CollectionInfo {
+                id: collection_id,
+                name: name.clone(),
+                sort_order,
+                image_count: image_count.max(0) as u64,
+                created_at: now,
+                updated_at: now,
+            })
+        },
+    )
+}
+
+/// 相似分组保存：一次事务创建全部集合，只记一条历史。
+pub fn create_groups(
+    database: &LibraryDb,
+    groups: &[Vec<i64>],
+    base_name: &str,
+) -> AppResult<Vec<CollectionInfo>> {
+    let base_name = base_name.trim();
+    let base_name = if base_name.is_empty() {
+        "相似组".to_owned()
+    } else {
+        base_name.to_owned()
+    };
+    validate_name(&base_name)?;
+    let groups: Vec<Vec<i64>> = groups
+        .iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| validate_ids(group, MAX_IMAGES))
+        .collect::<AppResult<Vec<_>>>()?;
+    if groups.is_empty() {
+        return Err(AppError::message("没有可保存的分组"));
+    }
+    history::write(
+        database,
+        NewOperation::new(
+            HistoryKind::SimilarityGroups,
+            format!("保存 {} 个相似组为集合", groups.len()),
+        ),
+        |transaction, draft| {
+            let mut used: HashSet<String> = transaction
+                .prepare("SELECT name FROM collections")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?
+                .into_iter()
+                .map(|name| name.to_lowercase())
+                .collect();
+            let mut sort_order = next_sort_order(transaction)?;
+            let now = now_ms();
+            let mut snapshots = Vec::new();
+            let mut infos = Vec::new();
+            let mut affected = 0_u64;
+            for group in &groups {
+                let name = unique_name(&mut used, &base_name, infos.len());
+                transaction.execute(
+                    "INSERT INTO collections(name, sort_order, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?3)",
+                    params![name, sort_order, now],
+                )?;
+                let collection_id = transaction.last_insert_rowid();
+                let mut items = Vec::new();
+                {
+                    let mut statement = transaction.prepare(
+                        "INSERT INTO collection_items(collection_id, image_id, position)
+                         SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                         ON CONFLICT(collection_id, image_id) DO NOTHING",
+                    )?;
+                    for image_id in group {
+                        let position = items.len() as i64;
+                        if statement.execute(params![collection_id, image_id, position])? > 0 {
+                            items.push((*image_id, position));
+                        }
+                    }
+                }
+                if items.is_empty() {
+                    transaction
+                        .execute("DELETE FROM collections WHERE id = ?1", [collection_id])?;
+                    continue;
+                }
+                affected += items.len() as u64;
+                snapshots.push(CollectionSnapshot {
+                    id: collection_id,
+                    name: name.clone(),
+                    sort_order,
+                    created_at: now,
+                    updated_at: now,
+                    items: items.clone(),
+                });
+                infos.push(CollectionInfo {
+                    id: collection_id,
+                    name,
+                    sort_order,
+                    image_count: items.len() as u64,
+                    created_at: now,
+                    updated_at: now,
+                });
+                sort_order += 1;
+            }
+            if snapshots.is_empty() {
+                return Err(AppError::message("分组里的图片都已不存在"));
+            }
+            draft.json(&snapshots)?;
+            draft.affected(affected);
+            Ok(infos)
+        },
+    )
+}
+
+fn next_sort_order(connection: &Connection) -> AppResult<i64> {
+    Ok(connection.query_row(
+        "SELECT coalesce(max(sort_order), -1) + 1 FROM collections",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn unique_name(used: &mut HashSet<String>, base: &str, index: usize) -> String {
+    let mut name = format!("{base} {}", index + 1);
+    let mut suffix = 2;
+    while used.contains(&name.to_lowercase()) {
+        name = format!("{base} {}-{suffix}", index + 1);
+        suffix += 1;
+    }
+    used.insert(name.to_lowercase());
+    name
+}
+
+fn collection_name(database: &LibraryDb, collection_id: i64) -> AppResult<String> {
+    database.with_reader(|connection| {
+        connection
+            .query_row(
+                "SELECT name FROM collections WHERE id = ?1",
+                [collection_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::message("集合不存在"))
     })
 }
 

@@ -138,23 +138,6 @@ export function SimilarityGroupsDialog({
     }
   };
 
-  const createCollection = async (name: string, ids: number[]) => {
-    const collection = await libraryApi.createCollection(name);
-    await libraryApi.addImagesToCollection(collection.id, ids);
-  };
-
-  const uniqueName = (used: Set<string>, base: string, index: number) => {
-    const prefix = base.trim() || "相似组";
-    let name = `${prefix} ${index + 1}`;
-    let suffix = 2;
-    while (used.has(name.toLowerCase())) {
-      name = `${prefix} ${index + 1}-${suffix}`;
-      suffix += 1;
-    }
-    used.add(name.toLowerCase());
-    return name;
-  };
-
   const saveGroups = async (groups: number[][]) => {
     if (saving || groups.length === 0) return;
     if (groups.length > 100) {
@@ -163,13 +146,8 @@ export function SimilarityGroupsDialog({
     }
     setSaving(true);
     try {
-      const collections = await libraryApi.getCollections();
-      const used = new Set(collections.map((collection) => collection.name.toLowerCase()));
-      for (let index = 0; index < groups.length; index += 1) {
-        const name = uniqueName(used, baseName, index);
-        await createCollection(name, groups[index]);
-      }
-      notify(`已创建 ${groups.length} 个集合`, "success");
+      const created = await libraryApi.createCollectionsFromGroups(groups, baseName);
+      notify(`已创建 ${created.length} 个集合`, "success");
       onChanged();
     } catch (cause) {
       notify("保存相似组失败", "error", errorMessage(cause));
@@ -180,13 +158,11 @@ export function SimilarityGroupsDialog({
 
   const mergeGroups = async () => {
     if (saving || !result || result.groups.length === 0) return;
+    const ids = [...new Set(result.groups.flat())];
+    if (ids.length === 0) return;
     setSaving(true);
     try {
-      const ids = [...new Set(result.groups.flat())];
-      const collections = await libraryApi.getCollections();
-      const used = new Set(collections.map((collection) => collection.name.toLowerCase()));
-      const name = uniqueName(used, baseName, 0);
-      await createCollection(name, ids);
+      await libraryApi.createCollectionsFromGroups([ids], baseName);
       notify(`已把 ${ids.length.toLocaleString()} 张图片保存为集合`, "success");
       onChanged();
     } catch (cause) {

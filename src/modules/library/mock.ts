@@ -982,6 +982,33 @@ export function mockCombineCollections(
   return collectionInfo(info);
 }
 
+export function mockCreateCollectionsFromGroups(
+  groups: number[][],
+  baseName: string,
+): CollectionInfo[] {
+  const base = baseName.trim() || "相似组";
+  const created: CollectionInfo[] = [];
+  groups
+    .map((group) => [...new Set(group)])
+    .filter((group) => group.length > 0)
+    .forEach((group, index) => {
+      let name = `${base} ${index + 1}`;
+      let suffix = 2;
+      while (
+        collections.some(
+          (item) => item.name.toLowerCase() === name.toLowerCase(),
+        )
+      ) {
+        name = `${base} ${index + 1}-${suffix}`;
+        suffix += 1;
+      }
+      const info = mockCreateCollection(name);
+      mockAddToCollection(info.id, group);
+      created.push(collectionInfo(info));
+    });
+  return created;
+}
+
 let mockOperations: HistoryEntry[] = [
   {
     id: 3,

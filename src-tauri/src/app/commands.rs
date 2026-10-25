@@ -552,6 +552,15 @@ pub fn combine_collections(
 }
 
 #[tauri::command]
+pub fn create_collections_from_groups(
+    state: State<'_, AppState>,
+    groups: Vec<Vec<i64>>,
+    base_name: String,
+) -> Result<Vec<CollectionInfo>, String> {
+    AppError::command(state.create_collections_from_groups(&groups, &base_name))
+}
+
+#[tauri::command]
 pub async fn get_viewer_source(
     state: State<'_, AppState>,
     image_id: i64,
@@ -679,12 +688,14 @@ pub async fn ai_describe_image(
 ) -> Result<AiDescriptionResult, String> {
     let settings = state.settings.snapshot().ai;
     let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         runtime.describe_image(&settings, image_id, prompt.as_deref(), max_tokens)
     })
     .await
     .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    state.after_history_write();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -820,6 +831,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         add_images_to_collection,
         remove_images_from_collection,
         combine_collections,
+        create_collections_from_groups,
         get_viewer_source,
         save_image_edit,
         estimate_edit_size,

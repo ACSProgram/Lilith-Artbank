@@ -13,7 +13,13 @@ use crate::{
         settings::AiSettings,
         tasks::{TaskHandle, TaskKind, TaskPhase},
     },
-    library::{content, db::LibraryDb, metadata, placeholders, thumbs::ThumbPack},
+    library::{
+        content,
+        db::LibraryDb,
+        history::{self, HistoryKind, NewOperation},
+        metadata, placeholders,
+        thumbs::ThumbPack,
+    },
 };
 
 use super::{
@@ -129,6 +135,51 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
         return Ok(());
     }
 
+    // 描述任务会产生用户可见的内容修改：先建 live 记录，逐张追加旧描述；
+    // 取消或失败时已经写入的描述仍然可以撤销。
+    let operation_id = if request.kind == AiJobKind::Description {
+        Some(history::begin_live(
+            &context.database,
+            NewOperation::new(
+                HistoryKind::AiDescription,
+                format!("AI 描述 {} 张", ids.len()),
+            ),
+        )?)
+    } else {
+        None
+    };
+
+    let outcome = run_job(
+        context,
+        task,
+        request,
+        &client,
+        &capability,
+        ids,
+        operation_id,
+    );
+    if let Some(operation_id) = operation_id {
+        let error = outcome
+            .as_ref()
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        if let Err(error) = history::finish_live(&context.database, operation_id, &error) {
+            log::warn!("收尾 AI 描述记录失败：{error}");
+        }
+    }
+    outcome
+}
+
+fn run_job(
+    context: &JobContext,
+    task: &TaskHandle,
+    request: &AiJobRequest,
+    client: &AiClient,
+    capability: &Capability,
+    ids: Vec<i64>,
+    operation_id: Option<i64>,
+) -> AppResult<()> {
     let mut consecutive_failures = 0_usize;
     for image_id in ids {
         if task.should_cancel() {
@@ -138,10 +189,11 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
         let result = process_one(
             context,
             request.kind,
-            &client,
-            &capability,
+            client,
+            capability,
             request,
             image_id,
+            operation_id,
         );
         match result {
             Ok(Outcome::Done) => {
@@ -179,6 +231,7 @@ fn process_one(
     capability: &Capability,
     request: &AiJobRequest,
     image_id: i64,
+    operation_id: Option<i64>,
 ) -> AppResult<Outcome> {
     let row = content::load(&context.database, image_id)?;
     if row.deleted_at.is_some() {
@@ -231,12 +284,22 @@ fn process_one(
             if result.text.trim().is_empty() {
                 return Err(AppError::message("描述服务返回了空文本"));
             }
-            let changed = metadata::set_ai_description(
-                &context.database,
-                image_id,
-                &result.text,
-                &result.model,
-            )?;
+            let changed = if let Some(operation_id) = operation_id {
+                metadata::set_ai_description_live(
+                    &context.database,
+                    operation_id,
+                    image_id,
+                    &result.text,
+                    &result.model,
+                )?
+            } else {
+                metadata::set_ai_description(
+                    &context.database,
+                    image_id,
+                    &result.text,
+                    &result.model,
+                )?
+            };
             Ok(if changed {
                 Outcome::Done
             } else {

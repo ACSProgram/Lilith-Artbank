@@ -195,6 +195,7 @@ Content-Type: application/octet-stream
 - 熔断：连续 5 张失败视为服务不可用，任务以失败结束，避免把整库都记成失败。
 - 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。
 - 已完成的 embedding/pose 写入 feature pack 与 `feature_blobs`；描述写入 `images.description`，并设置 `description_source='ai'`、`description_model`。用户手工编辑后 `description_source='user'`。
+- 描述任务会产生用户可见的内容修改，因此使用 live 操作记录：任务开始建 `pending` 记录，每张写入时在同一事务里追加旧描述并计入 `affected`，结束（含取消/失败）调用 `finish_live`；已经写入的描述在任务取消后仍可撤销。单张 `ai_describe_image` 走普通 `history::write`。embedding/pose 是派生数据，不进入操作记录。
 - 任务状态不持久化；崩溃后已保存结果保留，重跑时默认只处理缺失项。
 
 ## 存储

@@ -376,15 +376,76 @@ pub enum ImportRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RedoRecord {
-    ImageStates { items: Vec<ImageState> },
-    PurgeIds { ids: Vec<i64> },
-    MoveStates { items: Vec<MoveState> },
-    FolderRows { items: Vec<FolderRow> },
-    FolderSort { rows: Vec<(i64, i64)> },
-    EditState { state: EditRedoState },
-    ImportImages { items: Vec<ImportRedoImage> },
-    ImportTags { items: Vec<ImportRedoTag> },
-    ImportMerged { items: Vec<ImportRedoMerged> },
+    ImageStates {
+        items: Vec<ImageState>,
+    },
+    PurgeIds {
+        ids: Vec<i64>,
+    },
+    MoveStates {
+        items: Vec<MoveState>,
+    },
+    FolderRows {
+        items: Vec<FolderRow>,
+    },
+    FolderSort {
+        rows: Vec<(i64, i64)>,
+    },
+    EditState {
+        state: EditRedoState,
+    },
+    ImportImages {
+        items: Vec<ImportRedoImage>,
+    },
+    ImportTags {
+        items: Vec<ImportRedoTag>,
+    },
+    ImportMerged {
+        items: Vec<ImportRedoMerged>,
+    },
+    ScoreStates {
+        items: Vec<ScoreState>,
+    },
+    DescriptionStates {
+        items: Vec<DescriptionRecord>,
+    },
+    TagNames {
+        items: Vec<TagRefRecord>,
+    },
+    TagSets {
+        items: Vec<TagSetState>,
+    },
+    TagAdds {
+        pairs: Vec<(i64, i64)>,
+    },
+    TagRemovals {
+        pairs: Vec<(i64, i64)>,
+    },
+    TagDeletions {
+        ids: Vec<i64>,
+    },
+    CollectionRestores {
+        items: Vec<CollectionSnapshot>,
+    },
+    CollectionDeletions {
+        ids: Vec<i64>,
+    },
+    CollectionNames {
+        items: Vec<CollectionNameState>,
+    },
+    CollectionOrders {
+        rows: Vec<CollectionOrderState>,
+    },
+    CollectionAdds {
+        collection_id: i64,
+        items: Vec<(i64, i64)>,
+        updated_at: i64,
+    },
+    CollectionRemovals {
+        collection_id: i64,
+        items: Vec<(i64, i64)>,
+        updated_at: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,8 +554,125 @@ pub struct ImportRedoMerged {
     pub tag_ids: Vec<i64>,
 }
 
+/// 评分撤销/重做状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoreState {
+    pub image_id: i64,
+    pub score: i64,
+    pub modified_at: i64,
+}
+
+/// 描述撤销/重做状态；原始记录里是旧值，`redo` 里是撤销前的新值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescriptionRecord {
+    pub image_id: i64,
+    pub description: String,
+    pub description_source: String,
+    pub description_model: String,
+    pub modified_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagRefRecord {
+    pub id: i64,
+    pub name: String,
+}
+
+/// 标签写入的逆数据；批量关系按批追加，避免一次性 JSON 过大。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TagRecord {
+    Set {
+        image_id: i64,
+        old_tag_ids: Vec<i64>,
+        created: Vec<TagRefRecord>,
+    },
+    Add {
+        pairs: Vec<(i64, i64)>,
+        created: Vec<TagRefRecord>,
+    },
+    Remove {
+        pairs: Vec<(i64, i64)>,
+    },
+    Rename {
+        tag_id: i64,
+        old_name: String,
+    },
+    Delete {
+        tag_id: i64,
+        name: String,
+    },
+    Pairs {
+        pairs: Vec<(i64, i64)>,
+    },
+}
+
+/// 标签集合的完整状态；重做时先清空图片关系再插回。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagSetState {
+    pub image_id: i64,
+    pub tag_ids: Vec<i64>,
+    pub tags: Vec<TagRefRecord>,
+}
+
+/// 集合的完整快照；创建、删除、运算与相似分组共用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionSnapshot {
+    pub id: i64,
+    pub name: String,
+    pub sort_order: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// `(imageId, position)`，按 `position` 升序。
+    pub items: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionNameState {
+    pub id: i64,
+    pub name: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionOrderState {
+    pub id: i64,
+    pub sort_order: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionRenameRecord {
+    pub id: i64,
+    pub old_name: String,
+    pub old_updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionReorderRecord {
+    pub rows: Vec<CollectionOrderState>,
+}
+
+/// 集合加入/移出的逆数据，记下操作前的 `updated_at`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionItemsRecord {
+    pub collection_id: i64,
+    pub items: Vec<(i64, i64)>,
+    pub old_updated_at: i64,
+}
+
 /// 同步写操作：`work` 与记录写入处在同一个事务里。
-/// `affected == 0` 且没有逆数据时整条回滚，不留下空记录。
+/// `affected == 0` 且没有逆数据时整条回滚：既不留空记录，也不清空重做分支。
 pub fn write<T>(
     database: &LibraryDb,
     op: NewOperation<'_>,
@@ -1178,10 +1356,23 @@ fn undo_operation(
         | HistoryKind::Restore
         | HistoryKind::PermanentDelete
         | HistoryKind::EmptyTrash => undo_visibility(database, operation_id, kind)?,
-        other => {
-            log::warn!("记录 {operation_id} 的类型 {} 暂不支持撤销", other.as_str());
-            return Err(AppError::message("这类操作暂时不能撤销"));
+        HistoryKind::Score => undo_score(database, operation_id)?,
+        HistoryKind::Description | HistoryKind::AiDescription => {
+            undo_description(database, operation_id)?
         }
+        HistoryKind::TagSet
+        | HistoryKind::TagAdd
+        | HistoryKind::TagRemove
+        | HistoryKind::TagRename
+        | HistoryKind::TagDelete => undo_tags(database, operation_id, kind)?,
+        HistoryKind::CollectionCreate
+        | HistoryKind::CollectionRename
+        | HistoryKind::CollectionDelete
+        | HistoryKind::CollectionReorder
+        | HistoryKind::CollectionAdd
+        | HistoryKind::CollectionRemove
+        | HistoryKind::CollectionCombine
+        | HistoryKind::SimilarityGroups => undo_collection(database, operation_id, kind)?,
     }
     Ok(())
 }
@@ -1207,10 +1398,23 @@ fn redo_operation(
         | HistoryKind::Restore
         | HistoryKind::PermanentDelete
         | HistoryKind::EmptyTrash => redo_visibility(database, operation_id, kind)?,
-        other => {
-            log::warn!("记录 {operation_id} 的类型 {} 暂不支持重做", other.as_str());
-            return Err(AppError::message("这类操作暂时不能重做"));
+        HistoryKind::Score => redo_score(database, operation_id)?,
+        HistoryKind::Description | HistoryKind::AiDescription => {
+            redo_description(database, operation_id)?
         }
+        HistoryKind::TagSet
+        | HistoryKind::TagAdd
+        | HistoryKind::TagRemove
+        | HistoryKind::TagRename
+        | HistoryKind::TagDelete => redo_tags(database, operation_id)?,
+        HistoryKind::CollectionCreate
+        | HistoryKind::CollectionRename
+        | HistoryKind::CollectionDelete
+        | HistoryKind::CollectionReorder
+        | HistoryKind::CollectionAdd
+        | HistoryKind::CollectionRemove
+        | HistoryKind::CollectionCombine
+        | HistoryKind::SimilarityGroups => redo_collection(database, operation_id)?,
     }
     Ok(())
 }
@@ -1314,19 +1518,16 @@ fn redo_visibility(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -
             HistoryKind::Trash | HistoryKind::Restore => {
                 let mut applied = false;
                 for record in records {
-                    match record {
-                        RedoRecord::ImageStates { items } => {
-                            for item in items {
-                                transaction.execute(
-                                    "UPDATE images
-                                     SET deleted_at = ?1, modified_at = ?2
-                                     WHERE id = ?3",
-                                    params![item.deleted_at, item.modified_at, item.image_id],
-                                )?;
-                                applied = true;
-                            }
+                    if let RedoRecord::ImageStates { items } = record {
+                        for item in items {
+                            transaction.execute(
+                                "UPDATE images
+                                 SET deleted_at = ?1, modified_at = ?2
+                                 WHERE id = ?3",
+                                params![item.deleted_at, item.modified_at, item.image_id],
+                            )?;
+                            applied = true;
                         }
-                        _ => {}
                     }
                 }
                 if !applied {
@@ -1336,25 +1537,951 @@ fn redo_visibility(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -
             _ => {
                 let mut applied = false;
                 for record in records {
-                    match record {
-                        RedoRecord::PurgeIds { ids } => {
-                            for id in ids {
-                                transaction.execute(
-                                    "UPDATE images SET purge_operation_id = ?1
-                                     WHERE id = ?2 AND deleted_at IS NOT NULL
-                                       AND purge_operation_id IS NULL",
-                                    params![operation_id, id],
-                                )?;
-                                applied = true;
-                            }
+                    if let RedoRecord::PurgeIds { ids } = record {
+                        for id in ids {
+                            transaction.execute(
+                                "UPDATE images SET purge_operation_id = ?1
+                                 WHERE id = ?2 AND deleted_at IS NOT NULL
+                                   AND purge_operation_id IS NULL",
+                                params![operation_id, id],
+                            )?;
+                            applied = true;
                         }
-                        _ => {}
                     }
                 }
                 if !applied {
                     return Err(AppError::message("这条记录缺少重做数据"));
                 }
             }
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+/// 评分：恢复旧评分与修改时间；撤销前的新值写进 redo。
+fn undo_score(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut redo = Vec::new();
+        for chunk in load_chunks(&transaction, operation_id)? {
+            if chunk.format != ChunkFormat::Triples {
+                continue;
+            }
+            for (image_id, old_score, old_modified_at) in decode_triples(&chunk.data)? {
+                let current: Option<(i64, i64)> = transaction
+                    .query_row(
+                        "SELECT score, modified_at FROM images WHERE id = ?1",
+                        [image_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((score, modified_at)) = current else {
+                    continue;
+                };
+                if score == old_score && modified_at == old_modified_at {
+                    continue;
+                }
+                redo.push(ScoreState {
+                    image_id,
+                    score,
+                    modified_at,
+                });
+                transaction.execute(
+                    "UPDATE images SET score = ?1, modified_at = ?2 WHERE id = ?3",
+                    params![old_score, old_modified_at, image_id],
+                )?;
+            }
+        }
+        if !redo.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::ScoreStates { items: redo },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn redo_score(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = false;
+        for record in load_redo_records(&transaction, operation_id)? {
+            if let RedoRecord::ScoreStates { items } = record {
+                for item in items {
+                    transaction.execute(
+                        "UPDATE images SET score = ?1, modified_at = ?2 WHERE id = ?3",
+                        params![item.score, item.modified_at, item.image_id],
+                    )?;
+                    applied = true;
+                }
+            }
+        }
+        if !applied {
+            return Err(AppError::message("这条记录缺少重做数据"));
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+/// 描述（手工与 AI）：恢复旧文本、来源、模型与修改时间。
+fn undo_description(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut redo = Vec::new();
+        for chunk in load_chunks(&transaction, operation_id)? {
+            if chunk.format != ChunkFormat::Json {
+                continue;
+            }
+            let old: DescriptionRecord = decode_json(&chunk.data)?;
+            let current: Option<(String, String, String, i64)> = transaction
+                .query_row(
+                    "SELECT description, description_source, description_model, modified_at
+                     FROM images WHERE id = ?1",
+                    [old.image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((description, source, model, modified_at)) = current else {
+                continue;
+            };
+            if description == old.description
+                && source == old.description_source
+                && model == old.description_model
+                && modified_at == old.modified_at
+            {
+                continue;
+            }
+            redo.push(DescriptionRecord {
+                image_id: old.image_id,
+                description,
+                description_source: source,
+                description_model: model,
+                modified_at,
+            });
+            transaction.execute(
+                "UPDATE images
+                 SET description = ?1, description_source = ?2, description_model = ?3,
+                     modified_at = ?4
+                 WHERE id = ?5",
+                params![
+                    old.description,
+                    old.description_source,
+                    old.description_model,
+                    old.modified_at,
+                    old.image_id
+                ],
+            )?;
+        }
+        if !redo.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::DescriptionStates { items: redo },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn redo_description(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = false;
+        for record in load_redo_records(&transaction, operation_id)? {
+            if let RedoRecord::DescriptionStates { items } = record {
+                for item in items {
+                    transaction.execute(
+                        "UPDATE images
+                         SET description = ?1, description_source = ?2, description_model = ?3,
+                             modified_at = ?4
+                         WHERE id = ?5",
+                        params![
+                            item.description,
+                            item.description_source,
+                            item.description_model,
+                            item.modified_at,
+                            item.image_id
+                        ],
+                    )?;
+                    applied = true;
+                }
+            }
+        }
+        if !applied {
+            return Err(AppError::message("这条记录缺少重做数据"));
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn load_tag_records(connection: &Connection, operation_id: i64) -> AppResult<Vec<TagRecord>> {
+    let mut records = Vec::new();
+    for chunk in load_chunks(connection, operation_id)? {
+        if chunk.format == ChunkFormat::Json {
+            records.push(serde_json::from_slice(&chunk.data)?);
+        }
+    }
+    Ok(records)
+}
+
+fn insert_tag_pair(transaction: &Transaction<'_>, image_id: i64, tag_id: i64) -> AppResult<bool> {
+    let changed = transaction.execute(
+        "INSERT INTO image_tags(image_id, tag_id)
+         SELECT ?1, ?2
+         WHERE EXISTS (SELECT 1 FROM images WHERE id = ?1)
+           AND EXISTS (SELECT 1 FROM tags WHERE id = ?2)
+         ON CONFLICT(image_id, tag_id) DO NOTHING",
+        params![image_id, tag_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// 只在标签已没有任何图片引用时删除；返回真正删掉的行，供重做时重建。
+fn delete_unreferenced_tags(
+    transaction: &Transaction<'_>,
+    candidates: &[TagRefRecord],
+) -> AppResult<Vec<TagRefRecord>> {
+    let mut deleted = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in candidates {
+        if !seen.insert(tag.id) {
+            continue;
+        }
+        let referenced: i64 = transaction.query_row(
+            "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
+            [tag.id],
+            |row| row.get(0),
+        )?;
+        if referenced == 0 && transaction.execute("DELETE FROM tags WHERE id = ?1", [tag.id])? > 0 {
+            deleted.push(tag.clone());
+        }
+    }
+    Ok(deleted)
+}
+
+fn ensure_tag_row(transaction: &Transaction<'_>, tag: &TagRefRecord) -> AppResult<()> {
+    let changed = transaction.execute(
+        "UPDATE tags SET name = ?1 WHERE id = ?2",
+        params![tag.name, tag.id],
+    )?;
+    if changed == 0 {
+        transaction.execute(
+            "INSERT INTO tags(id, name) VALUES (?1, ?2)",
+            params![tag.id, tag.name],
+        )?;
+    }
+    Ok(())
+}
+
+/// 标签设置/增删/改名/删除的逆操作；所有关系变更都可重复执行。
+fn undo_tags(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let records = load_tag_records(&transaction, operation_id)?;
+        let mut redo_names: Vec<TagRefRecord> = Vec::new();
+        let mut redo_sets: Vec<TagSetState> = Vec::new();
+        let mut redo_adds: Vec<(i64, i64)> = Vec::new();
+        let mut redo_removals: Vec<(i64, i64)> = Vec::new();
+        let mut redo_deletions: Vec<i64> = Vec::new();
+
+        match kind {
+            HistoryKind::TagSet => {
+                let mut created = Vec::new();
+                for record in &records {
+                    let TagRecord::Set {
+                        image_id,
+                        old_tag_ids,
+                        created: record_created,
+                    } = record
+                    else {
+                        continue;
+                    };
+                    created.extend(record_created.iter().cloned());
+                    // 两侧都按 `tag_id` 升序，可以直接判等；相同说明这条记录已经撤过。
+                    let current: Vec<i64> = {
+                        let mut statement = transaction.prepare(
+                            "SELECT tag_id FROM image_tags WHERE image_id = ?1 ORDER BY tag_id",
+                        )?;
+                        statement
+                            .query_map([image_id], |row| row.get(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    if current == *old_tag_ids {
+                        continue;
+                    }
+                    let tags: Vec<TagRefRecord> = record_created
+                        .iter()
+                        .filter(|tag| current.contains(&tag.id))
+                        .cloned()
+                        .collect();
+                    redo_sets.push(TagSetState {
+                        image_id: *image_id,
+                        tag_ids: current,
+                        tags,
+                    });
+                    transaction
+                        .execute("DELETE FROM image_tags WHERE image_id = ?1", [image_id])?;
+                    for tag_id in old_tag_ids {
+                        insert_tag_pair(&transaction, *image_id, *tag_id)?;
+                    }
+                }
+                redo_names.extend(delete_unreferenced_tags(&transaction, &created)?);
+            }
+            HistoryKind::TagAdd => {
+                let mut created = Vec::new();
+                for record in &records {
+                    let TagRecord::Add {
+                        pairs,
+                        created: record_created,
+                    } = record
+                    else {
+                        continue;
+                    };
+                    created.extend(record_created.iter().cloned());
+                    let mut present = Vec::new();
+                    for (image_id, tag_id) in pairs {
+                        if transaction.execute(
+                            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2",
+                            params![image_id, tag_id],
+                        )? > 0
+                        {
+                            present.push((*image_id, *tag_id));
+                        }
+                    }
+                    redo_adds.extend(present);
+                }
+                redo_names.extend(delete_unreferenced_tags(&transaction, &created)?);
+            }
+            HistoryKind::TagRemove => {
+                for record in &records {
+                    let TagRecord::Remove { pairs } = record else {
+                        continue;
+                    };
+                    for (image_id, tag_id) in pairs {
+                        if insert_tag_pair(&transaction, *image_id, *tag_id)? {
+                            redo_removals.push((*image_id, *tag_id));
+                        }
+                    }
+                }
+            }
+            HistoryKind::TagRename => {
+                for record in &records {
+                    let TagRecord::Rename { tag_id, old_name } = record else {
+                        continue;
+                    };
+                    let current: Option<String> = transaction
+                        .query_row("SELECT name FROM tags WHERE id = ?1", [tag_id], |row| {
+                            row.get(0)
+                        })
+                        .optional()?;
+                    let Some(current) = current else {
+                        continue;
+                    };
+                    if current == *old_name {
+                        continue;
+                    }
+                    let duplicate: Option<i64> = transaction
+                        .query_row(
+                            "SELECT id FROM tags
+                             WHERE name = ?1 COLLATE NOCASE AND id <> ?2",
+                            params![old_name, tag_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if duplicate.is_some() {
+                        return Err(AppError::message("已经有同名标签，无法恢复"));
+                    }
+                    transaction.execute(
+                        "UPDATE tags SET name = ?1 WHERE id = ?2",
+                        params![old_name, tag_id],
+                    )?;
+                    redo_names.push(TagRefRecord {
+                        id: *tag_id,
+                        name: current,
+                    });
+                }
+            }
+            HistoryKind::TagDelete => {
+                let mut header: Option<(i64, String)> = None;
+                let mut pairs = Vec::new();
+                for record in &records {
+                    match record {
+                        TagRecord::Delete { tag_id, name } => {
+                            header = Some((*tag_id, name.clone()));
+                        }
+                        TagRecord::Pairs { pairs: batch } => pairs.extend(batch.iter().copied()),
+                        _ => {}
+                    }
+                }
+                let Some((tag_id, name)) = header else {
+                    return Err(AppError::message("这条记录缺少撤销数据"));
+                };
+                let existing: Option<i64> = transaction
+                    .query_row(
+                        "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+                        [&name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let target_id = if let Some(existing_id) = existing {
+                    // 同名标签已存在（例如崩溃续做）：合并关系，重做时只移除关系。
+                    existing_id
+                } else {
+                    transaction.execute(
+                        "INSERT INTO tags(id, name) VALUES (?1, ?2)",
+                        params![tag_id, name],
+                    )?;
+                    redo_deletions.push(tag_id);
+                    tag_id
+                };
+                let mut restored = Vec::new();
+                for (image_id, _) in &pairs {
+                    if insert_tag_pair(&transaction, *image_id, target_id)? {
+                        restored.push((*image_id, target_id));
+                    }
+                }
+                // 重建的标签重做时整行删除（关系随外键一起消失）；同名合并时只回退关系。
+                if target_id != tag_id {
+                    redo_removals.extend(restored);
+                }
+            }
+            _ => {}
+        }
+
+        if !redo_names.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::TagNames { items: redo_names },
+            )?;
+        }
+        if !redo_sets.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::TagSets { items: redo_sets },
+            )?;
+        }
+        if !redo_adds.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::TagAdds { pairs: redo_adds },
+            )?;
+        }
+        if !redo_removals.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::TagRemovals {
+                    pairs: redo_removals,
+                },
+            )?;
+        }
+        if !redo_deletions.is_empty() {
+            append_redo(
+                &transaction,
+                operation_id,
+                &RedoRecord::TagDeletions {
+                    ids: redo_deletions,
+                },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn redo_tags(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = false;
+        // `undo_tags` 按“改名 → 关系状态 → 加关系 → 减关系 → 删标签”的顺序追加 redo，
+        // 按 id 依次执行即可：标签行先补回，指向它的关系才插得进去。
+        for record in load_redo_records(&transaction, operation_id)? {
+            match record {
+                RedoRecord::TagNames { items } => {
+                    for tag in &items {
+                        ensure_tag_row(&transaction, tag)?;
+                    }
+                    applied |= !items.is_empty();
+                }
+                RedoRecord::TagSets { items } => {
+                    for item in &items {
+                        for tag in &item.tags {
+                            ensure_tag_row(&transaction, tag)?;
+                        }
+                        transaction.execute(
+                            "DELETE FROM image_tags WHERE image_id = ?1",
+                            [item.image_id],
+                        )?;
+                        for tag_id in &item.tag_ids {
+                            insert_tag_pair(&transaction, item.image_id, *tag_id)?;
+                        }
+                    }
+                    applied |= !items.is_empty();
+                }
+                RedoRecord::TagAdds { pairs } => {
+                    for (image_id, tag_id) in &pairs {
+                        insert_tag_pair(&transaction, *image_id, *tag_id)?;
+                    }
+                    applied |= !pairs.is_empty();
+                }
+                RedoRecord::TagRemovals { pairs } => {
+                    for (image_id, tag_id) in &pairs {
+                        transaction.execute(
+                            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2",
+                            params![image_id, tag_id],
+                        )?;
+                    }
+                    applied |= !pairs.is_empty();
+                }
+                RedoRecord::TagDeletions { ids } => {
+                    for id in &ids {
+                        transaction.execute("DELETE FROM tags WHERE id = ?1", [id])?;
+                    }
+                    applied |= !ids.is_empty();
+                }
+                _ => {}
+            }
+        }
+        if !applied {
+            return Err(AppError::message("这条记录缺少重做数据"));
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+/// 集合的当前完整状态；`collections` 的删除记录与撤销/重做共用这一份查询。
+pub(crate) fn collection_snapshot(
+    connection: &Connection,
+    collection_id: i64,
+) -> AppResult<Option<CollectionSnapshot>> {
+    let row: Option<(i64, String, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT id, name, sort_order, created_at, updated_at
+             FROM collections WHERE id = ?1",
+            [collection_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, name, sort_order, created_at, updated_at)) = row else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT image_id, position FROM collection_items
+         WHERE collection_id = ?1 ORDER BY position, image_id",
+    )?;
+    let items = statement
+        .query_map([collection_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(CollectionSnapshot {
+        id,
+        name,
+        sort_order,
+        created_at,
+        updated_at,
+        items,
+    }))
+}
+
+fn insert_collection_snapshot(
+    transaction: &Transaction<'_>,
+    snapshot: &CollectionSnapshot,
+) -> AppResult<()> {
+    transaction.execute(
+        "INSERT INTO collections(id, name, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             sort_order = excluded.sort_order,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at",
+        params![
+            snapshot.id,
+            snapshot.name,
+            snapshot.sort_order,
+            snapshot.created_at,
+            snapshot.updated_at
+        ],
+    )?;
+    for (image_id, position) in &snapshot.items {
+        transaction.execute(
+            "INSERT INTO collection_items(collection_id, image_id, position)
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+             ON CONFLICT(collection_id, image_id) DO UPDATE SET position = excluded.position",
+            params![snapshot.id, image_id, position],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_collection_snapshot(
+    connection: &Connection,
+    operation_id: i64,
+) -> AppResult<CollectionSnapshot> {
+    let chunks = load_chunks(connection, operation_id)?;
+    for chunk in chunks {
+        if chunk.format == ChunkFormat::Json {
+            return decode_json(&chunk.data);
+        }
+    }
+    Err(AppError::message("这条记录缺少撤销数据"))
+}
+
+fn load_collection_snapshots(
+    connection: &Connection,
+    operation_id: i64,
+) -> AppResult<Vec<CollectionSnapshot>> {
+    let chunks = load_chunks(connection, operation_id)?;
+    for chunk in chunks {
+        if chunk.format == ChunkFormat::Json {
+            return decode_json(&chunk.data);
+        }
+    }
+    Err(AppError::message("这条记录缺少撤销数据"))
+}
+
+fn collection_items(
+    connection: &Connection,
+    collection_id: i64,
+    image_ids: &[i64],
+) -> AppResult<Vec<(i64, i64)>> {
+    let mut items = Vec::new();
+    for chunk in image_ids.chunks(400) {
+        let marks = crate::library::placeholders(chunk.len());
+        let mut statement = connection.prepare(&format!(
+            "SELECT image_id, position FROM collection_items
+             WHERE collection_id = ?1 AND image_id IN ({marks})"
+        ))?;
+        items.extend(
+            statement
+                .query_map(
+                    rusqlite::params_from_iter(
+                        std::iter::once(rusqlite::types::Value::Integer(collection_id))
+                            .chain(chunk.iter().map(|id| rusqlite::types::Value::Integer(*id))),
+                    ),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    items.sort_unstable();
+    Ok(items)
+}
+
+/// 按 id 分批删除集合里的条目；撤销“加入”与重做“移出”共用。
+fn delete_collection_items(
+    transaction: &Transaction<'_>,
+    collection_id: i64,
+    image_ids: &[i64],
+) -> AppResult<()> {
+    for chunk in image_ids.chunks(400) {
+        let marks = crate::library::placeholders(chunk.len());
+        transaction.execute(
+            &format!(
+                "DELETE FROM collection_items
+                 WHERE collection_id = ?1 AND image_id IN ({marks})"
+            ),
+            rusqlite::params_from_iter(
+                std::iter::once(rusqlite::types::Value::Integer(collection_id))
+                    .chain(chunk.iter().map(|id| rusqlite::types::Value::Integer(*id))),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn undo_collection(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match kind {
+            HistoryKind::CollectionCreate | HistoryKind::CollectionCombine => {
+                let snapshot = load_collection_snapshot(&transaction, operation_id)?;
+                let live = collection_snapshot(&transaction, snapshot.id)?;
+                if let Some(live) = live {
+                    append_redo(
+                        &transaction,
+                        operation_id,
+                        &RedoRecord::CollectionRestores { items: vec![live] },
+                    )?;
+                }
+                transaction.execute("DELETE FROM collections WHERE id = ?1", [snapshot.id])?;
+            }
+            HistoryKind::SimilarityGroups => {
+                let snapshots = load_collection_snapshots(&transaction, operation_id)?;
+                let mut live = Vec::new();
+                for snapshot in &snapshots {
+                    if let Some(snapshot) = collection_snapshot(&transaction, snapshot.id)? {
+                        live.push(snapshot);
+                    }
+                }
+                if !live.is_empty() {
+                    append_redo(
+                        &transaction,
+                        operation_id,
+                        &RedoRecord::CollectionRestores { items: live },
+                    )?;
+                }
+                for snapshot in &snapshots {
+                    transaction.execute("DELETE FROM collections WHERE id = ?1", [snapshot.id])?;
+                }
+            }
+            HistoryKind::CollectionRename => {
+                let record: CollectionRenameRecord =
+                    load_collection_snapshot_json(&transaction, operation_id)?;
+                let current: Option<(String, i64)> = transaction
+                    .query_row(
+                        "SELECT name, updated_at FROM collections WHERE id = ?1",
+                        [record.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((name, updated_at)) = current else {
+                    return Err(AppError::message("集合已不存在，无法撤销重命名"));
+                };
+                if name == record.old_name && updated_at == record.old_updated_at {
+                    return Ok(());
+                }
+                append_redo(
+                    &transaction,
+                    operation_id,
+                    &RedoRecord::CollectionNames {
+                        items: vec![CollectionNameState {
+                            id: record.id,
+                            name,
+                            updated_at,
+                        }],
+                    },
+                )?;
+                transaction.execute(
+                    "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![record.old_name, record.old_updated_at, record.id],
+                )?;
+            }
+            HistoryKind::CollectionDelete => {
+                let snapshot = load_collection_snapshot(&transaction, operation_id)?;
+                append_redo(
+                    &transaction,
+                    operation_id,
+                    &RedoRecord::CollectionDeletions {
+                        ids: vec![snapshot.id],
+                    },
+                )?;
+                insert_collection_snapshot(&transaction, &snapshot)?;
+            }
+            HistoryKind::CollectionReorder => {
+                let record: CollectionReorderRecord =
+                    load_collection_snapshot_json(&transaction, operation_id)?;
+                let mut current = Vec::new();
+                for row in &record.rows {
+                    let state: Option<(i64, i64)> = transaction
+                        .query_row(
+                            "SELECT sort_order, updated_at FROM collections WHERE id = ?1",
+                            [row.id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((sort_order, updated_at)) = state {
+                        current.push(CollectionOrderState {
+                            id: row.id,
+                            sort_order,
+                            updated_at,
+                        });
+                    }
+                }
+                let changed = current.iter().any(|state| {
+                    record
+                        .rows
+                        .iter()
+                        .find(|row| row.id == state.id)
+                        .is_some_and(|row| {
+                            row.sort_order != state.sort_order || row.updated_at != state.updated_at
+                        })
+                });
+                if changed {
+                    append_redo(
+                        &transaction,
+                        operation_id,
+                        &RedoRecord::CollectionOrders { rows: current },
+                    )?;
+                    for row in &record.rows {
+                        transaction.execute(
+                            "UPDATE collections SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![row.sort_order, row.updated_at, row.id],
+                        )?;
+                    }
+                }
+            }
+            HistoryKind::CollectionAdd | HistoryKind::CollectionRemove => {
+                let record: CollectionItemsRecord =
+                    load_collection_snapshot_json(&transaction, operation_id)?;
+                let image_ids: Vec<i64> = record.items.iter().map(|(id, _)| *id).collect();
+                let updated_at: Option<i64> = transaction
+                    .query_row(
+                        "SELECT updated_at FROM collections WHERE id = ?1",
+                        [record.collection_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(updated_at) = updated_at else {
+                    return Err(AppError::message("集合已不存在，无法撤销"));
+                };
+                if kind == HistoryKind::CollectionAdd {
+                    let present = collection_items(&transaction, record.collection_id, &image_ids)?;
+                    if !present.is_empty() {
+                        append_redo(
+                            &transaction,
+                            operation_id,
+                            &RedoRecord::CollectionAdds {
+                                collection_id: record.collection_id,
+                                items: present.clone(),
+                                updated_at,
+                            },
+                        )?;
+                        let ids: Vec<i64> = present.iter().map(|(id, _)| *id).collect();
+                        delete_collection_items(&transaction, record.collection_id, &ids)?;
+                    }
+                } else {
+                    let mut restored = Vec::new();
+                    for (image_id, position) in &record.items {
+                        let changed = transaction.execute(
+                            "INSERT INTO collection_items(collection_id, image_id, position)
+                             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                             ON CONFLICT(collection_id, image_id) DO NOTHING",
+                            params![record.collection_id, image_id, position],
+                        )?;
+                        if changed > 0 {
+                            restored.push((*image_id, *position));
+                        }
+                    }
+                    if !restored.is_empty() {
+                        append_redo(
+                            &transaction,
+                            operation_id,
+                            &RedoRecord::CollectionRemovals {
+                                collection_id: record.collection_id,
+                                items: restored,
+                                updated_at,
+                            },
+                        )?;
+                    }
+                }
+                transaction.execute(
+                    "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                    params![record.old_updated_at, record.collection_id],
+                )?;
+            }
+            _ => {}
+        }
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn load_collection_snapshot_json<T: DeserializeOwned>(
+    connection: &Connection,
+    operation_id: i64,
+) -> AppResult<T> {
+    let chunks = load_chunks(connection, operation_id)?;
+    for chunk in chunks {
+        if chunk.format == ChunkFormat::Json {
+            return decode_json(&chunk.data);
+        }
+    }
+    Err(AppError::message("这条记录缺少撤销数据"))
+}
+
+fn redo_collection(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = false;
+        for record in load_redo_records(&transaction, operation_id)? {
+            match record {
+                RedoRecord::CollectionRestores { items } => {
+                    for snapshot in &items {
+                        insert_collection_snapshot(&transaction, snapshot)?;
+                    }
+                    applied = true;
+                }
+                RedoRecord::CollectionDeletions { ids } => {
+                    for id in ids {
+                        transaction.execute("DELETE FROM collections WHERE id = ?1", [id])?;
+                    }
+                    applied = true;
+                }
+                RedoRecord::CollectionNames { items } => {
+                    for item in items {
+                        transaction.execute(
+                            "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![item.name, item.updated_at, item.id],
+                        )?;
+                    }
+                    applied = true;
+                }
+                RedoRecord::CollectionOrders { rows } => {
+                    for row in rows {
+                        transaction.execute(
+                            "UPDATE collections SET sort_order = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![row.sort_order, row.updated_at, row.id],
+                        )?;
+                    }
+                    applied = true;
+                }
+                RedoRecord::CollectionAdds {
+                    collection_id,
+                    items,
+                    updated_at,
+                } => {
+                    for (image_id, position) in &items {
+                        transaction.execute(
+                            "INSERT INTO collection_items(collection_id, image_id, position)
+                             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                             ON CONFLICT(collection_id, image_id)
+                             DO UPDATE SET position = excluded.position",
+                            params![collection_id, image_id, position],
+                        )?;
+                    }
+                    transaction.execute(
+                        "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                        params![updated_at, collection_id],
+                    )?;
+                    applied = true;
+                }
+                RedoRecord::CollectionRemovals {
+                    collection_id,
+                    items,
+                    updated_at,
+                } => {
+                    let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+                    delete_collection_items(&transaction, collection_id, &ids)?;
+                    transaction.execute(
+                        "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                        params![updated_at, collection_id],
+                    )?;
+                    applied = true;
+                }
+                _ => {}
+            }
+        }
+        if !applied {
+            return Err(AppError::message("这条记录缺少重做数据"));
         }
         transaction.commit()?;
         Ok(())
@@ -2849,7 +3976,7 @@ mod tests {
     use super::*;
     use crate::{
         app::tasks::TaskKind,
-        library::{NoopReporter, import::ensure_folder, service},
+        library::{NoopReporter, collections, import::ensure_folder, service},
     };
 
     struct Fixture {
@@ -3990,5 +5117,283 @@ mod tests {
         assert_eq!(sort_of("人物"), 1);
         assert!(fixture.root.join("人物").is_dir());
         assert!(!fixture.root.join("人物").join("成品").exists());
+    }
+
+    fn tag_id(database: &LibraryDb, name: &str) -> i64 {
+        database
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+                    [name],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn tag_names(database: &LibraryDb, image_id: i64) -> Vec<String> {
+        database
+            .with_reader(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT tags.name FROM image_tags
+                     JOIN tags ON tags.id = image_tags.tag_id
+                     WHERE image_tags.image_id = ?1 ORDER BY tags.name",
+                )?;
+                Ok(statement
+                    .query_map([image_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap()
+    }
+
+    fn image_state(database: &LibraryDb, image_id: i64) -> (i64, String, String, String) {
+        database
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT score, description, description_source, description_model
+                     FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn tag_count(database: &LibraryDb) -> i64 {
+        database
+            .with_reader(|connection| {
+                Ok(connection.query_row("SELECT count(*) FROM tags", [], |row| row.get(0))?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn undoes_scores_descriptions_and_tags_in_linear_order() {
+        let fixture = Fixture::new();
+        let first = fixture.insert_image("a");
+        let second = fixture.insert_image("b");
+
+        metadata::update_score(fixture.db(), first, 3).unwrap();
+        metadata::set_scores(fixture.db(), &[first, second], 5).unwrap();
+        metadata::update_description(fixture.db(), first, "新描述").unwrap();
+        metadata::set_image_tags(fixture.db(), first, &["x".into(), "y".into()]).unwrap();
+        metadata::add_tags(fixture.db(), &[second], &["z".into()]).unwrap();
+        metadata::remove_tags(fixture.db(), &[first], &["y".into()]).unwrap();
+        let x = tag_id(fixture.db(), "x");
+        metadata::rename_tag(fixture.db(), x, "x2").unwrap();
+        let z = tag_id(fixture.db(), "z");
+        metadata::delete_tag(fixture.db(), z).unwrap();
+
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0].kind, HistoryKind::TagDelete);
+
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries.last().unwrap().id,
+            task(),
+        )
+        .unwrap();
+        assert_eq!(image_state(fixture.db(), first).0, 0);
+        assert_eq!(image_state(fixture.db(), second).0, 0);
+        assert_eq!(image_state(fixture.db(), first).1, "");
+        assert!(tag_names(fixture.db(), first).is_empty());
+        assert!(tag_names(fixture.db(), second).is_empty());
+        assert_eq!(tag_count(fixture.db()), 0);
+
+        run_redo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries[0].id,
+            task(),
+        )
+        .unwrap();
+        let first_state = image_state(fixture.db(), first);
+        assert_eq!(first_state.0, 5);
+        assert_eq!(first_state.1, "新描述");
+        assert_eq!(first_state.2, "user");
+        assert_eq!(image_state(fixture.db(), second).0, 5);
+        assert_eq!(tag_names(fixture.db(), first), vec!["x2"]);
+        assert!(tag_names(fixture.db(), second).is_empty());
+        // 原操作只移除了 y 与图片的关系，标签行本身仍保留。
+        assert_eq!(tag_count(fixture.db()), 2);
+    }
+
+    #[test]
+    fn undoes_ai_description_live_operations() {
+        let fixture = Fixture::new();
+        let image_id = fixture.insert_image("a");
+        let operation_id = begin_live(
+            fixture.db(),
+            NewOperation::new(HistoryKind::AiDescription, "AI 描述 1 张"),
+        )
+        .unwrap();
+        assert!(
+            metadata::set_ai_description_live(
+                fixture.db(),
+                operation_id,
+                image_id,
+                "AI 文本",
+                "model-x",
+            )
+            .unwrap()
+        );
+        finish_live(fixture.db(), operation_id, "").unwrap();
+
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HistoryKind::AiDescription);
+        assert_eq!(entries[0].affected, 1);
+
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            operation_id,
+            task(),
+        )
+        .unwrap();
+        let state = image_state(fixture.db(), image_id);
+        assert_eq!(state.1, "");
+        assert_eq!(state.2, "user");
+
+        run_redo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            operation_id,
+            task(),
+        )
+        .unwrap();
+        let state = image_state(fixture.db(), image_id);
+        assert_eq!(state.1, "AI 文本");
+        assert_eq!(state.2, "ai");
+        assert_eq!(state.3, "model-x");
+    }
+
+    fn collection_items(database: &LibraryDb, collection_id: i64) -> Vec<i64> {
+        database
+            .with_reader(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT image_id FROM collection_items
+                     WHERE collection_id = ?1 ORDER BY position, image_id",
+                )?;
+                Ok(statement
+                    .query_map([collection_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn undoes_and_redoes_collection_crud_and_ordering() {
+        let fixture = Fixture::new();
+        let first = fixture.insert_image("a");
+        let second = fixture.insert_image("b");
+
+        let reference = collections::create(fixture.db(), "参考").unwrap();
+        collections::add_images(fixture.db(), reference.id, &[first, second]).unwrap();
+        collections::remove_images(fixture.db(), reference.id, &[first]).unwrap();
+        collections::rename(fixture.db(), reference.id, "精选").unwrap();
+        let practice = collections::create(fixture.db(), "练习").unwrap();
+        collections::reorder(fixture.db(), &[practice.id, reference.id]).unwrap();
+        assert_eq!(collection_items(fixture.db(), reference.id), vec![second]);
+
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries.len(), 6);
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries.last().unwrap().id,
+            task(),
+        )
+        .unwrap();
+        assert!(collections::list(fixture.db()).unwrap().is_empty());
+
+        run_redo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries[0].id,
+            task(),
+        )
+        .unwrap();
+        let restored = collections::list(fixture.db()).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].id, practice.id);
+        assert_eq!(restored[1].id, reference.id);
+        assert_eq!(restored[1].name, "精选");
+        assert_eq!(collection_items(fixture.db(), reference.id), vec![second]);
+    }
+
+    #[test]
+    fn undoes_collection_combine_and_similarity_groups() {
+        let fixture = Fixture::new();
+        let first = fixture.insert_image("a");
+        let second = fixture.insert_image("b");
+        let third = fixture.insert_image("c");
+
+        let left = collections::create(fixture.db(), "A").unwrap();
+        collections::add_images(fixture.db(), left.id, &[first, second]).unwrap();
+        let right = collections::create(fixture.db(), "B").unwrap();
+        collections::add_images(fixture.db(), right.id, &[second, third]).unwrap();
+        let combined = collections::combine(
+            fixture.db(),
+            collections::CombineMode::Union,
+            &[left.id, right.id],
+            "并集",
+        )
+        .unwrap();
+        assert_eq!(
+            collection_items(fixture.db(), combined.id),
+            vec![first, second, third]
+        );
+
+        let groups =
+            collections::create_groups(fixture.db(), &[vec![first, second], vec![third]], "相似组")
+                .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "相似组 1");
+        assert_eq!(groups[1].name, "相似组 2");
+
+        let entries = list(fixture.db()).unwrap();
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries.last().unwrap().id,
+            task(),
+        )
+        .unwrap();
+        assert!(collections::list(fixture.db()).unwrap().is_empty());
+
+        run_redo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries[0].id,
+            task(),
+        )
+        .unwrap();
+        let restored = collections::list(fixture.db()).unwrap();
+        assert_eq!(restored.len(), 5);
+        assert!(restored.iter().any(|collection| collection.name == "并集"));
+        let group_one = restored
+            .iter()
+            .find(|collection| collection.name == "相似组 1")
+            .unwrap();
+        assert_eq!(
+            collection_items(fixture.db(), group_one.id),
+            vec![first, second]
+        );
+        let group_two = restored
+            .iter()
+            .find(|collection| collection.name == "相似组 2")
+            .unwrap();
+        assert_eq!(collection_items(fixture.db(), group_two.id), vec![third]);
     }
 }

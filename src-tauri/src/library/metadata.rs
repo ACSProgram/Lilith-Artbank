@@ -11,8 +11,11 @@ use crate::{
     library::{
         BatchReporter,
         db::LibraryDb,
-        history::{self, HistoryKind, NewOperation},
-        import::{ensure_folder_tracked, ensure_tags},
+        history::{
+            self, ChunkFormat, DescriptionRecord, HistoryKind, NewOperation, TagRecord,
+            TagRefRecord,
+        },
+        import::{ensure_folder_tracked, ensure_tags_tracked},
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
         placeholders,
         service::now_ms,
@@ -189,37 +192,74 @@ pub fn update_score(database: &LibraryDb, image_id: i64, score: i64) -> AppResul
         return Err(AppError::message("图片 id 无效"));
     }
     validate_score(score)?;
-    database.with_writer(|connection| {
-        let changed = connection.execute(
-            "UPDATE images SET score = ?1, modified_at = ?2 WHERE id = ?3",
-            params![score, now_ms(), image_id],
-        )?;
-        if changed == 0 {
-            return Err(AppError::message("图片不存在"));
-        }
-        Ok(())
-    })
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::Score, format!("评分 {score} 星")),
+        |transaction, draft| {
+            let old: Option<(i64, i64)> = transaction
+                .query_row(
+                    "SELECT score, modified_at FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((old_score, old_modified_at)) = old else {
+                return Err(AppError::message("图片不存在"));
+            };
+            transaction.execute(
+                "UPDATE images SET score = ?1, modified_at = ?2 WHERE id = ?3",
+                params![score, now_ms(), image_id],
+            )?;
+            draft.triples(&[(image_id, old_score, old_modified_at)]);
+            draft.affected(1);
+            Ok(())
+        },
+    )
 }
 
 pub fn set_scores(database: &LibraryDb, image_ids: &[i64], score: i64) -> AppResult<u64> {
     validate_score(score)?;
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
-    database.with_writer(|connection| {
-        let now = now_ms();
-        let mut changed = 0_u64;
-        for chunk in ids.chunks(SQL_CHUNK) {
-            let marks = placeholders(chunk.len());
-            changed += connection.execute(
-                &format!("UPDATE images SET score = ?1, modified_at = ?2 WHERE id IN ({marks})"),
-                params_from_iter(
-                    std::iter::once(Value::Integer(score))
-                        .chain(std::iter::once(Value::Integer(now)))
-                        .chain(chunk.iter().map(|id| Value::Integer(*id))),
-                ),
-            )? as u64;
-        }
-        Ok(changed)
-    })
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::Score, format!("批量评分 {score} 星")),
+        |transaction, draft| {
+            let now = now_ms();
+            let mut changed = 0_u64;
+            let mut triples = Vec::new();
+            for chunk in ids.chunks(SQL_CHUNK) {
+                let marks = placeholders(chunk.len());
+                let old_rows = {
+                    let mut statement = transaction.prepare(&format!(
+                        "SELECT id, score, modified_at FROM images WHERE id IN ({marks})"
+                    ))?;
+                    statement
+                        .query_map(params_from_iter(chunk.iter()), |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                triples.extend(old_rows);
+                changed += transaction.execute(
+                    &format!(
+                        "UPDATE images SET score = ?1, modified_at = ?2 WHERE id IN ({marks})"
+                    ),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(score))
+                            .chain(std::iter::once(Value::Integer(now)))
+                            .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                    ),
+                )? as u64;
+            }
+            draft.triples(&triples);
+            draft.affected(changed);
+            Ok(changed)
+        },
+    )
 }
 
 pub fn update_description(database: &LibraryDb, image_id: i64, description: &str) -> AppResult<()> {
@@ -227,24 +267,44 @@ pub fn update_description(database: &LibraryDb, image_id: i64, description: &str
         return Err(AppError::message("图片 id 无效"));
     }
     let description = description.trim();
-    if description.chars().count() > MAX_DESCRIPTION_CHARS {
-        return Err(AppError::message(format!(
-            "描述不能超过 {MAX_DESCRIPTION_CHARS} 个字符"
-        )));
-    }
-    database.with_writer(|connection| {
-        let changed = connection.execute(
-            "UPDATE images
-             SET description = ?1, description_source = 'user', description_model = '',
-                 modified_at = ?2
-             WHERE id = ?3",
-            params![description, now_ms(), image_id],
-        )?;
-        if changed == 0 {
-            return Err(AppError::message("图片不存在"));
-        }
-        Ok(())
-    })
+    validate_description(description)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::Description, "修改描述"),
+        |transaction, draft| {
+            let old: Option<(String, String, String, i64)> = transaction
+                .query_row(
+                    "SELECT description, description_source, description_model, modified_at
+                     FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let Some((old_description, old_source, old_model, old_modified_at)) = old else {
+                return Err(AppError::message("图片不存在"));
+            };
+            if old_description == description && old_source == "user" && old_model.is_empty() {
+                return Ok(());
+            }
+            let modified_at = now_ms();
+            transaction.execute(
+                "UPDATE images
+                 SET description = ?1, description_source = 'user', description_model = '',
+                     modified_at = ?2
+                 WHERE id = ?3",
+                params![description, modified_at, image_id],
+            )?;
+            draft.json(&DescriptionRecord {
+                image_id,
+                description: old_description,
+                description_source: old_source,
+                description_model: old_model,
+                modified_at: old_modified_at,
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )
 }
 
 /// AI 描述只覆盖空描述或非用户来源；手写描述默认受保护。
@@ -261,22 +321,103 @@ pub fn set_ai_description(
     if description.is_empty() {
         return Err(AppError::message("AI 描述为空"));
     }
+    validate_description(description)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::AiDescription, "AI 生成描述"),
+        |transaction, draft| {
+            let Some(old) = write_ai_description(transaction, image_id, description, model)? else {
+                return Ok(false);
+            };
+            draft.json(&old)?;
+            draft.affected(1);
+            Ok(true)
+        },
+    )
+}
+
+/// 批量 AI 描述：在任务开始前用 `begin_live` 建记录，每张图的事务里追加旧描述与影响数。
+pub fn set_ai_description_live(
+    database: &LibraryDb,
+    operation_id: i64,
+    image_id: i64,
+    description: &str,
+    model: &str,
+) -> AppResult<bool> {
+    if image_id <= 0 {
+        return Err(AppError::message("图片 id 无效"));
+    }
+    let description = description.trim();
+    if description.is_empty() {
+        return Err(AppError::message("AI 描述为空"));
+    }
+    validate_description(description)?;
+    database.with_writer(|connection| {
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(old) = write_ai_description(&transaction, image_id, description, model)? else {
+            return Ok(false);
+        };
+        history::discard_redo_in_tx(&transaction)?;
+        history::append_live_in_tx(
+            &transaction,
+            operation_id,
+            ChunkFormat::Json,
+            &serde_json::to_vec(&old)?,
+        )?;
+        history::add_live_affected_in_tx(&transaction, operation_id, 1)?;
+        transaction.commit()?;
+        Ok(true)
+    })
+}
+
+fn validate_description(description: &str) -> AppResult<()> {
     if description.chars().count() > MAX_DESCRIPTION_CHARS {
         return Err(AppError::message(format!(
             "描述不能超过 {MAX_DESCRIPTION_CHARS} 个字符"
         )));
     }
-    database.with_writer(|connection| {
-        let changed = connection.execute(
-            "UPDATE images
-             SET description = ?1, description_source = 'ai', description_model = ?2,
-                 modified_at = ?3
-             WHERE id = ?4
-               AND (description = '' OR description_source <> 'user')",
-            params![description, model, now_ms(), image_id],
-        )?;
-        Ok(changed > 0)
-    })
+    Ok(())
+}
+
+/// 写入 AI 描述并在返回值里带上撤销所需的旧值；手写描述受保护、内容未变时返回 `None`。
+fn write_ai_description(
+    connection: &rusqlite::Connection,
+    image_id: i64,
+    description: &str,
+    model: &str,
+) -> AppResult<Option<DescriptionRecord>> {
+    let old: Option<(String, String, String, i64)> = connection
+        .query_row(
+            "SELECT description, description_source, description_model, modified_at
+             FROM images WHERE id = ?1",
+            [image_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((old_description, old_source, old_model, old_modified_at)) = old else {
+        return Err(AppError::message("图片不存在"));
+    };
+    if !old_description.is_empty() && old_source == "user" {
+        return Ok(None);
+    }
+    if old_description == description && old_source == "ai" && old_model == model {
+        return Ok(None);
+    }
+    connection.execute(
+        "UPDATE images
+         SET description = ?1, description_source = 'ai', description_model = ?2,
+             modified_at = ?3
+         WHERE id = ?4",
+        params![description, model, now_ms(), image_id],
+    )?;
+    Ok(Some(DescriptionRecord {
+        image_id,
+        description: old_description,
+        description_source: old_source,
+        description_model: old_model,
+        modified_at: old_modified_at,
+    }))
 }
 
 pub fn set_image_tags(
@@ -288,27 +429,56 @@ pub fn set_image_tags(
         return Err(AppError::message("图片 id 无效"));
     }
     let names = normalize_tag_names(tag_names)?;
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)",
-            [image_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(AppError::message("图片不存在"));
-        }
-        let tag_ids = ensure_tags(&transaction, &names)?;
-        transaction.execute("DELETE FROM image_tags WHERE image_id = ?1", [image_id])?;
-        for tag_id in &tag_ids {
-            transaction.execute(
-                "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
-                params![image_id, tag_id],
+    let label = if names.is_empty() {
+        "清空标签".to_owned()
+    } else {
+        format!("设置标签「{}」", tag_summary(&names))
+    };
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::TagSet, label),
+        |transaction, draft| {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)",
+                [image_id],
+                |row| row.get(0),
             )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    })?;
+            if !exists {
+                return Err(AppError::message("图片不存在"));
+            }
+            let old_tag_ids: Vec<i64> = {
+                let mut statement = transaction
+                    .prepare("SELECT tag_id FROM image_tags WHERE image_id = ?1 ORDER BY tag_id")?;
+                statement
+                    .query_map([image_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut created = Vec::new();
+            let tag_ids = ensure_tags_tracked(transaction, &names, &mut created)?;
+            let mut sorted = tag_ids.clone();
+            sorted.sort_unstable();
+            if old_tag_ids == sorted && created.is_empty() {
+                return Ok(());
+            }
+            transaction.execute("DELETE FROM image_tags WHERE image_id = ?1", [image_id])?;
+            for tag_id in &tag_ids {
+                transaction.execute(
+                    "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
+                    params![image_id, tag_id],
+                )?;
+            }
+            draft.json(&TagRecord::Set {
+                image_id,
+                old_tag_ids,
+                created: created
+                    .into_iter()
+                    .map(|(id, name)| TagRefRecord { id, name })
+                    .collect(),
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )?;
     tag_refs(database, image_id)
 }
 
@@ -318,29 +488,81 @@ pub fn add_tags(database: &LibraryDb, image_ids: &[i64], tag_names: &[String]) -
     if names.is_empty() {
         return Ok(0);
     }
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        let tag_ids = ensure_tags(&transaction, &names)?;
-        let mut added = 0_u64;
-        for tag_id in &tag_ids {
-            for chunk in ids.chunks(SQL_CHUNK) {
-                let marks = placeholders(chunk.len());
-                added += transaction.execute(
-                    &format!(
-                        "INSERT INTO image_tags(image_id, tag_id)
-                         SELECT images.id, ?1 FROM images WHERE images.id IN ({marks})
-                         ON CONFLICT(image_id, tag_id) DO NOTHING"
-                    ),
-                    params_from_iter(
-                        std::iter::once(Value::Integer(*tag_id))
-                            .chain(chunk.iter().map(|id| Value::Integer(*id))),
-                    ),
-                )? as u64;
+    history::write(
+        database,
+        NewOperation::new(
+            HistoryKind::TagAdd,
+            format!("添加标签「{}」", tag_summary(&names)),
+        ),
+        |transaction, draft| {
+            let mut created = Vec::new();
+            let tag_ids = ensure_tags_tracked(transaction, &names, &mut created)?;
+            let mut pending_created: Vec<TagRefRecord> = created
+                .into_iter()
+                .map(|(id, name)| TagRefRecord { id, name })
+                .collect();
+            let mut added = 0_u64;
+            for tag_id in &tag_ids {
+                for chunk in ids.chunks(SQL_CHUNK) {
+                    let marks = placeholders(chunk.len());
+                    let existing_images: HashSet<i64> = {
+                        let mut statement = transaction
+                            .prepare(&format!("SELECT id FROM images WHERE id IN ({marks})"))?;
+                        statement
+                            .query_map(params_from_iter(chunk.iter()), |row| row.get(0))?
+                            .collect::<rusqlite::Result<HashSet<_>>>()?
+                    };
+                    let existing_relations: HashSet<i64> = {
+                        let mut statement = transaction.prepare(&format!(
+                            "SELECT image_id FROM image_tags
+                             WHERE tag_id = ?1 AND image_id IN ({marks})"
+                        ))?;
+                        statement
+                            .query_map(
+                                params_from_iter(
+                                    std::iter::once(Value::Integer(*tag_id))
+                                        .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                                ),
+                                |row| row.get(0),
+                            )?
+                            .collect::<rusqlite::Result<HashSet<_>>>()?
+                    };
+                    let mut pairs = Vec::new();
+                    for image_id in chunk {
+                        if !existing_images.contains(image_id)
+                            || existing_relations.contains(image_id)
+                        {
+                            continue;
+                        }
+                        let changed = transaction.execute(
+                            "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)
+                             ON CONFLICT(image_id, tag_id) DO NOTHING",
+                            params![image_id, tag_id],
+                        )?;
+                        if changed > 0 {
+                            pairs.push((*image_id, *tag_id));
+                        }
+                    }
+                    if pairs.is_empty() {
+                        continue;
+                    }
+                    draft.json(&TagRecord::Add {
+                        pairs: pairs.clone(),
+                        created: std::mem::take(&mut pending_created),
+                    })?;
+                    added += pairs.len() as u64;
+                }
             }
-        }
-        transaction.commit()?;
-        Ok(added)
-    })
+            if !pending_created.is_empty() {
+                draft.json(&TagRecord::Add {
+                    pairs: Vec::new(),
+                    created: pending_created,
+                })?;
+            }
+            draft.affected(added);
+            Ok(added)
+        },
+    )
 }
 
 pub fn remove_tags(
@@ -353,32 +575,52 @@ pub fn remove_tags(
     if names.is_empty() {
         return Ok(0);
     }
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        let tag_ids = tag_ids_for_names(&transaction, &names)?;
-        if tag_ids.is_empty() {
-            return Ok(0);
-        }
-        let tag_marks = placeholders(tag_ids.len());
-        let mut removed = 0_u64;
-        for chunk in ids.chunks(SQL_CHUNK) {
-            let marks = placeholders(chunk.len());
-            removed += transaction.execute(
-                &format!(
-                    "DELETE FROM image_tags
-                     WHERE tag_id IN ({tag_marks}) AND image_id IN ({marks})"
-                ),
-                params_from_iter(
-                    tag_ids
-                        .iter()
-                        .map(|id| Value::Integer(*id))
-                        .chain(chunk.iter().map(|id| Value::Integer(*id))),
-                ),
-            )? as u64;
-        }
-        transaction.commit()?;
-        Ok(removed)
-    })
+    history::write(
+        database,
+        NewOperation::new(
+            HistoryKind::TagRemove,
+            format!("移除标签「{}」", tag_summary(&names)),
+        ),
+        |transaction, draft| {
+            let tag_ids = tag_ids_for_names(transaction, &names)?;
+            let mut removed = 0_u64;
+            for tag_id in tag_ids {
+                for chunk in ids.chunks(SQL_CHUNK) {
+                    let marks = placeholders(chunk.len());
+                    let values = || {
+                        params_from_iter(
+                            std::iter::once(Value::Integer(tag_id))
+                                .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                        )
+                    };
+                    // 先查出现有关系：既得到撤销用的 `(imageId, tagId)`，也避免把没改动的行计入影响数。
+                    let present: Vec<(i64, i64)> = {
+                        let mut statement = transaction.prepare(&format!(
+                            "SELECT image_id FROM image_tags
+                             WHERE tag_id = ?1 AND image_id IN ({marks})"
+                        ))?;
+                        statement
+                            .query_map(values(), |row| Ok((row.get::<_, i64>(0)?, tag_id)))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    if present.is_empty() {
+                        continue;
+                    }
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM image_tags
+                             WHERE tag_id = ?1 AND image_id IN ({marks})"
+                        ),
+                        values(),
+                    )?;
+                    removed += present.len() as u64;
+                    draft.json(&TagRecord::Remove { pairs: present })?;
+                }
+            }
+            draft.affected(removed);
+            Ok(removed)
+        },
+    )
 }
 
 pub fn rename_tag(database: &LibraryDb, tag_id: i64, name: &str) -> AppResult<()> {
@@ -386,44 +628,99 @@ pub fn rename_tag(database: &LibraryDb, tag_id: i64, name: &str) -> AppResult<()
         return Err(AppError::message("标签 id 无效"));
     }
     let name = validate_tag_name(name)?;
-    database.with_writer(|connection| {
-        let duplicate: Option<i64> = connection
-            .query_row(
-                "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id <> ?2",
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::TagRename, format!("重命名标签「{name}」")),
+        |transaction, draft| {
+            let old_name: Option<String> = transaction
+                .query_row("SELECT name FROM tags WHERE id = ?1", [tag_id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let Some(old_name) = old_name else {
+                return Err(AppError::message("标签不存在"));
+            };
+            if old_name == name {
+                return Ok(());
+            }
+            let duplicate: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id <> ?2",
+                    params![name, tag_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if duplicate.is_some() {
+                return Err(AppError::message("已经有同名标签"));
+            }
+            transaction.execute(
+                "UPDATE tags SET name = ?1 WHERE id = ?2",
                 params![name, tag_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if duplicate.is_some() {
-            return Err(AppError::message("已经有同名标签"));
-        }
-        let changed = connection.execute(
-            "UPDATE tags SET name = ?1 WHERE id = ?2",
-            params![name, tag_id],
-        )?;
-        if changed == 0 {
-            return Err(AppError::message("标签不存在"));
-        }
-        Ok(())
-    })
+            )?;
+            draft.json(&TagRecord::Rename { tag_id, old_name })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )
 }
 
 pub fn delete_tag(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
     if tag_id <= 0 {
         return Err(AppError::message("标签 id 无效"));
     }
-    database.with_writer(|connection| {
-        let affected: i64 = connection.query_row(
-            "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
-            [tag_id],
-            |row| row.get(0),
-        )?;
-        let changed = connection.execute("DELETE FROM tags WHERE id = ?1", [tag_id])?;
-        if changed == 0 {
-            return Err(AppError::message("标签不存在"));
-        }
-        Ok(affected as u64)
-    })
+    let label = database
+        .with_reader(|connection| {
+            Ok(connection
+                .query_row("SELECT name FROM tags WHERE id = ?1", [tag_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?)
+        })?
+        .map(|name| format!("删除标签「{name}」"))
+        .unwrap_or_else(|| "删除标签".to_owned());
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::TagDelete, label),
+        |transaction, draft| {
+            let name: Option<String> = transaction
+                .query_row("SELECT name FROM tags WHERE id = ?1", [tag_id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let Some(name) = name else {
+                return Err(AppError::message("标签不存在"));
+            };
+            let image_ids: Vec<i64> = {
+                let mut statement = transaction.prepare(
+                    "SELECT image_id FROM image_tags WHERE tag_id = ?1 ORDER BY image_id",
+                )?;
+                statement
+                    .query_map([tag_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            draft.json(&TagRecord::Delete {
+                tag_id,
+                name: name.clone(),
+            })?;
+            for chunk in image_ids.chunks(1_000) {
+                draft.json(&TagRecord::Pairs {
+                    pairs: chunk.iter().map(|id| (*id, tag_id)).collect(),
+                })?;
+            }
+            transaction.execute("DELETE FROM tags WHERE id = ?1", [tag_id])?;
+            draft.affected(image_ids.len() as u64);
+            Ok(image_ids.len() as u64)
+        },
+    )
+}
+
+fn tag_summary(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let mut text = shown.join("、");
+    if names.len() > shown.len() {
+        text.push('…');
+    }
+    text
 }
 
 pub fn move_images(
