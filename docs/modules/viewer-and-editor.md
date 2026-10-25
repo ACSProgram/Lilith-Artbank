@@ -37,7 +37,7 @@
 
 ### 空间优化与编辑的边界
 
-空间优化不经过查看器的编辑会话：它不产生新的图片 id，不写编辑快照，也没有编辑器内的撤销栈。编码、PSNR 与 EXIF/ICC 搬运在 `src-tauri/src/imageops/optimize.rs`，与 `imageops/edit.rs` 的几何编辑分开。目前只实现只读估算（见 [维护与批量工作流](maintenance.md#图片空间优化估算)），替换原图的写路径尚未实现。
+空间优化不经过查看器的编辑会话：它不产生新的图片 id，不写编辑快照，也没有编辑器内的撤销栈。编码、PSNR 与 EXIF/ICC 搬运在 `src-tauri/src/imageops/optimize.rs`，与 `imageops/edit.rs` 的几何编辑分开；执行时按内容哈希发布新文件并删除旧图，但 `feature_blobs`、标签、集合与 `modified_at` 不动。见 [维护与批量工作流](maintenance.md#图片空间优化)。
 
 ### 保存语义（重要）
 

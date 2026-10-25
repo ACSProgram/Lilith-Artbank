@@ -1,3 +1,5 @@
+use crate::app::error::{AppError, AppResult};
+
 pub mod capability;
 pub mod collections;
 pub mod content;
@@ -8,6 +10,7 @@ pub mod history;
 pub mod import;
 pub mod manifest;
 pub mod metadata;
+pub mod optimize;
 pub mod optimize_estimate;
 pub mod paths;
 pub mod query;
@@ -35,6 +38,23 @@ pub trait BatchReporter: Send + Sync {
     fn cancelled(&self) -> bool;
     /// 可选的进度文案；不关心文案的调用方用默认实现。
     fn message(&self, _message: &str) {}
+}
+
+/// 压缩与估算共用的编码线程上限：两者都是整图编码，再多的线程在单块盘上也不会更快。
+const ENCODE_MAX_THREADS: usize = 8;
+
+/// 建一个整图编码线程池；`context` 只用于错误文案（“压缩” / “估算”）。
+///
+/// 独立线程池而不是全局 rayon 池：任务结束后线程立刻回收，不影响其他批量任务。
+pub(crate) fn encode_pool(context: &str) -> AppResult<rayon::ThreadPool> {
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, ENCODE_MAX_THREADS);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| AppError::message(format!("无法创建{context}线程池：{error}")))
 }
 
 #[cfg(test)]

@@ -60,6 +60,8 @@ pub enum HistoryKind {
     CollectionCombine,
     SimilarityGroups,
     AiDescription,
+    /// 图片空间压缩；文件已替换、原图已删除，不可撤销。
+    Optimize,
 }
 
 impl HistoryKind {
@@ -93,6 +95,7 @@ impl HistoryKind {
             Self::CollectionCombine => "collectionCombine",
             Self::SimilarityGroups => "similarityGroups",
             Self::AiDescription => "aiDescription",
+            Self::Optimize => "optimize",
         }
     }
 
@@ -126,6 +129,7 @@ impl HistoryKind {
             "collectionCombine" => Self::CollectionCombine,
             "similarityGroups" => Self::SimilarityGroups,
             "aiDescription" => Self::AiDescription,
+            "optimize" => Self::Optimize,
             other => {
                 return Err(AppError::message(format!("未知的操作类型：{other}")));
             }
@@ -790,6 +794,17 @@ pub fn finish_live(database: &LibraryDb, op_id: i64, error: &str) -> AppResult<(
     })
 }
 
+/// 长任务完成后把结果写进记录标题（例如“省 12 GB”）；不改表结构。
+pub fn update_label(database: &LibraryDb, operation_id: i64, label: &str) -> AppResult<()> {
+    database.with_writer(|connection| {
+        connection.execute(
+            "UPDATE operations SET label = ?1 WHERE id = ?2",
+            params![label, operation_id],
+        )?;
+        Ok(())
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
@@ -1128,6 +1143,15 @@ pub fn run_undo(
         return Err(AppError::message("没有可撤销的记录"));
     }
 
+    // 压缩会直接删除原图，无法回退；在标记 undoing 之前拒绝，避免留下假的“撤销失败”。
+    if operations
+        .iter()
+        .any(|(_, kind, _)| *kind == HistoryKind::Optimize)
+    {
+        finish_run(database, run_id, "failed")?;
+        return Err(AppError::message("压缩操作不可撤销，原图已删除"));
+    }
+
     task.set_total(operations.len());
     let mut cancelled = false;
     for (id, kind, label) in operations {
@@ -1373,6 +1397,9 @@ fn undo_operation(
         | HistoryKind::CollectionRemove
         | HistoryKind::CollectionCombine
         | HistoryKind::SimilarityGroups => undo_collection(database, operation_id, kind)?,
+        HistoryKind::Optimize => {
+            return Err(AppError::message("压缩操作不可撤销，原图已删除"));
+        }
     }
     Ok(())
 }
@@ -1415,6 +1442,9 @@ fn redo_operation(
         | HistoryKind::CollectionRemove
         | HistoryKind::CollectionCombine
         | HistoryKind::SimilarityGroups => redo_collection(database, operation_id)?,
+        HistoryKind::Optimize => {
+            return Err(AppError::message("压缩操作不可撤销，原图已删除"));
+        }
     }
     Ok(())
 }

@@ -90,3 +90,21 @@ export function confirmClearHistory(
     danger: true,
   });
 }
+
+/** 空间优化执行：替换原图且有损；执行中可以取消，但已完成的图片不会恢复。 */
+export function confirmOptimize(
+  confirm: ConfirmFn,
+  processCount: number,
+  savingsBytes: number,
+): Promise<boolean> {
+  return confirm({
+    title: "开始压缩这些图片？",
+    message: `会用压缩后的版本替换约 ${count(processCount)} 张图片的原图${
+      savingsBytes > 0 ? `，预计省 ${formatBytes(savingsBytes)}` : ""
+    }。`,
+    detail:
+      "压缩会损失一点画质，原图无法恢复；执行中可以随时取消，已完成的图片保持压缩后的版本。",
+    confirmLabel: "开始压缩",
+    danger: true,
+  });
+}

@@ -6,7 +6,9 @@ import { Modal } from "../shared/components/Modal";
 import { Spinner } from "../shared/components/Spinner";
 import { formatBytes, formatDuration } from "../shared/format";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
+import { confirmOptimize } from "../shared/confirm";
 import { errorMessage } from "../shared/errors";
+import { useNotices } from "./noticeContext";
 import { useTaskCenter } from "./taskContext";
 import { taskApi } from "./taskApi";
 import { OptimizeCurveChart, OptimizeShareChart, type OptimizeShareSegment } from "./OptimizeCharts";
@@ -19,6 +21,7 @@ import {
   type OptimizeEstimate,
   type OptimizeOptions,
   type OptimizeTier,
+  type TaskSnapshot,
   type TaskSummary,
 } from "./taskTypes";
 import {
@@ -55,12 +58,53 @@ const MAX_EDGES = [
 
 const SAMPLE_SIZES = [100, 200, 500];
 
+/** 范围的名字；数量另用 `scopeCountLabel`，两处展示要保持一致。 */
+function scopeName(scope: ScopeChoice, context: BatchTaskContextInfo | null): string {
+  switch (scope) {
+    case "selected":
+      return "当前选择";
+    case "folder":
+      return context?.folderName || "当前文件夹";
+    case "collection":
+      return context?.collectionName || "当前集合";
+    case "view":
+      return "当前视图";
+    case "library":
+      return "整个图库";
+  }
+}
+
+/** 估算与执行共用同一块进度展示，只有数据来源不同。 */
+function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number }) {
+  return (
+    <div className="batch-task-progress">
+      <div className="batch-task-progress-head">
+        <strong>
+          {task.label} · {TASK_PHASE_LABELS[task.phase]}
+        </strong>
+        <span>
+          {(task.completed + task.failed + task.skipped).toLocaleString()} /{" "}
+          {task.total.toLocaleString()}
+        </span>
+      </div>
+      <div className="task-progress">
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <div className="batch-task-progress-meta">
+        <span>{task.message || (isTaskActive(task) ? <Spinner size={12} /> : "已结束")}</span>
+      </div>
+    </div>
+  );
+}
+
 /** 跳过原因按体积从大到小展示；计数为 0 的不占版面。 */
 function skipSegments(estimate: OptimizeEstimate): OptimizeShareSegment[] {
   return [
     { key: "compact", label: "已足够紧凑", ...estimate.skipCompact },
     { key: "optimized", label: "已处理过", ...estimate.skipOptimized },
     { key: "transparent", label: "有透明通道", ...estimate.skipTransparent },
+    { key: "tooLarge", label: "超出 WebP 尺寸", ...estimate.skipTooLarge },
+    { key: "color", label: "非 sRGB 色彩", ...estimate.skipColorProfile },
     { key: "quality", label: "画质不达标", ...estimate.skipQuality },
     { key: "notSmaller", label: "省得太少", ...estimate.skipNotSmaller },
     { key: "depth", label: "16 位源", ...estimate.skipDepth },
@@ -72,6 +116,7 @@ function skipSegments(estimate: OptimizeEstimate): OptimizeShareSegment[] {
 
 export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) {
   const { start, cancel, find } = useTaskCenter();
+  const { confirm } = useNotices();
   const [scope, setScope] = useState<ScopeChoice>("library");
   const [tier, setTier] = useState<OptimizeTier>("high");
   const [outputFormat, setOutputFormat] =
@@ -88,8 +133,11 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
   const [taskId, setTaskId] = useState<string | null>(null);
   const [estimate, setEstimate] = useState<OptimizeEstimate | null>(null);
   const [loadingEstimate, setLoadingEstimate] = useState(false);
+  const [executeTaskId, setExecuteTaskId] = useState<string | null>(null);
+  const [pendingKind, setPendingKind] = useState<"estimate" | "execute">("estimate");
   // 结果在表单下方，估算完成时可能落在可视区外，需要主动滚进来。
   const resultRef = useRef<HTMLDivElement>(null);
+  const fetchedEstimate = useRef<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -108,6 +156,9 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     setTaskId(null);
     setEstimate(null);
     setLoadingEstimate(false);
+    setExecuteTaskId(null);
+    setPendingKind("estimate");
+    fetchedEstimate.current = null;
     // 只在打开时重置；任务进度不应打断用户正在改的选项。
   }, [open]);
 
@@ -143,16 +194,20 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
   }, [signature]);
 
   const task = taskId ? find(taskId) : null;
+  const execution = executeTaskId ? find(executeTaskId) : null;
   const activeTask = task && isTaskActive(task) ? task : null;
+  const activeExecution = execution && isTaskActive(execution) ? execution : null;
   const percent = task ? taskPercent(task) : 0;
-  const phase = task?.phase;
+  const executionPercent = execution ? taskPercent(execution) : 0;
 
   useEffect(() => {
-    if (!taskId || phase !== "completed") return;
+    if (!task || task.kind !== "optimizeEstimate" || task.phase !== "completed") return;
+    if (fetchedEstimate.current === task.taskId) return;
+    fetchedEstimate.current = task.taskId;
     let disposed = false;
     setLoadingEstimate(true);
     void taskApi
-      .optimizeEstimate(taskId)
+      .optimizeEstimate(task.taskId)
       .then((result) => {
         if (disposed) return;
         if (result) {
@@ -170,7 +225,7 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     return () => {
       disposed = true;
     };
-  }, [taskId, phase]);
+  }, [task]);
 
   const scopeOptions = useMemo(() => scopeAvailability(context), [context]);
 
@@ -178,24 +233,29 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     if (estimate) resultRef.current?.scrollIntoView({ block: "start" });
   }, [estimate]);
 
-  const launch = async (policy: ConflictPolicy) => {
+  const launchTask = async (
+    kind: "optimizeEstimate" | "optimize",
+    policy: ConflictPolicy,
+  ) => {
     if (!context) return;
+    if (kind === "optimize" && !estimate) return;
     const builtScope = buildScope(scope, context);
     if (!builtScope) return;
     setStarting(true);
     setError(null);
     setConflict(null);
-    setEstimate(null);
+    setPendingKind(kind === "optimize" ? "execute" : "estimate");
     try {
       const request: BatchTaskRequest = {
-        kind: "optimizeEstimate",
+        kind,
         scope: builtScope,
         overwrite: false,
         recalcVisuals: false,
         prompt: null,
         maxTokens: null,
         optimize: options,
-        estimateSampleSize: sampleSize,
+        estimateId: kind === "optimize" ? (estimate?.taskId ?? null) : null,
+        estimateSampleSize: kind === "optimizeEstimate" ? sampleSize : null,
         conflict: policy,
       };
       const result = await start(request);
@@ -203,7 +263,12 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
         setConflict(result.active);
         return;
       }
-      setTaskId(result.task.taskId);
+      if (kind === "optimize") {
+        setExecuteTaskId(result.task.taskId);
+      } else {
+        setTaskId(result.task.taskId);
+        setEstimate(null);
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -211,7 +276,32 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     }
   };
 
-  const footer = activeTask ? (
+  const confirmExecute = async () => {
+    if (!estimate) return;
+    const accepted = await confirmOptimize(
+      confirm,
+      estimate.processCount,
+      estimate.savingsBytes,
+    );
+    if (accepted) await launchTask("optimize", "fail");
+  };
+
+  const retryKind = pendingKind === "execute" ? "optimize" : "optimizeEstimate";
+
+  const footer = activeExecution ? (
+    <>
+      <Button variant="ghost" onClick={onClose}>
+        隐藏
+      </Button>
+      <Button
+        variant="danger"
+        icon={<Square size={13} />}
+        onClick={() => void cancel(activeExecution.taskId)}
+      >
+        取消任务
+      </Button>
+    </>
+  ) : activeTask ? (
     <>
       <Button variant="ghost" onClick={onClose}>
         隐藏
@@ -231,13 +321,42 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
       </Button>
       <Button
         variant="secondary"
-        onClick={() => void launch("cancelActive")}
+        onClick={() => void launchTask(retryKind, "cancelActive")}
         loading={starting}
       >
         取消现有任务并开始
       </Button>
-      <Button variant="primary" onClick={() => void launch("queue")} loading={starting}>
+      <Button
+        variant="primary"
+        onClick={() => void launchTask(retryKind, "queue")}
+        loading={starting}
+      >
         排队等待
+      </Button>
+    </>
+  ) : execution ? (
+    <Button variant="primary" onClick={onClose}>
+      关闭
+    </Button>
+  ) : estimate ? (
+    <>
+      <Button
+        variant="ghost"
+        onClick={() => {
+          setEstimate(null);
+          setError(null);
+        }}
+      >
+        返回修改
+      </Button>
+      <Button
+        variant="danger"
+        icon={<Play size={13} />}
+        loading={starting}
+        disabled={estimate.processCount === 0}
+        onClick={() => void confirmExecute()}
+      >
+        确认执行
       </Button>
     </>
   ) : (
@@ -250,9 +369,9 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
         icon={<Play size={13} />}
         loading={starting || loadingEstimate}
         disabled={!scopeOptions[scope].enabled}
-        onClick={() => void launch("fail")}
+        onClick={() => void launchTask("optimizeEstimate", "fail")}
       >
-        {estimate ? "重新估算" : "开始估算"}
+        开始估算
       </Button>
     </>
   );
@@ -269,155 +388,183 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     <Modal
       open={open}
       title="优化图片空间"
-      subtitle="先估算能省多少；估算只读取图片，不会改动任何文件。"
+      subtitle="先估算能省多少；确认执行后才会替换原图。"
       width={820}
       onClose={onClose}
       footer={footer}
     >
       <div className="batch-task">
-        <Field label="处理范围">
-          <div className="batch-task-scopes">
-            {(Object.keys(scopeOptions) as ScopeChoice[]).map((value) => {
-              const availability = scopeOptions[value];
-              return (
-                <label
-                  key={value}
-                  className={`batch-task-scope${availability.enabled ? "" : " is-disabled"}`}
-                  title={availability.reason}
-                >
-                  <input
-                    type="radio"
-                    name="optimize-scope"
-                    checked={scope === value}
-                    disabled={!availability.enabled}
-                    onChange={() => setScope(value)}
-                  />
-                  <span>
-                    {value === "selected"
-                      ? "当前选择"
-                      : value === "folder"
-                        ? context?.folderName || "当前文件夹"
-                        : value === "collection"
-                          ? context?.collectionName || "当前集合"
-                          : value === "view"
-                            ? "当前视图"
-                            : "整个图库"}
-                  </span>
-                  <em>
-                    {availability.enabled ? scopeCountLabel(value, context) : availability.reason}
-                  </em>
-                </label>
-              );
-            })}
-          </div>
-        </Field>
+        {!estimate && !execution ? (
+          <>
+            <Field label="处理范围">
+              <div className="batch-task-scopes">
+                {(Object.keys(scopeOptions) as ScopeChoice[]).map((value) => {
+                  const availability = scopeOptions[value];
+                  return (
+                    <label
+                      key={value}
+                      className={`batch-task-scope${availability.enabled ? "" : " is-disabled"}`}
+                      title={availability.reason}
+                    >
+                      <input
+                        type="radio"
+                        name="optimize-scope"
+                        checked={scope === value}
+                        disabled={!availability.enabled}
+                        onChange={() => setScope(value)}
+                      />
+                      <span>{scopeName(value, context)}</span>
+                      <em>
+                        {availability.enabled ? scopeCountLabel(value, context) : availability.reason}
+                      </em>
+                    </label>
+                  );
+                })}
+              </div>
+            </Field>
 
-        <div className="optimize-section">
-          <span className="field-label">质量档位</span>
-          <div className="optimize-tiers">
-            {TIERS.map((item) => (
-              <button
-                key={item.value}
-                type="button"
-                className={`batch-task-type${tier === item.value ? " is-active" : ""}`}
-                onClick={() => setTier(item.value)}
-              >
-                <span>{item.label}</span>
-                <small>{item.detail}</small>
-              </button>
-            ))}
-          </div>
-          <p className="field-hint">只压“存得浪费”的图，压不动的自动跳过。</p>
-        </div>
-
-        <div className="settings-grid">
-          <Field label="输出格式" hint="WebP 更省；选 JPEG 时有透明通道的图片会被跳过。">
-            <div className="optimize-choice-row">
-              {OUTPUT_FORMATS.map((item) => (
-                <button
-                  key={item.value}
-                  type="button"
-                  className={`optimize-choice${outputFormat === item.value ? " is-active" : ""}`}
-                  onClick={() => setOutputFormat(item.value)}
-                >
-                  {item.label}
-                </button>
-              ))}
+            <div className="optimize-section">
+              <span className="field-label">质量档位</span>
+              <div className="optimize-tiers">
+                {TIERS.map((item) => (
+                  <button
+                    key={item.value}
+                    type="button"
+                    className={`batch-task-type${tier === item.value ? " is-active" : ""}`}
+                    onClick={() => setTier(item.value)}
+                  >
+                    <span>{item.label}</span>
+                    <small>{item.detail}</small>
+                  </button>
+                ))}
+              </div>
+              <p className="field-hint">只压“存得浪费”的图，压不动的自动跳过。</p>
             </div>
-          </Field>
-          <Field label="长边上限" hint="超过上限的图片会被缩小，像素永久丢失。">
-            <select
-              className="input"
-              value={maxLongEdge ?? ""}
-              onChange={(event) =>
-                setMaxLongEdge(event.target.value === "" ? null : Number(event.target.value))
-              }
-            >
-              {MAX_EDGES.map((item) => (
-                <option key={item.label} value={item.value ?? ""}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
 
-        <div className="settings-grid">
-          <div className="field">
-            <span className="field-label">重新计算信息</span>
-            <div className="optimize-checks">
-              <label className="optimize-check" title="按压缩后的原图重建 512 px 缩略图">
-                <input
-                  type="checkbox"
-                  checked={regenerateThumbnails}
-                  onChange={(event) => setRegenerateThumbnails(event.target.checked)}
-                />
-                <span>缩略图</span>
-              </label>
-              <label className="optimize-check" title="不重算的话，找相似与相似分组仍用旧 pHash">
-                <input
-                  type="checkbox"
-                  checked={recomputePhash}
-                  onChange={(event) => setRecomputePhash(event.target.checked)}
-                />
-                <span>pHash</span>
-              </label>
-              <label className="optimize-check" title="不重算的话，按颜色筛选仍用旧主色">
-                <input
-                  type="checkbox"
-                  checked={recomputeColors}
-                  onChange={(event) => setRecomputeColors(event.target.checked)}
-                />
-                <span>主色</span>
-              </label>
+            <div className="settings-grid">
+              <Field label="输出格式" hint="WebP 更省，但不保留 EXIF 与色彩配置；选 JPEG 时透明图会被跳过。">
+                <div className="optimize-choice-row">
+                  {OUTPUT_FORMATS.map((item) => (
+                    <button
+                      key={item.value}
+                      type="button"
+                      className={`optimize-choice${outputFormat === item.value ? " is-active" : ""}`}
+                      onClick={() => setOutputFormat(item.value)}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+              <Field label="长边上限" hint="超过上限的图片会被缩小，像素永久丢失。">
+                <select
+                  className="input"
+                  value={maxLongEdge ?? ""}
+                  onChange={(event) =>
+                    setMaxLongEdge(event.target.value === "" ? null : Number(event.target.value))
+                  }
+                >
+                  {MAX_EDGES.map((item) => (
+                    <option key={item.label} value={item.value ?? ""}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+
+            <div className="settings-grid">
+              <div className="field">
+                <span className="field-label">重新计算信息</span>
+                <div className="optimize-checks">
+                  <label className="optimize-check" title="按压缩后的原图重建 512 px 缩略图">
+                    <input
+                      type="checkbox"
+                      checked={regenerateThumbnails}
+                      onChange={(event) => setRegenerateThumbnails(event.target.checked)}
+                    />
+                    <span>缩略图</span>
+                  </label>
+                  <label className="optimize-check" title="不重算的话，找相似与相似分组仍用旧 pHash">
+                    <input
+                      type="checkbox"
+                      checked={recomputePhash}
+                      onChange={(event) => setRecomputePhash(event.target.checked)}
+                    />
+                    <span>pHash</span>
+                  </label>
+                  <label className="optimize-check" title="不重算的话，按颜色筛选仍用旧主色">
+                    <input
+                      type="checkbox"
+                      checked={recomputeColors}
+                      onChange={(event) => setRecomputeColors(event.target.checked)}
+                    />
+                    <span>主色</span>
+                  </label>
+                </div>
+              </div>
+              <Field label="估算抽样" hint="样本越多越准，也越慢。">
+                <select
+                  className="input"
+                  value={sampleSize}
+                  onChange={(event) => setSampleSize(Number(event.target.value))}
+                >
+                  {SAMPLE_SIZES.map((value) => (
+                    <option key={value} value={value}>
+                      {value} 张
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={skipOptimized}
+                onChange={(event) => setSkipOptimized(event.target.checked)}
+              />
+              <span>
+                <strong>跳过已处理过的图片</strong>
+                <small>取消勾选会把这些图片再压一次，画质会继续下降。</small>
+              </span>
+            </label>
+          </>
+        ) : null}
+
+        {estimate ? (
+          <div className="optimize-run-summary">
+            <span className="field-label">本次设置</span>
+            <div className="optimize-outcome-rows">
+              <div className="optimize-outcome-row">
+                <span>范围</span>
+                <strong>
+                  {scopeName(scope, context)}
+                  {scopeCountLabel(scope, context)
+                    ? ` · ${scopeCountLabel(scope, context)}`
+                    : ""}
+                </strong>
+              </div>
+              <div className="optimize-outcome-row">
+                <span>档位</span>
+                <strong>
+                  {tier === "extreme" ? "极高" : tier === "medium" ? "中" : "高"}
+                </strong>
+              </div>
+              <div className="optimize-outcome-row">
+                <span>输出</span>
+                <strong>
+                  {outputFormat === "jpeg" ? "JPEG" : "WebP"} · 长边{" "}
+                  {maxLongEdge ? `${maxLongEdge} px` : "不限"}
+                </strong>
+              </div>
+              <div className="optimize-outcome-row">
+                <span>已处理图片</span>
+                <strong>{skipOptimized ? "跳过" : "再压一次"}</strong>
+              </div>
             </div>
           </div>
-          <Field label="估算抽样" hint="样本越多越准，也越慢。">
-            <select
-              className="input"
-              value={sampleSize}
-              onChange={(event) => setSampleSize(Number(event.target.value))}
-            >
-              {SAMPLE_SIZES.map((value) => (
-                <option key={value} value={value}>
-                  {value} 张
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
-
-        <label className="toggle-row">
-          <input
-            type="checkbox"
-            checked={skipOptimized}
-            onChange={(event) => setSkipOptimized(event.target.checked)}
-          />
-          <span>
-            <strong>跳过已处理过的图片</strong>
-            <small>取消勾选会把这些图片再压一次，画质会继续下降。</small>
-          </span>
-        </label>
+        ) : null}
 
         <div className="optimize-warning">
           <AlertTriangle size={14} />
@@ -436,31 +583,18 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
                 </li>
               ))}
             </ul>
-            <p>可以等它结束后自动开始，或者取消它、马上开始新的估算。</p>
+            <p>
+              可以等它结束后自动开始，或者取消它、马上开始
+              {pendingKind === "execute" ? "压缩" : "新的估算"}。
+            </p>
           </div>
         ) : null}
 
-        {task ? (
-          <div className="batch-task-progress">
-            <div className="batch-task-progress-head">
-              <strong>
-                {task.label} · {TASK_PHASE_LABELS[task.phase]}
-              </strong>
-              <span>
-                {(task.completed + task.failed + task.skipped).toLocaleString()} /{" "}
-                {task.total.toLocaleString()}
-              </span>
-            </div>
-            <div className="task-progress">
-              <span style={{ width: `${percent}%` }} />
-            </div>
-            <div className="batch-task-progress-meta">
-              <span>
-                {task.message || (isTaskActive(task) ? <Spinner size={12} /> : "已结束")}
-              </span>
-            </div>
-          </div>
+        {task && (isTaskActive(task) || (!estimate && !execution)) ? (
+          <ProgressPanel task={task} percent={percent} />
         ) : null}
+
+        {execution ? <ProgressPanel task={execution} percent={executionPercent} /> : null}
 
         {loadingEstimate ? (
           <div className="optimize-loading">

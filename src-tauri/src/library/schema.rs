@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -44,6 +44,8 @@ CREATE TABLE images (
     imported_at INTEGER NOT NULL,
     modified_at INTEGER NOT NULL,
     deleted_at INTEGER,
+    -- 已经过空间优化的时间戳（0 表示没有）；重跑时默认跳过，避免反复有损压缩。
+    optimized_at INTEGER NOT NULL DEFAULT 0,
     thumb_segment INTEGER NOT NULL DEFAULT 0,
     thumb_offset INTEGER NOT NULL DEFAULT 0,
     thumb_length INTEGER NOT NULL DEFAULT 0,
@@ -244,22 +246,30 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v1_to_v2(connection)?;
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)
+            migrate_v4_to_v5(connection)?;
+            migrate_v5_to_v6(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)
+            migrate_v4_to_v5(connection)?;
+            migrate_v5_to_v6(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
             migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)
+            migrate_v4_to_v5(connection)?;
+            migrate_v5_to_v6(connection)
         }
         4 => {
             verify_meta(connection, manifest)?;
-            migrate_v4_to_v5(connection)
+            migrate_v4_to_v5(connection)?;
+            migrate_v5_to_v6(connection)
+        }
+        5 => {
+            verify_meta(connection, manifest)?;
+            migrate_v5_to_v6(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -373,9 +383,22 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> AppResult<()> {
          ALTER TABLE images ADD COLUMN origin_operation_id INTEGER;",
     )?;
     transaction.execute_batch(HISTORY_SCHEMA_SQL)?;
-    mark_version(&transaction, SCHEMA_VERSION)?;
+    mark_version(&transaction, 5)?;
     transaction.commit()?;
-    log::info!("图库 schema 已从 v4 升级到 v{SCHEMA_VERSION}");
+    log::info!("图库 schema 已从 v4 升级到 v5");
+    Ok(())
+}
+
+/// v5 → v6：记录空间优化的时间戳；已有的行都视为“未优化”。
+fn migrate_v5_to_v6(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "ALTER TABLE images ADD COLUMN optimized_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    mark_version(&transaction, 6)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v5 升级到 v6");
     Ok(())
 }
 
@@ -484,7 +507,21 @@ mod tests {
             .unwrap();
     }
 
+    fn downgrade_to_v5(connection: &Connection) {
+        connection
+            .execute("ALTER TABLE images DROP COLUMN optimized_at", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '5' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
     fn downgrade_to_v4(connection: &Connection) {
+        downgrade_to_v5(connection);
         connection
             .execute_batch(
                 "DROP INDEX idx_images_purge;
@@ -726,5 +763,47 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn migrates_v5_to_v6_and_marks_existing_rows_unoptimized() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v5(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 5);
+
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'png', 1, 4096, 4, 3, 'png', 0, zeroblob(32), zeroblob(16),
+                           zeroblob(32), 0, '已有图片', 7, 7)",
+                [("b".repeat(64))],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schemaVersion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+
+        let (optimized_at, imported_at, modified_at): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT optimized_at, imported_at, modified_at FROM images WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(optimized_at, 0);
+        assert_eq!(imported_at, 7);
+        assert_eq!(modified_at, 7);
     }
 }

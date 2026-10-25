@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v5、schema v5、多级文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v5、schema v6、多级文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,11 +36,12 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 5；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 6；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
 - v4 → v5 新增 `operations` / `operation_chunks` / `undo_runs` 三张表、`images.purge_operation_id` / `origin_operation_id` 两列与 `idx_images_purge` 索引，不改现有行；v1–v3 库按链式迁移到 v5。
+- v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行；v1–v5 库按链式迁移到 v6。
 
 ### 表
 
@@ -73,6 +74,7 @@ description        用户可编辑文本；FTS 索引
 description_source user / ai / import
 description_model  AI 生成描述时的模型名；手工/导入为空
 imported_at / modified_at / deleted_at
+optimized_at       空间优化的写入时间；0 表示没压缩过
 thumb_segment / thumb_offset / thumb_length / thumb_format
 thumb_width / thumb_height / thumb_version
 purge_operation_id 非空表示已从回收站移除、等待释放；文件与行暂留
@@ -245,9 +247,10 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 历史保存在当前图库的 SQLite（`operations` / `operation_chunks` / `undo_runs`），换库后各自独立；最大步数来自设置 `history.maxSteps`。
 
-- 已接入：移入回收站、恢复、永久删除、清空回收站（批次 1）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序（批次 2）；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述（批次 3）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
+- 已接入：移入回收站、恢复、永久删除、清空回收站（批次 1）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序（批次 2）；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述（批次 3）；图片空间优化（`kind='optimize'`，只记结果，不可撤销）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
 - 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，既不留下空记录，也不清空重做分支（没有实际改动的操作不算新时间线）。`write` 在同一个事务里删除 `undone` / `redoing` 记录：确实写入的新操作开启新时间线，灰色记录与其暂存文件不再可重做。
-- 长任务用 `begin_live` 建 `pending` 记录、每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据、结束时 `finish_live`；导入与批量 AI 描述使用。`begin_live` 不结束重做分支：导入可能因 write lane 冲突根本没启动，或整批都是重复跳过；只有确实写入内容的批次（导入批次与 AI 描述写入）才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。
+- 长任务用 `begin_live` 建 `pending` 记录、每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据、结束时 `finish_live`；导入、批量 AI 描述与图片空间优化使用。`begin_live` 不结束重做分支：导入可能因 write lane 冲突根本没启动，或整批都是重复跳过；只有确实写入内容的批次（导入批次、AI 描述写入与压缩批次）才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。
+- 图片空间优化不写任何逆数据：每批事务内更新 `images` 并累加 `affected`，完成后用 `history::update_label` 把「N 张 · 省 X」写进标题。`run_undo` 在标记 `undoing` 之前预检链中含 `optimize` 就返回“压缩操作不可撤销，原图已删除”，不会留下假的 `undoFailed`；记录面板同样禁用撤销。
 - 撤销是线性回退：选中第 N 条 = 依次撤回当前仍为 `applied` 的记录，直到 N。成功的记录不再删除，而是标为 `undone`（列表里变灰）；`undone` 记录保持原 chunks，并通过 `redo` chunks 保存撤销前的状态。多条记录的撤销只在记录之间检查取消。
 - 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
 - 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重试成功或清空记录。所有逆操作与重做操作都可重复执行。
@@ -294,7 +297,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 `cargo test` 覆盖：
 
 - 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝；
@@ -305,6 +308,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
 - S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复、永久删除与清空回收站的延迟标记与释放；
 - 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读；批次 2 覆盖移动撤销（文件与行、部分恢复后续做）、编辑撤销（文件、行、缩略图、`feature_blobs`、暂存目录）、文件夹创建/重命名/移动/删除/排序撤销，以及导入新增/合并撤销（新建文件夹与标签清理、合并快照恢复）；重做覆盖回收站/恢复、永久删除标记、移动、编辑、文件夹创建/重命名/移动/排序/删除链条与导入新增/合并，另测“重做到较旧记录时保留更新记录为灰”、新操作清空重做分支、写入内容的导入清空重做分支而空 `pending` 导入保留、`redoing` 启动续做；批次 3 覆盖评分/描述/AI 描述、标签设置/增删/改名/删除、集合 CRUD/排序/加入移出/运算/相似分组的线性撤销与重做。
+- 图片空间优化：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、估算分层与只读、凭证指纹与候选 ±10%、执行后内容列与 `optimized_at` 更新而其余元数据不变、旧图删除、重复压缩跳过、`pending` 记录恢复为 `applied`。
 - S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
 - S4 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
 - S4 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。

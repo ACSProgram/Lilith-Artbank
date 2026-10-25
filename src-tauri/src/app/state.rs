@@ -657,7 +657,7 @@ impl AppState {
             Some(_) => return Err(AppError::message("只能重做已经撤销的操作")),
             None => return Err(AppError::message("操作记录不存在")),
         }
-        if count <= 0 {
+        if count == 0 {
             return Err(AppError::message("没有可重做的记录"));
         }
         self.start_redo_task(target_id, count)
@@ -1010,6 +1010,7 @@ impl AppState {
                 request.conflict,
             ),
             BatchTaskKind::OptimizeEstimate => self.start_optimize_estimate(app, request),
+            BatchTaskKind::Optimize => self.start_optimize_task(app, request),
         }
     }
 
@@ -1136,6 +1137,118 @@ impl AppState {
             })
     }
 
+    /// 空间优化执行：先按估算凭证核对范围与参数，再在写入 lane 上编码并发布。
+    fn start_optimize_task(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        let options = request.optimize.clone().unwrap_or_default();
+        options.validate()?;
+        let estimate_id = request
+            .estimate_id
+            .as_deref()
+            .ok_or_else(|| AppError::message("请先估算压缩空间，再确认执行"))?;
+        let estimate = self
+            .optimize_estimate(estimate_id)
+            .ok_or_else(|| AppError::message("估算结果已过期，请重新估算"))?;
+
+        let (database, thumbs, root) = self.edit_handles()?;
+        let fingerprint = optimize_fingerprint(&request.scope, &options);
+        let ids = request.scope.resolve(&database)?;
+        if ids.is_empty() {
+            return Err(AppError::message("当前范围没有图片"));
+        }
+        let candidates = crate::library::optimize::collect_candidates(&database, &ids)?;
+        let (count, bytes) = crate::library::optimize::eligible_summary(&candidates, &options);
+        // 指纹与候选漂移都在这里一次判定；没有候选时 `verify_grant` 自己会报错。
+        crate::library::optimize::verify_grant(&estimate, &fingerprint, count, bytes)?;
+
+        let operation_id = history::begin_live(
+            &database,
+            NewOperation::new(
+                HistoryKind::Optimize,
+                format!("优化图片空间 · {}", request.scope.label()),
+            ),
+        )?;
+
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::Optimize,
+            request.scope.label(),
+        );
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        let cleanup_database = database.clone();
+        let launched = self
+            .tasks
+            .launch(app, handle, request.conflict, move |guard| {
+                let _ = tasks.spawn_worker("optimize".to_owned(), worker.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Running);
+                    worker.set_total(count as usize);
+                    let result = crate::library::optimize::optimize(
+                        &database,
+                        &root,
+                        &thumbs,
+                        candidates,
+                        &options,
+                        operation_id,
+                        &*worker,
+                    );
+                    // 已提交的批次会改变文件、大小与可选特征；成功或中途出错都要刷新缓存。
+                    query::clear_page_cache();
+                    ai.invalidate_similarity();
+                    match result {
+                        Ok(report) => {
+                            let label = if report.processed > 0 {
+                                format!(
+                                    "优化图片空间 · {} 张 · 省 {}",
+                                    report.processed,
+                                    format_savings(report.savings_bytes)
+                                )
+                            } else {
+                                "优化图片空间".to_owned()
+                            };
+                            let _ = history::update_label(&database, operation_id, &label);
+                            let error = report.stop_reason.clone().unwrap_or_default();
+                            let _ = history::finish_live(&database, operation_id, &error);
+                            let mut summary = format!(
+                                "处理 {} 张，省 {}",
+                                report.processed,
+                                format_savings(report.savings_bytes)
+                            );
+                            if report.skipped > 0 {
+                                summary.push_str(&format!("，跳过 {} 张", report.skipped));
+                            }
+                            if report.failed > 0 {
+                                summary.push_str(&format!("，失败 {} 张", report.failed));
+                            }
+                            worker.set_message(&summary);
+                            if report.stop_reason.is_some() {
+                                worker.finish(TaskPhase::Failed);
+                            } else {
+                                worker.finish_from(&Ok(()));
+                            }
+                        }
+                        Err(error) => {
+                            let _ =
+                                history::finish_live(&database, operation_id, &error.to_string());
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                });
+            });
+
+        // 任务没能启动（冲突或线程失败）时不能留下一条永远不会结束的记录。
+        if matches!(launched, Ok(TaskStartResult::Conflict { .. }) | Err(_)) {
+            let _ = history::finish_live(&cleanup_database, operation_id, "");
+        }
+        launched
+    }
+
     pub fn optimize_estimate(&self, task_id: &str) -> Option<OptimizeEstimate> {
         self.optimize_estimates
             .lock()
@@ -1166,6 +1279,20 @@ fn optimize_fingerprint(scope: &crate::app::tasks::TaskScope, options: &Optimize
     blake3::hash(format!("{scope:?}|{options}").as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn format_savings(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.0} MB", bytes / MB)
+    } else {
+        format!("{:.0} KB", bytes / KB)
+    }
 }
 
 fn conflict_error(active: &[TaskSummary]) -> AppError {

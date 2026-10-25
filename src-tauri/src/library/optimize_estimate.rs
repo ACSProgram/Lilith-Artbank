@@ -10,18 +10,22 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use image::{ColorType, DynamicImage};
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::{
-    app::error::{AppError, AppResult},
+    app::error::AppResult,
     imageops::optimize::{
         self, LadderOutcome, OptimizeFormat, OptimizeOptions, SkipReason, SourceInfo,
     },
     import::decode,
     library::{
-        BatchReporter, db::LibraryDb, metadata, paths::LibraryPaths, placeholders, service::now_ms,
+        BatchReporter,
+        db::LibraryDb,
+        encode_pool, metadata,
+        optimize::{CandidateRow, collect_candidates},
+        paths::LibraryPaths,
+        service::now_ms,
     },
 };
 
@@ -32,7 +36,6 @@ const STRATUM_COUNT: usize = BUCKET_COUNT * 2;
 const MIN_PER_STRATUM: usize = 3;
 const BOOTSTRAP_ROUNDS: usize = 300;
 const MAX_SAMPLE_FAILURES: usize = 20;
-const MAX_THREADS: usize = 8;
 const CHUNK: usize = 400;
 
 pub const SAMPLE_CHOICES: [usize; 3] = [100, 200, 500];
@@ -48,6 +51,31 @@ impl SkipBucket {
     fn add(&mut self, count: u64, bytes: u64) {
         self.count += count;
         self.bytes += bytes;
+    }
+}
+
+/// 前置判据（只看数据库列）拦下的图片统计。
+///
+/// 执行阶段遇到同样的原因只是跳过，不会出现在报告里；估算要把它们算进“跳过”才不误导。
+#[derive(Debug, Clone, Default)]
+struct PrefilterSkips {
+    compact: SkipBucket,
+    optimized: SkipBucket,
+    transparent: SkipBucket,
+    too_large: SkipBucket,
+}
+
+impl PrefilterSkips {
+    /// 记一张被前置判据拦下的图片；不是前置判据的原因（16 位、画质、体积）返回 `false`。
+    fn record(&mut self, reason: &SkipReason, bytes: u64) -> bool {
+        match reason {
+            SkipReason::BppLow => self.compact.add(1, bytes),
+            SkipReason::AlreadyOptimized => self.optimized.add(1, bytes),
+            SkipReason::Transparent => self.transparent.add(1, bytes),
+            SkipReason::TooLargeForWebp => self.too_large.add(1, bytes),
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -78,7 +106,7 @@ pub struct FolderEstimate {
     pub savings_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OptimizeEstimate {
     pub task_id: String,
@@ -99,6 +127,8 @@ pub struct OptimizeEstimate {
     pub skip_compact: SkipBucket,
     pub skip_optimized: SkipBucket,
     pub skip_transparent: SkipBucket,
+    pub skip_too_large: SkipBucket,
+    pub skip_color_profile: SkipBucket,
     pub skip_depth: SkipBucket,
     pub skip_quality: SkipBucket,
     pub skip_not_smaller: SkipBucket,
@@ -129,30 +159,6 @@ struct FolderTotals {
     count: u64,
     bytes: u64,
     stratum_bytes: [u64; STRATUM_COUNT],
-}
-
-#[derive(Debug, Clone)]
-struct CandidateRow {
-    id: i64,
-    content_hash: String,
-    file_ext: String,
-    folder_id: i64,
-    folder_path: String,
-    file_size: i64,
-    width: u32,
-    height: u32,
-    format: String,
-    has_alpha: bool,
-}
-
-impl CandidateRow {
-    fn pixels(&self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
-    }
-
-    fn lossless_source(&self) -> bool {
-        !matches!(self.format.as_str(), "jpeg" | "jpg" | "webp")
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -210,50 +216,6 @@ fn stratum_index(lossless: bool, bucket: usize) -> usize {
     usize::from(lossless) * BUCKET_COUNT + bucket.min(BUCKET_COUNT - 1)
 }
 
-fn bit_depth(image: &DynamicImage) -> u8 {
-    match image.color() {
-        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => 16,
-        _ => 8,
-    }
-}
-
-fn load_rows(database: &LibraryDb, ids: &[i64]) -> AppResult<Vec<CandidateRow>> {
-    let mut rows = Vec::with_capacity(ids.len());
-    for chunk in ids.chunks(CHUNK) {
-        let sql = format!(
-            "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
-                    folders.path, images.file_size, images.width, images.height,
-                    images.format, images.has_alpha
-             FROM images JOIN folders ON folders.id = images.folder_id
-             WHERE images.deleted_at IS NULL
-               AND images.id IN ({})",
-            placeholders(chunk.len())
-        );
-        let mut part = database.with_reader(|connection| {
-            let mut statement = connection.prepare(&sql)?;
-            let rows = statement
-                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                    Ok(CandidateRow {
-                        id: row.get(0)?,
-                        content_hash: row.get(1)?,
-                        file_ext: row.get(2)?,
-                        folder_id: row.get(3)?,
-                        folder_path: row.get(4)?,
-                        file_size: row.get(5)?,
-                        width: row.get(6)?,
-                        height: row.get(7)?,
-                        format: row.get(8)?,
-                        has_alpha: row.get::<_, i64>(9)? != 0,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })?;
-        rows.append(&mut part);
-    }
-    Ok(rows)
-}
-
 /// 估算入口：只读；返回 `None` 表示中途取消。
 #[allow(clippy::too_many_arguments)]
 pub fn estimate(
@@ -273,8 +235,7 @@ pub fn estimate(
     let mut folders: HashMap<i64, FolderTotals> = HashMap::new();
     let mut total_count = 0_u64;
     let mut total_bytes = 0_u64;
-    let mut skip_compact = SkipBucket::default();
-    let mut skip_transparent = SkipBucket::default();
+    let mut skips = PrefilterSkips::default();
 
     reporter.message("正在统计候选图片…");
     reporter.report(0, 0);
@@ -283,22 +244,28 @@ pub fn estimate(
         if reporter.cancelled() {
             return Ok(None);
         }
-        let rows = load_rows(database, chunk)?;
+        let rows = collect_candidates(database, chunk)?;
         scanned += chunk.len();
         for row in rows {
             total_count += 1;
             let bytes = row.file_size.max(0) as u64;
             total_bytes += bytes;
-            let bpp = bytes as f64 * 8.0 / row.pixels().max(1) as f64;
-            if bpp < optimize::BPP_THRESHOLD {
-                skip_compact.add(1, bytes);
+            // 与执行阶段共用同一段前置判据；这里只有数据库列，位深按 8 位占位。
+            let source = SourceInfo {
+                format: row.format.clone(),
+                file_size: row.file_size,
+                width: row.width,
+                height: row.height,
+                has_alpha: row.has_alpha,
+                optimized_at: row.optimized_at,
+                bit_depth: 8,
+            };
+            if let Err(reason) = optimize::prefilter(&source, options)
+                && skips.record(&reason, bytes)
+            {
                 continue;
             }
-            if row.has_alpha && options.output_format == OptimizeFormat::Jpeg {
-                skip_transparent.add(1, bytes);
-                continue;
-            }
-            let stratum = stratum_index(row.lossless_source(), bucket_for(bpp));
+            let stratum = stratum_index(row.lossless_source(), bucket_for(source.bpp()));
             totals[stratum].count += 1;
             totals[stratum].bytes += bytes;
             totals[stratum].pixels += row.pixels();
@@ -320,9 +287,6 @@ pub fn estimate(
         ));
     }
 
-    // schema v5 还没有 optimized_at；批次 2 接入标记列后，这里改为读取该列。
-    let skip_optimized = SkipBucket::default();
-
     let candidate_count: u64 = totals.iter().map(|stratum| stratum.count).sum();
     let candidate_bytes: u64 = totals.iter().map(|stratum| stratum.bytes).sum();
     let candidate_pixels: u64 = totals.iter().map(|stratum| stratum.pixels).sum();
@@ -332,9 +296,7 @@ pub fn estimate(
             options_fingerprint,
             total_count,
             total_bytes,
-            skip_compact,
-            skip_optimized,
-            skip_transparent,
+            &skips,
         )));
     }
 
@@ -359,26 +321,18 @@ pub fn estimate(
             options_fingerprint,
             total_count,
             total_bytes,
-            skip_compact,
-            skip_optimized,
-            skip_transparent,
+            &skips,
         )));
     }
 
     let sample_ids: Vec<i64> = sample_tasks.iter().map(|(_, id, _)| *id).collect();
-    let sample_rows: HashMap<i64, CandidateRow> = load_rows(database, &sample_ids)?
+    let sample_rows: HashMap<i64, CandidateRow> = collect_candidates(database, &sample_ids)?
         .into_iter()
         .map(|row| (row.id, row))
         .collect();
 
-    let threads = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .clamp(1, MAX_THREADS);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|error| AppError::message(format!("无法创建估算线程池：{error}")))?;
+    let pool = encode_pool("估算")?;
+    let threads = pool.current_num_threads();
 
     reporter.message(&format!("正在编码样本 0 / {sample_total} 张"));
     reporter.report(0, sample_total);
@@ -442,12 +396,24 @@ pub fn estimate(
 
     let savings_bytes = point_savings(&totals, &samples);
     let savings_margin_bytes = bootstrap_margin(&totals, &samples, BOOTSTRAP_ROUNDS);
-    let (skip_depth, skip_quality, skip_not_smaller, failed_count, failed_bytes) =
-        cumulative_skips(&totals, &samples);
-    let skipped_count =
-        skip_depth.count + skip_quality.count + skip_not_smaller.count + failed_count;
-    let skipped_bytes =
-        skip_depth.bytes + skip_quality.bytes + skip_not_smaller.bytes + failed_bytes;
+    let (
+        skip_depth,
+        skip_quality,
+        skip_not_smaller,
+        skip_color_profile,
+        failed_count,
+        failed_bytes,
+    ) = cumulative_skips(&totals, &samples);
+    let skipped_count = skip_depth.count
+        + skip_quality.count
+        + skip_not_smaller.count
+        + skip_color_profile.count
+        + failed_count;
+    let skipped_bytes = skip_depth.bytes
+        + skip_quality.bytes
+        + skip_not_smaller.bytes
+        + skip_color_profile.bytes
+        + failed_bytes;
     let process_count = candidate_count.saturating_sub(skipped_count);
     let process_bytes = candidate_bytes.saturating_sub(skipped_bytes);
     let predicted_bytes = total_bytes.saturating_sub(savings_bytes);
@@ -521,9 +487,11 @@ pub fn estimate(
         candidate_bytes,
         process_count,
         process_bytes,
-        skip_compact,
-        skip_optimized,
-        skip_transparent,
+        skip_compact: skips.compact.clone(),
+        skip_optimized: skips.optimized.clone(),
+        skip_transparent: skips.transparent.clone(),
+        skip_too_large: skips.too_large.clone(),
+        skip_color_profile,
         skip_depth,
         skip_quality,
         skip_not_smaller,
@@ -545,9 +513,7 @@ fn empty_estimate(
     fingerprint: &str,
     total_count: u64,
     total_bytes: u64,
-    skip_compact: SkipBucket,
-    skip_optimized: SkipBucket,
-    skip_transparent: SkipBucket,
+    skips: &PrefilterSkips,
 ) -> OptimizeEstimate {
     OptimizeEstimate {
         task_id: task_id.to_owned(),
@@ -563,9 +529,11 @@ fn empty_estimate(
         candidate_bytes: 0,
         process_count: 0,
         process_bytes: 0,
-        skip_compact,
-        skip_optimized,
-        skip_transparent,
+        skip_compact: skips.compact.clone(),
+        skip_optimized: skips.optimized.clone(),
+        skip_transparent: skips.transparent.clone(),
+        skip_too_large: skips.too_large.clone(),
+        skip_color_profile: SkipBucket::default(),
         skip_depth: SkipBucket::default(),
         skip_quality: SkipBucket::default(),
         skip_not_smaller: SkipBucket::default(),
@@ -605,6 +573,19 @@ fn sample_one(
     let read_started = Instant::now();
     let source_bytes = std::fs::read(&path)?;
     let read_secs = read_started.elapsed().as_secs_f64();
+    if optimize::color_profile_guard(&source_bytes, &row.format, options).is_err() {
+        let old_bytes = source_bytes.len() as u64;
+        return Ok(SampleOutcome {
+            old_bytes,
+            new_bytes: old_bytes,
+            quality: None,
+            skip: Some(SkipReason::ColorProfile),
+            failed: false,
+            source_pixels: row.pixels(),
+            read_secs,
+            bad_pixel_ratio: 0.0,
+        });
+    }
     let decoded = decode::decode(&path)?;
 
     let source = SourceInfo {
@@ -613,8 +594,8 @@ fn sample_one(
         width: decoded.width,
         height: decoded.height,
         has_alpha: row.has_alpha || decoded.has_alpha,
-        optimized_at: 0,
-        bit_depth: bit_depth(&decoded.image),
+        optimized_at: row.optimized_at,
+        bit_depth: optimize::bit_depth(&decoded.image),
     };
     let old_bytes = source_bytes.len() as u64;
     let source_pixels = u64::from(decoded.width) * u64::from(decoded.height);
@@ -823,10 +804,11 @@ fn benefit_curve(
 fn cumulative_skips(
     totals: &[StratumTotals; STRATUM_COUNT],
     samples: &[Vec<SampleOutcome>; STRATUM_COUNT],
-) -> (SkipBucket, SkipBucket, SkipBucket, u64, u64) {
+) -> (SkipBucket, SkipBucket, SkipBucket, SkipBucket, u64, u64) {
     let mut depth = SkipBucket::default();
     let mut quality = SkipBucket::default();
     let mut not_smaller = SkipBucket::default();
+    let mut color = SkipBucket::default();
     let mut failed = 0_u64;
     let mut failed_bytes = 0_u64;
     for (index, outcomes) in samples.iter().enumerate() {
@@ -838,6 +820,7 @@ fn cumulative_skips(
         let mut depth_samples = 0_u64;
         let mut quality_samples = 0_u64;
         let mut not_smaller_samples = 0_u64;
+        let mut color_samples = 0_u64;
         let mut failed_samples = 0_u64;
         for sample in outcomes {
             if sample.failed {
@@ -848,6 +831,7 @@ fn cumulative_skips(
                 Some(SkipReason::SixteenBit) => depth_samples += 1,
                 Some(SkipReason::QualityNotMet) => quality_samples += 1,
                 Some(SkipReason::NotSmallEnough) => not_smaller_samples += 1,
+                Some(SkipReason::ColorProfile) => color_samples += 1,
                 _ => {}
             }
         }
@@ -863,10 +847,14 @@ fn cumulative_skips(
             scale(total.count, not_smaller_samples, sample_count),
             scale(total.bytes, not_smaller_samples, sample_count),
         );
+        color.add(
+            scale(total.count, color_samples, sample_count),
+            scale(total.bytes, color_samples, sample_count),
+        );
         failed += scale(total.count, failed_samples, sample_count);
         failed_bytes += scale(total.bytes, failed_samples, sample_count);
     }
-    (depth, quality, not_smaller, failed, failed_bytes)
+    (depth, quality, not_smaller, color, failed, failed_bytes)
 }
 
 fn scale(total: u64, part: u64, sample_count: u64) -> u64 {
@@ -946,7 +934,7 @@ fn estimate_seconds(
 mod tests {
     use std::{fs, io::Cursor};
 
-    use image::{Rgb, RgbImage};
+    use image::{DynamicImage, Rgb, RgbImage};
     use rusqlite::params;
     use tempfile::tempdir;
 
@@ -1036,8 +1024,9 @@ mod tests {
             outcome(100, None, None, true),
         ];
         assert_eq!(point_savings(&strata, &samples), 2_500);
-        let (depth, quality, not_smaller, failed, failed_bytes) =
+        let (depth, quality, not_smaller, color, failed, failed_bytes) =
             cumulative_skips(&strata, &samples);
+        assert_eq!(color.count, 0);
         assert_eq!(depth.count, 0);
         assert_eq!(quality.count, 25);
         assert_eq!(not_smaller.count, 0);

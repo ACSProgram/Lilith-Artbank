@@ -5699,6 +5699,17 @@ body.is-drag-sorting * {
   white-space: nowrap;
 }
 
+/* 估算完成后代替配置表单的只读摘要。 */
+.optimize-run-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
 .optimize-outcome {
   display: flex;
   flex-direction: column;

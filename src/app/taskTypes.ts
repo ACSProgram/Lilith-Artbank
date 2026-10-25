@@ -13,7 +13,8 @@ export type TaskKind =
   | "undo"
   | "redo"
   | "releaseGarbage"
-  | "optimizeEstimate";
+  | "optimizeEstimate"
+  | "optimize";
 
 export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =
@@ -26,7 +27,11 @@ export type TaskPhase =
 
 export type ConflictPolicy = "fail" | "queue" | "cancelActive";
 export type BatchTaskKind = "thumbnail" | "aiEmbedding" | "aiPose" | "aiDescription";
-export type TaskRequestKind = BatchTaskKind | "similarityGroups" | "optimizeEstimate";
+export type TaskRequestKind =
+  | BatchTaskKind
+  | "similarityGroups"
+  | "optimizeEstimate"
+  | "optimize";
 
 export type OptimizeTier = "extreme" | "high" | "medium";
 export type OptimizeOutputFormat = "jpeg" | "webp";
@@ -84,6 +89,8 @@ export interface OptimizeEstimate {
   skipCompact: OptimizeSkipBucket;
   skipOptimized: OptimizeSkipBucket;
   skipTransparent: OptimizeSkipBucket;
+  skipTooLarge: OptimizeSkipBucket;
+  skipColorProfile: OptimizeSkipBucket;
   skipDepth: OptimizeSkipBucket;
   skipQuality: OptimizeSkipBucket;
   skipNotSmaller: OptimizeSkipBucket;
@@ -155,6 +162,8 @@ export interface BatchTaskRequest {
   embeddingThreshold?: number | null;
   /** 空间优化估算参数。 */
   optimize?: OptimizeOptions | null;
+  /** 执行压缩时提交的估算任务 id；估算任务不用。 */
+  estimateId?: string | null;
   estimateSampleSize?: number | null;
   conflict: ConflictPolicy;
 }

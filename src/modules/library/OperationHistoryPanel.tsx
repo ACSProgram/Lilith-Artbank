@@ -116,6 +116,7 @@ export function OperationHistoryPanel({
         affected: chain.reduce((sum, entry) => sum + entry.affected, 0),
         unit: affectedUnit(chain.map((entry) => entry.kind)),
         failed: null,
+        blocked: null,
       };
     }
     if (target.status === "applied") {
@@ -133,6 +134,9 @@ export function OperationHistoryPanel({
             (entry) =>
               entry.status === "undoFailed" || (isRedoStatus(entry) && entry.error),
           ) ?? null,
+        blocked: active.some((entry) => entry.kind === "optimize")
+          ? "压缩记录不可撤销，原图已删除"
+          : null,
       };
     }
     return null;
@@ -143,11 +147,13 @@ export function OperationHistoryPanel({
     busy ||
     historyTask != null ||
     !selection ||
+    selection.blocked != null ||
     (selection.mode === "undo" &&
       (selection.target.status !== "applied" || selection.failed != null));
 
   const actionReason =
     page?.blockedReason ??
+    selection?.blocked ??
     (selection?.failed
       ? selection.failed.status === "undoFailed"
         ? "有一条记录上次撤销失败，需要先处理它"

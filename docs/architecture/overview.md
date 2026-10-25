@@ -153,4 +153,6 @@ S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）�
 
 2026-10-25 图库操作撤销批次 1–3 已实现：schema v5（`operations` / `operation_chunks` / `undo_runs`、`images.purge_operation_id` / `origin_operation_id`）与设置 v5（`history.maxSteps`）、`library/history.rs`（同事务记录、线性撤销、裁剪、启动恢复、释放）、永久删除与清空回收站改为延迟释放标记、`TaskKind::Undo` / `ReleaseGarbage`、工具栏“记录”面板；导入/编辑/移动/文件夹、评分/描述/AI 描述/标签/集合与相似分组记录均已接入。撤销后的记录以灰色 `undone` 保留，可重做（`TaskKind::Redo` / `redo_to_operation`），新的图库写入清空重做分支；编辑与导入使用 `.artbank/undo/<op>/` 暂存原图。详见 [操作撤销实现记录](../planning/archive/2026-10-25-操作撤销实现记录.md) 与 [图库与元数据](../modules/library.md#操作记录与撤销)。
 
+2026-10-25 图片空间优化（智能压缩）两批已实现：`imageops/optimize.rs` 的三档判据、阶梯编码与 EXIF/ICC 搬运；`library/optimize_estimate.rs` 的分层估算与只读报告；schema v6 的 `images.optimized_at`；`library/optimize.rs` 的候选收集、分批编码发布与旧图清理；`HistoryKind::Optimize` 不可撤销记录与 `update_label`；`start_batch_task(kind = "optimize")` 的估算凭证校验；`OptimizeDialog` 的估算 → 确认执行两阶段界面。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化) 与 [当前阶段状态](../planning/current-handoff.md)。
+
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图包压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

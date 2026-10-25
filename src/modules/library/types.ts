@@ -210,7 +210,8 @@ export type HistoryKind =
   | "collectionRemove"
   | "collectionCombine"
   | "similarityGroups"
-  | "aiDescription";
+  | "aiDescription"
+  | "optimize";
 
 export type HistoryStatus = "applied" | "undone" | "redoing" | "undoFailed";
 

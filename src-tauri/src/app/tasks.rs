@@ -50,6 +50,7 @@ pub enum TaskKind {
     Redo,
     ReleaseGarbage,
     OptimizeEstimate,
+    Optimize,
 }
 
 impl TaskKind {
@@ -62,7 +63,8 @@ impl TaskKind {
             | Self::EmptyTrash
             | Self::Undo
             | Self::Redo
-            | Self::ReleaseGarbage => TaskLane::Write,
+            | Self::ReleaseGarbage
+            | Self::Optimize => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription => TaskLane::Ai,
             Self::SimilarityGroups | Self::OptimizeEstimate => TaskLane::Scan,
         }
@@ -83,6 +85,7 @@ impl TaskKind {
             Self::Redo => "重做操作",
             Self::ReleaseGarbage => "释放删除文件",
             Self::OptimizeEstimate => "估算压缩空间",
+            Self::Optimize => "优化图片空间",
         }
     }
 }
@@ -825,6 +828,7 @@ pub enum BatchTaskKind {
     AiDescription,
     SimilarityGroups,
     OptimizeEstimate,
+    Optimize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -843,6 +847,8 @@ pub struct BatchTaskRequest {
     pub embedding_threshold: Option<f32>,
     /// 空间优化：档位、输出格式与重算开关。
     pub optimize: Option<OptimizeOptions>,
+    /// 执行时用于校验估算凭证；估算任务不用。
+    pub estimate_id: Option<String>,
     pub estimate_sample_size: Option<usize>,
     pub conflict: ConflictPolicy,
 }

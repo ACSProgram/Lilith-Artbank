@@ -3,8 +3,8 @@
 //! 这里不读写数据库，也不发布文件；估算与执行共用同一套编码与裁决逻辑。
 
 use image::{
-    DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, codecs::jpeg::JpegEncoder,
-    imageops::FilterType,
+    ColorType, DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder,
+    codecs::jpeg::JpegEncoder, imageops::FilterType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,8 @@ pub const BPP_THRESHOLD: f64 = 0.12;
 pub const MAX_SIZE_RATIO: f64 = 0.95;
 /// 单通道差值超过该值的像素计入“局部坏点”。
 pub const BAD_PIXEL_DELTA: u8 = 6;
+/// WebP（VP8）单边上限；超过这个尺寸编码器会直接拒绝。
+pub const WEBP_MAX_EDGE: u32 = 16_383;
 
 /// 编码器存在量化误差，完全相同的图也可能只到 50-60 dB；用 99 表示“无差异”。
 const PSNR_CAP: f64 = 99.0;
@@ -62,6 +64,24 @@ pub enum OptimizeFormat {
     WebP,
 }
 
+impl OptimizeFormat {
+    /// 新文件的扩展名；原图按内容哈希命名，扩展名跟着输出格式走。
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::WebP => "webp",
+        }
+    }
+
+    /// 写进 `images.format` 的格式名。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
+            Self::WebP => "webp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OptimizeOptions {
@@ -69,7 +89,7 @@ pub struct OptimizeOptions {
     pub output_format: OptimizeFormat,
     /// 长边上限；`None` 表示不缩放。
     pub max_long_edge: Option<u32>,
-    /// 默认跳过已有 `optimized_at` 标记的图片；schema v6 接入前该标记恒为 0。
+    /// 默认跳过已有 `optimized_at` 标记的图片，避免对同一张图反复有损压缩。
     pub skip_optimized: bool,
     pub regenerate_thumbnails: bool,
     pub recompute_phash: bool,
@@ -137,6 +157,10 @@ pub enum SkipReason {
     AlreadyOptimized,
     /// 有透明通道，而输出格式装不下。
     Transparent,
+    /// 单边超过 WebP 的 16383 上限，输出 WebP 时无法编码。
+    TooLargeForWebp,
+    /// 源文件带非 sRGB 的 ICC 配置，而输出格式装不下它；丢掉会让颜色变样。
+    ColorProfile,
     /// 16 位源，降到 8 位会损失色阶。
     SixteenBit,
     /// 阶梯用尽仍达不到 PSNR 底线。
@@ -151,8 +175,11 @@ pub struct OptimizePlan {
     pub psnr_floor: f64,
 }
 
-/// 执行前判据；画质与“省得太少”两条要在编码后才知道。
-pub fn plan(source: &SourceInfo, options: &OptimizeOptions) -> Result<OptimizePlan, SkipReason> {
+/// 只依赖数据库列的前置判据：bpp、已优化、透明。
+///
+/// 执行与估算共用这一段，保证“估算里被跳过的图，执行时也跳过”。
+/// 16 位源要解码后才知道，不在这里判断。
+pub fn prefilter(source: &SourceInfo, options: &OptimizeOptions) -> Result<(), SkipReason> {
     if source.bpp() < BPP_THRESHOLD {
         return Err(SkipReason::BppLow);
     }
@@ -162,6 +189,22 @@ pub fn plan(source: &SourceInfo, options: &OptimizeOptions) -> Result<OptimizePl
     if source.has_alpha && options.output_format == OptimizeFormat::Jpeg {
         return Err(SkipReason::Transparent);
     }
+    // 长边上限不高于 16383 时，`prepare` 一定会把尺寸压进 WebP 的范围内。
+    let resized_into_range = options
+        .max_long_edge
+        .is_some_and(|edge| edge <= WEBP_MAX_EDGE);
+    if options.output_format == OptimizeFormat::WebP
+        && !resized_into_range
+        && (source.width > WEBP_MAX_EDGE || source.height > WEBP_MAX_EDGE)
+    {
+        return Err(SkipReason::TooLargeForWebp);
+    }
+    Ok(())
+}
+
+/// 执行前判据；画质与“省得太少”两条要在编码后才知道。
+pub fn plan(source: &SourceInfo, options: &OptimizeOptions) -> Result<OptimizePlan, SkipReason> {
+    prefilter(source, options)?;
     if source.bit_depth > 8 {
         return Err(SkipReason::SixteenBit);
     }
@@ -169,6 +212,187 @@ pub fn plan(source: &SourceInfo, options: &OptimizeOptions) -> Result<OptimizePl
         start_quality: options.tier.start_quality(),
         psnr_floor: options.tier.psnr_floor(source.lossless_source()),
     })
+}
+
+/// 输出格式是否保留源文件的 ICC 配置：只有 JPEG → JPEG 会搬运。
+fn keeps_color_profile(source_format: &str, output: OptimizeFormat) -> bool {
+    output == OptimizeFormat::Jpeg && matches!(source_format, "jpeg" | "jpg")
+}
+
+/// 输出装不下源文件的非 sRGB 配置时跳过，避免颜色变样。
+///
+/// 只看配置里的 `desc` 名称：名字带 sRGB 才放行，其余（含认不出来的）一律按
+/// “会变色”处理——宁可少压一张，也不让颜色变样。
+pub fn color_profile_guard(
+    bytes: &[u8],
+    source_format: &str,
+    options: &OptimizeOptions,
+) -> Result<(), SkipReason> {
+    if keeps_color_profile(source_format, options.output_format) {
+        return Ok(());
+    }
+    match color_profile_is_srgb(bytes) {
+        Some(false) => Err(SkipReason::ColorProfile),
+        _ => Ok(()),
+    }
+}
+
+/// 源文件嵌入的 ICC 配置是否为 sRGB；`None` 表示没有嵌入配置。
+pub fn color_profile_is_srgb(bytes: &[u8]) -> Option<bool> {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_icc(bytes).map(|profile| icc_is_srgb(&profile));
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return png_icc_name(bytes).map(|name| name_is_srgb(&name));
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return webp_icc(bytes).map(icc_is_srgb);
+    }
+    None
+}
+
+fn name_is_srgb(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("srgb")
+}
+
+fn icc_is_srgb(profile: &[u8]) -> bool {
+    icc_profile_name(profile).is_some_and(|name| name_is_srgb(&name))
+}
+
+/// ICC 配置里 `desc`（或 `mluc`）标签的说明文字。
+fn icc_profile_name(profile: &[u8]) -> Option<String> {
+    if profile.len() < 132 {
+        return None;
+    }
+    let count = usize::try_from(read_u32(profile, 128, false)?).ok()?;
+    for index in 0..count.min(64) {
+        let entry = 132 + index * 12;
+        if profile.get(entry..entry + 4)? != b"desc" {
+            continue;
+        }
+        let offset = usize::try_from(read_u32(profile, entry + 4, false)?).ok()?;
+        match profile.get(offset..offset + 4)? {
+            b"desc" => {
+                let length = usize::try_from(read_u32(profile, offset + 8, false)?).ok()?;
+                let text = profile.get(offset + 12..offset + 12 + length.saturating_sub(1))?;
+                return Some(
+                    String::from_utf8_lossy(text)
+                        .trim_end_matches('\0')
+                        .to_owned(),
+                );
+            }
+            b"mluc" => {
+                let record = offset + 16;
+                let length = usize::try_from(read_u32(profile, record + 4, false)?).ok()?;
+                let start = usize::try_from(read_u32(profile, record + 8, false)?).ok()?;
+                let raw = profile.get(offset + start..offset + start + length)?;
+                let mut text = String::new();
+                for pair in raw.chunks_exact(2) {
+                    let unit = u16::from_be_bytes([pair[0], pair[1]]);
+                    if unit == 0 {
+                        break;
+                    }
+                    text.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+                }
+                return Some(text);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// JPEG 的 ICC 可能分多段存放，按序号拼起来。
+fn jpeg_icc(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut parts: Vec<(u8, &[u8])> = Vec::new();
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xFF {
+            break;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xFF {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            break;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset + 1)?,
+        ]));
+        if length < 2 || offset + length > bytes.len() {
+            break;
+        }
+        let payload = &bytes[offset + 2..offset + length];
+        if marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0") && payload.len() > 14 {
+            parts.push((payload[12], &payload[14..]));
+        }
+        offset += length;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort_by_key(|part| part.0);
+    let mut profile = Vec::with_capacity(parts.iter().map(|part| part.1.len()).sum());
+    for (_, part) in parts {
+        profile.extend_from_slice(part);
+    }
+    Some(profile)
+}
+
+/// PNG 的 `iCCP` 里配置是压缩过的；这里只取前面的配置名，不解压。
+fn png_icc_name(bytes: &[u8]) -> Option<String> {
+    let mut offset = 8;
+    while offset + 8 <= bytes.len() {
+        let length = u32::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset + 1)?,
+            *bytes.get(offset + 2)?,
+            *bytes.get(offset + 3)?,
+        ]) as usize;
+        let kind = bytes.get(offset + 4..offset + 8)?;
+        if kind == b"iCCP" {
+            let data = bytes.get(offset + 8..offset + 8 + length)?;
+            let end = data.iter().position(|byte| *byte == 0)?;
+            return Some(String::from_utf8_lossy(&data[..end]).into_owned());
+        }
+        if kind == b"IDAT" || kind == b"IEND" {
+            break;
+        }
+        offset = offset.checked_add(12 + length)?;
+    }
+    None
+}
+
+fn webp_icc(bytes: &[u8]) -> Option<&[u8]> {
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let kind = bytes.get(offset..offset + 4)?;
+        let length = u32::from_le_bytes([
+            *bytes.get(offset + 4)?,
+            *bytes.get(offset + 5)?,
+            *bytes.get(offset + 6)?,
+            *bytes.get(offset + 7)?,
+        ]) as usize;
+        if kind == b"ICCP" {
+            return bytes.get(offset + 8..offset + 8 + length);
+        }
+        offset = offset.checked_add(8 + length + (length & 1))?;
+    }
+    None
+}
+
+/// 解码后的位深；16 位源降到 8 位会损失色阶，执行与估算都要用同一条判断。
+pub fn bit_depth(image: &DynamicImage) -> u8 {
+    match image.color() {
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => 16,
+        _ => 8,
+    }
 }
 
 /// 从起点开始的质量序列；起点不在标准阶梯里时先试起点本身。
@@ -285,15 +509,26 @@ pub fn encode(
             })
         }
         OptimizeFormat::WebP => {
-            let encoded = if image.color().has_alpha() {
-                let rgba = image.to_rgba8();
-                webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                    .encode(f32::from(quality))
-            } else {
-                let rgb = image.to_rgb8();
-                webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
-                    .encode(f32::from(quality))
-            };
+            let (width, height) = (image.width(), image.height());
+            if width > WEBP_MAX_EDGE || height > WEBP_MAX_EDGE {
+                return Err(AppError::message(format!(
+                    "图片尺寸 {width}×{height} 超过 WebP 单边上限 {WEBP_MAX_EDGE}"
+                )));
+            }
+            // `webp` 的 `encode()` 内部是 `unwrap`：编码器拒绝时会把错误变成 panic。
+            // 这里兜住，让异常落进失败清单，而不是把整个任务线程带走。
+            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if image.color().has_alpha() {
+                    let rgba = image.to_rgba8();
+                    webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                        .encode(f32::from(quality))
+                } else {
+                    let rgb = image.to_rgb8();
+                    webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+                        .encode(f32::from(quality))
+                }
+            }))
+            .map_err(|_| AppError::message("WebP 编码器拒绝了这张图片"))?;
             if encoded.is_empty() {
                 return Err(AppError::message("WebP 编码结果为空"));
             }
@@ -676,6 +911,82 @@ mod tests {
         assert_eq!(plan(&deep, &options).unwrap_err(), SkipReason::SixteenBit);
     }
 
+    fn icc_with_name(name: &str) -> Vec<u8> {
+        let mut profile = vec![0u8; 128];
+        profile.extend_from_slice(&1_u32.to_be_bytes());
+        profile.extend_from_slice(b"desc");
+        profile.extend_from_slice(&144_u32.to_be_bytes());
+        profile.extend_from_slice(&0_u32.to_be_bytes());
+        profile.extend_from_slice(b"desc");
+        profile.extend_from_slice(&0_u32.to_be_bytes());
+        profile.extend_from_slice(&(name.len() as u32 + 1).to_be_bytes());
+        profile.extend_from_slice(name.as_bytes());
+        profile.push(0);
+        profile
+    }
+
+    fn jpeg_with_icc(profile: &[u8]) -> Vec<u8> {
+        let base = encode_with_quality(&textured(24, 16), 90);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"ICC_PROFILE\0");
+        payload.extend_from_slice(&[1, 1]);
+        payload.extend_from_slice(profile);
+        let mut output = Vec::new();
+        output.extend_from_slice(&base[..2]);
+        output.extend_from_slice(&segment(0xE2, &payload));
+        output.extend_from_slice(&base[2..]);
+        output
+    }
+
+    #[test]
+    fn skips_sources_whose_color_profile_would_be_dropped() {
+        let webp = OptimizeOptions {
+            output_format: OptimizeFormat::WebP,
+            ..OptimizeOptions::default()
+        };
+        let srgb = jpeg_with_icc(&icc_with_name("sRGB IEC61966-2.1"));
+        let adobe = jpeg_with_icc(&icc_with_name("Adobe RGB (1998)"));
+
+        assert!(color_profile_guard(&srgb, "jpeg", &webp).is_ok());
+        assert_eq!(
+            color_profile_guard(&adobe, "jpeg", &webp),
+            Err(SkipReason::ColorProfile)
+        );
+        // JPEG → JPEG 会搬运配置，不受影响。
+        assert!(color_profile_guard(&adobe, "jpeg", &OptimizeOptions::default()).is_ok());
+        // PNG 源转 JPEG 不搬运配置。
+        assert_eq!(
+            color_profile_guard(&adobe, "png", &OptimizeOptions::default()),
+            Err(SkipReason::ColorProfile)
+        );
+        // 没有配置的图照常处理。
+        let plain = encode_with_quality(&textured(24, 16), 90);
+        assert!(color_profile_guard(&plain, "jpeg", &webp).is_ok());
+    }
+
+    #[test]
+    fn webp_skips_images_beyond_its_edge_limit() {
+        let webp = OptimizeOptions {
+            output_format: OptimizeFormat::WebP,
+            ..OptimizeOptions::default()
+        };
+        let tall = source("jpeg", 8_000_000, 391, 17_799);
+        assert_eq!(plan(&tall, &webp).unwrap_err(), SkipReason::TooLargeForWebp);
+        // 同一张图输出 JPEG 不受影响。
+        assert!(plan(&tall, &OptimizeOptions::default()).is_ok());
+        // 长边上限足够小时，缩放后必然在范围内，不该被前置判据拦掉。
+        let resized = OptimizeOptions {
+            max_long_edge: Some(4096),
+            ..webp
+        };
+        assert!(plan(&tall, &resized).is_ok());
+
+        // 编码层再兜一次：不 panic，返回可读错误。
+        let image = DynamicImage::ImageRgb8(RgbImage::new(4, 16_400));
+        let error = encode(&image, OptimizeFormat::WebP, 85, None).unwrap_err();
+        assert!(error.to_string().contains("16383"), "{error}");
+    }
+
     #[test]
     fn tier_uses_separate_floors_for_lossless_sources() {
         let high = plan(
@@ -843,5 +1154,29 @@ mod tests {
                 .iter()
                 .any(|segment| segment[..2] == [0xFF, 0xE1])
         );
+    }
+
+    #[test]
+    fn output_format_names_its_file_and_column() {
+        assert_eq!(OptimizeFormat::Jpeg.extension(), "jpg");
+        assert_eq!(OptimizeFormat::Jpeg.name(), "jpeg");
+        assert_eq!(OptimizeFormat::WebP.extension(), "webp");
+        assert_eq!(OptimizeFormat::WebP.name(), "webp");
+    }
+
+    #[test]
+    fn prefilter_covers_database_columns_only() {
+        let options = OptimizeOptions::default();
+        let mut optimized = source("jpeg", 8_000_000, 4000, 4000);
+        optimized.optimized_at = 1;
+        assert_eq!(
+            prefilter(&optimized, &options).unwrap_err(),
+            SkipReason::AlreadyOptimized
+        );
+
+        let mut deep = source("tiff", 20_000_000, 2000, 2000);
+        deep.bit_depth = 16;
+        assert!(prefilter(&deep, &options).is_ok());
+        assert_eq!(plan(&deep, &options).unwrap_err(), SkipReason::SixteenBit);
     }
 }

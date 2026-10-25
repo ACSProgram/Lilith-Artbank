@@ -13,7 +13,7 @@
 - AI 服务端与便携打包：读 `docs/modules/ai-service.md` 的“服务端实现”，再进入 `server/`、`tools/package-portable.mjs`、`src-tauri/src/app/paths.rs`。
 - 找相似、相似分组、pHash/主色/embedding/pose 相似度：读 `docs/modules/ai-service.md` 的“本地检索”，再进入 `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`。
 - 清理、缩略图重建、描述导入导出：读 `docs/modules/maintenance.md`。
-- 图片空间优化估算：读 `docs/modules/maintenance.md` 的“图片空间优化（估算）”，再进入 `src-tauri/src/imageops/optimize.rs`、`src-tauri/src/library/optimize_estimate.rs`、`src-tauri/src/app/state.rs`、`src/app/OptimizeDialog.tsx`。
+- 图片空间优化（估算与执行）：读 `docs/modules/maintenance.md` 的“图片空间优化”，再进入 `src-tauri/src/imageops/optimize.rs`、`src-tauri/src/library/optimize_estimate.rs`、`src-tauri/src/library/optimize.rs`、`src-tauri/src/app/state.rs`、`src/app/OptimizeDialog.tsx`。
 - 构建、测试、性能基准：读 `docs/guides/validation.md`、`docs/guides/performance.md`。
 - 当前阶段状态与未完成事项：读 `docs/planning/current-handoff.md`、`docs/planning/todo.md`；阶段划分看 `docs/planning/roadmap.md`。
 
