@@ -1,6 +1,6 @@
 # 浏览与检索
 
-S3 在 S2 的键集查询与虚拟网格之上补齐了搜索、扩展筛选、集合、回收站和详情/批量编辑。A–C 把文件夹改为多级树，并把浏览状态提升到工作区，让文件夹树与网格共享同一份筛选。P1 重排了主界面：删掉主区头部、工具栏改成两行、缩略图改成纯图方格并可切“裁剪 / 适应”、右键菜单分组、筛选分面隐藏零值。前端仍不持有全库数组，每次只请求一页；筛选计数只在筛选面板打开时计算。
+S3 在 S2 的键集查询与虚拟网格之上补齐了搜索、扩展筛选、集合、回收站和详情/批量编辑。A–C 把文件夹改为多级树，并把浏览状态提升到工作区，让文件夹树与网格共享同一份筛选。P1 重排了主界面：删掉主区头部、工具栏改成两行、缩略图改成纯图方格并可切“裁剪 / 适应”、右键菜单分组、筛选分面隐藏零值。P4 把内部拖放改为指针事件实现，补上文件夹手动排序与图片多级排序，并用 id 列表游标支撑多级/文件夹排序的跨页。前端仍不持有全库数组，每次只请求一页；筛选计数只在筛选面板打开时计算。
 
 ## 查询 DTO
 
@@ -26,19 +26,25 @@ LibraryQuery {
     embedding: "any" | "has" | "missing",
     pose: "any" | "has" | "missing"
   },
-  sort: {
-    key: "importedAt" | "score" | "size" | "collectionPosition",
-    descending: boolean
-  },
-  cursor?: { sortKey: string, id: number } | null,
+  sort: SortSpec[],                 // 1-7 级，同一指标不可重复
+  cursor?: { sortValues: string[], id: number } | null,
+  pageToken?: string | null,        // id 列表游标：token:offset
+  anchorId?: number | null,         // 从该图片的排序位置开始取页（包含它）
   limit?: number | null             // 默认 150，限制 1-300
+}
+
+SortSpec {
+  key: "importedAt" | "modifiedAt" | "score" | "size"
+     | "pixels" | "folder" | "collectionPosition",
+  descending: boolean
 }
 ```
 
 - 筛选去重并校验：文件夹最多 256、扩展名最多 32、评分只允许 0-5、标签最多 64。
 - 文件夹 id 先解析为路径；每个路径匹配自身与全部后代，使用路径边界（`path = ?` 或 `path LIKE ? || '/%'`），避免 `人物` 命中 `人物速写`。选中的 id 全部失效时查询返回空集；包含根目录时不限制文件夹；多选之间取并集。
-- `collectionPosition` 只在集合视图有效；集合视图默认按手工顺序升序。
-- 排序键都是整数列，游标 `sortKey` 用十进制字符串传递。
+- `collectionPosition` 只在集合视图有效；全库搜索时取不到集合位置，因此也拒绝。`folder`、`pixels` 在所有视图可用。
+- 排序值由 Rust 按级转换为十进制字符串放进 `sortValues`；像素尺寸用 `width * height`，文件夹用 `folders.path COLLATE NOCASE`。
+- 单级且不是文件夹的排序使用键集游标；多级、文件夹排序或带 `anchorId` 时返回 `nextPageToken`。同一时刻只缓存最新 2 份 id 列表，游标自带查询指纹；任何改变图片集合、排序字段或筛选字段的写入都会让缓存整体失效（`AppState::mutate` 与导入收尾负责），旧 token 再被使用会返回“排序结果已过期”，前端同时通过刷新令牌重新取第一页。
 - `ImageRow` 新增 `deletedAt`；回收站行在网格/列表中带“回收站”前缀。
 - 返回行只含列表需要的字段，不含 embedding/pose 本体：
 
@@ -79,7 +85,7 @@ tags: string[]
 - 动作：`apply` 用这个标签替换标签条件；`append` 在当前视图里叠加/取消这一个标签；`remove` 取消它。Ctrl/Cmd 点击 chip 等于 `append`。
 - 范围：`view` 保留当前的视图、搜索与其它筛选；`folder` 只保留当前文件夹子树；`collection` 只保留当前集合；`library` 清空文件夹与集合、在整个图库内筛选。后三者会清空搜索与其它筛选条件，并把排序按新视图换算（离开集合时退回默认排序）。
 - 菜单里“当前文件夹/当前集合”两项在没有对应范围时置灰，并说明原因；已生效的标签 chip 显示选中态，菜单第一项变成“取消该标签筛选”。
-- 切换后保留原来的图片选择：新查询返回时的第一页如果包含它，滚动到它；不在第一页时用锚点游标（`useImageQuery.jumpTo`，游标 = 该行排序值 + id）取它所在的一页并把该行放到页首。取消标签会放宽结果，无法确认目标图仍在结果里，因此这种情况按常规清空选择；集合内顺序没有行字段可当游标，此时只保留选择、不强制跳转。
+- 切换后保留原来的图片选择：新查询返回时的第一页如果包含它，滚动到它；不在第一页时用锚点（`useImageQuery.jumpTo`，发送该图 id，Rust 按它的排序位置取一页并包含它）跳过去。锚点走 id 列表通道，因此集合内顺序也可用。取消标签会放宽结果，无法确认目标图仍在结果里，因此这种情况按常规清空选择。
 - 筛选后选择不会因为 `selectionResetSignature` 变化被清空：`LibraryView` 用一个一次性标志把这次变化排除在外。
 
 ## 命令契约
@@ -90,10 +96,10 @@ tags: string[]
 
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
-| `query_images` | `{ query }` | `{ items, nextCursor }` |
+| `query_images` | `{ query }` | `{ items, nextCursor, nextPageToken }`（两者至多一个非空） |
 | `query_image_ids` | `{ query }` | `number[]`（当前查询的全部 id，最多 100 万） |
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
-| `get_folders` | — | `FolderInfo[]`（`directImageCount` / `totalImageCount`，按路径排序） |
+| `get_folders` | — | `FolderInfo[]`（`directImageCount` / `totalImageCount`，按路径排序，含 `sortIndex`） |
 | `get_tags` | `{ limit? }` | `TagInfo[]`（默认/最多 500，按活跃图片数降序） |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]`（按名称子串，最多 200） |
 | `copy_text` | `{ text }` | `null`（Rust `arboard` 写系统剪贴板） |
@@ -109,6 +115,15 @@ tags: string[]
   tags:        [{ tagId, count }]
 }
 ```
+
+### 文件夹
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `reorder_folders` | `{ folderIds, parentId, sortIndex }` | `FolderInfo[]` |
+
+- 只接受同一父文件夹下的子文件夹；按给定 id 顺序插入到 `sortIndex`，事务内重新编号同级 `sort_index`，返回完整列表。
+- 新建文件夹与移动文件夹追加到同级末尾。
 
 ### 详情与元数据
 
@@ -166,15 +181,18 @@ tags: string[]
 
 ## 查询与索引
 
-- 排序统一追加 `id` 作为稳定次序：`ORDER BY <sort_col> <dir>, images.id <dir>`。
-- 翻页使用行值比较，禁止深 `OFFSET`：
+- 排序统一追加 `id` 作为稳定次序，方向跟随最后一级；多级排序逐级比较，前级相等才比较后级。
+- 单级（导入时间 / 修改时间 / 评分 / 大小 / 像素 / 集合内顺序）走键集游标，没有深 `OFFSET`：
 
 ```sql
--- 降序
+-- 单级降序
 WHERE (images.score, images.id) < (?, ?)
--- 升序
+-- 单级升序
 WHERE (images.score, images.id) > (?, ?)
 ```
+
+- 多级或文件夹排序没有可直接用于行值比较的复合索引，改走 id 列表通道：首次按完整排序取有序 id（最多 20 万条量级），按 `token:offset` 切片返回；后续页只做切片，不重复排序。缓存最多 2 份，进程内过期即丢弃。
+- 锚点查询（`anchorId`）也走 id 列表，从目标图片的排序位置开始取一页并包含它；若它已被筛选排除，就从它原本的位置开始返回后续匹配行，不会把不匹配的行插进结果。
 
 - 视图条件：`deleted_at IS NULL`（all）、`deleted_at IS NOT NULL`（trash）、集合 `JOIN collection_items`（collection）。
 - 文件夹筛选先把选中 id 解析为路径，再用 `images.folder_id IN (SELECT id FROM folders WHERE path = ? OR path LIKE ? ESCAPE '\')` 匹配整棵子树。子树展开只扫描 `folders` 行，代价随文件夹数量而不是图片数量增长；路径的唯一性由 `folders(path COLLATE NOCASE)` 保证。
@@ -183,25 +201,35 @@ WHERE (images.score, images.id) > (?, ?)
 - 首屏、深分页、文件夹、标签、集合都命中现有索引；20 万行实测见[性能基准](../guides/performance.md)。
 - 标签摘要在一页返回后按页内 id 批量查询，避免 N+1；详情侧栏单独读取 4/8 主色。
 
+## 排序
+
+- 排序是全局一套（`SortSpec[]`），叠加到全部 / 回收站 / 集合 / 文件夹 / 搜索；写入 `settings.ui.sort` 并在下次启动时恢复。排序变化保留已选图片、清空滚动位置并从第一页重新加载。
+- `collectionPosition` 只用于集合视图：离开集合时把整套排序暂存到 `BrowseState.collectionSort`，回到集合再恢复；离开期间用去掉集合顺序后的排序。没有集合顺序可暂存时（普通视图下改了排序）沿用新的全局排序。
+- 工具栏排序按钮显示“排序 · 第一级 ↓ + 第二级 ↓（+N）”摘要；弹层内每级可改指标、切方向、上移/下移/删除，最多 7 级且指标不可重复。不可用指标置灰（集合内顺序只在集合视图）。排序旁不再有单独的升降序快捷按钮。
+- 排序方案保存在 `settings.ui.sortProfiles`，最多 50 个，名称不区分大小写唯一；可另存、覆盖当前方案、删除。方案不按视图自动套用，切换后由用户手动选择。
+- 列表视图的列头可直接改排序：第一级同列再点切换方向，点其它列改为按该列排序（文件夹与集合顺序默认升序，其余默认降序）。
+- 相似 / 语义结果固定按相似度，不参与图库排序；此模式下排序按钮置灰，退出结果视图后沿用进入前的全局排序。
+- 文件夹树有自己的排序菜单（手动 / 名称 / 图片数含子文件夹 / 图片数直接，可升降序），只影响树内同级顺序，状态存 `localStorage`；只有“手动”模式允许拖动排序。
+
 ## 前端模块
 
 ```text
 src/modules/library/
-  types.ts                  边界 DTO（含 FolderInfo）
+  types.ts                  边界 DTO（含 FolderInfo / SortSpec / QueryCursor）
   api.ts                    Tauri 命令入口 + 浏览器预览 mock
   mock.ts                   浏览器预览用的可变数据集与查询/编辑/文件夹实现
-  model.ts                  BrowseState、查询构造、排序选项、格式化、筛选键、标签筛选换算
-  useLibraryBrowse.ts       受控 BrowseState、浏览历史与返回
-  useImageQuery.ts          首屏/下一页、代次、锚点跳转与就地替换行、查询与翻页状态类型、错误重试
+  model.ts                  BrowseState、查询构造、全局排序与集合顺序暂存、筛选键、标签筛选换算
+  useLibraryBrowse.ts       受控 BrowseState、初始排序、浏览历史与返回
+  useImageQuery.ts          首屏/下一页、代次、锚点跳转、pageToken 与就地替换行、错误重试
   LibraryView.tsx           视图：搜索/排序/选择/键盘/右键菜单/面包屑
+  SortMenu.tsx              排序弹层：多级编辑、方向、排序方案
   LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
   ViewBar.tsx               全部/回收站标签、集合胶囊、集合管理入口、清空回收站
-  FolderTree.tsx            侧栏文件夹树：多选、展开、右键菜单、拖放
-  folderTreeModel.ts        树构建、可见行展开、祖先路径、面包屑、包含判断
+  FolderTree.tsx            侧栏文件夹树：多选、展开、右键菜单、排序菜单、指针拖放
+  folderTreeModel.ts        树构建与排序、可见行展开、祖先路径、面包屑、包含判断
   FolderDialogs.tsx         文件夹命名/重命名对话框
-  dnd.ts                    图片与文件夹拖放的内部 MIME 读写
-  VirtualGrid.tsx           自适应列数虚拟网格（支持拖出图片 id）
-  VirtualList.tsx           固定行高虚拟列表（支持拖出图片 id）
+  VirtualGrid.tsx           自适应列数虚拟网格（支持开始拖动图片）
+  VirtualList.tsx           固定行高虚拟列表（列头排序、开始拖动图片）
   virtual.ts                两个虚拟视图共用的滚动句柄类型
   FilterPanel.tsx           范围与存在性筛选（不含文件夹分面）
   Inspector.tsx             单张详情与批量编辑侧栏（文件夹选择器、标签点击筛选菜单）
@@ -210,6 +238,9 @@ src/modules/library/
   CollectionPickerDialog.tsx  把选中图片加入现有或新集合
   TagManagerDialog.tsx      标签搜索、重命名、删除
   LibraryThumbnail.tsx      占位、失败与重试（含解码缓存）
+
+src/shared/
+  useDragSort.ts            指针事件拖放控制器（图片与文件夹共用）
 ```
 
 - 相似结果不经过图库查询：`src/app/useSimilarityBrowse.ts` 提供 `SimilarityBrowseState`（`mode: "semantic" | "similar"`、`token`、`findSimilar`、`loadMore`、`ids`），与 `useImageQuery` 共享 `items/status/error/hasMore` 契约，`LibraryView` 只切换数据源；全库相似组在 `src/app/SimilarityGroupsDialog.tsx`。
@@ -223,12 +254,16 @@ src/modules/library/
 
 ## 视图、选择与键盘
 
-- 主界面分两行工具栏：第一行是返回、视图栏（全部 / 回收站 / 集合胶囊 / `＋ 新建集合` / `⋯` 集合管理）、选择摘要、`导入`、`任务` 菜单（批量任务、相似分组）；第二行是文件夹面包屑、搜索框与搜索范围、语义搜索、筛选、排序指标与方向、网格/列表切换、裁剪/适应切换、详情侧栏开关、刷新。图库名与路径只在侧栏出现一次，标题栏不再重复。
-- 视图栏：全部 / 回收站两个标签、集合胶囊、集合管理、清空回收站。切回标签时搜索范围重置为“当前视图”。集合胶囊右键可重命名、左移/右移、另存为新集合、删除集合；`＋ 新建集合` 打开独立对话框（预填 `集合 N`、内容来源可选空集合 / 当前选择 / 当前视图），创建后自动切到该集合并清空选择。
+- 主界面分两行工具栏：第一行是返回、视图栏（全部 / 回收站 / 集合胶囊 / `＋ 新建集合` / `⋯` 集合管理）、选择摘要、`导入`、`任务` 菜单（批量任务、相似分组）；第二行是文件夹面包屑、搜索框与搜索范围、语义搜索、筛选、排序、网格/列表切换、裁剪/适应切换、详情侧栏开关、刷新。图库名与路径只在侧栏出现一次，标题栏不再重复。
+- 视图栏：全部 / 回收站两个标签、集合胶囊、集合管理、清空回收站。在视图之间切换保留搜索文本与“当前视图 / 全库”范围；集合顺序随视图切换暂存/恢复，其它排序级别保持不变。集合胶囊右键可重命名、左移/右移、另存为新集合、删除集合；`＋ 新建集合` 打开独立对话框（预填 `集合 N`、内容来源可选空集合 / 当前选择 / 当前视图），创建后自动切到该集合并清空选择。
 - 左侧文件夹树以“全部图片”为根；单击文件夹即把 `filters.folderIds` 设为该子树并显示在面包屑中。Ctrl/Cmd 单击多选，Shift 单击按可见顺序选择区间；展开/折叠状态只影响树，不进入浏览历史。
 - 面包屑条位于视图栏下方，显示当前选中的文件夹；点击层级跳回对应子树，“全部图片”清空文件夹筛选。
 - 树右键菜单：新建子文件夹、重命名、移动到…、删除空文件夹、把当前选中的图片移到此文件夹。空文件夹也显示在树中，计数为 0。
-- 拖放：网格/列表中的图片可拖到树节点或文件夹选择器；树节点可拖到另一个节点改变层级。图片拖放使用 `application/x-artbank-images` 携带 id，文件夹拖放使用 `application/x-artbank-folder`；位置与冲突由 Rust 校验。
+- 拖放使用指针事件（`shared/useDragSort.ts`），不依赖 HTML5 DnD，因此在开启原生拖放的 WebView2 里也能工作：
+  - 网格/列表里按住图片拖到文件夹行中间 = 移入该文件夹，列表/树的拖放目标与图片集合由 `LibraryWorkspace` 统一提交；
+  - 文件夹只能拖到另一个文件夹（换父级）或同级行上下 1/4（排序），拖到自身或后代时拒绝并提示；
+  - 悬停文件夹 600ms 自动展开；靠近树或网格边缘自动滚动；Esc 取消；拖动结束后紧跟的一次 click 被忽略，避免改变选择；
+  - 从资源管理器拖文件进窗口仍走 Tauri 原生拖放，打开导入对话框并预填当前单选文件夹。
 - 浏览历史保存完整的视图/搜索/筛选/排序快照；视图、搜索或文件夹筛选变化都会新增记录（切换排序不单独入栈）。`Ctrl/Cmd+Z` 或工具栏后退按钮回到上一状态。
 - 单击选中；Ctrl/Cmd 单击切换；Shift 单击按当前已加载顺序区间选择。
 - `Ctrl+A` 调 `query_image_ids` 取当前筛选的全部 id，包含尚未滚动加载的图片，结果在工具栏的选择摘要里显示总数。
@@ -291,11 +326,12 @@ src/modules/library/
 
 - 2 字搜索必须全表扫描 `description`，无法使用 trigram 索引；20 万条集合的计数需要扫描集合命中集并聚合标签关系。两者都只在筛选面板打开时计算，并有加载态。
 - 搜索/集合分面计数使用单条 `MATERIALIZED` CTE，比逐分面重复求命中集快数倍；但 20 万级命中仍会超过 100 ms。普通视图计数仍在预算内。
+- P4 的排序路径在 20 万行上实测：单级排序首页 0.66-0.76 ms；6 级排序首次建 id 列表 213 ms（预算 400 ms）；后续翻页与 offset 199 850 的深页都是 0.83 ms（预算 60 ms）；文件夹单级排序走同一条 id 列表通道，42 ms。数字与口径见[性能基准](../guides/performance.md)。
 - 浏览器预览（724×712 CSS，4,000 行 mock）验证了 DOM 有界与全部 S3 交互；真实 WebView2 的 20 万行滚动帧率、150 张缩略图加载与真实美术样本仍需手工验收。
 
 ## 尚未实现
 
-- 列表列头点击排序、列隐藏；当前用工具栏排序。
+- 列表列头只做了点击排序，列显示/隐藏仍未实现。
 - 拖出到资源管理器（Windows OLE）；复制图片到剪贴板已在 S4 实现。
 - 相似度作为筛选条件与排序键：S7 只做了“找相似”结果视图与全库相似组，筛选面板与列表排序没有接 pHash/主色/embedding/pose 分数。
 - 原始文件名：当前不入库；如需按文件名识别，需要 schema 变更与导入记录。

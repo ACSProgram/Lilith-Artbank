@@ -5,8 +5,8 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Check, RefreshCw } from "lucide-react";
 import { Spinner } from "../../shared/components/Spinner";
@@ -36,7 +36,7 @@ interface VirtualGridProps {
   onItemClick: (item: ImageRow, event: ReactMouseEvent) => void;
   onItemActivate: (item: ImageRow) => void;
   onItemContextMenu: (item: ImageRow, event: ReactMouseEvent) => void;
-  onItemDragStart: (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => void;
+  onItemPointerDown: (item: ImageRow, event: ReactPointerEvent<HTMLDivElement>) => void;
   onBackgroundClick: () => void;
   onLayout: (columns: number) => void;
 }
@@ -61,7 +61,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     onItemClick,
     onItemActivate,
     onItemContextMenu,
-    onItemDragStart,
+    onItemPointerDown,
     onBackgroundClick,
     onLayout,
   },
@@ -203,6 +203,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
       ref={containerRef}
       tabIndex={0}
       role="grid"
+      data-drag-scroll="true"
       aria-rowcount={rows}
       aria-colcount={columns}
       onClick={(event) => {
@@ -244,8 +245,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             }}
             onDoubleClick={() => onItemActivate(item)}
             onContextMenu={(event) => onItemContextMenu(item, event)}
-            draggable
-            onDragStart={(event) => onItemDragStart(item, event)}
+            onPointerDown={(event) => onItemPointerDown(item, event)}
           >
             <span className="grid-cell-image">
               <LibraryThumbnail image={item} className={`is-${thumbFit}`} />

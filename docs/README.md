@@ -9,7 +9,7 @@
 - [当前阶段状态](planning/current-handoff.md)：现在做到哪里、验证过什么。
 - [待办与待决策](planning/todo.md)：唯一未完成清单。
 - [分阶段路线图](planning/roadmap.md)：阶段目标、代码预算与验收门槛。
-- [迁移后体验整改计划](planning/2026-10-24-体验整改计划.md)：17 项体验问题的定位与 P0–P4 批次（P0、P1 已完成，P2–P4 待执行）。
+- [规划归档](planning/archive/README.md)：已完成批次的计划与实现记录（体验整改 P0–P4、单库重构、S0–S7 各批）。
 
 ## 领域模块
 

@@ -4,13 +4,12 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
   AlertTriangle,
-  ArrowDownUp,
   ArrowLeft,
   ChevronRight,
   Crop,
@@ -50,15 +49,15 @@ import {
 import { FilterPanel } from "./FilterPanel";
 import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
+import { SortMenu } from "./SortMenu";
 import { TagManagerDialog } from "./TagManagerDialog";
 import { ViewBar } from "./ViewBar";
-import { IMAGE_DRAG_MIME } from "./dnd";
 import { breadcrumbsFor, buildFolderTree } from "./folderTreeModel";
 import {
-  COLLECTION_SORT,
-  DEFAULT_SORT,
+  COLLECTION_SORT_LEVELS,
   activeFilterCount,
   buildQuery,
+  effectiveViewOf,
   emptyFilters,
   filterKey,
   folderLabel,
@@ -68,9 +67,7 @@ import {
   queryKey,
   rowInTagScope,
   selectionRange,
-  sortForView,
-  sortOptionsFor,
-  sortValueForRow,
+  sortForViewChange,
   tagFilterState,
   type BrowseState,
   type SimilarityBrowseState,
@@ -107,6 +104,8 @@ interface LibraryViewProps {
   onOpenViewer: (session: ViewerSession) => void;
   onCopyImage: (imageId: number) => void;
   onOpenImport?: () => void;
+  /** 开始把网格/列表中的图片拖到文件夹。 */
+  onBeginImageDrag: (imageIds: number[], label: string, event: ReactPointerEvent<HTMLDivElement>) => void;
   similarity?: SimilarityBrowseState;
   onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
   onOpenSimilarityGroups?: () => void;
@@ -144,6 +143,7 @@ export function LibraryView({
   onOpenViewer,
   onCopyImage,
   onOpenImport,
+  onBeginImageDrag,
   similarity,
   onFindSimilar,
   onOpenSimilarityGroups,
@@ -197,7 +197,6 @@ export function LibraryView({
   const pendingTagFocusRef = useRef<{
     id: number;
     row: ImageRow;
-    sortValue: number | null;
     jumpTried: boolean;
     queryKey: string;
   } | null>(null);
@@ -356,14 +355,9 @@ export function LibraryView({
       viewRef.current?.ensureIndex(index);
       return;
     }
-    if (!pending.jumpTried && imageQuery.hasMore && pending.sortValue != null) {
+    if (!pending.jumpTried && imageQuery.hasMore) {
       pending.jumpTried = true;
-      imageQuery.jumpTo(pending.row, pending.sortValue);
-      return;
-    }
-    if (imageQuery.hasMore && pending.sortValue == null) {
-      // 集合内顺序没有行字段可当游标；保留选择，不强制清空。
-      pendingTagFocusRef.current = null;
+      imageQuery.jumpTo(pending.row);
       return;
     }
     // 结果里确实没有这张图：清空选择，避免详情继续显示不在当前结果里的图。
@@ -417,12 +411,15 @@ export function LibraryView({
   useEffect(() => {
     if (!collectionsLoaded || browse.view !== "collection" || browse.collectionId == null) return;
     if (collections.some((collection) => collection.id === browse.collectionId)) return;
-    applyBrowse({
-      ...browseRef.current,
-      view: "all",
-      collectionId: null,
-      sort: sortForView("all", browseRef.current.sort),
-    }, false);
+    applyBrowse(
+      {
+        ...browseRef.current,
+        ...sortForViewChange(browseRef.current, "all"),
+        view: "all",
+        collectionId: null,
+      },
+      false,
+    );
   }, [collections, collectionsLoaded, browse.view, browse.collectionId]);
 
   useEffect(() => {
@@ -459,14 +456,13 @@ export function LibraryView({
     similarityClear?.();
   }, [onGoBack, similarityClear]);
 
-  // 切换固定视图时搜索范围回到“当前视图”，集合内顺序排序在离开集合时回退到默认排序。
+  // 切换视图保留搜索范围与全局排序；“集合内顺序”只在集合视图里暂存/恢复。
   const showAll = useCallback(() => {
     applyBrowse({
       ...browseRef.current,
+      ...sortForViewChange(browseRef.current, "all"),
       view: "all",
       collectionId: null,
-      searchScope: "view",
-      sort: sortForView("all", browseRef.current.sort),
     });
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
@@ -474,10 +470,9 @@ export function LibraryView({
   const showTrash = useCallback(() => {
     applyBrowse({
       ...browseRef.current,
+      ...sortForViewChange(browseRef.current, "trash"),
       view: "trash",
       collectionId: null,
-      searchScope: "view",
-      sort: sortForView("trash", browseRef.current.sort),
     });
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
@@ -487,13 +482,9 @@ export function LibraryView({
       const currentState = browseRef.current;
       applyBrowse({
         ...currentState,
+        ...sortForViewChange(currentState, "collection"),
         view: "collection",
         collectionId,
-        searchScope: "view",
-        sort:
-          currentState.view === "collection"
-            ? currentState.sort
-            : COLLECTION_SORT,
       });
       similarityClear?.();
     },
@@ -501,28 +492,52 @@ export function LibraryView({
   );
 
   const setSearchScope = (scope: BrowseState["searchScope"]) => {
-    const currentState = browseRef.current;
-    applyBrowse({
-      ...currentState,
-      searchScope: scope,
-      sort:
-        scope === "library" && currentState.sort.key === "collectionPosition"
-          ? DEFAULT_SORT
-          : currentState.sort,
-    });
+    applyBrowse({ ...browseRef.current, searchScope: scope });
   };
+
+  /** 调整排序：立即生效，并把全局排序写回设置。 */
+  const applySort = useCallback(
+    (nextSort: BrowseState["sort"]) => {
+      const state = browseRef.current;
+      const hasCollectionOrder = nextSort.some((spec) => spec.key === "collectionPosition");
+      applyBrowse(
+        {
+          ...state,
+          sort: nextSort,
+          collectionSort: hasCollectionOrder ? nextSort : null,
+        },
+        false,
+      );
+      const globalSort = nextSort.filter((spec) => spec.key !== "collectionPosition");
+      if (globalSort.length > 0) persistUi({ sort: globalSort });
+    },
+    [applyBrowse, persistUi],
+  );
+
+  /** 列表列头：点击第一级同列切换方向，其它列改为按该列排序。 */
+  const handleColumnSort = useCallback(
+    (key: SortKey) => {
+      const current = browseRef.current.sort;
+      if (current.length === 1 && current[0].key === key) {
+        applySort([{ key, descending: !current[0].descending }]);
+        return;
+      }
+      applySort([{ key, descending: key !== "folder" && key !== "collectionPosition" }]);
+    },
+    [applySort],
+  );
 
   useEffect(() => {
     onImageSelectionChange?.([...selected]);
   }, [selected, onImageSelectionChange]);
 
-  const handleItemDragStart = useCallback(
-    (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => {
+  const handleItemPointerDown = useCallback(
+    (item: ImageRow, event: ReactPointerEvent<HTMLDivElement>) => {
       const ids = selected.has(item.id) ? [...selected] : [item.id];
-      event.dataTransfer.setData(IMAGE_DRAG_MIME, JSON.stringify({ imageIds: ids }));
-      event.dataTransfer.effectAllowed = "move";
+      if (ids.length === 0) return;
+      onBeginImageDrag(ids, `${ids.length} 张图片`, event);
     },
-    [selected],
+    [onBeginImageDrag, selected],
   );
 
   // 单击只选中；双击 / Enter 打开查看器；详情面板由按钮或右键控制，避免每次点图都挤动网格。
@@ -650,7 +665,7 @@ export function LibraryView({
         search: "",
         searchScope: "view",
         filters: emptyFilters(),
-        sort: COLLECTION_SORT,
+        sort: COLLECTION_SORT_LEVELS,
         cursor: null,
         limit: null,
       }),
@@ -876,7 +891,6 @@ export function LibraryView({
         pendingTagFocusRef.current = {
           id: targetRow.id,
           row: targetRow,
-          sortValue: sortValueForRow(targetRow, currentState.sort.key),
           jumpTried: false,
           queryKey: nextKey,
         };
@@ -963,10 +977,10 @@ export function LibraryView({
       void reloadCollections();
       applyBrowse({
         ...browseRef.current,
+        ...sortForViewChange(browseRef.current, "collection"),
         view: "collection",
         collectionId: collection.id,
         searchScope: "view",
-        sort: COLLECTION_SORT,
       });
     },
     [applyBrowse, clearSelection, reloadCollections],
@@ -987,9 +1001,9 @@ export function LibraryView({
         if (browseRef.current.collectionId === collection.id) {
           applyBrowse({
             ...browseRef.current,
+            ...sortForViewChange(browseRef.current, "all"),
             view: "all",
             collectionId: null,
-            sort: sortForView("all", browseRef.current.sort),
           });
         }
         void reloadCollections();
@@ -1187,9 +1201,6 @@ export function LibraryView({
   const selectedIds = useMemo(() => [...selected], [selected]);
   const contextHasDeleted = contextMenu?.items.some((item) => item.deletedAt != null) ?? false;
   const contextHasActive = contextMenu?.items.some((item) => item.deletedAt == null) ?? false;
-  const searchOptions = sortOptionsFor(browse.view).filter(
-    (option) => !(browse.searchScope === "library" && option.key === "collectionPosition"),
-  );
 
   return (
     <div className="library-view" onKeyDown={handleKeyDown}>
@@ -1415,48 +1426,14 @@ export function LibraryView({
             />
           </div>
 
-          <div className="sort-control">
-            <select
-              className="input sort-select"
-              value={browse.sort.key}
-              aria-label="排序方式"
-              disabled={similarityActive}
-              onChange={(event) => {
-                const key = event.target.value as SortKey;
-                const descending =
-                  key === "collectionPosition"
-                    ? false
-                    : browse.sort.key === "collectionPosition"
-                      ? true
-                      : browse.sort.descending;
-                applyBrowse(
-                  { ...browseRef.current, sort: { key, descending } },
-                  false,
-                );
-              }}
-            >
-              {searchOptions.map((option: { key: SortKey; label: string }) => (
-                <option key={option.key} value={option.key}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <IconButton
-              label={browse.sort.descending ? "降序，点击切换为升序" : "升序，点击切换为降序"}
-              disabled={similarityActive}
-              onClick={() =>
-                applyBrowse(
-                  {
-                    ...browseRef.current,
-                    sort: { ...browse.sort, descending: !browse.sort.descending },
-                  },
-                  false,
-                )
-              }
-            >
-              <ArrowDownUp size={14} />
-            </IconButton>
-          </div>
+          <SortMenu
+            sort={browse.sort}
+            profiles={settings?.ui.sortProfiles ?? []}
+            view={effectiveViewOf(browse)}
+            disabled={similarityActive}
+            onSortChange={applySort}
+            onProfilesChange={(sortProfiles) => persistUi({ sortProfiles })}
+          />
 
           <div className="segmented" role="group" aria-label="视图模式">
             <button
@@ -1680,7 +1657,7 @@ export function LibraryView({
               onItemClick={handleItemClick}
               onItemActivate={activateItem}
               onItemContextMenu={handleItemContextMenu}
-              onItemDragStart={handleItemDragStart}
+              onItemPointerDown={handleItemPointerDown}
               onBackgroundClick={handleBackgroundClick}
               onLayout={setGridColumns}
             />
@@ -1693,15 +1670,18 @@ export function LibraryView({
               resetKey={resetSignature}
               selected={selected}
               activeId={activeId}
+              sort={browse.sort}
+              sortDisabled={similarityActive}
               hasMore={hasMore}
               moreStatus={moreStatus}
               moreError={moreError}
+              onSortChange={handleColumnSort}
               onLoadMore={loadMore}
               onRetryMore={retryMore}
               onItemClick={handleItemClick}
               onItemActivate={activateItem}
               onItemContextMenu={handleItemContextMenu}
-              onItemDragStart={handleItemDragStart}
+              onItemPointerDown={handleItemPointerDown}
               onBackgroundClick={handleBackgroundClick}
             />
           ) : null}

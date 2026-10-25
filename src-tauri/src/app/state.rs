@@ -182,6 +182,7 @@ impl AppState {
             PathBuf::from(&info.path),
         );
         *self.library.lock() = Some(session);
+        query::clear_page_cache();
         Ok(info)
     }
 
@@ -198,6 +199,7 @@ impl AppState {
             PathBuf::from(&info.path),
         );
         *self.library.lock() = Some(session);
+        query::clear_page_cache();
         Ok(info)
     }
 
@@ -231,6 +233,7 @@ impl AppState {
         }
         self.ai.library_closed();
         *self.library.lock() = None;
+        query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())
     }
@@ -259,6 +262,18 @@ impl AppState {
             .ok_or_else(|| AppError::message("尚未打开图库"))
     }
 
+    /// 会改变图片集合、排序字段或筛选字段的写入：成功后让 id 列表游标整体失效。
+    ///
+    /// 有序 id 列表按查询指纹缓存，任何一条这样的写入都可能让它过期；失败时数据库已回滚，
+    /// 缓存继续有效，不必清空。
+    fn mutate<T>(&self, operation: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
+        let result = operation();
+        if result.is_ok() {
+            query::clear_page_cache();
+        }
+        result
+    }
+
     pub fn query_images(&self, query: LibraryQuery) -> AppResult<ImagePage> {
         let (database, root) = self.query_source()?;
         query::query_page(&database, &root, query)
@@ -282,25 +297,36 @@ impl AppState {
     pub fn create_folder(&self, path: &str) -> AppResult<Vec<FolderInfo>> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        folder_service::create(&database, &root, path)
+        self.mutate(|| folder_service::create(&database, &root, path))
     }
 
     pub fn rename_folder(&self, folder_id: i64, name: &str) -> AppResult<Vec<FolderInfo>> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        folder_service::rename(&database, &root, folder_id, name)
+        self.mutate(|| folder_service::rename(&database, &root, folder_id, name))
     }
 
     pub fn move_folder(&self, folder_id: i64, parent_id: i64) -> AppResult<Vec<FolderInfo>> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        folder_service::move_to(&database, &root, folder_id, parent_id)
+        self.mutate(|| folder_service::move_to(&database, &root, folder_id, parent_id))
+    }
+
+    pub fn reorder_folders(
+        &self,
+        folder_ids: &[i64],
+        parent_id: i64,
+        sort_index: i64,
+    ) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, _) = self.query_source()?;
+        self.mutate(|| folder_service::reorder(&database, folder_ids, parent_id, sort_index))
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> AppResult<Vec<FolderInfo>> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        folder_service::delete(&database, &root, folder_id)
+        self.mutate(|| folder_service::delete(&database, &root, folder_id))
     }
 
     pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
@@ -320,42 +346,42 @@ impl AppState {
 
     pub fn update_image_score(&self, image_id: i64, score: i64) -> AppResult<()> {
         let (database, _) = self.query_source()?;
-        metadata::update_score(&database, image_id, score)
+        self.mutate(|| metadata::update_score(&database, image_id, score))
     }
 
     pub fn set_images_score(&self, image_ids: &[i64], score: i64) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::set_scores(&database, image_ids, score)
+        self.mutate(|| metadata::set_scores(&database, image_ids, score))
     }
 
     pub fn update_image_description(&self, image_id: i64, description: &str) -> AppResult<()> {
         let (database, _) = self.query_source()?;
-        metadata::update_description(&database, image_id, description)
+        self.mutate(|| metadata::update_description(&database, image_id, description))
     }
 
     pub fn set_image_tags(&self, image_id: i64, tag_names: &[String]) -> AppResult<Vec<TagRef>> {
         let (database, _) = self.query_source()?;
-        metadata::set_image_tags(&database, image_id, tag_names)
+        self.mutate(|| metadata::set_image_tags(&database, image_id, tag_names))
     }
 
     pub fn add_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::add_tags(&database, image_ids, tag_names)
+        self.mutate(|| metadata::add_tags(&database, image_ids, tag_names))
     }
 
     pub fn remove_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::remove_tags(&database, image_ids, tag_names)
+        self.mutate(|| metadata::remove_tags(&database, image_ids, tag_names))
     }
 
     pub fn rename_tag(&self, tag_id: i64, name: &str) -> AppResult<()> {
         let (database, _) = self.query_source()?;
-        metadata::rename_tag(&database, tag_id, name)
+        self.mutate(|| metadata::rename_tag(&database, tag_id, name))
     }
 
     pub fn delete_tag(&self, tag_id: i64) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        metadata::delete_tag(&database, tag_id)
+        self.mutate(|| metadata::delete_tag(&database, tag_id))
     }
 
     pub fn move_images(
@@ -365,19 +391,19 @@ impl AppState {
         reporter: &dyn BatchReporter,
     ) -> AppResult<MoveReport> {
         let (database, root) = self.query_source()?;
-        metadata::move_images(&database, &root, image_ids, folder_path, reporter)
+        self.mutate(|| metadata::move_images(&database, &root, image_ids, folder_path, reporter))
     }
 
     pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        let changed = metadata::set_trashed(&database, image_ids, true)?;
+        let changed = self.mutate(|| metadata::set_trashed(&database, image_ids, true))?;
         self.ai.invalidate_similarity();
         Ok(changed)
     }
 
     pub fn restore_images(&self, image_ids: &[i64]) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        let changed = metadata::set_trashed(&database, image_ids, false)?;
+        let changed = self.mutate(|| metadata::set_trashed(&database, image_ids, false))?;
         self.ai.invalidate_similarity();
         Ok(changed)
     }
@@ -388,14 +414,15 @@ impl AppState {
         reporter: &dyn BatchReporter,
     ) -> AppResult<DeleteReport> {
         let (database, root) = self.query_source()?;
-        let report = metadata::delete_images(&database, &root, image_ids, reporter)?;
+        let report =
+            self.mutate(|| metadata::delete_images(&database, &root, image_ids, reporter))?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
 
     pub fn empty_trash(&self, reporter: &dyn BatchReporter) -> AppResult<DeleteReport> {
         let (database, root) = self.query_source()?;
-        let report = metadata::empty_trash(&database, &root, reporter)?;
+        let report = self.mutate(|| metadata::empty_trash(&database, &root, reporter))?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
@@ -417,7 +444,7 @@ impl AppState {
 
     pub fn delete_collection(&self, collection_id: i64) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        collections::delete(&database, collection_id)
+        self.mutate(|| collections::delete(&database, collection_id))
     }
 
     pub fn reorder_collections(&self, collection_ids: &[i64]) -> AppResult<()> {
@@ -431,7 +458,7 @@ impl AppState {
         image_ids: &[i64],
     ) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        collections::add_images(&database, collection_id, image_ids)
+        self.mutate(|| collections::add_images(&database, collection_id, image_ids))
     }
 
     pub fn remove_images_from_collection(
@@ -440,7 +467,7 @@ impl AppState {
         image_ids: &[i64],
     ) -> AppResult<u64> {
         let (database, _) = self.query_source()?;
-        collections::remove_images(&database, collection_id, image_ids)
+        self.mutate(|| collections::remove_images(&database, collection_id, image_ids))
     }
 
     pub fn combine_collections(
@@ -450,7 +477,7 @@ impl AppState {
         name: &str,
     ) -> AppResult<CollectionInfo> {
         let (database, _) = self.query_source()?;
-        collections::combine(&database, mode, collection_ids, name)
+        self.mutate(|| collections::combine(&database, mode, collection_ids, name))
     }
 
     pub fn image_pose(&self, image_id: i64) -> AppResult<Option<PoseData>> {
@@ -460,6 +487,7 @@ impl AppState {
     pub(crate) fn begin_edit(&self) -> AppResult<LaneGuard> {
         let guard = self.begin_maintenance()?;
         self.ai.invalidate_similarity();
+        query::clear_page_cache();
         Ok(guard)
     }
 

@@ -186,6 +186,11 @@ pub fn join_folder(parent: &str, name: &str) -> String {
     }
 }
 
+/// 上级路径；根目录与一级文件夹都返回空串。
+pub fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
 pub fn normalize_content_extension(value: &str) -> AppResult<String> {
     let ext = value.trim().trim_start_matches('.').to_ascii_lowercase();
     if ext.is_empty() || ext.len() > 16 || !ext.chars().all(|ch| ch.is_ascii_alphanumeric()) {

@@ -4,8 +4,8 @@ import {
   useImperativeHandle,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { RefreshCw } from "lucide-react";
 import { Spinner } from "../../shared/components/Spinner";
@@ -18,7 +18,7 @@ import {
   formatDimensions,
   formatScore,
 } from "./model";
-import type { ImageRow } from "./types";
+import type { ImageRow, SortKey, SortSpec } from "./types";
 import type { MoreStatus } from "./useImageQuery";
 import type { VirtualViewHandle } from "./virtual";
 
@@ -27,15 +27,18 @@ interface VirtualListProps {
   resetKey: string;
   selected: Set<number>;
   activeId: number | null;
+  sort: SortSpec[];
+  sortDisabled: boolean;
   hasMore: boolean;
   moreStatus: MoreStatus;
   moreError: string | null;
+  onSortChange: (key: SortKey) => void;
   onLoadMore: () => void;
   onRetryMore: () => void;
   onItemClick: (item: ImageRow, event: ReactMouseEvent) => void;
   onItemActivate: (item: ImageRow) => void;
   onItemContextMenu: (item: ImageRow, event: ReactMouseEvent) => void;
-  onItemDragStart: (item: ImageRow, event: ReactDragEvent<HTMLDivElement>) => void;
+  onItemPointerDown: (item: ImageRow, event: ReactPointerEvent<HTMLDivElement>) => void;
   onBackgroundClick: () => void;
 }
 
@@ -50,15 +53,18 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
     resetKey,
     selected,
     activeId,
+    sort,
+    sortDisabled,
     hasMore,
     moreStatus,
     moreError,
+    onSortChange,
     onLoadMore,
     onRetryMore,
     onItemClick,
     onItemActivate,
     onItemContextMenu,
-    onItemDragStart,
+    onItemPointerDown,
     onBackgroundClick,
   },
   ref,
@@ -161,19 +167,59 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
       ref={containerRef}
       tabIndex={0}
       role="grid"
+      data-drag-scroll="true"
       onClick={(event) => {
         if (event.target === event.currentTarget) onBackgroundClick();
       }}
     >
       <div className="virtual-list-head virtual-list-grid" role="row">
-        <span />
-        <span>尺寸</span>
-        <span>格式</span>
-        <span>大小</span>
-        <span>评分</span>
-        <span>标签</span>
-        <span>导入时间</span>
-        <span>文件夹</span>
+        <span role="columnheader" />
+        {(
+          [
+            ["尺寸", "pixels"],
+            ["格式", null],
+            ["大小", "size"],
+            ["评分", "score"],
+            ["标签", null],
+            ["导入时间", "importedAt"],
+            ["文件夹", "folder"],
+          ] as const
+        ).map(([label, key]) => {
+          if (!key) {
+            return (
+              <span key={label} role="columnheader">
+                {label}
+              </span>
+            );
+          }
+          const level = sort.findIndex((spec) => spec.key === key);
+          const active = level >= 0;
+          return (
+            <span
+              key={label}
+              role="columnheader"
+              aria-sort={
+                active ? (sort[level].descending ? "descending" : "ascending") : "none"
+              }
+            >
+              <button
+                type="button"
+                className={`list-sort${active ? " is-active" : ""}`}
+                disabled={sortDisabled}
+                title={active ? "点击切换方向；其它列点击改为按该列排序" : "按这一列排序"}
+                onClick={() => onSortChange(key)}
+              >
+                {label}
+                {active ? (
+                  <span className="list-sort-arrow">
+                    {sort[level].descending ? "↓" : "↑"}
+                    {sort.length > 1 ? level + 1 : ""}
+                  </span>
+                ) : null}
+              </button>
+            </span>
+          );
+        })}
       </div>
       <div className="virtual-space" style={{ height: spacerHeight }} />
       {items.slice(firstRow, lastRow).map((item, offset) => {
@@ -195,8 +241,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
             }}
             onDoubleClick={() => onItemActivate(item)}
             onContextMenu={(event) => onItemContextMenu(item, event)}
-            draggable
-            onDragStart={(event) => onItemDragStart(item, event)}
+            onPointerDown={(event) => onItemPointerDown(item, event)}
           >
             <span className="virtual-list-thumb">
               <LibraryThumbnail image={item} />

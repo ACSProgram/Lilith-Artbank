@@ -279,6 +279,16 @@ pub fn move_folder(
 }
 
 #[tauri::command]
+pub fn reorder_folders(
+    state: State<'_, AppState>,
+    folder_ids: Vec<i64>,
+    parent_id: i64,
+    sort_index: i64,
+) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.reorder_folders(&folder_ids, parent_id, sort_index))
+}
+
+#[tauri::command]
 pub fn delete_folder(
     state: State<'_, AppState>,
     folder_id: i64,
@@ -759,6 +769,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         create_folder,
         rename_folder,
         move_folder,
+        reorder_folders,
         delete_folder,
         get_tags,
         search_tags,

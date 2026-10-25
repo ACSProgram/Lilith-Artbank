@@ -24,6 +24,8 @@ type View = "options" | "running" | "done";
 interface ImportDialogProps {
   open: boolean;
   initialPaths: string[];
+  /** 打开时预填的目标文件夹（当前浏览的文件夹）。 */
+  initialFolder?: string;
   folders: ImportFolder[];
   onClose: () => void;
   onFinished: () => void;
@@ -73,6 +75,7 @@ function formatDuration(milliseconds: number): string {
 export function ImportDialog({
   open,
   initialPaths,
+  initialFolder = "",
   folders,
   onClose,
   onFinished,
@@ -93,10 +96,12 @@ export function ImportDialog({
 
   const jobIdRef = useRef<string | null>(null);
   const initialRef = useRef(initialPaths);
+  const initialFolderRef = useRef(initialFolder);
   const finishedRef = useRef(false);
   const viewRef = useRef<View>("options");
   const onFinishedRef = useRef(onFinished);
   initialRef.current = initialPaths;
+  initialFolderRef.current = initialFolder;
   viewRef.current = view;
   onFinishedRef.current = onFinished;
 
@@ -126,7 +131,7 @@ export function ImportDialog({
   useEffect(() => {
     if (!open) return;
     setPaths(initialRef.current);
-    setFolder("");
+    setFolder(initialFolderRef.current);
     setFolderMode("flat");
     setFolderPickerOpen(false);
     setTagsText("");

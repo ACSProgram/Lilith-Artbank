@@ -239,6 +239,8 @@ impl ImportJob {
         *self.phase.lock() = phase;
         *self.finished_at.lock() = Some(now_ms());
         self.set_current("");
+        // 导入会新增图片行，缓存的有序 id 列表随即过期。
+        crate::library::query::clear_page_cache();
         self.handle.finish(task_phase(phase));
     }
 

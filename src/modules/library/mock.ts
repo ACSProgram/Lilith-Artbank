@@ -15,6 +15,7 @@ import type {
   LibraryQuery,
   MoveReport,
   QueryCursor,
+  SortKey,
   TagCount,
   TagInfo,
   TagRef,
@@ -45,7 +46,25 @@ const DIMENSIONS: [number, number][] = [
   [900, 1600],
 ];
 
-const folderState = FOLDER_PATHS.map((path, index) => ({ id: index + 1, path }));
+function parentOf(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "" : path.slice(0, index);
+}
+
+const folderState = FOLDER_PATHS.map((path, index) => ({
+  id: index + 1,
+  path,
+  sortIndex: 0,
+}));
+{
+  const counters = new Map<string, number>();
+  for (const folder of folderState) {
+    const parent = parentOf(folder.path);
+    const next = counters.get(parent) ?? 0;
+    folder.sortIndex = next;
+    counters.set(parent, next + 1);
+  }
+}
 const tagState = TAG_NAMES.map((name, index) => ({ id: index + 1, name }));
 const descriptions = new Map<number, string>();
 const palettes = new Map<number, { colors4: ColorEntry[]; colors8: ColorEntry[] }>();
@@ -135,6 +154,7 @@ export function mockFolders(): FolderInfo[] {
     .map((folder) => ({
       id: folder.id,
       path: folder.path,
+      sortIndex: folder.sortIndex,
       directImageCount: direct.get(folder.id) ?? 0,
       totalImageCount: totals.get(folder.id) ?? 0,
     }))
@@ -235,53 +255,134 @@ function matches(image: ImageRow, query: LibraryQuery, exclude: Facet): boolean 
   return inView(image, query) && matchesSearch(image, query) && matchesFilters(image, query.filters, exclude);
 }
 
-function sortValue(image: ImageRow, query: LibraryQuery): number {
-  if (query.sort.key === "collectionPosition") {
-    const collectionId = query.collectionId ?? -1;
-    return (collectionItems.get(collectionId) ?? []).indexOf(image.id);
+function sortValue(image: ImageRow, key: SortKey, query: LibraryQuery): number | string {
+  switch (key) {
+    case "importedAt":
+      return image.importedAt;
+    case "modifiedAt":
+      return image.modifiedAt;
+    case "score":
+      return image.score;
+    case "size":
+      return image.fileSize;
+    case "pixels":
+      return image.width * image.height;
+    case "folder":
+      return image.folderPath;
+    case "collectionPosition": {
+      const collectionId = query.collectionId ?? -1;
+      return (collectionItems.get(collectionId) ?? []).indexOf(image.id);
+    }
   }
-  if (query.sort.key === "score") return image.score;
-  if (query.sort.key === "size") return image.fileSize;
-  return image.importedAt;
 }
 
-function compareImages(a: ImageRow, b: ImageRow, query: LibraryQuery): number {
-  const direction = query.sort.descending ? -1 : 1;
-  const difference = sortValue(a, query) - sortValue(b, query);
-  if (difference !== 0) return difference * direction;
-  return (a.id - b.id) * direction;
+function compareSortValues(left: number | string, right: number | string): number {
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  return String(left).localeCompare(String(right), "zh-Hans-CN");
 }
 
-function afterCursor(image: ImageRow, query: LibraryQuery): boolean {
-  const cursor = query.cursor;
-  if (!cursor) return true;
-  const key = Number(cursor.sortKey);
-  const difference = sortValue(image, query) - key;
-  if (difference !== 0) {
-    return query.sort.descending ? difference < 0 : difference > 0;
+function imageSortValues(image: ImageRow, query: LibraryQuery): (number | string)[] {
+  return query.sort.map((spec) => sortValue(image, spec.key, query));
+}
+
+export function compareImages(a: ImageRow, b: ImageRow, query: LibraryQuery): number {
+  for (const spec of query.sort) {
+    const difference = compareSortValues(
+      sortValue(a, spec.key, query),
+      sortValue(b, spec.key, query),
+    );
+    if (difference !== 0) return difference * (spec.descending ? -1 : 1);
   }
-  return query.sort.descending ? image.id < cursor.id : image.id > cursor.id;
+  const last = query.sort[query.sort.length - 1];
+  return (a.id - b.id) * (last?.descending ? -1 : 1);
+}
+
+function usesIdCursor(query: LibraryQuery): boolean {
+  return query.sort.length > 1 || query.sort[0]?.key === "folder";
+}
+
+function orderedMatches(query: LibraryQuery): ImageRow[] {
+  return mockImages
+    .filter((image) => matches(image, query, null))
+    .sort((a, b) => compareImages(a, b, query));
+}
+
+const idPageLists = new Map<string, number[]>();
+let nextIdPage = 1;
+
+function parsePageToken(token: string): { listId: string; offset: number } {
+  const index = token.lastIndexOf(":");
+  if (index < 0) throw new Error("分页 token 无效");
+  return { listId: token.slice(0, index), offset: Number(token.slice(index + 1)) || 0 };
+}
+
+function pageFromIds(query: LibraryQuery, limit: number): ImagePage {
+  const ordered = orderedMatches(query);
+  let list: number[];
+  let listId: string;
+  let offset = 0;
+  if (query.pageToken) {
+    const parsed = parsePageToken(query.pageToken);
+    const cached = idPageLists.get(parsed.listId);
+    if (!cached) throw new Error("排序结果已过期，请重新载入");
+    list = cached;
+    listId = parsed.listId;
+    offset = parsed.offset;
+  } else {
+    list = ordered.map((image) => image.id);
+    listId = String(nextIdPage++);
+    idPageLists.set(listId, list);
+    while (idPageLists.size > 2) {
+      const oldest = idPageLists.keys().next().value;
+      if (oldest == null) break;
+      idPageLists.delete(oldest);
+    }
+    if (query.anchorId != null) {
+      const position = list.indexOf(query.anchorId);
+      if (position < 0) {
+        return { items: [], nextCursor: null, nextPageToken: null };
+      }
+      offset = position;
+    }
+  }
+  const byId = new Map(ordered.map((image) => [image.id, image]));
+  const end = Math.min(list.length, offset + limit);
+  const items = list
+    .slice(offset, end)
+    .map((id) => byId.get(id))
+    .filter((image): image is ImageRow => image != null);
+  return {
+    items,
+    nextCursor: null,
+    nextPageToken: end < list.length ? `${listId}:${end}` : null,
+  };
 }
 
 export function mockQueryPage(query: LibraryQuery): ImagePage {
   const limit = Math.min(query.limit ?? 150, 300);
-  const items = mockImages
-    .filter((image) => matches(image, query, null) && afterCursor(image, query))
-    .sort((a, b) => compareImages(a, b, query))
-    .slice(0, limit);
+  if (usesIdCursor(query) || query.pageToken || query.anchorId != null) {
+    return pageFromIds(query, limit);
+  }
+  const ordered = orderedMatches(query);
+  let start = 0;
+  if (query.cursor) {
+    const position = ordered.findIndex((image) => image.id === query.cursor?.id);
+    start = position < 0 ? ordered.length : position + 1;
+  }
+  const items = ordered.slice(start, start + limit);
   const last = items[items.length - 1];
   const nextCursor: QueryCursor | null =
-    items.length > 0 && items.length === limit
-      ? { sortKey: String(sortValue(last, query)), id: last.id }
+    items.length === limit
+      ? {
+          sortValues: imageSortValues(last, query).map(String),
+          id: last.id,
+        }
       : null;
-  return { items, nextCursor };
+  return { items, nextCursor, nextPageToken: null };
 }
 
 export function mockQueryIds(query: LibraryQuery): number[] {
-  return mockImages
-    .filter((image) => matches(image, query, null))
-    .sort((a, b) => compareImages(a, b, query))
-    .map((image) => image.id);
+  return orderedMatches(query).map((image) => image.id);
 }
 
 function groupCounts(rows: ImageRow[], key: (image: ImageRow) => string): Map<string, number> {
@@ -504,7 +605,7 @@ function normalizeMockFolder(value: string): string {
   return value.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
 }
 
-function findFolder(id: number): { id: number; path: string } {
+function findFolder(id: number): { id: number; path: string; sortIndex: number } {
   const folder = folderState.find((item) => item.id === id);
   if (!folder) throw new Error("文件夹不存在");
   return folder;
@@ -542,7 +643,15 @@ function ensureMockFolder(path: string): number {
       id = found.id;
       continue;
     }
-    const folder = { id: nextFolderId++, path: current };
+    const parent = parentOf(current);
+    const sortIndex =
+      Math.max(
+        -1,
+        ...folderState
+          .filter((folder) => parentOf(folder.path) === parent)
+          .map((folder) => folder.sortIndex),
+      ) + 1;
+    const folder = { id: nextFolderId++, path: current, sortIndex };
     folderState.push(folder);
     id = folder.id;
   }
@@ -616,6 +725,43 @@ export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
     throw new Error("目标位置已经有同名文件夹");
   }
   replaceFolderPrefix(folder.path, nextPath);
+  assignSortIndexAtEnd(id);
+  return mockFolders();
+}
+
+function assignSortIndexAtEnd(id: number) {
+  const folder = findFolder(id);
+  const parent = parentOf(folder.path);
+  folder.sortIndex =
+    Math.max(
+      -1,
+      ...folderState
+        .filter((item) => item.id !== id && parentOf(item.path) === parent)
+        .map((item) => item.sortIndex),
+    ) + 1;
+}
+
+export function mockReorderFolders(
+  ids: number[],
+  parentId: number,
+  sortIndex: number,
+): FolderInfo[] {
+  const parent = findFolder(parentId);
+  const siblings = folderState
+    .filter((folder) => folder.path !== "" && parentOf(folder.path) === parent.path)
+    .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
+  if (ids.some((id) => !siblings.some((folder) => folder.id === id))) {
+    throw new Error("只能调整同一级文件夹的顺序");
+  }
+  const moved = new Set(ids);
+  const ordered = siblings.filter((folder) => !moved.has(folder.id)).map((folder) => folder.id);
+  const at = Math.max(0, Math.min(ordered.length, sortIndex));
+  ordered.splice(at, 0, ...ids);
+  const byId = new Map(folderState.map((folder) => [folder.id, folder]));
+  ordered.forEach((id, index) => {
+    const folder = byId.get(id);
+    if (folder) folder.sortIndex = index;
+  });
   return mockFolders();
 }
 

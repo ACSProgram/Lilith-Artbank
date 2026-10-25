@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderOpen, Images, Trash2, Upload } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
@@ -21,6 +21,8 @@ import { Sidebar } from "./Sidebar";
 import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
+import { useDragSort, type DragPayload, type DropTarget } from "../shared/useDragSort";
+import { isSameOrDescendant, parentFolderPath } from "../modules/library/folderTreeModel";
 
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
@@ -28,7 +30,7 @@ interface LibraryWorkspaceProps {
 }
 
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
-  const { current, refreshStatus } = useAppRuntime();
+  const { current, refreshStatus, settings } = useAppRuntime();
   const { notify } = useNotices();
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
@@ -41,7 +43,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
-  const browse = useLibraryBrowse();
+  const browse = useLibraryBrowse(settings?.ui.sort);
+  const importFolder = useMemo(() => {
+    const selected = browse.browse.filters.folderIds;
+    if (selected.length !== 1) return "";
+    return folders.find((folder) => folder.id === selected[0])?.path ?? "";
+  }, [browse.browse.filters.folderIds, folders]);
   const similarity = useSimilarityBrowse();
   const { dataVersion: taskDataVersion } = useTaskCenter();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
@@ -137,6 +144,91 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return aiApi.generatePose(imageId);
   }, []);
 
+  const handleDrop = useCallback(
+    async (item: DragPayload, target: DropTarget) => {
+      if (item.kind === "images") {
+        if (target.position !== "inside") return;
+        const path =
+          target.kind === "root"
+            ? ""
+            : (folders.find((folder) => folder.id === target.folderId)?.path ?? "");
+        try {
+          const report = await libraryApi.moveImagesToFolder(item.imageIds, path);
+          notify(
+            `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`,
+            report.failures.length > 0 ? "error" : "success",
+            report.failures[0]?.reason,
+          );
+          await reloadFolders();
+          setRefreshToken((value) => value + 1);
+        } catch (cause) {
+          notify("移动图片失败", "error", errorMessage(cause));
+        }
+        return;
+      }
+
+      const dragged = folders.find((folder) => folder.id === item.folderId);
+      if (!dragged) return;
+      const targetFolder =
+        target.kind === "root"
+          ? folders.find((folder) => folder.path === "")
+          : folders.find((folder) => folder.id === target.folderId);
+      if (!targetFolder) return;
+      if (isSameOrDescendant(targetFolder.path, dragged.path)) {
+        notify("不能把文件夹移动到自身或子文件夹", "error");
+        return;
+      }
+
+      try {
+        if (target.position === "inside") {
+          await libraryApi.moveFolder(dragged.id, targetFolder.id);
+        } else {
+          const parentPath = parentFolderPath(targetFolder.path);
+          const parent = folders.find((folder) => folder.path === parentPath);
+          if (!parent) return;
+          const sameParent = parentFolderPath(dragged.path) === parentPath;
+          if (!sameParent) {
+            await libraryApi.moveFolder(dragged.id, parent.id);
+          }
+          const siblings = folders
+            .filter(
+              (folder) =>
+                folder.path !== "" &&
+                parentFolderPath(folder.path) === parentPath &&
+                folder.id !== dragged.id,
+            )
+            .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
+          const position = siblings.findIndex((folder) => folder.id === targetFolder.id);
+          if (position < 0) return;
+          const index = target.position === "before" ? position : position + 1;
+          await libraryApi.reorderFolders([dragged.id], parent.id, index);
+        }
+        await reloadFolders();
+        setRefreshToken((value) => value + 1);
+      } catch (cause) {
+        notify("移动文件夹失败", "error", errorMessage(cause));
+      }
+    },
+    [folders, notify, reloadFolders],
+  );
+
+  const { beginDrag } = useDragSort({
+    onDrop: (item, target) => handleDrop(item, target),
+    onReject: (item, target) => {
+      if (item.kind === "folder" && target.kind === "folder") {
+        notify("不能把文件夹移动到自身或子文件夹", "error");
+      }
+    },
+    canDrop: (item, target) => {
+      if (item.kind === "images") return target.position === "inside";
+      if (target.kind === "root") return true;
+      const dragged = folders.find((folder) => folder.id === item.folderId);
+      const targetFolder = folders.find((folder) => folder.id === target.folderId);
+      if (!dragged || !targetFolder) return false;
+      return !isSameOrDescendant(targetFolder.path, dragged.path);
+    },
+  });
+
   if (!current) return null;
 
   const hasImages = current.imageCount > 0 || current.trashCount > 0;
@@ -199,6 +291,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
         onSelectFolders={selectFolders}
         onFoldersChanged={setFolders}
         onDataChanged={handleDataChanged}
+        onBeginFolderDrag={(folderId, label, event) =>
+          beginDrag({ kind: "folder", folderId, label }, event)
+        }
       />
       <main className="app-main">
         <div className={`workspace${hasImages ? " workspace-browse" : ""}`}>
@@ -216,6 +311,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               onOpenViewer={setViewerSession}
               onCopyImage={(imageId) => void handleCopyImage(imageId)}
               onOpenImport={() => openImport()}
+              onBeginImageDrag={(imageIds, label, event) =>
+                beginDrag({ kind: "images", imageIds, label }, event)
+              }
               similarity={similarity}
               onFindSimilar={(kind, imageId) => similarity.findSimilar(kind, imageId)}
               onOpenSimilarityGroups={() => {
@@ -294,6 +392,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
           <ImportDialog
             open={importOpen}
             initialPaths={pendingPaths}
+            initialFolder={importFolder}
             folders={folders}
             onClose={closeImport}
             onFinished={handleImportFinished}

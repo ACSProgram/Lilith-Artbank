@@ -1,5 +1,12 @@
 export type LibraryView = "all" | "trash" | "collection";
-export type SortKey = "importedAt" | "score" | "size" | "collectionPosition";
+export type SortKey =
+  | "importedAt"
+  | "modifiedAt"
+  | "score"
+  | "size"
+  | "pixels"
+  | "folder"
+  | "collectionPosition";
 export type TagMode = "any" | "all";
 export type ViewMode = "grid" | "list";
 export type SearchScope = "view" | "library";
@@ -27,7 +34,7 @@ export interface SortSpec {
 }
 
 export interface QueryCursor {
-  sortKey: string;
+  sortValues: string[];
   id: number;
 }
 
@@ -37,8 +44,14 @@ export interface LibraryQuery {
   search: string;
   searchScope: SearchScope;
   filters: LibraryFilters;
-  sort: SortSpec;
+  /** 第一级为主排序；最多 7 级，指标不可重复。 */
+  sort: SortSpec[];
+  /** 单级排序的键集游标。 */
   cursor?: QueryCursor | null;
+  /** 多级或文件夹排序时的有序 id 列表游标。 */
+  pageToken?: string | null;
+  /** 从这张图所在的排序位置开始取一页（包含它自身）。 */
+  anchorId?: number | null;
   limit?: number | null;
 }
 
@@ -67,6 +80,7 @@ export interface ImageRow {
 export interface ImagePage {
   items: ImageRow[];
   nextCursor: QueryCursor | null;
+  nextPageToken: string | null;
 }
 
 export interface FolderCount {
@@ -95,6 +109,8 @@ export interface FilterCounts {
 export interface FolderInfo {
   id: number;
   path: string;
+  /** 同一父级下的手动排序位。 */
+  sortIndex: number;
   /** 直接位于该文件夹的未删除图片数。 */
   directImageCount: number;
   /** 包含全部后代的未删除图片数。 */

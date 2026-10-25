@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  COLLECTION_SORT,
-  DEFAULT_SORT,
+  COLLECTION_SORT_LEVELS,
+  DEFAULT_SORT_LEVELS,
   defaultBrowseState,
+  effectiveSort,
   rowInTagScope,
-  sortForView,
-  sortValueForRow,
+  sortForViewChange,
+  sortSummary,
   tagFilterState,
   type BrowseState,
 } from "./model.ts";
@@ -62,7 +63,8 @@ test("scoped filtering drops search and unrelated filters", () => {
     view: "collection",
     collectionId: 4,
     search: "狐狸",
-    sort: COLLECTION_SORT,
+    sort: COLLECTION_SORT_LEVELS,
+    collectionSort: COLLECTION_SORT_LEVELS,
     filters: {
       ...defaultBrowseState().filters,
       folderIds: [2],
@@ -80,7 +82,8 @@ test("scoped filtering drops search and unrelated filters", () => {
   assert.equal(next?.view, "all");
   assert.equal(next?.collectionId, null);
   assert.equal(next?.search, "");
-  assert.deepEqual(next?.sort, DEFAULT_SORT);
+  assert.deepEqual(next?.sort, DEFAULT_SORT_LEVELS);
+  assert.deepEqual(next?.collectionSort, COLLECTION_SORT_LEVELS);
   assert.deepEqual(next?.filters, { ...defaultBrowseState().filters, tagIds: [9] });
 });
 
@@ -139,18 +142,55 @@ test("append toggles the tag while remove drops it", () => {
   assert.deepEqual(removed?.filters.tagIds, [9]);
 });
 
-test("sortForView only allows collection order inside a collection", () => {
-  assert.deepEqual(sortForView("collection", DEFAULT_SORT), COLLECTION_SORT);
-  assert.deepEqual(sortForView("all", COLLECTION_SORT), DEFAULT_SORT);
-  assert.deepEqual(sortForView("all", DEFAULT_SORT), DEFAULT_SORT);
+test("global sort applies to every library view", () => {
+  const current = state({
+    sort: [
+      { key: "score", descending: true },
+      { key: "size", descending: false },
+    ],
+  });
+  assert.deepEqual(effectiveSort({ ...current, view: "trash" }), current.sort);
+  assert.deepEqual(effectiveSort({ ...current, view: "collection", collectionId: 1 }), current.sort);
 });
 
-test("sortValueForRow follows the sort key", () => {
-  const item = row({ score: 4, fileSize: 2048, importedAt: 99 });
-  assert.equal(sortValueForRow(item, "importedAt"), 99);
-  assert.equal(sortValueForRow(item, "score"), 4);
-  assert.equal(sortValueForRow(item, "size"), 2048);
-  assert.equal(sortValueForRow(item, "collectionPosition"), null);
+test("collection order is stashed when leaving and restored when returning", () => {
+  const inCollection = state({ view: "collection", collectionId: 1, sort: COLLECTION_SORT_LEVELS });
+  const leaving = sortForViewChange(inCollection, "all");
+  assert.deepEqual(leaving.sort, DEFAULT_SORT_LEVELS);
+  assert.deepEqual(leaving.collectionSort, COLLECTION_SORT_LEVELS);
+
+  const back = sortForViewChange(
+    { ...inCollection, view: "all", sort: leaving.sort, collectionSort: leaving.collectionSort },
+    "collection",
+  );
+  assert.deepEqual(back.sort, COLLECTION_SORT_LEVELS);
+});
+
+test("collection order is dropped from the effective sort outside a collection", () => {
+  const current = state({ sort: COLLECTION_SORT_LEVELS });
+  assert.deepEqual(effectiveSort({ ...current, view: "all" }), DEFAULT_SORT_LEVELS);
+  assert.deepEqual(
+    effectiveSort({
+      ...current,
+      view: "collection",
+      collectionId: 1,
+      search: "狐狸",
+      searchScope: "library",
+    }),
+    DEFAULT_SORT_LEVELS,
+  );
+});
+
+test("sort summary names the first levels", () => {
+  assert.equal(sortSummary(DEFAULT_SORT_LEVELS), "导入时间 ↓");
+  assert.equal(
+    sortSummary([
+      { key: "score", descending: true },
+      { key: "importedAt", descending: false },
+      { key: "size", descending: true },
+    ]),
+    "评分 ↓ + 导入时间 ↑ +1",
+  );
 });
 
 test("rowInTagScope matches folder subtrees and trash state", () => {

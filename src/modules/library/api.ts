@@ -25,6 +25,7 @@ import {
   mockRenameFolder,
   mockRenameTag,
   mockReorderCollections,
+  mockReorderFolders,
   mockRestoreImages,
   mockSearchTags,
   mockSetImageTags,
@@ -86,6 +87,15 @@ export const libraryApi = {
   async moveFolder(folderId: number, parentId: number): Promise<FolderInfo[]> {
     if (!isTauri()) return mockMoveFolder(folderId, parentId);
     return invoke<FolderInfo[]>("move_folder", { folderId, parentId });
+  },
+
+  async reorderFolders(
+    folderIds: number[],
+    parentId: number,
+    sortIndex: number,
+  ): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockReorderFolders(folderIds, parentId, sortIndex);
+    return invoke<FolderInfo[]>("reorder_folders", { folderIds, parentId, sortIndex });
   },
 
   async deleteFolder(folderId: number): Promise<FolderInfo[]> {

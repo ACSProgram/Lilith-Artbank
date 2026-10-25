@@ -96,7 +96,7 @@
 
 - 命令入口：`src/modules/import/api.ts`。
 - 类型：`src/modules/import/types.ts`。
-- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。目标文件夹使用与侧栏相同的 `FolderPickerDialog`；目录层级用“平铺 / 保留源目录”两个按钮切换。
+- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。目标文件夹使用与侧栏相同的 `FolderPickerDialog`，打开时预填当前浏览的单选文件夹（多选或根目录时为空）；目录层级用“平铺 / 保留源目录”两个按钮切换。
 - 导入完成时工作区递增浏览刷新令牌，`LibraryView` 重新查询第一页并刷新图库计数；筛选条件保留，图片选择清空。结果弹窗仍显示最近 24 张预览，关闭后回到网格。
 
 | 命令 | 输入 | 输出 |

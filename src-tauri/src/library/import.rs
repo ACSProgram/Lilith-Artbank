@@ -4,7 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::{paths::normalize_folder, thumbs::ThumbLocation},
+    library::{
+        paths::{escape_like, normalize_folder, parent_path},
+        thumbs::ThumbLocation,
+    },
 };
 
 pub struct ImageInsert {
@@ -55,11 +58,38 @@ fn resolve_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i6
     {
         return Ok(id);
     }
+    let sort_index = next_sort_index(connection, path)?;
     connection.execute(
-        "INSERT INTO folders(path, created_at) VALUES (?1, ?2)",
-        params![path, now],
+        "INSERT INTO folders(path, created_at, sort_index) VALUES (?1, ?2, ?3)",
+        params![path, now, sort_index],
     )?;
     Ok(connection.last_insert_rowid())
+}
+
+/// 新文件夹追加到同一父级的末尾，避免手动排序里新文件夹与已有项并列 0。
+pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<i64> {
+    let parent = parent_path(path);
+    if parent.is_empty() {
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
+                 WHERE path <> '' AND instr(path, '/') = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::from)
+    } else {
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
+                 WHERE path LIKE ?1 ESCAPE '\\'
+                   AND path <> ?2
+                   AND instr(substr(path, length(?2) + 2), '/') = 0",
+                params![format!("{}/%", escape_like(parent)), parent],
+                |row| row.get(0),
+            )
+            .map_err(AppError::from)
+    }
 }
 
 pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i64>> {

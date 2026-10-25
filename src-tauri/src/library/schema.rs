@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -59,6 +59,10 @@ CREATE INDEX idx_images_active_imported
     ON images(deleted_at, imported_at DESC, id DESC);
 CREATE INDEX idx_images_active_size
     ON images(deleted_at, file_size DESC, id DESC);
+CREATE INDEX idx_images_active_modified
+    ON images(deleted_at, modified_at DESC, id DESC);
+CREATE INDEX idx_images_active_pixels
+    ON images(deleted_at, (width * height) DESC, id DESC);
 CREATE INDEX idx_images_folder_imported
     ON images(folder_id, deleted_at, imported_at DESC, id DESC);
 CREATE INDEX idx_images_trash
@@ -196,11 +200,17 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
         1 => {
             verify_meta(connection, manifest)?;
             migrate_v1_to_v2(connection)?;
-            migrate_v2_to_v3(connection)
+            migrate_v2_to_v3(connection)?;
+            migrate_v3_to_v4(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
-            migrate_v2_to_v3(connection)
+            migrate_v2_to_v3(connection)?;
+            migrate_v3_to_v4(connection)
+        }
+        3 => {
+            verify_meta(connection, manifest)?;
+            migrate_v3_to_v4(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -285,9 +295,24 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> AppResult<()> {
          UPDATE folders SET sort_index = (SELECT position FROM ordered WHERE ordered.id = folders.id)",
         [],
     )?;
+    mark_version(&transaction, 3)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v2 升级到 v3");
+    Ok(())
+}
+
+/// v3 → v4：补两个排序索引（修改时间、像素尺寸），避免这两种排序退化为全表排序。
+fn migrate_v3_to_v4(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_images_active_modified
+             ON images(deleted_at, modified_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_images_active_pixels
+             ON images(deleted_at, (width * height) DESC, id DESC);",
+    )?;
     mark_version(&transaction, SCHEMA_VERSION)?;
     transaction.commit()?;
-    log::info!("图库 schema 已从 v2 升级到 v{SCHEMA_VERSION}");
+    log::info!("图库 schema 已从 v3 升级到 v{SCHEMA_VERSION}");
     Ok(())
 }
 

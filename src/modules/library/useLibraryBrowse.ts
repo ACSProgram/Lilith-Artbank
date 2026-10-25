@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { buildQuery, defaultBrowseState, filterKey, type BrowseState } from "./model";
+import type { SortSpec } from "./types";
 
 export interface LibraryBrowseController {
   browse: BrowseState;
@@ -9,8 +10,8 @@ export interface LibraryBrowseController {
 }
 
 /** 树与网格共享的浏览状态；历史仍只记录视图/搜索/筛选变化。 */
-export function useLibraryBrowse(): LibraryBrowseController {
-  const [browse, setBrowse] = useState<BrowseState>(defaultBrowseState);
+export function useLibraryBrowse(initialSort?: SortSpec[]): LibraryBrowseController {
+  const [browse, setBrowse] = useState<BrowseState>(() => defaultBrowseState(initialSort));
   const [history, setHistory] = useState<BrowseState[]>([]);
   const browseRef = useRef(browse);
   browseRef.current = browse;

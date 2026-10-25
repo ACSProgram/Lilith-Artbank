@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -6,9 +6,9 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
-        import::ensure_folder,
+        import::{ensure_folder, next_sort_index},
         paths::{
-            LibraryPaths, join_folder, normalize_folder, normalize_folder_name,
+            LibraryPaths, join_folder, normalize_folder, normalize_folder_name, parent_path,
             subtree_like_pattern,
         },
         query::{self, FolderInfo},
@@ -80,7 +80,7 @@ pub fn rename(
         if old_path.is_empty() {
             return Err(AppError::message("不能重命名图库根目录"));
         }
-        let parent = old_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let parent = parent_path(&old_path);
         let new_path = join_folder(parent, &name);
         if old_path == new_path {
             return Ok((old_path, new_path));
@@ -178,7 +178,13 @@ pub fn move_to(
     ensure_inside_root(root, &new_dir)?;
 
     let update = db.with_writer(|connection| {
-        update_subtree_paths(connection, &old_path, &new_path, folder_id_value)
+        update_subtree_paths(connection, &old_path, &new_path, folder_id_value)?;
+        let next = next_sort_index(connection, &new_path)?;
+        connection.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![next, folder_id_value],
+        )?;
+        Ok(())
     });
     if let Err(error) = update {
         if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
@@ -189,6 +195,62 @@ pub fn move_to(
         }
         return Err(error);
     }
+    query::list_folders(db)
+}
+
+/// 把同一父级下的若干文件夹移动到指定位置；只调整 `sort_index`，不动目录。
+pub fn reorder(
+    db: &LibraryDb,
+    folder_ids: &[i64],
+    parent_id: i64,
+    sort_index: i64,
+) -> AppResult<Vec<FolderInfo>> {
+    if folder_ids.is_empty() {
+        return Err(AppError::message("没有要调整顺序的文件夹"));
+    }
+    let mut moved = HashSet::new();
+    for id in folder_ids {
+        if *id <= 0 || !moved.insert(*id) {
+            return Err(AppError::message("文件夹 id 无效或重复"));
+        }
+    }
+    db.with_writer(|connection| {
+        let parent = folder_path(connection, parent_id)?;
+        // 同级文件夹一次读出来：手动排序只在拖放时发生，几千行路径的读取代价可以接受。
+        let mut statement =
+            connection.prepare("SELECT id, path FROM folders ORDER BY sort_index, id")?;
+        let folders = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut siblings: Vec<i64> = folders
+            .iter()
+            .filter(|(_, path)| !path.is_empty() && parent_path(path) == parent)
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(foreign) = moved.iter().find(|id| !siblings.contains(id)) {
+            return Err(AppError::message(format!(
+                "文件夹 {foreign} 不在目标位置，只能调整同一级文件夹的顺序"
+            )));
+        }
+
+        siblings.retain(|id| !moved.contains(id));
+        let insert_at = sort_index.clamp(0, siblings.len() as i64) as usize;
+        siblings.splice(insert_at..insert_at, folder_ids.iter().copied());
+
+        let transaction = connection.unchecked_transaction()?;
+        for (position, id) in siblings.iter().enumerate() {
+            transaction.execute(
+                "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                params![position as i64, id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })?;
     query::list_folders(db)
 }
 
@@ -367,6 +429,47 @@ mod tests {
         assert!(names.iter().any(|name| name == "sketches"));
         assert!(!names.iter().any(|name| name == "Sketches"));
         assert!(create(&db, &root, "SKETCHES").is_err());
+    }
+
+    #[test]
+    fn reorders_siblings_and_rejects_foreign_folders() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "一").unwrap();
+        create(&db, &root, "二").unwrap();
+        create(&db, &root, "三").unwrap();
+        create(&db, &root, "组/子").unwrap();
+        let id = |path: &str| {
+            db.with_reader(|connection| folder_id(connection, path))
+                .unwrap()
+                .unwrap()
+        };
+        let root_id = id("");
+        let (one, two, three) = (id("一"), id("二"), id("三"));
+        let group_child = id("组/子");
+
+        let order = |db: &LibraryDb| {
+            db.with_reader(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT path FROM folders WHERE instr(path, '/') = 0 AND path <> ''
+                     ORDER BY sort_index, id",
+                )?;
+                let paths = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(paths)
+            })
+            .unwrap()
+        };
+
+        reorder(&db, &[three], root_id, 0).unwrap();
+        assert_eq!(order(&db), vec!["三", "一", "二", "组"]);
+
+        reorder(&db, &[one], root_id, 10).unwrap();
+        reorder(&db, &[two], root_id, 0).unwrap();
+        assert_eq!(order(&db), vec!["二", "三", "组", "一"]);
+
+        assert!(reorder(&db, &[group_child], root_id, 0).is_err());
+        assert!(reorder(&db, &[one, two], three, 0).is_err());
     }
 
     #[test]

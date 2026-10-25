@@ -4,10 +4,11 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
+  ArrowDownUp,
   ChevronDown,
   ChevronRight,
   Folder,
@@ -20,21 +21,22 @@ import {
 } from "lucide-react";
 import { IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
+import { MenuSection } from "../../shared/components/MenuSection";
+import { Popover } from "../../shared/components/Popover";
 import { useNotices } from "../../app/noticeContext";
 import { errorMessage } from "../../shared/errors";
+import { FOLDER_DRAG_HOVER_EVENT } from "../../shared/useDragSort";
 import { libraryApi } from "./api";
-import {
-  FOLDER_DRAG_MIME,
-  IMAGE_DRAG_MIME,
-  readFolderDrag,
-  readImageDrag,
-} from "./dnd";
 import { FolderNameDialog } from "./FolderDialogs";
 import {
+  DEFAULT_FOLDER_SORT,
+  FOLDER_SORT_LABELS,
   ancestorPaths,
   buildFolderTree,
   flattenVisible,
   type FolderNode,
+  type FolderSortMode,
+  type FolderSortSpec,
 } from "./folderTreeModel";
 import type { FolderInfo } from "./types";
 
@@ -45,6 +47,11 @@ interface FolderTreeProps {
   onSelect: (folderIds: number[]) => void;
   onFoldersChanged: (folders: FolderInfo[]) => void;
   onDataChanged: () => void;
+  onBeginFolderDrag: (
+    folderId: number,
+    label: string,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => void;
 }
 
 interface FolderMenu {
@@ -53,9 +60,17 @@ interface FolderMenu {
   node: FolderNode;
 }
 
-interface DropTarget {
-  node: FolderNode | null;
-  root: boolean;
+function initialFolderSort(): FolderSortSpec {
+  try {
+    const raw = localStorage.getItem("lilith.folderSort");
+    if (!raw) return DEFAULT_FOLDER_SORT;
+    const parsed = JSON.parse(raw) as Partial<FolderSortSpec>;
+    const modes: FolderSortMode[] = ["manual", "name", "total", "direct"];
+    if (!parsed.mode || !modes.includes(parsed.mode)) return DEFAULT_FOLDER_SORT;
+    return { mode: parsed.mode, descending: Boolean(parsed.descending) };
+  } catch {
+    return DEFAULT_FOLDER_SORT;
+  }
 }
 
 export function FolderTree({
@@ -65,9 +80,13 @@ export function FolderTree({
   onSelect,
   onFoldersChanged,
   onDataChanged,
+  onBeginFolderDrag,
 }: FolderTreeProps) {
   const { notify, confirm } = useNotices();
-  const tree = useMemo(() => buildFolderTree(folders), [folders]);
+  const [folderSort, setFolderSort] = useState<FolderSortSpec>(initialFolderSort);
+  const [sortOpen, setSortOpen] = useState(false);
+  const sortAnchorRef = useRef<HTMLSpanElement>(null);
+  const tree = useMemo(() => buildFolderTree(folders, folderSort), [folders, folderSort]);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
   const [anchorId, setAnchorId] = useState<number | null>(null);
   const [menu, setMenu] = useState<FolderMenu | null>(null);
@@ -76,7 +95,6 @@ export function FolderTree({
   const [moveTarget, setMoveTarget] = useState<FolderNode | null>(null);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const initialized = useRef(false);
 
@@ -109,6 +127,29 @@ export function FolderTree({
       return changed ? next : current;
     });
   }, [selectedFolderIds, tree]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("lilith.folderSort", JSON.stringify(folderSort));
+    } catch {
+      // 忽略浏览器限制；排序方式仍在本会话内生效。
+    }
+  }, [folderSort]);
+
+  useEffect(() => {
+    const onHover = (event: Event) => {
+      const folderId = (event as CustomEvent<{ folderId: number | null }>).detail?.folderId;
+      if (folderId == null) return;
+      setExpanded((current) => {
+        if (current.has(folderId)) return current;
+        const next = new Set(current);
+        next.add(folderId);
+        return next;
+      });
+    };
+    window.addEventListener(FOLDER_DRAG_HOVER_EVENT, onHover);
+    return () => window.removeEventListener(FOLDER_DRAG_HOVER_EVENT, onHover);
+  }, []);
 
   useEffect(() => {
     if (!menu) return;
@@ -253,52 +294,6 @@ export function FolderTree({
     }
   };
 
-  const handleDrop = async (event: ReactDragEvent, target: DropTarget) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setDropTarget(null);
-    const imageIds = readImageDrag(event.dataTransfer);
-    if (imageIds.length > 0) {
-      await moveImagesTo(imageIds, target.node);
-      return;
-    }
-    const folderId = readFolderDrag(event.dataTransfer);
-    if (folderId != null) {
-      const parentId = target.node?.id ?? tree.rootId;
-      if (parentId == null) {
-        notify("无法移动到根目录", "error", "图库根文件夹记录缺失。");
-        return;
-      }
-      await moveFolderTo(folderId, parentId);
-    }
-  };
-
-  const dropProps = (target: DropTarget) => {
-    const active = dropTarget?.root === target.root && dropTarget?.node?.id === target.node?.id;
-    return {
-      onDragOver: (event: ReactDragEvent) => {
-        if (
-          !event.dataTransfer.types.includes(IMAGE_DRAG_MIME) &&
-          !event.dataTransfer.types.includes(FOLDER_DRAG_MIME)
-        ) {
-          return;
-        }
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-        setDropTarget(target);
-      },
-      onDragLeave: () => {
-        setDropTarget((current) =>
-          current?.root === target.root && current?.node?.id === target.node?.id
-            ? null
-            : current,
-        );
-      },
-      onDrop: (event: ReactDragEvent) => void handleDrop(event, target),
-      "data-drop-active": active ? "true" : undefined,
-    };
-  };
-
   const disabledMoveIds = useMemo(() => {
     if (!moveTarget) return new Set<number>();
     const ids = new Set<number>();
@@ -317,25 +312,41 @@ export function FolderTree({
     <div className="folder-tree">
       <div className="folder-tree-heading">
         <span>文件夹</span>
-        <IconButton
-          label="新建文件夹"
-          onClick={() => {
-            setDialogError(null);
-            setCreateParent("");
-          }}
-        >
-          <Plus size={14} />
-        </IconButton>
+        <div className="folder-tree-heading-actions">
+          <span ref={sortAnchorRef} className="folder-tree-sort-anchor">
+            <IconButton
+              label={`文件夹排序：${FOLDER_SORT_LABELS[folderSort.mode]}${folderSort.descending ? "降序" : "升序"}`}
+              className={folderSort.mode === "manual" ? "" : "is-active"}
+              onClick={() => setSortOpen((open) => !open)}
+            >
+              <ArrowDownUp size={14} />
+            </IconButton>
+          </span>
+          <IconButton
+            label="新建文件夹"
+            onClick={() => {
+              setDialogError(null);
+              setCreateParent("");
+            }}
+          >
+            <Plus size={14} />
+          </IconButton>
+        </div>
       </div>
 
-      <div className="folder-tree-scroll" role="tree" aria-label="文件夹树">
+      <div
+        className="folder-tree-scroll"
+        role="tree"
+        aria-label="文件夹树"
+        data-drag-scroll="true"
+      >
         <div
           className={`folder-tree-row folder-tree-root${
             selectedFolderIds.length === 0 ? " is-selected" : ""
           }`}
           role="treeitem"
           aria-selected={selectedFolderIds.length === 0}
-          {...dropProps({ node: null, root: true })}
+          data-drop-root="true"
           onClick={selectRoot}
         >
           <span className="folder-tree-toggle">
@@ -359,12 +370,10 @@ export function FolderTree({
               aria-expanded={hasChildren ? isExpanded : undefined}
               style={{ paddingLeft: 6 + node.depth * 14 }}
               title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
-              draggable
-              onDragStart={(event) => {
-                event.dataTransfer.setData(FOLDER_DRAG_MIME, String(node.id));
-                event.dataTransfer.effectAllowed = "move";
+              data-drop-folder={node.id}
+              onPointerDown={(event) => {
+                if (folderSort.mode === "manual") onBeginFolderDrag(node.id, node.name, event);
               }}
-              {...dropProps({ node, root: false })}
               onClick={(event) => selectNode(node, event)}
               onContextMenu={(event) => {
                 event.preventDefault();
@@ -488,6 +497,46 @@ export function FolderTree({
           </button>
         </div>
       ) : null}
+
+      <Popover
+        open={sortOpen}
+        anchorRef={sortAnchorRef}
+        placement="bottom-start"
+        onClose={() => setSortOpen(false)}
+        minWidth={220}
+      >
+        <MenuSection title="排序方式">
+          {(Object.keys(FOLDER_SORT_LABELS) as FolderSortMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              className={`context-menu-item${folderSort.mode === mode ? " is-active" : ""}`}
+              onClick={() => setFolderSort((current) => ({ ...current, mode }))}
+            >
+              <span>{FOLDER_SORT_LABELS[mode]}</span>
+            </button>
+          ))}
+        </MenuSection>
+        <MenuSection title="方向">
+          <button
+            type="button"
+            className={`context-menu-item${folderSort.descending ? "" : " is-active"}`}
+            onClick={() => setFolderSort((current) => ({ ...current, descending: false }))}
+          >
+            <span>升序</span>
+          </button>
+          <button
+            type="button"
+            className={`context-menu-item${folderSort.descending ? " is-active" : ""}`}
+            onClick={() => setFolderSort((current) => ({ ...current, descending: true }))}
+          >
+            <span>降序</span>
+          </button>
+        </MenuSection>
+        {folderSort.mode === "manual" ? null : (
+          <div className="folder-sort-note">切换到“手动”后才能拖动文件夹调整顺序。</div>
+        )}
+      </Popover>
 
       <FolderNameDialog
         open={createParent != null}

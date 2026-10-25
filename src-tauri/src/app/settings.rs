@@ -22,8 +22,8 @@ const SORT_KEYS: [&str; 7] = [
     "collectionPosition",
 ];
 
-/// 排序级数上限：等于可用指标数量，不额外设人为限制（每个指标最多用一次）。
-pub const MAX_SORT_LEVELS: usize = SORT_KEYS.len();
+/// 排序级数上限：与查询层的指标数量一致，不额外设人为限制（每个指标最多用一次）。
+pub const MAX_SORT_LEVELS: usize = crate::library::query::MAX_SORT_LEVELS;
 /// 排序方案是存储上限，与排序级数无关。
 pub const MAX_SORT_PROFILES: usize = 50;
 
@@ -404,6 +404,12 @@ mod tests {
             library_path: Some(r"G:\Lilith Image Library".into()),
             ..Default::default()
         }
+    }
+
+    /// 新增一个 `SortKey` 时必须同步这里的字符串列表，否则设置里的排序会被判成未知指标。
+    #[test]
+    fn sort_key_list_matches_query_limit() {
+        assert_eq!(SORT_KEYS.len(), MAX_SORT_LEVELS);
     }
 
     #[test]

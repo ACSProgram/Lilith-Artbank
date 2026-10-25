@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test:web": "node --test src/modules/viewer/model.test.ts src/modules/library/model.test.ts",
+    "test:web": "node --test src/modules/viewer/model.test.ts src/modules/library/model.test.ts src/modules/library/folderTreeModel.test.ts",
     "tauri": "tauri",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo check --manifest-path src-tauri/Cargo.toml",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml"

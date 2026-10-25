@@ -14,7 +14,29 @@ import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 export const PAGE_SIZE = 150;
 
 export const DEFAULT_SORT: SortSpec = { key: "importedAt", descending: true };
+export const DEFAULT_SORT_LEVELS: SortSpec[] = [DEFAULT_SORT];
 export const COLLECTION_SORT: SortSpec = { key: "collectionPosition", descending: false };
+export const COLLECTION_SORT_LEVELS: SortSpec[] = [COLLECTION_SORT];
+
+export const SORT_KEYS: SortKey[] = [
+  "importedAt",
+  "modifiedAt",
+  "score",
+  "size",
+  "pixels",
+  "folder",
+  "collectionPosition",
+];
+
+export const SORT_LABELS: Record<SortKey, string> = {
+  importedAt: "导入时间",
+  modifiedAt: "修改时间",
+  score: "评分",
+  size: "文件大小",
+  pixels: "像素尺寸",
+  folder: "文件夹",
+  collectionPosition: "集合内顺序",
+};
 
 export interface BrowseState {
   view: LibraryView;
@@ -22,37 +44,72 @@ export interface BrowseState {
   search: string;
   searchScope: SearchScope;
   filters: LibraryFilters;
-  sort: SortSpec;
+  /** 全局一套排序；集合内顺序只会在集合视图里生效。 */
+  sort: SortSpec[];
+  /** 离开集合时暂存带“集合内顺序”的排序，回到集合再恢复。 */
+  collectionSort: SortSpec[] | null;
 }
 
-export function defaultBrowseState(): BrowseState {
+export function defaultBrowseState(initialSort: SortSpec[] = DEFAULT_SORT_LEVELS): BrowseState {
   return {
     view: "all",
     collectionId: null,
     search: "",
     searchScope: "view",
     filters: emptyFilters(),
-    sort: DEFAULT_SORT,
+    sort: initialSort.length > 0 ? initialSort : DEFAULT_SORT_LEVELS,
+    collectionSort: null,
   };
 }
 
-export function sortOptionsFor(view: LibraryView): { key: SortKey; label: string }[] {
-  const base = [
-    { key: "importedAt" as const, label: "导入时间" },
-    { key: "score" as const, label: "评分" },
-    { key: "size" as const, label: "文件大小" },
-  ];
-  return view === "collection"
-    ? [{ key: "collectionPosition" as const, label: "集合内顺序" }, ...base]
-    : base;
+/** 当前视图实际使用的视图（全库搜索时临时按“全部”展示）。 */
+export function effectiveViewOf(state: BrowseState): LibraryView {
+  return state.search.trim() && state.searchScope === "library" ? "all" : state.view;
 }
 
-/** 集合内顺序只在集合视图有效，离开集合时退回默认排序。 */
-export function sortForView(view: LibraryView, sort: SortSpec): SortSpec {
+/** 查询使用的排序：非集合视图去掉“集合内顺序”，为空时回退默认排序。 */
+export function effectiveSort(state: BrowseState): SortSpec[] {
+  const view = effectiveViewOf(state);
+  const sort =
+    view === "collection"
+      ? state.sort
+      : state.sort.filter((spec) => spec.key !== "collectionPosition");
+  return sort.length > 0 ? sort : DEFAULT_SORT_LEVELS;
+}
+
+/** 切换视图时如何安置排序：“集合内顺序”离开集合暂存，回到集合恢复。 */
+export function sortForViewChange(
+  state: BrowseState,
+  view: LibraryView,
+): { sort: SortSpec[]; collectionSort: SortSpec[] | null } {
   if (view === "collection") {
-    return sort.key === "collectionPosition" ? sort : COLLECTION_SORT;
+    return {
+      sort: state.collectionSort ?? state.sort,
+      collectionSort: state.collectionSort,
+    };
   }
-  return sort.key === "collectionPosition" ? DEFAULT_SORT : sort;
+  if (state.sort.some((spec) => spec.key === "collectionPosition")) {
+    const kept = state.sort.filter((spec) => spec.key !== "collectionPosition");
+    return {
+      sort: kept.length > 0 ? kept : DEFAULT_SORT_LEVELS,
+      collectionSort: state.sort,
+    };
+  }
+  return { sort: state.sort, collectionSort: state.collectionSort };
+}
+
+export function sortSummary(sort: SortSpec[]): string {
+  if (sort.length === 0) return SORT_LABELS.importedAt;
+  const [first, second] = sort;
+  const head = `${SORT_LABELS[first.key]} ${first.descending ? "↓" : "↑"}`;
+  if (!second) return head;
+  const tail = `${SORT_LABELS[second.key]} ${second.descending ? "↓" : "↑"}`;
+  return sort.length > 2 ? `${head} + ${tail} +${sort.length - 2}` : `${head} + ${tail}`;
+}
+
+/** 指标是否可用于当前视图；“集合内顺序”只能用于集合视图。 */
+export function sortKeyAvailable(key: SortKey, view: LibraryView): boolean {
+  return key !== "collectionPosition" || view === "collection";
 }
 
 export function emptyFilters(): LibraryFilters {
@@ -100,7 +157,7 @@ export function buildQuery(
     search,
     searchScope: search ? state.searchScope : "view",
     filters: normalizeFilters(state.filters),
-    sort: state.sort,
+    sort: effectiveSort(state),
     cursor,
     limit: PAGE_SIZE,
   };
@@ -188,20 +245,6 @@ export function extensionLabel(extension: string): string {
   return extension.toUpperCase();
 }
 
-/** 当前单级排序的游标取值；集合内顺序没有行字段，返回 null 表示不跳转。 */
-export function sortValueForRow(row: ImageRow, key: SortKey): number | null {
-  switch (key) {
-    case "importedAt":
-      return row.importedAt;
-    case "score":
-      return row.score;
-    case "size":
-      return row.fileSize;
-    default:
-      return null;
-  }
-}
-
 export interface TagFilterRequest {
   tagId: number;
   action: TagFilterAction;
@@ -243,11 +286,11 @@ export function tagFilterState(
   const view: LibraryView = scope === "collection" ? "collection" : "all";
   return {
     ...state,
+    ...sortForViewChange(state, view),
     view,
     collectionId: view === "collection" ? collectionId : null,
     search: "",
     searchScope: "view",
-    sort: sortForView(view, state.sort),
     filters: {
       ...emptyFilters(),
       folderIds: scope === "folder" ? state.filters.folderIds : [],

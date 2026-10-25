@@ -1,3 +1,4 @@
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { Database, FolderOpen, Settings } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { useAppRuntime } from "./runtimeContext";
@@ -14,6 +15,11 @@ interface SidebarProps {
   onSelectFolders?: (folderIds: number[]) => void;
   onFoldersChanged?: (folders: FolderInfo[]) => void;
   onDataChanged?: () => void;
+  onBeginFolderDrag?: (
+    folderId: number,
+    label: string,
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => void;
 }
 
 /** 侧栏：图库身份（名称 / 路径 / 计数）与文件夹树；底部只有设置一个入口。 */
@@ -26,6 +32,7 @@ export function Sidebar({
   onSelectFolders,
   onFoldersChanged,
   onDataChanged,
+  onBeginFolderDrag,
 }: SidebarProps) {
   const { current } = useAppRuntime();
   const browsing = current != null && folders != null;
@@ -58,6 +65,7 @@ export function Sidebar({
           onSelect={onSelectFolders ?? (() => undefined)}
           onFoldersChanged={onFoldersChanged ?? (() => undefined)}
           onDataChanged={onDataChanged ?? (() => undefined)}
+          onBeginFolderDrag={onBeginFolderDrag ?? (() => undefined)}
         />
       ) : (
         <div className="library-list">

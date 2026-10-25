@@ -1,5 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
@@ -8,7 +11,7 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
-        paths::{escape_like, normalize_content_extension, subtree_like_pattern},
+        paths::{escape_like, normalize_content_extension, parent_path, subtree_like_pattern},
         placeholders,
     },
 };
@@ -17,6 +20,29 @@ pub const DEFAULT_LIMIT: u32 = 150;
 pub const MAX_LIMIT: u32 = 300;
 pub const MAX_TAGS: u32 = 500;
 const MAX_IDS: usize = 1_000_000;
+/// 排序级数上限：等于可用指标数量，每个指标最多用一次。设置文件的校验沿用这个值。
+pub const MAX_SORT_LEVELS: usize = 7;
+/// id 游标只保留最近两份有序 id 列表，够“当前页 + 上一份”回退。
+const MAX_CACHED_LISTS: usize = 2;
+
+/// 多级排序或没有可走索引的指标时，一次性算出有序 id 列表并按 offset 切页。
+/// 缓存放在进程内，token 只在前端来回传递；库关闭或数据变化时清空。
+struct CachedIdList {
+    token: String,
+    fingerprint: String,
+    ids: Arc<Vec<i64>>,
+}
+
+static ID_PAGE_CACHE: Mutex<Vec<CachedIdList>> = Mutex::new(Vec::new());
+
+/// 让已缓存的有序 id 列表整体失效：数据变更后前端会重新取第一页，旧 token 即便被用也会报“已过期”。
+///
+/// 任何改变图片集合、排序字段或筛选字段的写入都要调用（`AppState::mutate` 与导入收尾已覆盖）。
+pub fn clear_page_cache() {
+    if let Ok(mut cache) = ID_PAGE_CACHE.lock() {
+        cache.clear();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -27,13 +53,16 @@ pub enum LibraryView {
     Collection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SortKey {
     #[default]
     ImportedAt,
+    ModifiedAt,
     Score,
     Size,
+    Pixels,
+    Folder,
     CollectionPosition,
 }
 
@@ -103,24 +132,35 @@ pub struct LibraryQuery {
     pub search: String,
     pub search_scope: SearchScope,
     pub filters: LibraryFilters,
-    pub sort: SortSpec,
+    /// 第一级为主排序；级数不超过指标数量。
+    pub sort: Vec<SortSpec>,
+    /// 单级排序的键集游标；多级或文件夹排序走 `page_token`。
     pub cursor: Option<QueryCursor>,
+    /// id 游标通道：`<列表 token>:<offset>`。
+    pub page_token: Option<String>,
+    /// 跳转锚点：从这张图所在的位置开始取一页（包含锚点本身）。
+    pub anchor_id: Option<i64>,
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryCursor {
-    pub sort_key: String,
+    pub sort_values: Vec<String>,
     pub id: i64,
 }
 
 impl QueryCursor {
     // 游标排序值是排序列的原始整数；用字符串跨 IPC 传递，避免前端数值精度问题。
-    fn sort_value(&self) -> AppResult<i64> {
-        self.sort_key
-            .parse()
-            .map_err(|_| AppError::message("游标排序值无效"))
+    fn sort_values(&self) -> AppResult<Vec<i64>> {
+        self.sort_values
+            .iter()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| AppError::message("游标排序值无效"))
+            })
+            .collect()
     }
 }
 
@@ -153,6 +193,7 @@ pub struct ImageRow {
 pub struct ImagePage {
     pub items: Vec<ImageRow>,
     pub next_cursor: Option<QueryCursor>,
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +232,8 @@ pub struct FilterCounts {
 pub struct FolderInfo {
     pub id: i64,
     pub path: String,
+    /// 同一父级下的手动排序位。
+    pub sort_index: i64,
     /// 直接位于该文件夹的未删除图片数。
     pub direct_image_count: u64,
     /// 包含全部后代的未删除图片数。
@@ -209,93 +252,214 @@ pub fn query_page(database: &LibraryDb, root: &Path, query: LibraryQuery) -> App
     let (query, limit) = normalize(query)?;
     database.with_reader(|connection| {
         let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
-        let mut prepared = PreparedQuery::new(&query, None, SearchMode::Page, &folder_paths);
-
-        let sort_column = sort_column(query.sort.key);
-        let direction = if query.sort.descending { "DESC" } else { "ASC" };
-        if let Some(cursor) = &query.cursor {
-            let sort_key = cursor.sort_value()?;
-            let operator = if query.sort.descending { "<" } else { ">" };
-            prepared
-                .filters
-                .clauses
-                .push(format!("({sort_column}, images.id) {operator} (?, ?)"));
-            prepared.filters.params.push(Value::Integer(sort_key));
-            prepared.filters.params.push(Value::Integer(cursor.id));
+        if uses_id_cursor(&query.sort) || query.page_token.is_some() || query.anchor_id.is_some() {
+            return page_from_id_list(connection, root, &query, &folder_paths, limit);
         }
+        page_from_keyset(connection, root, &query, &folder_paths, limit)
+    })
+}
 
-        let mut params = prepared.join_params.clone();
-        params.extend(prepared.filters.params.iter().cloned());
-        params.push(Value::Integer(i64::from(limit)));
+fn page_from_keyset(
+    connection: &Connection,
+    root: &Path,
+    query: &LibraryQuery,
+    folder_paths: &[String],
+    limit: u32,
+) -> AppResult<ImagePage> {
+    let mut prepared = PreparedQuery::new(query, None, SearchMode::Page, folder_paths);
+    if let Some(cursor) = &query.cursor {
+        let values = cursor.sort_values()?;
+        if values.len() != query.sort.len() {
+            return Err(AppError::message("游标排序值与排序级数不一致"));
+        }
+        let (clause, params) = keyset_condition(&query.sort, &values, cursor.id);
+        prepared.filters.clauses.push(clause);
+        prepared.filters.params.extend(params);
+    }
 
-        // 末尾多选一次排序列：游标键直接从行里读，不必再按排序键映射列下标。
-        let sql = format!(
-            "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
-                    folders.path, images.file_size, images.width, images.height,
-                    images.format, images.has_alpha, images.score, images.imported_at,
-                    images.modified_at, images.deleted_at, images.thumb_version,
-                    images.thumb_width, images.thumb_height, {sort_column}
-             FROM images
-             JOIN folders ON folders.id = images.folder_id
-             {} WHERE {}
-             ORDER BY {sort_column} {direction}, images.id {direction}
-             LIMIT ?",
-            prepared.join_sql,
-            prepared.filters.clauses.join(" AND ")
-        );
+    let mut params = prepared.join_params.clone();
+    params.extend(prepared.filters.params.iter().cloned());
+    params.push(Value::Integer(i64::from(limit)));
 
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
-            let content_hash: String = row.get(1)?;
-            let file_ext: String = row.get(2)?;
-            let folder_path: String = row.get(4)?;
-            let file_name = format!("{content_hash}.{file_ext}");
-            let file_path = if folder_path.is_empty() {
-                root.join(&file_name)
-            } else {
-                root.join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                    .join(&file_name)
-            };
-            Ok((
-                ImageRow {
-                    id: row.get(0)?,
-                    content_hash,
-                    file_ext,
-                    folder_id: row.get(3)?,
-                    folder_path,
-                    file_path: file_path.to_string_lossy().into_owned(),
-                    file_size: row.get(5)?,
-                    width: row.get(6)?,
-                    height: row.get(7)?,
-                    format: row.get(8)?,
-                    has_alpha: row.get::<_, i64>(9)? != 0,
-                    score: row.get(10)?,
-                    imported_at: row.get(11)?,
-                    modified_at: row.get(12)?,
-                    deleted_at: row.get(13)?,
-                    thumb_version: row.get(14)?,
-                    thumb_width: row.get(15)?,
-                    thumb_height: row.get(16)?,
-                    tags: Vec::new(),
-                },
-                row.get::<_, i64>(17)?,
-            ))
-        })?;
+    // 末尾依次多选每一级排序列：游标键直接从行里读。
+    let sort_selects = query
+        .sort
+        .iter()
+        .map(|spec| sort_expression(spec.key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
+                folders.path, images.file_size, images.width, images.height,
+                images.format, images.has_alpha, images.score, images.imported_at,
+                images.modified_at, images.deleted_at, images.thumb_version,
+                images.thumb_width, images.thumb_height, {sort_selects}
+         FROM images
+         JOIN folders ON folders.id = images.folder_id
+         {} WHERE {}
+         ORDER BY {}
+         LIMIT ?",
+        prepared.join_sql,
+        prepared.filters.clauses.join(" AND "),
+        order_by(&query.sort)
+    );
 
-        let rows_with_keys = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let next_cursor = if rows_with_keys.len() == limit as usize {
-            rows_with_keys.last().map(|(item, sort_key)| QueryCursor {
-                sort_key: sort_key.to_string(),
+    let mut statement = connection.prepare(&sql)?;
+    let sort_count = query.sort.len();
+    let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+        let item = image_row_from_row(row, root)?;
+        let mut sort_values = Vec::with_capacity(sort_count);
+        for index in 0..sort_count {
+            sort_values.push(row.get::<_, i64>(17 + index)?);
+        }
+        Ok((item, sort_values))
+    })?;
+
+    let rows_with_keys = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let next_cursor = if rows_with_keys.len() == limit as usize {
+        rows_with_keys
+            .last()
+            .map(|(item, sort_values)| QueryCursor {
+                sort_values: sort_values.iter().map(i64::to_string).collect(),
                 id: item.id,
             })
-        } else {
-            None
-        };
+    } else {
+        None
+    };
 
-        let mut items: Vec<ImageRow> = rows_with_keys.into_iter().map(|(item, _)| item).collect();
-        attach_tags(connection, &mut items)?;
-        Ok(ImagePage { items, next_cursor })
+    let mut items: Vec<ImageRow> = rows_with_keys.into_iter().map(|(item, _)| item).collect();
+    attach_tags(connection, &mut items)?;
+    Ok(ImagePage {
+        items,
+        next_cursor,
+        next_page_token: None,
     })
+}
+
+/// 多级排序或文件夹排序：一次性算出有序 id 列表并按 offset 切页。
+fn page_from_id_list(
+    connection: &Connection,
+    root: &Path,
+    query: &LibraryQuery,
+    folder_paths: &[String],
+    limit: u32,
+) -> AppResult<ImagePage> {
+    let fingerprint = list_fingerprint(query);
+    let (token, ids) = match &query.page_token {
+        Some(page_token) => {
+            let (list_token, _) = parse_page_token(page_token)?;
+            let cached = ID_PAGE_CACHE.lock().ok().and_then(|cache| {
+                cache
+                    .iter()
+                    .find(|item| item.token == list_token)
+                    .map(|item| (item.fingerprint.clone(), item.ids.clone()))
+            });
+            match cached {
+                Some((cached_fingerprint, ids)) if cached_fingerprint == fingerprint => {
+                    (list_token.to_owned(), ids)
+                }
+                _ => return Err(AppError::message("排序结果已过期，请重新载入")),
+            }
+        }
+        None => {
+            let ids = Arc::new(build_sorted_ids(connection, query, folder_paths)?);
+            let token = uuid::Uuid::new_v4().to_string();
+            cache_id_list(&token, &fingerprint, ids.clone());
+            (token, ids)
+        }
+    };
+
+    let offset = if let Some(page_token) = &query.page_token {
+        parse_page_token(page_token)?.1
+    } else if let Some(anchor) = query.anchor_id {
+        match ids.iter().position(|id| *id == anchor) {
+            Some(position) => position,
+            // 锚点不在结果里：返回空页，调用方按“没找到”处理。
+            None => {
+                return Ok(ImagePage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                    next_page_token: None,
+                });
+            }
+        }
+    } else {
+        0
+    };
+
+    let end = offset.saturating_add(limit as usize).min(ids.len());
+    let slice = ids.get(offset..end).unwrap_or(&[]);
+    let mut items = rows_for_ids(connection, root, slice)?;
+    attach_tags(connection, &mut items)?;
+    let next_page_token = (end < ids.len()).then(|| format!("{token}:{end}"));
+    Ok(ImagePage {
+        items,
+        next_cursor: None,
+        next_page_token,
+    })
+}
+
+fn build_sorted_ids(
+    connection: &Connection,
+    query: &LibraryQuery,
+    folder_paths: &[String],
+) -> AppResult<Vec<i64>> {
+    let prepared = PreparedQuery::new(query, None, SearchMode::Count, folder_paths);
+    let mut params = prepared.join_params.clone();
+    params.extend(prepared.filters.params.iter().cloned());
+    params.push(Value::Integer(MAX_IDS as i64 + 1));
+    let sql = format!(
+        "SELECT images.id FROM images
+         JOIN folders ON folders.id = images.folder_id
+         {} WHERE {}
+         ORDER BY {}
+         LIMIT ?",
+        prepared.join_sql,
+        prepared.filters.clauses.join(" AND "),
+        order_by(&query.sort)
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let ids = statement
+        .query_map(params_from_iter(params.iter()), |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if ids.len() > MAX_IDS {
+        return Err(AppError::message("当前筛选结果超过 100 万张，无法排序"));
+    }
+    Ok(ids)
+}
+
+fn parse_page_token(token: &str) -> AppResult<(&str, usize)> {
+    let (list_token, offset) = token
+        .rsplit_once(':')
+        .ok_or_else(|| AppError::message("分页 token 无效"))?;
+    let offset = offset
+        .parse()
+        .map_err(|_| AppError::message("分页 token 无效"))?;
+    Ok((list_token, offset))
+}
+
+fn list_fingerprint(query: &LibraryQuery) -> String {
+    let mut normalized = query.clone();
+    normalized.cursor = None;
+    normalized.page_token = None;
+    normalized.anchor_id = None;
+    normalized.limit = None;
+    format!("{normalized:?}")
+}
+
+fn cache_id_list(token: &str, fingerprint: &str, ids: Arc<Vec<i64>>) {
+    let Ok(mut cache) = ID_PAGE_CACHE.lock() else {
+        return;
+    };
+    cache.insert(
+        0,
+        CachedIdList {
+            token: token.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            ids,
+        },
+    );
+    cache.truncate(MAX_CACHED_LISTS);
 }
 
 /// 按给定 id 顺序取完整行；用于语义搜索结果的分页回填。
@@ -319,37 +483,7 @@ pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<
         let mut statement = connection.prepare(&sql)?;
         let rows = statement
             .query_map(params_from_iter(values.iter()), |row| {
-                let content_hash: String = row.get(1)?;
-                let file_ext: String = row.get(2)?;
-                let folder_path: String = row.get(4)?;
-                let file_name = format!("{content_hash}.{file_ext}");
-                let file_path = if folder_path.is_empty() {
-                    root.join(&file_name)
-                } else {
-                    root.join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                        .join(&file_name)
-                };
-                Ok(ImageRow {
-                    id: row.get(0)?,
-                    content_hash,
-                    file_ext,
-                    folder_id: row.get(3)?,
-                    folder_path,
-                    file_path: file_path.to_string_lossy().into_owned(),
-                    file_size: row.get(5)?,
-                    width: row.get(6)?,
-                    height: row.get(7)?,
-                    format: row.get(8)?,
-                    has_alpha: row.get::<_, i64>(9)? != 0,
-                    score: row.get(10)?,
-                    imported_at: row.get(11)?,
-                    modified_at: row.get(12)?,
-                    deleted_at: row.get(13)?,
-                    thumb_version: row.get(14)?,
-                    thumb_width: row.get(15)?,
-                    thumb_height: row.get(16)?,
-                    tags: Vec::new(),
-                })
+                image_row_from_row(row, root)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut by_id: HashMap<i64, ImageRow> = rows.into_iter().map(|row| (row.id, row)).collect();
@@ -364,25 +498,91 @@ pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<
     })
 }
 
+fn rows_for_ids(connection: &Connection, root: &Path, ids: &[i64]) -> AppResult<Vec<ImageRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = crate::library::placeholders(ids.len());
+    let sql = format!(
+        "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
+                folders.path, images.file_size, images.width, images.height,
+                images.format, images.has_alpha, images.score, images.imported_at,
+                images.modified_at, images.deleted_at, images.thumb_version,
+                images.thumb_width, images.thumb_height
+         FROM images
+         JOIN folders ON folders.id = images.folder_id
+         WHERE images.id IN ({placeholders})"
+    );
+    let values: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            image_row_from_row(row, root)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut by_id: HashMap<i64, ImageRow> = rows.into_iter().map(|row| (row.id, row)).collect();
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(row) = by_id.remove(id) {
+            items.push(row);
+        }
+    }
+    Ok(items)
+}
+
+fn image_row_from_row(row: &rusqlite::Row<'_>, root: &Path) -> rusqlite::Result<ImageRow> {
+    let content_hash: String = row.get(1)?;
+    let file_ext: String = row.get(2)?;
+    let folder_path: String = row.get(4)?;
+    let file_name = format!("{content_hash}.{file_ext}");
+    let file_path = if folder_path.is_empty() {
+        root.join(&file_name)
+    } else {
+        root.join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .join(&file_name)
+    };
+    Ok(ImageRow {
+        id: row.get(0)?,
+        content_hash,
+        file_ext,
+        folder_id: row.get(3)?,
+        folder_path,
+        file_path: file_path.to_string_lossy().into_owned(),
+        file_size: row.get(5)?,
+        width: row.get(6)?,
+        height: row.get(7)?,
+        format: row.get(8)?,
+        has_alpha: row.get::<_, i64>(9)? != 0,
+        score: row.get(10)?,
+        imported_at: row.get(11)?,
+        modified_at: row.get(12)?,
+        deleted_at: row.get(13)?,
+        thumb_version: row.get(14)?,
+        thumb_width: row.get(15)?,
+        thumb_height: row.get(16)?,
+        tags: Vec::new(),
+    })
+}
+
 pub fn query_ids(database: &LibraryDb, query: LibraryQuery) -> AppResult<Vec<i64>> {
     // 全选只取 id，不翻页；游标与 limit 在这里没有意义。
     let (query, _) = normalize(query)?;
     database.with_reader(|connection| {
         let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
         let prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
-        let direction = if query.sort.descending { "DESC" } else { "ASC" };
         let mut params = prepared.join_params.clone();
         params.extend(prepared.filters.params.iter().cloned());
         params.push(Value::Integer(MAX_IDS as i64 + 1));
 
         let sql = format!(
             "SELECT images.id FROM images
+             JOIN folders ON folders.id = images.folder_id
              {} WHERE {}
-             ORDER BY {} {direction}, images.id {direction}
+             ORDER BY {}
              LIMIT ?",
             prepared.join_sql,
             prepared.filters.clauses.join(" AND "),
-            sort_column(query.sort.key),
+            order_by(&query.sort),
         );
 
         let mut statement = connection.prepare(&sql)?;
@@ -421,11 +621,16 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
         let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
         let totals: HashMap<i64, u64> =
             expand_folder_counts(direct, &folders).into_iter().collect();
+        let sort_indexes: HashMap<i64, i64> = connection
+            .prepare("SELECT id, sort_index FROM folders")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(folders
             .into_iter()
             .map(|(id, path)| FolderInfo {
                 id,
                 path,
+                sort_index: sort_indexes.get(&id).copied().unwrap_or(0),
                 direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
                 total_image_count: totals.get(&id).copied().unwrap_or(0),
             })
@@ -500,6 +705,23 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
         query.search_scope = SearchScope::View;
     }
 
+    if query.sort.is_empty() {
+        query.sort.push(SortSpec::default());
+    }
+    if query.sort.len() > MAX_SORT_LEVELS {
+        return Err(AppError::message(format!("排序最多 {MAX_SORT_LEVELS} 级")));
+    }
+    let mut sort_keys = HashSet::new();
+    for spec in &query.sort {
+        if !sort_keys.insert(spec.key) {
+            return Err(AppError::message("排序指标不能重复"));
+        }
+    }
+    let collection_position = query
+        .sort
+        .iter()
+        .any(|spec| spec.key == SortKey::CollectionPosition);
+
     match query.view {
         LibraryView::Collection => {
             let collection_id = query
@@ -508,9 +730,7 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
             if collection_id <= 0 {
                 return Err(AppError::message("集合 id 无效"));
             }
-            if query.sort.key == SortKey::CollectionPosition
-                && query.search_scope == SearchScope::Library
-            {
+            if collection_position && query.search_scope == SearchScope::Library {
                 return Err(AppError::message("全库搜索不能按集合内顺序排序"));
             }
         }
@@ -518,7 +738,7 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
             if query.collection_id.is_some() {
                 return Err(AppError::message("集合 id 只能用于集合视图"));
             }
-            if query.sort.key == SortKey::CollectionPosition {
+            if collection_position {
                 return Err(AppError::message("集合内顺序只能用于集合视图"));
             }
         }
@@ -569,10 +789,19 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
     query.filters.scores = scores;
 
     if let Some(cursor) = &query.cursor {
-        cursor.sort_value()?;
+        let values = cursor.sort_values()?;
+        if values.len() != query.sort.len() {
+            return Err(AppError::message("游标排序值与排序级数不一致"));
+        }
         if cursor.id <= 0 {
             return Err(AppError::message("游标图片 id 无效"));
         }
+    }
+    if let Some(token) = &query.page_token {
+        parse_page_token(token)?;
+    }
+    if query.anchor_id.is_some_and(|id| id <= 0) {
+        return Err(AppError::message("锚点图片 id 无效"));
     }
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -596,13 +825,77 @@ fn dedupe_ids(values: Vec<i64>, max: usize, label: &str) -> AppResult<Vec<i64>> 
     Ok(result)
 }
 
-fn sort_column(key: SortKey) -> &'static str {
+fn sort_expression(key: SortKey) -> &'static str {
     match key {
         SortKey::ImportedAt => "images.imported_at",
+        SortKey::ModifiedAt => "images.modified_at",
         SortKey::Score => "images.score",
         SortKey::Size => "images.file_size",
+        SortKey::Pixels => "(images.width * images.height)",
+        SortKey::Folder => "folders.path COLLATE NOCASE",
         SortKey::CollectionPosition => "collection_items.position",
     }
+}
+
+fn direction(descending: bool) -> &'static str {
+    if descending { "DESC" } else { "ASC" }
+}
+
+fn order_by(sort: &[SortSpec]) -> String {
+    let mut parts: Vec<String> = sort
+        .iter()
+        .map(|spec| {
+            format!(
+                "{} {}",
+                sort_expression(spec.key),
+                direction(spec.descending)
+            )
+        })
+        .collect();
+    // 末级方向也决定 id 次序，保证跨页稳定。
+    let last = sort.last().copied().unwrap_or_default();
+    parts.push(format!("images.id {}", direction(last.descending)));
+    parts.join(", ")
+}
+
+/// 单级且不是文件夹（文本列）时走键集游标；多级或文件夹排序走有序 id 列表。
+fn uses_id_cursor(sort: &[SortSpec]) -> bool {
+    sort.len() > 1 || sort.first().is_some_and(|spec| spec.key == SortKey::Folder)
+}
+
+fn keyset_condition(sort: &[SortSpec], values: &[i64], cursor_id: i64) -> (String, Vec<Value>) {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    for level in 0..sort.len() {
+        let mut terms = Vec::new();
+        for index in 0..level {
+            terms.push(format!("{} = ?", sort_expression(sort[index].key)));
+            params.push(Value::Integer(values[index]));
+        }
+        terms.push(format!(
+            "{} {} ?",
+            sort_expression(sort[level].key),
+            if sort[level].descending { "<" } else { ">" }
+        ));
+        params.push(Value::Integer(values[level]));
+        clauses.push(format!("({})", terms.join(" AND ")));
+    }
+    let mut terms = Vec::new();
+    for (index, spec) in sort.iter().enumerate() {
+        terms.push(format!("{} = ?", sort_expression(spec.key)));
+        params.push(Value::Integer(values[index]));
+    }
+    terms.push(format!(
+        "images.id {} ?",
+        if sort.last().is_some_and(|spec| spec.descending) {
+            "<"
+        } else {
+            ">"
+        }
+    ));
+    params.push(Value::Integer(cursor_id));
+    clauses.push(format!("({})", terms.join(" AND ")));
+    (format!("({})", clauses.join(" OR ")), params)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1216,7 +1509,7 @@ fn expand_folder_counts(direct: Vec<(i64, u64)>, folders: &[(i64, String)]) -> V
             if prefix.is_empty() {
                 break;
             }
-            current = Some(prefix.rsplit_once('/').map_or("", |(parent, _)| parent));
+            current = Some(parent_path(prefix));
         }
     }
     totals.into_iter().collect()
@@ -1513,7 +1806,7 @@ mod tests {
         assert_eq!(
             first.next_cursor,
             Some(QueryCursor {
-                sort_key: "300".into(),
+                sort_values: vec!["300".into()],
                 id: 1
             })
         );
@@ -1611,10 +1904,10 @@ mod tests {
             &fixture.session.db,
             &fixture.root,
             LibraryQuery {
-                sort: SortSpec {
+                sort: vec![SortSpec {
                     key: SortKey::Score,
                     descending: true,
-                },
+                }],
                 ..base_query()
             },
         )
@@ -1625,10 +1918,10 @@ mod tests {
             &fixture.session.db,
             &fixture.root,
             LibraryQuery {
-                sort: SortSpec {
+                sort: vec![SortSpec {
                     key: SortKey::Size,
                     descending: false,
-                },
+                }],
                 ..base_query()
             },
         )
@@ -1846,10 +2139,10 @@ mod tests {
                 &session.db,
                 &root,
                 LibraryQuery {
-                    sort: SortSpec {
+                    sort: vec![SortSpec {
                         key: SortKey::Score,
                         descending: true,
-                    },
+                    }],
                     cursor,
                     limit: Some(1),
                     ..Default::default()
@@ -2055,10 +2348,10 @@ mod tests {
             LibraryQuery {
                 view: LibraryView::Collection,
                 collection_id: Some(collection_id),
-                sort: SortSpec {
+                sort: vec![SortSpec {
                     key: SortKey::CollectionPosition,
                     descending: false,
-                },
+                }],
                 limit: Some(10),
                 ..Default::default()
             },
@@ -2246,10 +2539,10 @@ mod tests {
             &fixture.session.db,
             &fixture.root,
             LibraryQuery {
-                sort: SortSpec {
+                sort: vec![SortSpec {
                     key: SortKey::CollectionPosition,
                     descending: false,
-                },
+                }],
                 ..base_query()
             },
         );
@@ -2268,5 +2561,259 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_level_sort_pages_with_duplicates_across_six_levels() {
+        let fixture = fixture();
+        let (folder_a, folder_b) = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                Ok((
+                    ensure_folder(connection, "排序测试", 1)?,
+                    ensure_folder(connection, "排序测试二", 1)?,
+                ))
+            })
+            .unwrap();
+        let rows = [
+            ("m1", 2, 100, 5, 10, 10, "排序测试"),
+            ("m2", 2, 100, 5, 10, 10, "排序测试二"),
+            ("m3", 2, 100, 5, 20, 5, "排序测试"),
+            ("m4", 3, 50, 6, 10, 10, "排序测试二"),
+            ("m5", 1, 200, 7, 10, 10, "排序测试"),
+            ("m6", 2, 100, 4, 10, 10, "排序测试二"),
+            ("m7", 3, 50, 6, 10, 10, "排序测试"),
+            ("m8", 2, 100, 5, 5, 20, "排序测试二"),
+            ("m9", 0, 100, 5, 10, 10, "排序测试"),
+            ("m10", 5, 1, 1, 1, 1, "排序测试二"),
+            ("m11", 2, 100, 5, 10, 10, "排序测试"),
+            ("m12", 4, 100, 3, 16, 16, "排序测试二"),
+        ];
+        let mut expected: Vec<(i64, i64, i64, i64, i64, String)> = Vec::new();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                for (seed, score, size, imported, width, height, path) in rows {
+                    let folder = if path == "排序测试" {
+                        folder_a
+                    } else {
+                        folder_b
+                    };
+                    insert_image(
+                        connection,
+                        seed,
+                        "jpg",
+                        score,
+                        folder,
+                        size,
+                        imported,
+                        width,
+                        height,
+                        None,
+                        &[],
+                    );
+                    let id = connection.last_insert_rowid();
+                    expected.push((id, score, size, imported, width * height, path.to_owned()));
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // 六级：评分↓、大小↑、导入↑、像素↑、修改时间↓、文件夹↓。
+        let sort = vec![
+            SortSpec {
+                key: SortKey::Score,
+                descending: true,
+            },
+            SortSpec {
+                key: SortKey::Size,
+                descending: false,
+            },
+            SortSpec {
+                key: SortKey::ImportedAt,
+                descending: false,
+            },
+            SortSpec {
+                key: SortKey::Pixels,
+                descending: false,
+            },
+            SortSpec {
+                key: SortKey::ModifiedAt,
+                descending: true,
+            },
+            SortSpec {
+                key: SortKey::Folder,
+                descending: true,
+            },
+        ];
+        expected.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then(left.2.cmp(&right.2))
+                .then(left.3.cmp(&right.3))
+                .then(left.4.cmp(&right.4))
+                .then(right.3.cmp(&left.3))
+                .then(right.5.cmp(&left.5))
+                .then(right.0.cmp(&left.0))
+        });
+        let expected: Vec<i64> = expected.into_iter().map(|row| row.0).collect();
+
+        let mut page_token = None;
+        let mut collected = Vec::new();
+        loop {
+            let page = query_page(
+                &fixture.session.db,
+                &fixture.root,
+                LibraryQuery {
+                    filters: LibraryFilters {
+                        folder_ids: vec![folder_a, folder_b],
+                        ..Default::default()
+                    },
+                    sort: sort.clone(),
+                    page_token: page_token.clone(),
+                    limit: Some(3),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(page.next_cursor.is_none());
+            collected.extend(ids(&page));
+            match page.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(collected.len(), rows.len());
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn folder_sort_uses_id_cursor_and_orders_by_path() {
+        let fixture = fixture();
+        let query = LibraryQuery {
+            sort: vec![SortSpec {
+                key: SortKey::Folder,
+                descending: false,
+            }],
+            limit: Some(2),
+            ..Default::default()
+        };
+        let mut page_token = None;
+        let mut paths = Vec::new();
+        loop {
+            let page = query_page(
+                &fixture.session.db,
+                &fixture.root,
+                LibraryQuery {
+                    sort: query.sort.clone(),
+                    page_token: page_token.clone(),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(page.next_cursor.is_none());
+            paths.extend(page.items.iter().map(|item| item.folder_path.clone()));
+            match page.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+        // 第 5 张在回收站，活动视图只返回 4 张。
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths.first().map(String::as_str), Some("人物"));
+        assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn anchor_page_starts_at_the_requested_image() {
+        let fixture = fixture();
+        let page = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_people],
+                    ..Default::default()
+                },
+                sort: vec![SortSpec {
+                    key: SortKey::Score,
+                    descending: false,
+                }],
+                anchor_id: Some(1),
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.items.first().map(|item| item.id), Some(1));
+        assert!(page.items.iter().any(|item| item.id == 2));
+    }
+
+    #[test]
+    fn rejects_invalid_sort_specs() {
+        let fixture = fixture();
+        let spec = |key: SortKey| SortSpec {
+            key,
+            descending: true,
+        };
+        let page = |query: LibraryQuery| query_page(&fixture.session.db, &fixture.root, query);
+
+        // 超过指标数量的级数。
+        let too_many = vec![
+            spec(SortKey::ImportedAt),
+            spec(SortKey::ModifiedAt),
+            spec(SortKey::Score),
+            spec(SortKey::Size),
+            spec(SortKey::Pixels),
+            spec(SortKey::Folder),
+            spec(SortKey::CollectionPosition),
+            spec(SortKey::Score),
+        ];
+        let error = page(LibraryQuery {
+            sort: too_many,
+            ..base_query()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("排序最多"));
+
+        // 同一指标重复。
+        let error = page(LibraryQuery {
+            sort: vec![spec(SortKey::Score), spec(SortKey::Score)],
+            ..base_query()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("不能重复"));
+
+        // 键集游标的排序值数量与级数不一致。
+        let error = page(LibraryQuery {
+            sort: vec![spec(SortKey::Score), spec(SortKey::Size)],
+            cursor: Some(QueryCursor {
+                sort_values: vec!["3".into()],
+                id: 1,
+            }),
+            ..base_query()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("游标排序值"));
+
+        // 锚点与分页 token 的格式。
+        assert!(
+            page(LibraryQuery {
+                anchor_id: Some(0),
+                ..base_query()
+            })
+            .is_err()
+        );
+        assert!(
+            page(LibraryQuery {
+                page_token: Some("missing-offset".into()),
+                ..base_query()
+            })
+            .is_err()
+        );
     }
 }

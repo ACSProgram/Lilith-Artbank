@@ -15,6 +15,22 @@ export interface FolderTreeModel {
 
 const collator = new Intl.Collator("zh-Hans-CN", { numeric: true, sensitivity: "base" });
 
+export type FolderSortMode = "manual" | "name" | "total" | "direct";
+
+export interface FolderSortSpec {
+  mode: FolderSortMode;
+  descending: boolean;
+}
+
+export const DEFAULT_FOLDER_SORT: FolderSortSpec = { mode: "manual", descending: false };
+
+export const FOLDER_SORT_LABELS: Record<FolderSortMode, string> = {
+  manual: "手动",
+  name: "名称",
+  total: "图片数（含子文件夹）",
+  direct: "图片数（直接）",
+};
+
 export function folderName(path: string): string {
   const index = path.lastIndexOf("/");
   return index < 0 ? path : path.slice(index + 1);
@@ -25,7 +41,10 @@ export function parentFolderPath(path: string): string {
   return index < 0 ? "" : path.slice(0, index);
 }
 
-export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {
+export function buildFolderTree(
+  folders: FolderInfo[],
+  sort: FolderSortSpec = DEFAULT_FOLDER_SORT,
+): FolderTreeModel {
   const byId = new Map<number, FolderNode>();
   const byPath = new Map<string, FolderNode>();
   const rootId = folders.find((folder) => folder.path === "")?.id ?? null;
@@ -52,8 +71,17 @@ export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {
     else nodes.push(node);
   }
 
+  const direction = sort.descending ? -1 : 1;
+  const compareNodes = (left: FolderNode, right: FolderNode) => {
+    let difference = 0;
+    if (sort.mode === "name") difference = collator.compare(left.name, right.name);
+    else if (sort.mode === "total") difference = left.totalImageCount - right.totalImageCount;
+    else if (sort.mode === "direct") difference = left.directImageCount - right.directImageCount;
+    else difference = left.sortIndex - right.sortIndex;
+    return difference !== 0 ? difference * direction : left.id - right.id;
+  };
   const sortNodes = (items: FolderNode[]) => {
-    items.sort((left, right) => collator.compare(left.name, right.name));
+    items.sort(compareNodes);
     for (const item of items) sortNodes(item.children);
   };
   sortNodes(nodes);

@@ -423,12 +423,12 @@ fn perf_metadata_200k() {
     );
 
     let deep_query = LibraryQuery {
-        sort: SortSpec {
+        sort: vec![SortSpec {
             key: SortKey::Score,
             descending: true,
-        },
+        }],
         cursor: Some(QueryCursor {
-            sort_key: "2".into(),
+            sort_values: vec!["2".into()],
             id: 150_000,
         }),
         limit: Some(PAGE_SIZE as u32),
@@ -573,10 +573,10 @@ fn perf_metadata_200k() {
     let collection_query = LibraryQuery {
         view: crate::library::query::LibraryView::Collection,
         collection_id: Some(collection_id),
-        sort: SortSpec {
+        sort: vec![SortSpec {
             key: SortKey::CollectionPosition,
             descending: false,
-        },
+        }],
         limit: Some(PAGE_SIZE as u32),
         ..Default::default()
     };
@@ -607,6 +607,153 @@ fn perf_metadata_200k() {
             ms(percentile(&samples, 0.95))
         );
     }
+
+    // ---------- P4：7 个排序指标与 id 列表游标 ----------
+
+    // 多级排序先建 token 再测后续页：每次取第一页都会挤掉一份缓存列表，旧 token 会失效。
+    // 「集合内顺序」只在集合视图可用，这里用前 5 级代表多级排序，集合顺序另有专项。
+    let sort_levels = vec![
+        SortSpec {
+            key: SortKey::Score,
+            descending: true,
+        },
+        SortSpec {
+            key: SortKey::Size,
+            descending: false,
+        },
+        SortSpec {
+            key: SortKey::ImportedAt,
+            descending: true,
+        },
+        SortSpec {
+            key: SortKey::Pixels,
+            descending: true,
+        },
+        SortSpec {
+            key: SortKey::ModifiedAt,
+            descending: false,
+        },
+        SortSpec {
+            key: SortKey::Folder,
+            descending: false,
+        },
+    ];
+
+    let first_query = LibraryQuery {
+        sort: sort_levels.clone(),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let first_page =
+        query::query_page(database, &root, first_query.clone()).expect("multi sort page");
+    assert_eq!(first_page.items.len() as i64, PAGE_SIZE);
+    let list_token = first_page
+        .next_page_token
+        .expect("多级排序应返回 id 列表游标");
+    let token_prefix = list_token
+        .rsplit_once(':')
+        .map(|(prefix, _)| prefix.to_owned())
+        .expect("token 形如 uuid:offset");
+
+    let paged_query = LibraryQuery {
+        sort: sort_levels.clone(),
+        page_token: Some(list_token),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let mut samples = Vec::with_capacity(30);
+    for _ in 0..30 {
+        let start = Instant::now();
+        let page = query::query_page(database, &root, paged_query.clone()).expect("paged");
+        assert_eq!(page.items.len() as i64, PAGE_SIZE);
+        samples.push(start.elapsed());
+    }
+    println!(
+        "[perf] sort 6 levels page 1 (token slice): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&samples, 0.5)),
+        ms(percentile(&samples, 0.95))
+    );
+
+    let deep_paged = LibraryQuery {
+        sort: sort_levels.clone(),
+        page_token: Some(format!("{token_prefix}:{}", IMAGE_COUNT - PAGE_SIZE)),
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let mut samples = Vec::with_capacity(30);
+    for _ in 0..30 {
+        let start = Instant::now();
+        let page = query::query_page(database, &root, deep_paged.clone()).expect("deep paged");
+        assert_eq!(page.items.len() as i64, PAGE_SIZE);
+        samples.push(start.elapsed());
+    }
+    println!(
+        "[perf] sort 6 levels page at offset {} (token slice): p50={:.2}ms p95={:.2}ms",
+        IMAGE_COUNT - PAGE_SIZE,
+        ms(percentile(&samples, 0.5)),
+        ms(percentile(&samples, 0.95))
+    );
+
+    let (p50, p95) = time_query(database, &root, first_query.clone(), 8);
+    println!(
+        "[perf] sort 6 levels first page (build id list, {IMAGE_COUNT} rows): p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+
+    for (label, key) in [
+        ("importedAt", SortKey::ImportedAt),
+        ("modifiedAt", SortKey::ModifiedAt),
+        ("score", SortKey::Score),
+        ("size", SortKey::Size),
+        ("pixels", SortKey::Pixels),
+        ("folder", SortKey::Folder),
+    ] {
+        let query = LibraryQuery {
+            sort: vec![SortSpec {
+                key,
+                descending: true,
+            }],
+            limit: Some(PAGE_SIZE as u32),
+            ..Default::default()
+        };
+        // 文件夹排序没有可用的复合索引，走 id 列表通道，迭代次数降到 8。
+        let iterations = if key == SortKey::Folder { 8 } else { 30 };
+        let (p50, p95) = time_query(database, &root, query, iterations);
+        println!(
+            "[perf] sort single level {label} desc first page 150: p50={:.2}ms p95={:.2}ms",
+            ms(p50),
+            ms(p95)
+        );
+    }
+
+    // schema v3 → v4 只新增这两个索引；在 20 万行上量一次建索引耗时。
+    database
+        .with_writer(|connection| {
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS idx_images_active_modified;
+                 DROP INDEX IF EXISTS idx_images_active_pixels;",
+            )?;
+            Ok(())
+        })
+        .expect("drop v4 indexes");
+    let index_start = Instant::now();
+    database
+        .with_writer(|connection| {
+            connection.execute_batch(
+                "CREATE INDEX idx_images_active_modified
+                     ON images(deleted_at, modified_at DESC, id DESC);
+                 CREATE INDEX idx_images_active_pixels
+                     ON images(deleted_at, (width * height) DESC, id DESC);
+                 ANALYZE;",
+            )?;
+            Ok(())
+        })
+        .expect("rebuild v4 indexes");
+    println!(
+        "[perf] schema v3->v4 index build on {IMAGE_COUNT} rows: {:.2}ms",
+        ms(index_start.elapsed())
+    );
 }
 
 fn folder_id(database: &crate::library::db::LibraryDb, path: &str) -> i64 {

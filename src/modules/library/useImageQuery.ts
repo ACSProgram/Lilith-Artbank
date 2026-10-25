@@ -23,13 +23,14 @@ export interface ImageQueryState {
   retryMore: () => void;
   /** 就地替换已加载行（编辑保存后避免重置查询与滚动位置）。 */
   patchItem: (imageId: number, update: Partial<ImageRow>) => void;
-  /** 从指定行之后开始取一页，并把该行放到页首；用于筛选后定位原图。 */
-  jumpTo: (anchor: ImageRow, sortValue: number) => void;
+  /** 从指定行所在位置开始取一页；用于筛选后定位原图。 */
+  jumpTo: (anchor: Pick<ImageRow, "id">) => void;
 }
 
 /**
- * 键集分页控制器。查询条件变化时递增代次，过期的页结果直接丢弃，
- * 不覆盖新视图；`refreshToken` 用于导入完成等外部刷新。
+ * 分页控制器。单级索引排序用键集游标，多级/文件夹排序用 Rust 回传的有序 id 列表游标
+ * （`pageToken`）；查询条件变化时递增代次，过期的页结果直接丢弃，不覆盖新视图；
+ * `refreshToken` 用于导入完成等外部刷新。
  */
 export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQueryState {
   const [items, setItems] = useState<ImageRow[]>([]);
@@ -45,12 +46,14 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
   const generation = useRef(0);
   const inFlight = useRef(false);
   const cursorRef = useRef<QueryCursor | null>(null);
+  const pageTokenRef = useRef<string | null>(null);
 
   const loadFirst = useCallback(async () => {
     const currentGeneration = generation.current + 1;
     generation.current = currentGeneration;
     inFlight.current = true;
     cursorRef.current = null;
+    pageTokenRef.current = null;
     setItems([]);
     setHasMore(false);
     setLoadedKey(null);
@@ -61,11 +64,17 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
 
     try {
       const requestKey = queryKey(queryRef.current);
-      const page = await libraryApi.queryImages({ ...queryRef.current, cursor: null });
+      const page = await libraryApi.queryImages({
+        ...queryRef.current,
+        cursor: null,
+        pageToken: null,
+        anchorId: null,
+      });
       if (currentGeneration !== generation.current) return;
       setItems(page.items);
       cursorRef.current = page.nextCursor;
-      setHasMore(page.nextCursor !== null);
+      pageTokenRef.current = page.nextPageToken;
+      setHasMore(page.nextCursor !== null || page.nextPageToken !== null);
       setLoadedKey(requestKey);
       setStatus("ready");
     } catch (cause) {
@@ -87,8 +96,9 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
 
   const loadMore = useCallback(async () => {
     if (inFlight.current) return;
+    const pageToken = pageTokenRef.current;
     const cursor = cursorRef.current;
-    if (!cursor) return;
+    if (!pageToken && !cursor) return;
 
     const currentGeneration = generation.current;
     inFlight.current = true;
@@ -96,7 +106,11 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
     setMoreError(null);
 
     try {
-      const page = await libraryApi.queryImages({ ...queryRef.current, cursor });
+      const page = await libraryApi.queryImages({
+        ...queryRef.current,
+        cursor: pageToken ? null : cursor,
+        pageToken,
+      });
       if (currentGeneration !== generation.current) return;
       if (page.items.length > 0) {
         setItems((previous) => {
@@ -105,7 +119,8 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
         });
       }
       cursorRef.current = page.nextCursor;
-      setHasMore(page.nextCursor !== null);
+      pageTokenRef.current = page.nextPageToken;
+      setHasMore(page.nextCursor !== null || page.nextPageToken !== null);
       setMoreStatus("idle");
     } catch (cause) {
       if (currentGeneration !== generation.current) return;
@@ -118,7 +133,7 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
     }
   }, []);
 
-  const jumpTo = useCallback(async (anchor: ImageRow, sortValue: number) => {
+  const jumpTo = useCallback(async (anchor: Pick<ImageRow, "id">) => {
     const currentGeneration = generation.current + 1;
     generation.current = currentGeneration;
     inFlight.current = true;
@@ -130,13 +145,16 @@ export function useImageQuery(query: LibraryQuery, refreshToken: number): ImageQ
       const requestKey = queryKey(queryRef.current);
       const page = await libraryApi.queryImages({
         ...queryRef.current,
-        cursor: { sortKey: String(sortValue), id: anchor.id },
+        cursor: null,
+        pageToken: null,
+        anchorId: anchor.id,
       });
       if (currentGeneration !== generation.current) return;
-      // 游标是排他的：先补回锚点行，保持排序顺序，再追加它之后的一页。
-      setItems([anchor, ...page.items]);
+      // 锚点页从目标图自身开始；找不到时返回空页，由调用方清空选择。
+      setItems(page.items);
       cursorRef.current = page.nextCursor;
-      setHasMore(page.nextCursor !== null);
+      pageTokenRef.current = page.nextPageToken;
+      setHasMore(page.nextCursor !== null || page.nextPageToken !== null);
       setLoadedKey(requestKey);
       setStatus("ready");
     } catch (cause) {
