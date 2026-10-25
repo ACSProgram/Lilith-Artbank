@@ -18,6 +18,7 @@ use crate::{
     library::{
         content::{self, ContentRow},
         db::LibraryDb,
+        history::{self, EditSnapshot, HistoryKind, NewOperation},
         metadata,
         paths::LibraryPaths,
         service::now_ms,
@@ -192,76 +193,105 @@ pub fn save(
         i64::try_from(new_size).map_err(|_| AppError::message("编辑结果大小超出数据库范围"))?;
 
     let mut published = false;
-    let commit = database.with_writer(|connection| {
-        let transaction =
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut operation_id = None;
+    let commit = history::write(
+        database,
+        NewOperation::new(HistoryKind::Edit, "编辑图片"),
+        |transaction, draft| {
+            let conflict: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM images WHERE content_hash = ?1 AND id <> ?2",
+                    params![new_hash, row.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(other) = conflict {
+                return Err(AppError::message(format!(
+                    "编辑结果与图片 #{other} 的内容相同，已拒绝保存；请调整裁剪或输出设置"
+                )));
+            }
 
-        let conflict: Option<i64> = transaction
-            .query_row(
-                "SELECT id FROM images WHERE content_hash = ?1 AND id <> ?2",
-                params![new_hash, row.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(other) = conflict {
-            return Err(AppError::message(format!(
-                "编辑结果与图片 #{other} 的内容相同，已拒绝保存；请调整裁剪或输出设置"
-            )));
-        }
+            let id = draft.id();
+            operation_id = Some(id);
+            let staged_dir = history::undo_dir(root, id);
+            std::fs::create_dir_all(&staged_dir)?;
+            let staged = staged_dir.join(format!("{}.{}", row.content_hash, row.file_ext));
+            stage_original(&source, &staged)?;
 
-        published = publish(temp.path(), &destination)?;
-        let location = thumbs.append(&thumb.bytes)?;
-        let now = now_ms();
+            published = publish(temp.path(), &destination)?;
+            let location = thumbs.append(&thumb.bytes)?;
+            let now = now_ms();
 
-        let changed = transaction.execute(
-            "UPDATE images SET
-                content_hash = ?1, file_ext = ?2, file_size = ?3, width = ?4, height = ?5,
-                format = ?6, has_alpha = ?7, phash = ?8, colors4 = ?9, colors8 = ?10,
-                modified_at = ?11, thumb_segment = ?12, thumb_offset = ?13,
-                thumb_length = ?14, thumb_format = 'webp', thumb_width = ?15,
-                thumb_height = ?16, thumb_version = thumb_version + 1
-             WHERE id = ?17",
-            params![
-                new_hash,
-                file_ext,
-                file_size,
-                width,
-                height,
-                output_format.name(),
-                has_alpha,
-                hash.as_slice(),
-                colors4.as_slice(),
-                colors8.as_slice(),
-                now,
-                location.segment,
-                i64::try_from(location.offset)
-                    .map_err(|_| AppError::message("缩略图偏移超出数据库范围"))?,
-                location.length,
-                thumb.width,
-                thumb.height,
-                row.id,
-            ],
-        )?;
-        if changed == 0 {
-            return Err(AppError::message("图片不存在或已被删除"));
-        }
-        // 内容已变，旧的 embedding/pose 不再有效。
-        transaction.execute("DELETE FROM feature_blobs WHERE image_id = ?1", [row.id])?;
-        crate::library::import::ensure_thumb_segment(&transaction, location.segment, now)?;
-        if let Ok(size) = thumbs.segment_size_bytes(location.segment) {
-            crate::library::import::update_thumb_segment_size(
-                &transaction,
-                location.segment,
-                size,
+            let changed = transaction.execute(
+                "UPDATE images SET
+                    content_hash = ?1, file_ext = ?2, file_size = ?3, width = ?4, height = ?5,
+                    format = ?6, has_alpha = ?7, phash = ?8, colors4 = ?9, colors8 = ?10,
+                    modified_at = ?11, thumb_segment = ?12, thumb_offset = ?13,
+                    thumb_length = ?14, thumb_format = 'webp', thumb_width = ?15,
+                    thumb_height = ?16, thumb_version = thumb_version + 1
+                 WHERE id = ?17",
+                params![
+                    new_hash,
+                    file_ext,
+                    file_size,
+                    width,
+                    height,
+                    output_format.name(),
+                    has_alpha,
+                    hash.as_slice(),
+                    colors4.as_slice(),
+                    colors8.as_slice(),
+                    now,
+                    location.segment,
+                    i64::try_from(location.offset)
+                        .map_err(|_| AppError::message("缩略图偏移超出数据库范围"))?,
+                    location.length,
+                    thumb.width,
+                    thumb.height,
+                    row.id,
+                ],
             )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    });
+            if changed == 0 {
+                return Err(AppError::message("图片不存在或已被删除"));
+            }
+            // 内容已变，旧的 embedding/pose 不再有效。
+            transaction.execute("DELETE FROM feature_blobs WHERE image_id = ?1", [row.id])?;
+            crate::library::import::ensure_thumb_segment(&transaction, location.segment, now)?;
+            if let Ok(size) = thumbs.segment_size_bytes(location.segment) {
+                crate::library::import::update_thumb_segment_size(
+                    &transaction,
+                    location.segment,
+                    size,
+                )?;
+            }
+            draft.json(&EditSnapshot {
+                image_id: row.id,
+                folder_path: row.folder_path.clone(),
+                content_hash: row.content_hash.clone(),
+                file_ext: row.file_ext.clone(),
+                file_size: row.file_size,
+                width: row.width,
+                height: row.height,
+                format: row.format.clone(),
+                has_alpha: row.has_alpha,
+                phash: row.phash.clone(),
+                colors4: row.colors4.clone(),
+                colors8: row.colors8.clone(),
+                modified_at: row.modified_at,
+                new_hash: new_hash.clone(),
+                new_file_ext: file_ext.to_owned(),
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    );
 
     if let Err(error) = commit {
         if published {
             let _ = std::fs::remove_file(&destination);
+        }
+        if let Some(id) = operation_id {
+            let _ = std::fs::remove_dir_all(history::undo_dir(root, id));
         }
         return Err(error);
     }
@@ -429,6 +459,19 @@ fn write_encoded(
     let mut writer = HashingFile::create(path)?;
     edit::encode(image, format, quality, &mut writer)?;
     writer.finish()
+}
+
+/// 把旧原图暂存到撤销目录：优先硬链接（不占额外空间，且在提交前原路径仍有效），
+/// 同一卷不支持时退化为复制。
+fn stage_original(source: &Path, destination: &Path) -> AppResult<()> {
+    if destination.is_file() {
+        return Ok(());
+    }
+    if std::fs::hard_link(source, destination).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(source, destination)?;
+    Ok(())
 }
 
 fn publish(temp: &Path, destination: &Path) -> AppResult<bool> {

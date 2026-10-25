@@ -22,6 +22,7 @@ import {
   mockOperationHistory,
   mockQueryIds,
   mockQueryPage,
+  mockRedoToOperation,
   mockRemoveFromCollection,
   mockRemoveTags,
   mockRenameCollection,
@@ -205,6 +206,11 @@ export const libraryApi = {
   async undoToOperation(targetId: number): Promise<TaskStartResult> {
     if (!isTauri()) return mockUndoToOperation(targetId);
     return invoke<TaskStartResult>("undo_to_operation", { targetId });
+  },
+
+  async redoToOperation(targetId: number): Promise<TaskStartResult> {
+    if (!isTauri()) return mockRedoToOperation(targetId);
+    return invoke<TaskStartResult>("redo_to_operation", { targetId });
   },
 
   async clearOperationHistory(): Promise<TaskStartResult> {

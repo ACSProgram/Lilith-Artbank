@@ -35,7 +35,7 @@ use crate::{
         content,
         db::LibraryDb,
         folders as folder_service,
-        history::{self, HistoryPage, RecoveryPlan},
+        history::{self, HistoryKind, HistoryPage, NewOperation, RecoveryPlan},
         manifest::{LibraryInspection, inspect},
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
@@ -127,17 +127,37 @@ impl AppState {
         let handle = job.handle();
         let runner_job = job.clone();
         let runner_app = app.clone();
+        let label = if request.folder.is_empty() {
+            format!("导入 {} 个路径", request.paths.len())
+        } else {
+            format!(
+                "导入 {} 个路径到「{}」",
+                request.paths.len(),
+                request.folder
+            )
+        };
+        let operation_id =
+            history::begin_live(&database, NewOperation::new(HistoryKind::Import, label))?;
         let source = ImportSource {
-            database,
+            database: database.clone(),
             thumbs,
             root,
+            operation_id: Some(operation_id),
         };
-        let started = self
+        let started = match self
             .tasks
             .launch(app, handle, ConflictPolicy::Fail, move |guard| {
                 crate::import::start(runner_app, source, runner_job, request, guard);
-            })?;
+            }) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = history::finish_live(&database, operation_id, &error.to_string());
+                return Err(error);
+            }
+        };
         if let TaskStartResult::Conflict { active } = started {
+            // 冲突时导入线程没有启动；空记录在这里收掉。
+            let _ = history::finish_live(&database, operation_id, "");
             return Err(conflict_error(&active));
         }
         *self.import_job.lock() = Some(job.clone());
@@ -513,8 +533,8 @@ impl AppState {
         let (pending_purge_count, pending_purge_bytes) = history::pending_summary(&database)?;
         // 撤销要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
         let blocked_reason = match self.tasks.active().first() {
-            Some(task) => Some(format!("「{}」正在进行，完成后才能撤销", task.label)),
-            None if entries.is_empty() => Some("还没有可撤销的操作".to_owned()),
+            Some(task) => Some(format!("「{}」正在进行，完成后才能撤销或重做", task.label)),
+            None if entries.is_empty() => Some("还没有操作记录".to_owned()),
             None => None,
         };
         Ok(HistoryPage {
@@ -529,7 +549,7 @@ impl AppState {
 
     pub fn undo_to(&self, target_id: i64) -> AppResult<TaskStartResult> {
         let (database, _) = self.query_source()?;
-        let (status, failed, count) = database.with_reader(|connection| {
+        let (status, failed, redo_failed, count) = database.with_reader(|connection| {
             let status: Option<String> = connection
                 .query_row(
                     "SELECT status FROM operations WHERE id = ?1",
@@ -543,13 +563,19 @@ impl AppState {
                 [target_id],
                 |row| row.get(0),
             )?;
+            let redo_failed: i64 = connection.query_row(
+                "SELECT count(*) FROM operations
+                 WHERE id >= ?1 AND status IN ('undone', 'redoing') AND error <> ''",
+                [target_id],
+                |row| row.get(0),
+            )?;
             let count: i64 = connection.query_row(
                 "SELECT count(*) FROM operations
                  WHERE id >= ?1 AND status IN ('applied', 'undoing')",
                 [target_id],
                 |row| row.get(0),
             )?;
-            Ok((status, failed, count))
+            Ok((status, failed, redo_failed, count))
         })?;
         match status.as_deref() {
             Some("applied") => {}
@@ -557,6 +583,9 @@ impl AppState {
                 return Err(AppError::message(
                     "这条记录上次撤销失败，需要先处理失败原因",
                 ));
+            }
+            Some("undone") | Some("redoing") => {
+                return Err(AppError::message("这条记录已经撤销，可以重做"));
             }
             Some(_) => return Err(AppError::message("只能撤销已经完成的操作")),
             None => return Err(AppError::message("操作记录不存在")),
@@ -566,10 +595,55 @@ impl AppState {
                 "之后有一条记录上次撤销失败，不能继续回退；请先处理失败原因或清空记录",
             ));
         }
+        if redo_failed > 0 {
+            return Err(AppError::message(
+                "之后有一条记录上次重做失败，不能继续回退；请先重试重做或清空记录",
+            ));
+        }
         if count <= 0 {
             return Err(AppError::message("没有可撤销的记录"));
         }
         self.start_undo_task(target_id, count as usize)
+    }
+
+    pub fn redo_to(&self, target_id: i64) -> AppResult<TaskStartResult> {
+        let (database, _) = self.query_source()?;
+        let (status, count) = database.with_reader(|connection| {
+            let status: Option<String> = connection
+                .query_row(
+                    "SELECT status FROM operations WHERE id = ?1",
+                    [target_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut statement = connection
+                .prepare("SELECT status FROM operations WHERE id <= ?1 ORDER BY id DESC")?;
+            let statuses = statement
+                .query_map([target_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let count = statuses
+                .iter()
+                .take_while(|status| *status == "undone" || *status == "redoing")
+                .count();
+            Ok((status, count))
+        })?;
+        match status.as_deref() {
+            Some("undone") | Some("redoing") => {}
+            Some("applied") => {
+                return Err(AppError::message("这条记录还没有撤销，不能重做"));
+            }
+            Some("undoFailed") => {
+                return Err(AppError::message(
+                    "这条记录上次撤销失败，需要先处理失败原因",
+                ));
+            }
+            Some(_) => return Err(AppError::message("只能重做已经撤销的操作")),
+            None => return Err(AppError::message("操作记录不存在")),
+        }
+        if count <= 0 {
+            return Err(AppError::message("没有可重做的记录"));
+        }
+        self.start_redo_task(target_id, count)
     }
 
     pub fn clear_history(&self) -> AppResult<TaskStartResult> {
@@ -612,6 +686,16 @@ impl AppState {
         self.after_history_write();
     }
 
+    /// 后台任务（导入）收尾后按最大步数裁剪；失败只记日志。
+    pub(crate) fn after_background_write(&self) {
+        self.after_history_write();
+    }
+
+    /// 编辑保存成功后按最大步数裁剪；命令里没有经过 `mutate`。
+    pub(crate) fn after_file_write(&self) {
+        self.after_history_write();
+    }
+
     /// 图库可用后的收尾：先续做中断的撤销（撤销不可排队，要先占 write lane），再按上限裁剪。
     fn after_library_open(&self) {
         self.schedule_recovery();
@@ -625,13 +709,9 @@ impl AppState {
         let max_steps = self.settings.snapshot().history.max_steps;
         match history::trim(&database, max_steps) {
             Ok(evicted) => {
-                if evicted
-                    .iter()
-                    .any(|operation| operation.kind.keeps_staged_files())
-                {
-                    if let Err(error) = history::cleanup_undo_dirs(&database, &root) {
-                        log::warn!("清理撤销暂存目录失败：{error}");
-                    }
+                // 新写入会删除重做分支，被裁掉的编辑/导入记录也要清掉暂存目录。
+                if let Err(error) = history::cleanup_undo_dirs(&database, &root) {
+                    log::warn!("清理撤销暂存目录失败：{error}");
                 }
                 if evicted
                     .iter()
@@ -649,6 +729,7 @@ impl AppState {
             let mut guard = self.recovery.lock();
             std::mem::take(&mut *guard)
         };
+        let mut resumed = false;
         if let Some(target_id) = plan.resume_undo {
             let Ok((database, _)) = self.query_source() else {
                 return;
@@ -665,10 +746,34 @@ impl AppState {
                 Ok(count) if count > 0 => {
                     if let Err(error) = self.start_undo_task(target_id, count as usize) {
                         log::warn!("恢复中断的撤销失败：{error}");
+                    } else {
+                        resumed = true;
                     }
                 }
                 Ok(_) => {}
                 Err(error) => log::warn!("读取未完成撤销记录失败：{error}"),
+            }
+        }
+        if !resumed && let Some(target_id) = plan.resume_redo {
+            let Ok((database, _)) = self.query_source() else {
+                return;
+            };
+            let count = database.with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM operations
+                     WHERE id <= ?1 AND status = 'redoing'",
+                    [target_id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            });
+            match count {
+                Ok(count) if count > 0 => {
+                    if let Err(error) = self.start_redo_task(target_id, count as usize) {
+                        log::warn!("恢复中断的重做失败：{error}");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("读取未完成重做记录失败：{error}"),
             }
         }
         if plan.release_needed {
@@ -701,7 +806,9 @@ impl AppState {
     }
 
     fn start_undo_task(&self, target_id: i64, count: usize) -> AppResult<TaskStartResult> {
-        let (database, root) = self.query_source()?;
+        let (database, thumbs, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             TaskKind::Undo,
@@ -715,6 +822,7 @@ impl AppState {
         self.tasks
             .launch(app, handle, ConflictPolicy::Fail, move |guard| {
                 let database = database.clone();
+                let thumbs = thumbs.clone();
                 let root = root.clone();
                 let task = worker.clone();
                 let tasks = tasks.clone();
@@ -722,7 +830,42 @@ impl AppState {
                 let _ = tasks.spawn_worker("undo-history".to_owned(), task.clone(), move || {
                     let _guard: LaneGuard = guard;
                     task.set_phase(TaskPhase::Running);
-                    let result = history::run_undo(&database, &root, target_id, task.clone());
+                    let result =
+                        history::run_undo(&database, &root, &thumbs, target_id, task.clone());
+                    query::clear_page_cache();
+                    ai.invalidate_similarity();
+                    task.finish_from(&result);
+                });
+            })
+    }
+
+    fn start_redo_task(&self, target_id: i64, count: usize) -> AppResult<TaskStartResult> {
+        let (database, thumbs, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::Redo,
+            format!("重做 {count} 条记录"),
+        );
+        handle.set_cancellable(count > 1);
+        let app = self.app.clone();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        self.tasks
+            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+                let database = database.clone();
+                let thumbs = thumbs.clone();
+                let root = root.clone();
+                let task = worker.clone();
+                let tasks = tasks.clone();
+                let ai = ai.clone();
+                let _ = tasks.spawn_worker("redo-history".to_owned(), task.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    task.set_phase(TaskPhase::Running);
+                    let result =
+                        history::run_redo(&database, &root, &thumbs, target_id, task.clone());
                     query::clear_page_cache();
                     ai.invalidate_similarity();
                     task.finish_from(&result);

@@ -54,7 +54,7 @@ PRAGMA mmap_size = 268435456;
 | `thumb_segments` | 缩略图包分段；0 号为占位段 |
 | `feature_blobs` | embedding / pose 在 feature pack 中的位置 |
 | `operations` / `operation_chunks` | 操作记录与逆数据；批量操作只记一条，大列表用原始 BLOB |
-| `undo_runs` | 一次撤销运行的起点、状态与起止时间 |
+| `undo_runs` | 一次撤销或重做运行的起点、状态与起止时间 |
 | `image_search` | FTS5 external-content 表，索引 `images.description` |
 
 `images` 关键字段：
@@ -182,7 +182,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `delete_images_permanently` | `{ imageIds }` | `DeleteReport`（`deferred=true`） |
 | `empty_trash` | — | `DeleteReport`（`deferred=true`） |
 | `get_operation_history` | — | `HistoryPage` |
-| `undo_to_operation` | `{ targetId }` | `TaskStartResult`（撤销目标及其之后的记录） |
+| `undo_to_operation` | `{ targetId }` | `TaskStartResult`（撤销目标及上方尚未撤销的记录） |
+| `redo_to_operation` | `{ targetId }` | `TaskStartResult`（从当前状态重做到目标记录） |
 | `clear_operation_history` | — | `TaskStartResult`（清空记录并释放全部待删除文件） |
 | `get_collections` | — | `CollectionInfo[]` |
 | `create_collection` | `{ name }` | `CollectionInfo` |
@@ -243,17 +244,28 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 历史保存在当前图库的 SQLite（`operations` / `operation_chunks` / `undo_runs`），换库后各自独立；最大步数来自设置 `history.maxSteps`。
 
-- 批次 1 已接入：移入回收站、恢复、永久删除、清空回收站。其余内容修改（导入、编辑、移动、文件夹、元数据、集合、AI 描述）的记录与逆操作在批次 2/3 接入；`HistoryKind` 已覆盖全部类型。
-- 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，不留下空记录。
-- 长任务用 `begin_live` + 每批 `append_live_*` / `add_live_affected`，结束时 `finish_live`；崩溃留下的 `pending` 记录在下次打开时按已提交内容转为 `applied`，没有内容则删除。
-- 撤销是线性回退：选中第 N 条 = 依次撤回 N 之后的所有记录，再撤回 N；每条成功后在同一事务里删除记录。多条记录的撤销只在记录之间检查取消。
-- 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能继续向更早记录回退，直到处理失败原因或清空记录。
-- 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置与打开图库后各裁剪一次。被裁掉的编辑记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
+- 已接入：移入回收站、恢复、永久删除、清空回收站（批次 1）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序（批次 2），以及这些记录的撤销与重做。元数据、标签、集合与 AI 描述在批次 3 接入；`HistoryKind` 已覆盖全部类型。
+- 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，不留下空记录。`write` / `begin_live` 在同一个事务里删除 `undone` / `redoing` 记录：新操作开启新时间线，灰色记录与其暂存文件不再可重做。
+- 长任务用 `begin_live` + 每批 `append_live_*` / `add_live_affected`，结束时 `finish_live`；目前只有导入使用。崩溃留下的 `pending` 导入记录在下次打开时按 `origin_operation_id` 或已有 chunk 转为 `applied`，没有内容则删除；其他 pending 记录按 `affected` / chunk 判断。
+- 撤销是线性回退：选中第 N 条 = 依次撤回当前仍为 `applied` 的记录，直到 N。成功的记录不再删除，而是标为 `undone`（列表里变灰）；`undone` 记录保持原 chunks，并通过 `redo` chunks 保存撤销前的状态。多条记录的撤销只在记录之间检查取消。
+- 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
+- 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重试成功或清空记录。所有逆操作与重做操作都可重复执行。
+- 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
 - `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；可重复执行，不可取消。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件。
-- 启动恢复在 `AppState::open_library` 做 DB 部分：`pending` 转 `applied` 或删除、收集 `undoing` 记录、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，`undoing` 记录从最小 id 续做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canUndo, blockedReason }`；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canUndo, blockedReason }`；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
 - 待释放行对查询不可见：回收站视图与“全库搜索”显式加 `images.purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
-- 界面入口在浏览工具栏“记录”按钮，见 [浏览与检索](browse-and-query.md#操作记录)。
+- 界面入口在浏览工具栏“记录”按钮：灰色 `undone` 记录可选中重做，“当前状态”分隔线标出撤销位置；新操作后灰色记录消失。见 [浏览与检索](browse-and-query.md#操作记录)。
+
+### 逆数据格式与撤销/重做语义
+
+- 原始逆数据写在 `ids` / `triples` / `moves` / `json` chunks；撤销时另写 `redo` chunks（同一张表，`format='redo'`），只描述“撤销前是什么”，原始 chunks 不动。每次从 `applied` 进入撤销会先清掉旧 `redo` chunks；崩溃续做保留已写入的快照。
+- 回收站/恢复：`triples(imageId, oldDeletedAt, oldModifiedAt)`。撤销写回旧状态；重做使用撤销时捕获的 `ImageStates`（当前 `deleted_at` / `modified_at`）。永久删除/清空回收站撤销时先记下 `purge_operation_id` 的图片 id，再清空标记；重做重新写标记。
+- `moves`：`(imageId, fromFolderId, toFolderId, oldModifiedAt)`。撤销按当前 `folder_id` 判断：已是源文件夹就跳过，仍是目标文件夹才把文件移回并恢复 `modified_at`；文件移动失败会回滚本记录已完成的移动。重做按相反方向执行，并恢复撤销时的修改时间。移动时隐式新建的目标文件夹会在撤销后按空文件夹清理；重做按捕获的完整文件夹行重建。
+- 文件夹：创建记录本次新建的全部 `(id, path)`（多级路径会同时新建祖先）；撤销时从深到浅，仅在仍为空时删目录与行，重做用原 id、路径、`created_at`、`sort_index` 补回。重命名/移动记录旧/新路径与旧/新 `sort_index`；撤销与重做都以当前路径判断方向。删除记录 `id`、路径、`created_at`、`sort_index`，撤销用原 id 重建行与目录，重做在仍为空时再次删除。排序记录同级全部旧 `sort_index`，撤销逐个恢复，重做使用撤销时捕获的目标排序位。
+- 编辑：保存时在事务内暂存旧原图到 `.artbank/undo/<operationId>/`、写入编辑前完整内容快照（含 pHash / 主色 / `modified_at`）与本次新哈希。撤销要求当前哈希等于本次新哈希，用暂存文件恢复内容、重新编码缩略图、递增 `thumb_version`、清空 `feature_blobs`，并把新原图移入暂存目录（不删除）；重做使用撤销时捕获的完整内容状态，把新原图移回、恢复行与缩略图。撤销/重做都会删除另一侧的预览缓存；旧图暂存会保留以便再次撤销。
+- 导入：新增行带 `origin_operation_id`；chunk 记录新建文件夹、新建标签与合并前快照。撤销按 origin 分块把原图移入 `.artbank/undo/<op>/`、捕获完整行（含标签、集合位置、缩略图指针）后删行，恢复合并项，再删除本次新建且仍为空的文件夹与无引用的标签。重做用原 id 插回行、移回原图、补标签/集合位置并恢复合并后的评分/时间，再重建本次新建的文件夹与标签。
+- 编辑/导入暂存目录不会自动过期；记录裁剪、重做分支被新操作清空或“清空操作记录”时删除，启动时也会清理没有对应 `operations.id` 的目录。
 
 ## 生命周期
 
@@ -268,7 +280,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v5（含 v1→v2→v3→v4→v5 迁移）、连接池、设置 v5（含 v1→v2→v3→v4→v5 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v5（含 v1→v2→v3→v4→v5 迁移）、连接池、设置 v5（含 v1→v2→v3→v4→v5 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–2（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -287,7 +299,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - P4 查询：6 级排序跨页无重复无遗漏（重复值 + 混合方向 + 两个文件夹）、文件夹排序走 id 游标、锚点包含目标行、排序级数/重复指标/游标长度校验；文件夹同级重排、跨父级拒绝；
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
 - S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复、永久删除与清空回收站的延迟标记与释放；
-- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读。
+- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读；批次 2 覆盖移动撤销（文件与行、部分恢复后续做）、编辑撤销（文件、行、缩略图、`feature_blobs`、暂存目录）、文件夹创建/重命名/移动/删除/排序撤销，以及导入新增/合并撤销（新建文件夹与标签清理、合并快照恢复）；重做覆盖回收站/恢复、永久删除标记、移动、编辑、文件夹全套与导入新增/合并，另测“重做到较旧记录时保留更新记录为灰”、新操作清空重做分支、`redoing` 启动续做。
 - S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
 - S4 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
 - S4 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。

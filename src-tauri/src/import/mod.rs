@@ -6,14 +6,15 @@ pub mod scan;
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     app::{
         error::{AppError, AppResult},
+        state::AppState,
         tasks::LaneGuard,
     },
-    library::{db::LibraryDb, paths::normalize_folder, thumbs::ThumbPack},
+    library::{db::LibraryDb, history, paths::normalize_folder, thumbs::ThumbPack},
 };
 
 use job::{DuplicatePolicy, ImportJob, ImportPhase};
@@ -110,6 +111,8 @@ pub struct ImportSource {
     pub database: Arc<LibraryDb>,
     pub thumbs: Arc<ThumbPack>,
     pub root: PathBuf,
+    /// 本次导入的操作记录 id；为 `Some` 时新增行写入 `origin_operation_id` 并追加逆数据。
+    pub operation_id: Option<i64>,
 }
 
 /// 启动后台导入；立即返回，进度与最终结果通过事件推送。
@@ -123,6 +126,10 @@ pub fn start(
 ) {
     spawn_progress(app.clone(), job.clone());
 
+    let operation_id = source.operation_id;
+    let history_database = source.database.clone();
+    let history_database_fallback = history_database.clone();
+    let history_app = app.clone();
     let fallback_app = app.clone();
     let fallback_job = job.clone();
     let spawn = std::thread::Builder::new()
@@ -153,12 +160,29 @@ pub fn start(
             };
 
             job.finish(phase);
+            if let Some(op_id) = operation_id {
+                let error = if phase == ImportPhase::Failed {
+                    "导入未完成"
+                } else {
+                    ""
+                };
+                if let Err(error) = history::finish_live(&history_database, op_id, error) {
+                    log::warn!("收尾导入操作记录失败：{error}");
+                }
+            }
+            if let Some(state) = history_app.try_state::<AppState>() {
+                state.after_background_write();
+            }
             let _ = app.emit("import-progress", job.progress());
             let _ = app.emit("import-finished", job.snapshot());
         });
 
     if let Err(error) = spawn {
         log::error!("无法启动导入线程：{error}");
+        if let Some(op_id) = operation_id {
+            // 还没有任何批次提交，finish_live 会删掉空记录。
+            let _ = history::finish_live(&history_database_fallback, op_id, "导入线程启动失败");
+        }
         fallback_job.add_failure("", format!("无法启动导入任务：{error}"));
         fallback_job.inc_failed();
         fallback_job.finish(ImportPhase::Failed);

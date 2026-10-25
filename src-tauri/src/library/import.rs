@@ -27,27 +27,47 @@ pub struct ImageInsert {
     pub thumb_width: u32,
     pub thumb_height: u32,
     pub imported_at: i64,
+    /// 导入记录 id；撤销导入时按它找回本次新增的行。
+    pub origin_operation_id: Option<i64>,
 }
 
 /// 创建文件夹行以及全部缺失祖先；路径按 Windows 大小写语义解析。
+///
+/// 生产写路径用带追踪的版本；这个简化包装只给测试准备固定目录。
+#[cfg(test)]
 pub fn ensure_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i64> {
+    ensure_folder_tracked(connection, path, now, &mut Vec::new())
+}
+
+/// 与 `ensure_folder` 相同，但把本次真正新建的文件夹 `(id, path)` 追加到 `created`。
+pub fn ensure_folder_tracked(
+    connection: &Connection,
+    path: &str,
+    now: i64,
+    created: &mut Vec<(i64, String)>,
+) -> AppResult<i64> {
     let path = normalize_folder(path)?;
     if path.is_empty() {
-        return resolve_folder(connection, "", now);
+        return resolve_folder(connection, "", now, created);
     }
     let mut current = String::new();
-    let mut id = resolve_folder(connection, "", now)?;
+    let mut id = resolve_folder(connection, "", now, created)?;
     for segment in path.split('/') {
         if !current.is_empty() {
             current.push('/');
         }
         current.push_str(segment);
-        id = resolve_folder(connection, &current, now)?;
+        id = resolve_folder(connection, &current, now, created)?;
     }
     Ok(id)
 }
 
-fn resolve_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i64> {
+fn resolve_folder(
+    connection: &Connection,
+    path: &str,
+    now: i64,
+    created: &mut Vec<(i64, String)>,
+) -> AppResult<i64> {
     if let Some(id) = connection
         .query_row(
             "SELECT id FROM folders WHERE path = ?1 COLLATE NOCASE",
@@ -63,7 +83,9 @@ fn resolve_folder(connection: &Connection, path: &str, now: i64) -> AppResult<i6
         "INSERT INTO folders(path, created_at, sort_index) VALUES (?1, ?2, ?3)",
         params![path, now, sort_index],
     )?;
-    Ok(connection.last_insert_rowid())
+    let id = connection.last_insert_rowid();
+    created.push((id, path.to_owned()));
+    Ok(id)
 }
 
 /// 新文件夹追加到同一父级的末尾，避免手动排序里新文件夹与已有项并列 0。
@@ -93,6 +115,15 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
 }
 
 pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i64>> {
+    ensure_tags_tracked(connection, tags, &mut Vec::new())
+}
+
+/// 与 `ensure_tags` 相同，但把本次真正新建的标签 `(id, name)` 追加到 `created`。
+pub fn ensure_tags_tracked(
+    connection: &Connection,
+    tags: &[String],
+    created: &mut Vec<(i64, String)>,
+) -> AppResult<Vec<i64>> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
     for tag in tags {
@@ -100,7 +131,7 @@ pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i6
         if name.is_empty() || !seen.insert(name.to_lowercase()) {
             continue;
         }
-        connection.execute(
+        let inserted = connection.execute(
             "INSERT INTO tags(name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
             [name],
         )?;
@@ -109,6 +140,9 @@ pub fn ensure_tags(connection: &Connection, tags: &[String]) -> AppResult<Vec<i6
             [name],
             |row| row.get(0),
         )?;
+        if inserted > 0 {
+            created.push((id, name.to_owned()));
+        }
         ids.push(id);
     }
     Ok(ids)
@@ -130,10 +164,10 @@ pub fn insert_image(
             content_hash, file_ext, folder_id, file_size, width, height, format,
             has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at,
             thumb_segment, thumb_offset, thumb_length, thumb_format,
-            thumb_width, thumb_height, thumb_version
+            thumb_width, thumb_height, thumb_version, origin_operation_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', ?13, ?13,
-            ?14, ?15, ?16, ?17, ?18, ?19, 1
+            ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20
          )
          ON CONFLICT(content_hash) DO NOTHING",
         params![
@@ -156,6 +190,7 @@ pub fn insert_image(
             image.thumb_format,
             image.thumb_width,
             image.thumb_height,
+            image.origin_operation_id,
         ],
     )?;
 
@@ -292,6 +327,7 @@ mod tests {
                         thumb_width: 4,
                         thumb_height: 3,
                         imported_at: 1,
+                        origin_operation_id: None,
                     },
                 )?;
                 attach_tags(connection, id.unwrap(), &tags)?;
@@ -329,6 +365,7 @@ mod tests {
                             thumb_width: 4,
                             thumb_height: 3,
                             imported_at: 2,
+                            origin_operation_id: None,
                         },
                     )?
                     .is_none()

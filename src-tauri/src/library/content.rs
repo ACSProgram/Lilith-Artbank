@@ -8,6 +8,8 @@ use crate::{
 };
 
 /// 查看器与编辑保存共用的原图行快照。
+///
+/// `phash` / `colors*` / `modified_at` 只用于编辑撤销的前置快照；查看器路径不读它们。
 pub struct ContentRow {
     pub id: i64,
     pub content_hash: String,
@@ -18,6 +20,10 @@ pub struct ContentRow {
     pub height: u32,
     pub format: String,
     pub has_alpha: bool,
+    pub phash: Vec<u8>,
+    pub colors4: Vec<u8>,
+    pub colors8: Vec<u8>,
+    pub modified_at: i64,
     pub thumb_version: i64,
     pub deleted_at: Option<i64>,
 }
@@ -44,9 +50,10 @@ pub fn load(database: &LibraryDb, image_id: i64) -> AppResult<ContentRow> {
     database.with_reader(|connection| {
         connection
             .query_row(
-                "SELECT images.id, images.content_hash, images.file_ext, folders.path,
-                        images.file_size, images.width, images.height, images.format,
-                        images.has_alpha, images.thumb_version, images.deleted_at
+                "SELECT images.id, images.content_hash, images.file_ext,
+                        folders.path, images.file_size, images.width, images.height,
+                        images.format, images.has_alpha, images.phash, images.colors4,
+                        images.colors8, images.modified_at, images.thumb_version, images.deleted_at
                  FROM images
                  JOIN folders ON folders.id = images.folder_id
                  WHERE images.id = ?1",
@@ -62,8 +69,12 @@ pub fn load(database: &LibraryDb, image_id: i64) -> AppResult<ContentRow> {
                         height: row.get(6)?,
                         format: row.get(7)?,
                         has_alpha: row.get::<_, i64>(8)? != 0,
-                        thumb_version: row.get(9)?,
-                        deleted_at: row.get(10)?,
+                        phash: row.get(9)?,
+                        colors4: row.get(10)?,
+                        colors8: row.get(11)?,
+                        modified_at: row.get(12)?,
+                        thumb_version: row.get(13)?,
+                        deleted_at: row.get(14)?,
                     })
                 },
             )

@@ -212,7 +212,7 @@ export type HistoryKind =
   | "similarityGroups"
   | "aiDescription";
 
-export type HistoryStatus = "applied" | "undoFailed";
+export type HistoryStatus = "applied" | "undone" | "redoing" | "undoFailed";
 
 export interface HistoryEntry {
   id: number;

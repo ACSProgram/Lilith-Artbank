@@ -1,12 +1,16 @@
 use std::{collections::HashSet, path::Path};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
-        import::{ensure_folder, next_sort_index},
+        history::{
+            self, FolderDeleted, FolderPathChange, FolderRef, FolderReorder, FolderRow,
+            HistoryKind, NewOperation,
+        },
+        import::{ensure_folder_tracked, next_sort_index},
         paths::{
             LibraryPaths, join_folder, normalize_folder, normalize_folder_name, parent_path,
             subtree_like_pattern,
@@ -16,6 +20,7 @@ use crate::{
     },
 };
 
+/// 撤销量不在用户取消粒度内；所有逆操作都通过 `_inner` 或专用恢复函数完成，不再写历史。
 fn folder_id(connection: &Connection, path: &str) -> AppResult<Option<i64>> {
     connection
         .query_row(
@@ -54,16 +59,30 @@ pub fn create(db: &LibraryDb, root: &Path, path: &str) -> AppResult<Vec<FolderIn
         return Err(AppError::message("根目录已经存在"));
     }
     let target = LibraryPaths::new(root).folder_dir(&path);
-    db.with_writer(|connection| {
-        if folder_id(connection, &path)?.is_some() {
-            return Err(AppError::message("文件夹已存在"));
-        }
-        // 物理目录先落地；ensure_folder 再从根到叶补齐缺失的数据库行。
-        std::fs::create_dir_all(&target)?;
-        ensure_inside_root(root, &target)?;
-        ensure_folder(connection, &path, now_ms())?;
-        Ok(())
-    })?;
+    history::write(
+        db,
+        NewOperation::new(HistoryKind::FolderCreate, format!("新建文件夹「{path}」")),
+        |transaction, draft| {
+            if folder_id(transaction, &path)?.is_some() {
+                return Err(AppError::message("文件夹已存在"));
+            }
+            // 物理目录先落地；ensure_folder 再从根到叶补齐缺失的数据库行。
+            std::fs::create_dir_all(&target)?;
+            ensure_inside_root(root, &target)?;
+            let mut created = Vec::new();
+            ensure_folder_tracked(transaction, &path, now_ms(), &mut created)?;
+            if created.is_empty() {
+                return Err(AppError::message("文件夹已存在"));
+            }
+            let rows: Vec<FolderRef> = created
+                .into_iter()
+                .map(|(id, path)| FolderRef { id, path })
+                .collect();
+            draft.json(&rows)?;
+            draft.affected(rows.len() as u64);
+            Ok(())
+        },
+    )?;
     query::list_folders(db)
 }
 
@@ -75,53 +94,70 @@ pub fn rename(
 ) -> AppResult<Vec<FolderInfo>> {
     let name = normalize_folder_name(name)?;
     let paths = LibraryPaths::new(root);
-    let (old_path, new_path) = db.with_writer(|connection| {
-        let old_path = folder_path(connection, folder_id_value)?;
-        if old_path.is_empty() {
-            return Err(AppError::message("不能重命名图库根目录"));
-        }
-        let parent = parent_path(&old_path);
-        let new_path = join_folder(parent, &name);
-        if old_path == new_path {
-            return Ok((old_path, new_path));
-        }
-        if let Some(existing) = folder_id(connection, &new_path)?
-            && existing != folder_id_value
-        {
-            return Err(AppError::message("目标文件夹已存在"));
-        }
-        Ok((old_path, new_path))
-    })?;
-    if old_path == new_path {
-        return query::list_folders(db);
-    }
+    history::write(
+        db,
+        NewOperation::new(
+            HistoryKind::FolderRename,
+            format!("重命名文件夹为「{name}」"),
+        ),
+        |transaction, draft| {
+            let old_path = folder_path(transaction, folder_id_value)?;
+            if old_path.is_empty() {
+                return Err(AppError::message("不能重命名图库根目录"));
+            }
+            let parent = parent_path(&old_path);
+            let new_path = join_folder(parent, &name);
+            if old_path == new_path {
+                return Ok(());
+            }
+            if let Some(existing) = folder_id(transaction, &new_path)?
+                && existing != folder_id_value
+            {
+                return Err(AppError::message("目标文件夹已存在"));
+            }
 
-    let old_dir = paths.folder_dir(&old_path);
-    let new_dir = paths.folder_dir(&new_path);
-    if !old_dir.is_dir() {
-        return Err(AppError::message(format!(
-            "文件夹目录不存在：{}",
-            old_dir.display()
-        )));
-    }
-    if !new_path.eq_ignore_ascii_case(&old_path) && new_dir.exists() {
-        return Err(AppError::message("目标文件夹目录已存在"));
-    }
-    rename_directory(&old_dir, &new_dir, new_path.eq_ignore_ascii_case(&old_path))?;
-    ensure_inside_root(root, &new_dir)?;
+            let old_dir = paths.folder_dir(&old_path);
+            let new_dir = paths.folder_dir(&new_path);
+            if !old_dir.is_dir() {
+                return Err(AppError::message(format!(
+                    "文件夹目录不存在：{}",
+                    old_dir.display()
+                )));
+            }
+            let case_only = new_path.eq_ignore_ascii_case(&old_path);
+            if !case_only && new_dir.exists() {
+                return Err(AppError::message("目标文件夹目录已存在"));
+            }
+            rename_directory(&old_dir, &new_dir, case_only)?;
+            ensure_inside_root(root, &new_dir)?;
 
-    let update = db.with_writer(|connection| {
-        update_subtree_paths(connection, &old_path, &new_path, folder_id_value)
-    });
-    if let Err(error) = update {
-        if let Err(rollback) = rename_directory(&new_dir, &old_dir, true) {
-            log::error!(
-                "回滚文件夹重命名失败：{rollback}；目录位于 {}",
-                new_dir.display()
-            );
-        }
-        return Err(error);
-    }
+            if let Err(error) =
+                update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)
+            {
+                if let Err(rollback) = rename_directory(&new_dir, &old_dir, true) {
+                    log::error!(
+                        "回滚文件夹重命名失败：{rollback}；目录位于 {}",
+                        new_dir.display()
+                    );
+                }
+                return Err(error);
+            }
+            let sort_index: i64 = transaction.query_row(
+                "SELECT sort_index FROM folders WHERE id = ?1",
+                [folder_id_value],
+                |row| row.get(0),
+            )?;
+            draft.json(&FolderPathChange {
+                id: folder_id_value,
+                old_path,
+                new_path,
+                old_sort_index: sort_index,
+                new_sort_index: sort_index,
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )?;
     query::list_folders(db)
 }
 
@@ -132,69 +168,86 @@ pub fn move_to(
     parent_id: i64,
 ) -> AppResult<Vec<FolderInfo>> {
     let paths = LibraryPaths::new(root);
-    let (old_path, new_path) = db.with_writer(|connection| {
-        let old_path = folder_path(connection, folder_id_value)?;
-        if old_path.is_empty() {
-            return Err(AppError::message("不能移动图库根目录"));
-        }
-        let parent_path = folder_path(connection, parent_id)?;
-        if parent_path == old_path || parent_path.starts_with(&format!("{old_path}/")) {
-            return Err(AppError::message("不能把文件夹移动到自身或子文件夹"));
-        }
-        let leaf = old_path
-            .rsplit_once('/')
-            .map_or(old_path.as_str(), |(_, leaf)| leaf);
-        let new_path = join_folder(&parent_path, leaf);
-        if new_path == old_path {
-            return Ok((old_path, new_path));
-        }
-        if let Some(existing) = folder_id(connection, &new_path)?
-            && existing != folder_id_value
-        {
-            return Err(AppError::message("目标位置已经有同名文件夹"));
-        }
-        Ok((old_path, new_path))
-    })?;
-    if old_path == new_path {
-        return query::list_folders(db);
-    }
+    history::write(
+        db,
+        NewOperation::new(HistoryKind::FolderMove, "移动文件夹"),
+        |transaction, draft| {
+            let old_path = folder_path(transaction, folder_id_value)?;
+            if old_path.is_empty() {
+                return Err(AppError::message("不能移动图库根目录"));
+            }
+            let parent_path = folder_path(transaction, parent_id)?;
+            if parent_path == old_path || parent_path.starts_with(&format!("{old_path}/")) {
+                return Err(AppError::message("不能把文件夹移动到自身或子文件夹"));
+            }
+            let leaf = old_path
+                .rsplit_once('/')
+                .map_or(old_path.as_str(), |(_, leaf)| leaf);
+            let new_path = join_folder(&parent_path, leaf);
+            if new_path == old_path {
+                return Ok(());
+            }
+            if let Some(existing) = folder_id(transaction, &new_path)?
+                && existing != folder_id_value
+            {
+                return Err(AppError::message("目标位置已经有同名文件夹"));
+            }
 
-    let old_dir = paths.folder_dir(&old_path);
-    let new_dir = paths.folder_dir(&new_path);
-    if !old_dir.is_dir() {
-        return Err(AppError::message(format!(
-            "文件夹目录不存在：{}",
-            old_dir.display()
-        )));
-    }
-    if let Some(parent) = new_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-        ensure_inside_root(root, parent)?;
-    }
-    if new_dir.exists() {
-        return Err(AppError::message("目标文件夹目录已存在"));
-    }
-    std::fs::rename(&old_dir, &new_dir)?;
-    ensure_inside_root(root, &new_dir)?;
+            let old_dir = paths.folder_dir(&old_path);
+            let new_dir = paths.folder_dir(&new_path);
+            if !old_dir.is_dir() {
+                return Err(AppError::message(format!(
+                    "文件夹目录不存在：{}",
+                    old_dir.display()
+                )));
+            }
+            if let Some(parent) = new_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+                ensure_inside_root(root, parent)?;
+            }
+            if new_dir.exists() {
+                return Err(AppError::message("目标文件夹目录已存在"));
+            }
+            std::fs::rename(&old_dir, &new_dir)?;
+            ensure_inside_root(root, &new_dir)?;
 
-    let update = db.with_writer(|connection| {
-        update_subtree_paths(connection, &old_path, &new_path, folder_id_value)?;
-        let next = next_sort_index(connection, &new_path)?;
-        connection.execute(
-            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
-            params![next, folder_id_value],
-        )?;
-        Ok(())
-    });
-    if let Err(error) = update {
-        if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
-            log::error!(
-                "回滚文件夹移动失败：{rollback}；目录位于 {}",
-                new_dir.display()
-            );
-        }
-        return Err(error);
-    }
+            let result = (|| -> AppResult<(i64, i64)> {
+                let old_sort_index: i64 = transaction.query_row(
+                    "SELECT sort_index FROM folders WHERE id = ?1",
+                    [folder_id_value],
+                    |row| row.get(0),
+                )?;
+                let new_sort_index = next_sort_index(transaction, &new_path)?;
+                update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)?;
+                transaction.execute(
+                    "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                    params![new_sort_index, folder_id_value],
+                )?;
+                Ok((old_sort_index, new_sort_index))
+            })();
+            let (old_sort_index, new_sort_index) = match result {
+                Ok(values) => values,
+                Err(error) => {
+                    if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
+                        log::error!(
+                            "回滚文件夹移动失败：{rollback}；目录位于 {}",
+                            new_dir.display()
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            draft.json(&FolderPathChange {
+                id: folder_id_value,
+                old_path,
+                new_path,
+                old_sort_index,
+                new_sort_index,
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )?;
     query::list_folders(db)
 }
 
@@ -214,95 +267,514 @@ pub fn reorder(
             return Err(AppError::message("文件夹 id 无效或重复"));
         }
     }
-    db.with_writer(|connection| {
-        let parent = folder_path(connection, parent_id)?;
-        // 同级文件夹一次读出来：手动排序只在拖放时发生，几千行路径的读取代价可以接受。
-        let mut statement =
-            connection.prepare("SELECT id, path FROM folders ORDER BY sort_index, id")?;
-        let folders = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+    history::write(
+        db,
+        NewOperation::new(HistoryKind::FolderReorder, "调整文件夹顺序"),
+        |transaction, draft| {
+            let parent = folder_path(transaction, parent_id)?;
+            // 同级文件夹一次读出来：手动排序只在拖放时发生，几千行路径的读取代价可以接受。
+            let mut statement = transaction
+                .prepare("SELECT id, path, sort_index FROM folders ORDER BY sort_index, id")?;
+            let folders = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
 
-        let mut siblings: Vec<i64> = folders
-            .iter()
-            .filter(|(_, path)| !path.is_empty() && parent_path(path) == parent)
-            .map(|(id, _)| *id)
-            .collect();
-        if let Some(foreign) = moved.iter().find(|id| !siblings.contains(id)) {
-            return Err(AppError::message(format!(
-                "文件夹 {foreign} 不在目标位置，只能调整同一级文件夹的顺序"
-            )));
-        }
+            let siblings: Vec<(i64, String, i64)> = folders
+                .into_iter()
+                .filter(|(_, path, _)| !path.is_empty() && parent_path(path) == parent)
+                .collect();
+            if let Some(foreign) = moved
+                .iter()
+                .find(|id| !siblings.iter().any(|(existing, _, _)| existing == *id))
+            {
+                return Err(AppError::message(format!(
+                    "文件夹 {foreign} 不在目标位置，只能调整同一级文件夹的顺序"
+                )));
+            }
 
-        siblings.retain(|id| !moved.contains(id));
-        let insert_at = sort_index.clamp(0, siblings.len() as i64) as usize;
-        siblings.splice(insert_at..insert_at, folder_ids.iter().copied());
+            let old_positions: Vec<(i64, i64)> = siblings
+                .iter()
+                .map(|(id, _, index)| (*id, *index))
+                .collect();
+            let mut order: Vec<i64> = siblings
+                .iter()
+                .map(|(id, _, _)| *id)
+                .filter(|id| !moved.contains(id))
+                .collect();
+            let insert_at = sort_index.clamp(0, order.len() as i64) as usize;
+            order.splice(insert_at..insert_at, folder_ids.iter().copied());
 
-        let transaction = connection.unchecked_transaction()?;
-        for (position, id) in siblings.iter().enumerate() {
-            transaction.execute(
-                "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
-                params![position as i64, id],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    })?;
+            let changed = order
+                .iter()
+                .enumerate()
+                .filter(|(position, id)| {
+                    old_positions
+                        .iter()
+                        .find(|(existing, _)| existing == *id)
+                        .is_some_and(|(_, index)| *index != *position as i64)
+                })
+                .count();
+            if changed == 0 {
+                return Ok(());
+            }
+            for (position, id) in order.iter().enumerate() {
+                transaction.execute(
+                    "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                    params![position as i64, id],
+                )?;
+            }
+            draft.json(&FolderReorder {
+                rows: old_positions,
+            })?;
+            draft.affected(changed as u64);
+            Ok(())
+        },
+    )?;
     query::list_folders(db)
 }
 
 pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Vec<FolderInfo>> {
     let paths = LibraryPaths::new(root);
-    let path = db.with_writer(|connection| {
-        let path = folder_path(connection, folder_id_value)?;
-        if path.is_empty() {
-            return Err(AppError::message("不能删除图库根目录"));
-        }
-        let pattern = subtree_like_pattern(&path);
-        let children: i64 = connection.query_row(
-            "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
-            [pattern],
-            |row| row.get(0),
-        )?;
-        if children > 0 {
-            return Err(AppError::message("文件夹还包含子文件夹，不能删除"));
-        }
-        let images: i64 = connection.query_row(
-            "SELECT count(*) FROM images WHERE folder_id = ?1",
-            [folder_id_value],
-            |row| row.get(0),
-        )?;
-        if images > 0 {
-            return Err(AppError::message("文件夹中还有图片，不能删除"));
-        }
-        Ok(path)
-    })?;
+    history::write(
+        db,
+        NewOperation::new(HistoryKind::FolderDelete, "删除文件夹"),
+        |transaction, draft| {
+            let (path, created_at, sort_index): (String, i64, i64) = transaction
+                .query_row(
+                    "SELECT path, created_at, sort_index FROM folders WHERE id = ?1",
+                    [folder_id_value],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::message("文件夹不存在"))?;
+            if path.is_empty() {
+                return Err(AppError::message("不能删除图库根目录"));
+            }
+            let pattern = subtree_like_pattern(&path);
+            let children: i64 = transaction.query_row(
+                "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
+                [pattern],
+                |row| row.get(0),
+            )?;
+            if children > 0 {
+                return Err(AppError::message("文件夹还包含子文件夹，不能删除"));
+            }
+            let images: i64 = transaction.query_row(
+                "SELECT count(*) FROM images WHERE folder_id = ?1",
+                [folder_id_value],
+                |row| row.get(0),
+            )?;
+            if images > 0 {
+                return Err(AppError::message("文件夹中还有图片，不能删除"));
+            }
 
-    let directory = paths.folder_dir(&path);
+            let directory = paths.folder_dir(&path);
+            if directory.exists() {
+                ensure_inside_root(root, &directory)?;
+                if std::fs::read_dir(&directory)?.next().is_some() {
+                    return Err(AppError::message("文件夹目录不是空的，不能删除"));
+                }
+                std::fs::remove_dir(&directory)?;
+            }
+
+            let changed =
+                transaction.execute("DELETE FROM folders WHERE id = ?1", [folder_id_value])?;
+            if changed == 0 {
+                if let Err(error) = std::fs::create_dir_all(&directory) {
+                    log::error!(
+                        "回滚文件夹删除失败：{error}；目录应位于 {}",
+                        directory.display()
+                    );
+                }
+                return Err(AppError::message("文件夹不存在"));
+            }
+            draft.json(&FolderDeleted {
+                id: folder_id_value,
+                path,
+                created_at,
+                sort_index,
+            })?;
+            draft.affected(1);
+            Ok(())
+        },
+    )?;
+    query::list_folders(db)
+}
+
+/// 撤销“新建文件夹”：记录里的行仍然存在且为空时删目录与行；已经被移动或已有内容则失败。
+pub(crate) fn undo_create(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    created: &[FolderRef],
+) -> AppResult<()> {
+    let paths = LibraryPaths::new(root);
+    let mut rows = created.to_vec();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.path.matches('/').count()));
+    for item in rows {
+        let current: Option<String> = transaction
+            .query_row("SELECT path FROM folders WHERE id = ?1", [item.id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current) = current else {
+            continue;
+        };
+        if !current.eq_ignore_ascii_case(&item.path) {
+            return Err(AppError::message("文件夹已被移动，不能撤销新建"));
+        }
+        remove_folder_if_empty(transaction, &paths, root, item.id, &item.path, true)?;
+    }
+    Ok(())
+}
+
+/// 导入撤销只清理本次新建且仍为空的文件夹；已经有内容的就保留，不让整条记录失败。
+pub(crate) fn cleanup_created(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    created: &[FolderRef],
+) -> AppResult<()> {
+    let paths = LibraryPaths::new(root);
+    let mut rows = created.to_vec();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.path.matches('/').count()));
+    for item in rows {
+        let current: Option<String> = transaction
+            .query_row("SELECT path FROM folders WHERE id = ?1", [item.id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current) = current else {
+            continue;
+        };
+        if !current.eq_ignore_ascii_case(&item.path) {
+            continue;
+        }
+        remove_folder_if_empty(transaction, &paths, root, item.id, &item.path, false)?;
+    }
+    Ok(())
+}
+
+fn remove_folder_if_empty(
+    transaction: &Transaction<'_>,
+    paths: &LibraryPaths,
+    root: &Path,
+    id: i64,
+    path: &str,
+    strict: bool,
+) -> AppResult<()> {
+    let children: i64 = transaction.query_row(
+        "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
+        [subtree_like_pattern(path)],
+        |row| row.get(0),
+    )?;
+    let images: i64 = transaction.query_row(
+        "SELECT count(*) FROM images WHERE folder_id = ?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    if children > 0 || images > 0 {
+        if strict {
+            return Err(AppError::message("文件夹里已经有内容，不能撤销新建"));
+        }
+        return Ok(());
+    }
+    let directory = paths.folder_dir(path);
     if directory.exists() {
         ensure_inside_root(root, &directory)?;
         if std::fs::read_dir(&directory)?.next().is_some() {
-            return Err(AppError::message("文件夹目录不是空的，不能删除"));
+            if strict {
+                return Err(AppError::message("文件夹目录不是空的，不能撤销新建"));
+            }
+            return Ok(());
         }
         std::fs::remove_dir(&directory)?;
     }
+    transaction.execute("DELETE FROM folders WHERE id = ?1", [id])?;
+    Ok(())
+}
 
-    if let Err(error) = db.with_writer(|connection| {
-        connection.execute("DELETE FROM folders WHERE id = ?1", [folder_id_value])?;
-        Ok(())
-    }) {
-        if let Err(rollback) = std::fs::create_dir_all(&directory) {
+/// 撤销重命名/移动：当前路径是旧路径视为已完成；是目标路径才反向搬回。
+pub(crate) fn undo_path_change(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    change: &FolderPathChange,
+) -> AppResult<()> {
+    let current = folder_path(transaction, change.id)?;
+    if current.eq_ignore_ascii_case(&change.old_path) {
+        transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![change.old_sort_index, change.id],
+        )?;
+        return Ok(());
+    }
+    if !current.eq_ignore_ascii_case(&change.new_path) {
+        return Err(AppError::message("文件夹当前路径与记录不符，无法撤销"));
+    }
+
+    let paths = LibraryPaths::new(root);
+    let old_dir = paths.folder_dir(&change.old_path);
+    let new_dir = paths.folder_dir(&change.new_path);
+    let case_only = change.old_path.eq_ignore_ascii_case(&change.new_path);
+    // 上次中断可能已经把目录搬回，只剩数据库未更新；这时只补 SQL。
+    let physical_done = !new_dir.is_dir() && old_dir.is_dir();
+    if !physical_done {
+        if !new_dir.is_dir() {
+            return Err(AppError::message("被移动的文件夹目录不存在，无法撤销"));
+        }
+        if !case_only && old_dir.exists() {
+            return Err(AppError::message("原位置已经有同名文件夹，无法撤销"));
+        }
+        rename_directory(&new_dir, &old_dir, case_only)?;
+        ensure_inside_root(root, &old_dir)?;
+    }
+
+    let result = update_subtree_paths(transaction, &change.new_path, &change.old_path, change.id)
+        .and_then(|_| {
+            transaction.execute(
+                "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                params![change.old_sort_index, change.id],
+            )?;
+            Ok(())
+        });
+    if let Err(error) = result {
+        if let Err(rollback) = rename_directory(&old_dir, &new_dir, true) {
             log::error!(
-                "回滚文件夹删除失败：{rollback}；目录应位于 {}",
-                directory.display()
+                "回滚文件夹撤销失败：{rollback}；目录位于 {}",
+                old_dir.display()
             );
         }
         return Err(error);
     }
-    query::list_folders(db)
+    Ok(())
+}
+
+/// 撤销“删除空文件夹”：用原 id 重建数据库行与物理目录；行已存在视为已完成。
+pub(crate) fn undo_delete(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    deleted: &FolderDeleted,
+) -> AppResult<()> {
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT path FROM folders WHERE id = ?1",
+            [deleted.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing.eq_ignore_ascii_case(&deleted.path) {
+            return Ok(());
+        }
+        // folders.id 是普通 INTEGER PRIMARY KEY，删除最大 id 后新建可能复用同一个 id。
+        return Err(AppError::message(
+            "原文件夹 id 已被其他文件夹占用，无法恢复",
+        ));
+    }
+    if let Some(existing) = folder_id(transaction, &deleted.path)? {
+        return Err(AppError::message(format!(
+            "路径已被文件夹 {existing} 占用，无法恢复"
+        )));
+    }
+    let directory = LibraryPaths::new(root).folder_dir(&deleted.path);
+    if directory.exists() && !directory.is_dir() {
+        return Err(AppError::message("原文件夹位置被文件占用，无法恢复"));
+    }
+    std::fs::create_dir_all(&directory)?;
+    ensure_inside_root(root, &directory)?;
+    transaction.execute(
+        "INSERT INTO folders(id, path, created_at, sort_index) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            deleted.id,
+            deleted.path,
+            deleted.created_at,
+            deleted.sort_index
+        ],
+    )?;
+    Ok(())
+}
+
+/// 撤销同级排序：把每个文件夹恢复成记录里的 `sort_index`。
+pub(crate) fn undo_reorder(
+    transaction: &Transaction<'_>,
+    reorder: &FolderReorder,
+) -> AppResult<()> {
+    for (id, sort_index) in &reorder.rows {
+        let changed = transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![sort_index, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::message("排序记录中的文件夹不存在"));
+        }
+    }
+    Ok(())
+}
+
+/// 重做“新建文件夹”：按原 id、路径与排序位补回行和目录；已存在则跳过。
+pub(crate) fn redo_create(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    rows: &[FolderRow],
+) -> AppResult<()> {
+    let paths = LibraryPaths::new(root);
+    let mut rows = rows.to_vec();
+    rows.sort_by_key(|row| row.path.matches('/').count());
+    for item in rows {
+        let existing: Option<String> = transaction
+            .query_row("SELECT path FROM folders WHERE id = ?1", [item.id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(existing) = existing {
+            if !existing.eq_ignore_ascii_case(&item.path) {
+                return Err(AppError::message(format!(
+                    "重做时文件夹 id {} 已被其他文件夹占用",
+                    item.id
+                )));
+            }
+            let directory = paths.folder_dir(&item.path);
+            if !directory.is_dir() {
+                std::fs::create_dir_all(&directory)?;
+                ensure_inside_root(root, &directory)?;
+            }
+            continue;
+        }
+        if let Some(existing) = folder_id(transaction, &item.path)? {
+            return Err(AppError::message(format!(
+                "重做时路径「{}」已被文件夹 {existing} 占用",
+                item.path
+            )));
+        }
+        let directory = paths.folder_dir(&item.path);
+        std::fs::create_dir_all(&directory)?;
+        ensure_inside_root(root, &directory)?;
+        transaction.execute(
+            "INSERT INTO folders(id, path, created_at, sort_index) VALUES (?1, ?2, ?3, ?4)",
+            params![item.id, item.path, item.created_at, item.sort_index],
+        )?;
+    }
+    Ok(())
+}
+
+/// 重做“重命名/移动文件夹”：与撤销对称，当前已在目标路径时只补排序位。
+pub(crate) fn redo_path_change(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    change: &FolderPathChange,
+) -> AppResult<()> {
+    let current = folder_path(transaction, change.id)?;
+    if current.eq_ignore_ascii_case(&change.new_path) {
+        transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![change.new_sort_index, change.id],
+        )?;
+        return Ok(());
+    }
+    if !current.eq_ignore_ascii_case(&change.old_path) {
+        return Err(AppError::message("文件夹当前路径与记录不符，无法重做"));
+    }
+
+    let paths = LibraryPaths::new(root);
+    let old_dir = paths.folder_dir(&change.old_path);
+    let new_dir = paths.folder_dir(&change.new_path);
+    let case_only = change.old_path.eq_ignore_ascii_case(&change.new_path);
+    let physical_done = !old_dir.is_dir() && new_dir.is_dir();
+    if !physical_done {
+        if !old_dir.is_dir() {
+            return Err(AppError::message("文件夹目录不存在，无法重做"));
+        }
+        if !case_only && new_dir.exists() {
+            return Err(AppError::message("目标位置已经有同名文件夹，无法重做"));
+        }
+        rename_directory(&old_dir, &new_dir, case_only)?;
+        ensure_inside_root(root, &new_dir)?;
+    }
+
+    let result = update_subtree_paths(transaction, &change.old_path, &change.new_path, change.id)
+        .and_then(|_| {
+            transaction.execute(
+                "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                params![change.new_sort_index, change.id],
+            )?;
+            Ok(())
+        });
+    if let Err(error) = result {
+        if let Err(rollback) = rename_directory(&new_dir, &old_dir, true) {
+            log::error!(
+                "回滚文件夹重做失败：{rollback}；目录位于 {}",
+                new_dir.display()
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 重做“删除空文件夹”：仍为空时删目录与行；已经不存在视为完成。
+pub(crate) fn redo_delete(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    deleted: &FolderDeleted,
+) -> AppResult<()> {
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT path FROM folders WHERE id = ?1",
+            [deleted.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if !existing.eq_ignore_ascii_case(&deleted.path) {
+        return Err(AppError::message(
+            "文件夹 id 已被其他文件夹占用，无法重做删除",
+        ));
+    }
+    let pattern = subtree_like_pattern(&deleted.path);
+    let children: i64 = transaction.query_row(
+        "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
+        [pattern],
+        |row| row.get(0),
+    )?;
+    let images: i64 = transaction.query_row(
+        "SELECT count(*) FROM images WHERE folder_id = ?1",
+        [deleted.id],
+        |row| row.get(0),
+    )?;
+    if children > 0 || images > 0 {
+        return Err(AppError::message("文件夹里已经有内容，不能重做删除"));
+    }
+    let directory = LibraryPaths::new(root).folder_dir(&deleted.path);
+    if directory.exists() {
+        ensure_inside_root(root, &directory)?;
+        if std::fs::read_dir(&directory)?.next().is_some() {
+            return Err(AppError::message("文件夹目录不是空的，不能重做删除"));
+        }
+        std::fs::remove_dir(&directory)?;
+    }
+    transaction.execute("DELETE FROM folders WHERE id = ?1", [deleted.id])?;
+    Ok(())
+}
+
+/// 重做同级排序：恢复撤销时捕获的目标排序位。
+pub(crate) fn redo_reorder(transaction: &Transaction<'_>, rows: &[(i64, i64)]) -> AppResult<()> {
+    for (id, sort_index) in rows {
+        let changed = transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![sort_index, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::message("排序记录中的文件夹不存在"));
+        }
+    }
+    Ok(())
 }
 
 fn rename_directory(old: &Path, new: &Path, case_only: bool) -> AppResult<()> {
@@ -328,19 +800,17 @@ fn update_subtree_paths(
     new_path: &str,
     folder_id_value: i64,
 ) -> AppResult<()> {
-    let transaction = connection.unchecked_transaction()?;
     let pattern = subtree_like_pattern(old_path);
-    transaction.execute(
+    connection.execute(
         "UPDATE folders
          SET path = ?1 || substr(path, length(?2) + 1)
          WHERE path LIKE ?3 ESCAPE '\\' AND id <> ?4",
         params![new_path, old_path, pattern, folder_id_value],
     )?;
-    transaction.execute(
+    connection.execute(
         "UPDATE folders SET path = ?1 WHERE id = ?2",
         params![new_path, folder_id_value],
     )?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -351,7 +821,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::service;
+    use crate::library::{history, service};
 
     fn fixture() -> (tempfile::TempDir, Arc<LibraryDb>, PathBuf) {
         let temp = tempdir().unwrap();
@@ -372,6 +842,11 @@ mod tests {
         assert!(root.join("人物").join("速写").join("手部").is_dir());
         assert!(create(&db, &root, "人物").is_err());
         assert!(create(&db, &root, "CON").is_err());
+
+        let entries = history::list(&db).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HistoryKind::FolderCreate);
+        assert_eq!(entries[0].affected, 3);
     }
 
     #[test]
@@ -505,5 +980,94 @@ mod tests {
             .unwrap();
         assert!(delete(&db, &root, external).is_err());
         assert!(untracked.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn undo_restores_created_renamed_moved_deleted_and_reordered_folders() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "人物/速写").unwrap();
+        let people = db
+            .with_reader(|connection| folder_id(connection, "人物"))
+            .unwrap()
+            .unwrap();
+        let sketch = db
+            .with_reader(|connection| folder_id(connection, "人物/速写"))
+            .unwrap()
+            .unwrap();
+        rename(&db, &root, sketch, "草稿").unwrap();
+        let scenery = create(&db, &root, "风景").unwrap();
+        let scenery_id = scenery
+            .iter()
+            .find(|item| item.path == "风景")
+            .map(|item| item.id)
+            .unwrap();
+        move_to(&db, &root, sketch, scenery_id).unwrap();
+        let root_id = db
+            .with_reader(|connection| folder_id(connection, ""))
+            .unwrap()
+            .unwrap();
+        reorder(&db, &[scenery_id, people], root_id, 0).unwrap();
+        delete(&db, &root, sketch).unwrap();
+
+        let entries = history::list(&db).unwrap();
+        let target = entries.last().unwrap().id;
+        let thumbs = crate::library::thumbs::ThumbPack::open(
+            crate::library::paths::LibraryPaths::new(&root).thumbs,
+        )
+        .unwrap();
+        let task = crate::app::tasks::TaskHandle::new(
+            "folder-undo",
+            crate::app::tasks::TaskKind::Undo,
+            "测试",
+        );
+        history::run_undo(&db, &root, &thumbs, target, task).unwrap();
+
+        let entries = history::list(&db).unwrap();
+        assert_eq!(entries.len(), 6);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.status == crate::library::history::OperationStatus::Undone)
+        );
+        assert!(!root.join("人物").exists());
+        assert!(!root.join("风景").exists());
+        assert!(
+            db.with_reader(|connection| folder_id(connection, "人物/速写"))
+                .unwrap()
+                .is_none()
+        );
+
+        let target = entries[0].id;
+        let task = crate::app::tasks::TaskHandle::new(
+            "folder-redo",
+            crate::app::tasks::TaskKind::Redo,
+            "测试",
+        );
+        history::run_redo(&db, &root, &thumbs, target, task).unwrap();
+        let entries = history::list(&db).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.status == crate::library::history::OperationStatus::Applied)
+        );
+        assert!(root.join("人物").is_dir());
+        assert!(root.join("风景").is_dir());
+        assert!(!root.join("风景").join("草稿").exists());
+        assert!(!root.join("人物").join("速写").exists());
+        assert!(!root.join("人物").join("草稿").exists());
+        let order: Vec<String> = db
+            .with_reader(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT path FROM folders
+                     WHERE instr(path, '/') = 0 AND path <> ''
+                     ORDER BY sort_index, id",
+                )?;
+                let paths = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(paths)
+            })
+            .unwrap();
+        assert_eq!(order, vec!["风景".to_owned(), "人物".to_owned()]);
     }
 }

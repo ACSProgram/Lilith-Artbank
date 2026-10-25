@@ -11,6 +11,7 @@ export type TaskKind =
   | "permanentDelete"
   | "emptyTrash"
   | "undo"
+  | "redo"
   | "releaseGarbage";
 
 export type TaskLane = "write" | "ai" | "scan";

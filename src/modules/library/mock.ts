@@ -1041,19 +1041,47 @@ export function mockOperationHistory(): HistoryPage {
     pendingPurgeCount: 0,
     pendingPurgeBytes: 0,
     canUndo: entries.length > 0,
-    blockedReason: entries.length > 0 ? null : "还没有可撤销的操作",
+    blockedReason: entries.length > 0 ? null : "还没有操作记录",
   };
 }
 
 export function mockUndoToOperation(targetId: number): TaskStartResult {
-  const removed = mockOperations.filter((entry) => entry.id >= targetId);
-  mockOperations = mockOperations.filter((entry) => entry.id < targetId);
+  let count = 0;
+  mockOperations = mockOperations.map((entry) => {
+    if (entry.id >= targetId && entry.status === "applied") {
+      count += 1;
+      return { ...entry, status: "undone", error: "" };
+    }
+    return entry;
+  });
   return {
     status: "started",
     task: mockHistoryTask(
       "undo",
       "撤销操作",
-      `撤销 ${Math.max(1, removed.length)} 条记录`,
+      `撤销 ${Math.max(1, count)} 条记录`,
+    ),
+  };
+}
+
+export function mockRedoToOperation(targetId: number): TaskStartResult {
+  const candidates = mockOperations
+    .filter((entry) => entry.id <= targetId)
+    .sort((left, right) => right.id - left.id);
+  const ids = new Set<number>();
+  for (const entry of candidates) {
+    if (entry.status !== "undone" && entry.status !== "redoing") break;
+    ids.add(entry.id);
+  }
+  mockOperations = mockOperations.map((entry) =>
+    ids.has(entry.id) ? { ...entry, status: "applied", error: "" } : entry,
+  );
+  return {
+    status: "started",
+    task: mockHistoryTask(
+      "redo",
+      "重做操作",
+      `重做 ${Math.max(1, ids.size)} 条记录`,
     ),
   };
 }

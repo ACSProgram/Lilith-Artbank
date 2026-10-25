@@ -46,6 +46,7 @@ pub enum TaskKind {
     PermanentDelete,
     EmptyTrash,
     Undo,
+    Redo,
     ReleaseGarbage,
 }
 
@@ -58,6 +59,7 @@ impl TaskKind {
             | Self::PermanentDelete
             | Self::EmptyTrash
             | Self::Undo
+            | Self::Redo
             | Self::ReleaseGarbage => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription => TaskLane::Ai,
             Self::SimilarityGroups => TaskLane::Scan,
@@ -76,6 +78,7 @@ impl TaskKind {
             Self::PermanentDelete => "永久删除",
             Self::EmptyTrash => "清空回收站",
             Self::Undo => "撤销操作",
+            Self::Redo => "重做操作",
             Self::ReleaseGarbage => "释放删除文件",
         }
     }
@@ -934,6 +937,7 @@ mod tests {
     #[test]
     fn undo_and_release_run_on_write_lane() {
         assert_eq!(TaskKind::Undo.lane(), TaskLane::Write);
+        assert_eq!(TaskKind::Redo.lane(), TaskLane::Write);
         assert_eq!(TaskKind::ReleaseGarbage.lane(), TaskLane::Write);
         assert_eq!(TaskKind::Undo.label(), "撤销操作");
         assert_eq!(TaskKind::ReleaseGarbage.label(), "释放删除文件");

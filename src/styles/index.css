@@ -2224,7 +2224,7 @@ textarea:focus-visible {
 .operation-history {
   display: flex;
   flex-direction: column;
-  width: 360px;
+  width: 380px;
   max-height: 60vh;
 }
 
@@ -2280,9 +2280,43 @@ textarea:focus-visible {
   background: var(--panel-hover);
 }
 
+.operation-history-row.is-undone {
+  opacity: 0.5;
+}
+
+.operation-history-row.is-undone:hover,
+.operation-history-row.is-undone.is-selected {
+  opacity: 0.85;
+}
+
 .operation-history-row.is-selected {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.operation-history-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+  color: var(--accent);
+  font-size: 9.5px;
+}
+
+.operation-history-current::before,
+.operation-history-current::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.operation-history-current span {
+  padding: 1px 7px;
+  border: 1px solid var(--accent);
+  border-radius: 99px;
+  background: var(--accent-soft);
+  white-space: nowrap;
 }
 
 .operation-history-row:focus-visible {

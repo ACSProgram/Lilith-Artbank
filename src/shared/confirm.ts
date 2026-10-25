@@ -41,17 +41,34 @@ export function confirmEmptyTrash(confirm: ConfirmFn, imageCount: number): Promi
   });
 }
 
-/** 线性回退：目标记录及其之后的全部记录都会撤销。 */
+/** 线性重做：从当前状态到目标记录之间的灰记录会重新应用。 */
+export function confirmRedoTo(
+  confirm: ConfirmFn,
+  targetLabel: string,
+  recordCount: number,
+  affectedCount: number,
+  unit = "张",
+): Promise<boolean> {
+  return confirm({
+    title: `重做到「${targetLabel}」？`,
+    message: `会重新应用当前状态到这条记录之间的 ${count(recordCount)} 条记录，共影响 ${count(affectedCount)} ${unit}。`,
+    detail: "重做后这些记录会重新变为可撤销。",
+    confirmLabel: "重做",
+  });
+}
+
+/** 线性回退：目标记录及其上方仍为 applied 的记录都会撤销。 */
 export function confirmUndoTo(
   confirm: ConfirmFn,
   targetLabel: string,
   recordCount: number,
   affectedCount: number,
+  unit = "张",
 ): Promise<boolean> {
   return confirm({
     title: `撤销到「${targetLabel}」之前？`,
-    message: `会撤销这条及其之后的 ${count(recordCount)} 条记录，共影响 ${count(affectedCount)} 张图片。`,
-    detail: "撤销后这些记录会从列表移除。",
+    message: `会从当前状态回退到这条记录之前，撤销 ${count(recordCount)} 条尚未撤销的记录，共影响 ${count(affectedCount)} ${unit}。`,
+    detail: "这些记录会变灰，之后可以重做。",
     confirmLabel: "撤销",
   });
 }

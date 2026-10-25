@@ -12,7 +12,7 @@ use crate::{
         BatchReporter,
         db::LibraryDb,
         history::{self, HistoryKind, NewOperation},
-        import::{ensure_folder, ensure_tags},
+        import::{ensure_folder_tracked, ensure_tags},
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
         placeholders,
         service::now_ms,
@@ -436,100 +436,128 @@ pub fn move_images(
     let ids = validate_ids_for_files(image_ids)?;
     let folder_path = normalize_folder(folder_path)?;
     let paths = LibraryPaths::new(root);
-    let mut report = MoveReport::default();
     let total = ids.len();
     reporter.report(0, total);
 
-    database.with_writer(|connection| {
-        let transaction = connection.transaction()?;
-        let target_folder = ensure_folder(&transaction, &folder_path, now_ms())?;
-        let target_dir = if folder_path.is_empty() {
-            paths.root.clone()
-        } else {
-            paths
-                .root
-                .join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-        };
-        std::fs::create_dir_all(&target_dir)?;
-        ensure_dir_inside_root(&paths.root, &target_dir)?;
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::Move, format!("移动图片到「{folder_path}」")),
+        |transaction, draft| {
+            let mut report = MoveReport::default();
+            let mut created_folders = Vec::new();
+            let target_folder =
+                ensure_folder_tracked(transaction, &folder_path, now_ms(), &mut created_folders)?;
+            let target_dir = if folder_path.is_empty() {
+                paths.root.clone()
+            } else {
+                paths
+                    .root
+                    .join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+            };
+            std::fs::create_dir_all(&target_dir)?;
+            ensure_dir_inside_root(&paths.root, &target_dir)?;
 
-        let now = now_ms();
-        let mut done = 0_usize;
-        for chunk in ids.chunks(SQL_CHUNK) {
-            if reporter.cancelled() {
-                break;
-            }
-            let marks = placeholders(chunk.len());
-            let mut statement = transaction.prepare(&format!(
-                "SELECT images.id, images.content_hash, images.file_ext, folders.path
-                 FROM images JOIN folders ON folders.id = images.folder_id
-                 WHERE images.id IN ({marks})"
-            ))?;
-            let rows = statement
-                .query_map(params_from_iter(chunk.iter()), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-
-            for (image_id, content_hash, file_ext, old_folder) in rows {
+            let now = now_ms();
+            let mut done = 0_usize;
+            let mut moves = Vec::new();
+            for chunk in ids.chunks(SQL_CHUNK) {
                 if reporter.cancelled() {
                     break;
                 }
-                done += 1;
-                reporter.report(done, total);
-                if old_folder == folder_path {
-                    report.skipped += 1;
-                    continue;
-                }
-                let old_path = content_path(&paths, &old_folder, &content_hash, &file_ext)?;
-                let new_path = content_path(&paths, &folder_path, &content_hash, &file_ext)?;
-                if let Err(error) = std::fs::rename(&old_path, &new_path) {
-                    report.failures.push(BatchFailure {
-                        image_id: Some(image_id),
-                        path: old_path.to_string_lossy().into_owned(),
-                        reason: format!("移动文件失败：{error}"),
-                    });
-                    continue;
-                }
-                match transaction.execute(
-                    "UPDATE images SET folder_id = ?1, modified_at = ?2 WHERE id = ?3",
-                    params![target_folder, now, image_id],
-                ) {
-                    Ok(changed) if changed > 0 => report.moved += 1,
-                    Ok(_) => {
-                        let _ = std::fs::rename(&new_path, &old_path);
-                        report.failures.push(BatchFailure {
-                            image_id: Some(image_id),
-                            path: new_path.to_string_lossy().into_owned(),
-                            reason: "图片记录已不存在".to_owned(),
-                        });
+                let marks = placeholders(chunk.len());
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT images.id, images.content_hash, images.file_ext, folders.path,
+                            images.folder_id, images.modified_at
+                     FROM images JOIN folders ON folders.id = images.folder_id
+                     WHERE images.id IN ({marks})"
+                ))?;
+                let rows = statement
+                    .query_map(params_from_iter(chunk.iter()), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+
+                for (
+                    image_id,
+                    content_hash,
+                    file_ext,
+                    old_folder,
+                    old_folder_id,
+                    old_modified_at,
+                ) in rows
+                {
+                    if reporter.cancelled() {
+                        break;
                     }
-                    Err(error) => {
-                        if let Err(rollback) = std::fs::rename(&new_path, &old_path) {
-                            log::error!(
-                                "回滚文件夹移动失败 image={image_id}: {rollback}；文件位于 {}",
-                                new_path.display()
-                            );
-                        }
+                    done += 1;
+                    reporter.report(done, total);
+                    if old_folder == folder_path {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    let old_path = content_path(&paths, &old_folder, &content_hash, &file_ext)?;
+                    let new_path = content_path(&paths, &folder_path, &content_hash, &file_ext)?;
+                    if let Err(error) = std::fs::rename(&old_path, &new_path) {
                         report.failures.push(BatchFailure {
                             image_id: Some(image_id),
-                            path: new_path.to_string_lossy().into_owned(),
-                            reason: format!("更新数据库失败：{error}"),
+                            path: old_path.to_string_lossy().into_owned(),
+                            reason: format!("移动文件失败：{error}"),
                         });
+                        continue;
+                    }
+                    match transaction.execute(
+                        "UPDATE images SET folder_id = ?1, modified_at = ?2 WHERE id = ?3",
+                        params![target_folder, now, image_id],
+                    ) {
+                        Ok(changed) if changed > 0 => {
+                            report.moved += 1;
+                            moves.push((image_id, old_folder_id, target_folder, old_modified_at));
+                        }
+                        Ok(_) => {
+                            let _ = std::fs::rename(&new_path, &old_path);
+                            report.failures.push(BatchFailure {
+                                image_id: Some(image_id),
+                                path: new_path.to_string_lossy().into_owned(),
+                                reason: "图片记录已不存在".to_owned(),
+                            });
+                        }
+                        Err(error) => {
+                            if let Err(rollback) = std::fs::rename(&new_path, &old_path) {
+                                log::error!(
+                                    "回滚文件夹移动失败 image={image_id}: {rollback}；文件位于 {}",
+                                    new_path.display()
+                                );
+                            }
+                            report.failures.push(BatchFailure {
+                                image_id: Some(image_id),
+                                path: new_path.to_string_lossy().into_owned(),
+                                reason: format!("更新数据库失败：{error}"),
+                            });
+                        }
                     }
                 }
             }
-        }
-        transaction.commit()?;
-        Ok(())
-    })?;
-    Ok(report)
+            draft.moves(&moves);
+            if !created_folders.is_empty() {
+                draft.json(
+                    &created_folders
+                        .into_iter()
+                        .map(|(id, path)| crate::library::history::FolderRef { id, path })
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            draft.affected(report.moved);
+            Ok(report)
+        },
+    )
 }
 
 pub fn set_trashed(database: &LibraryDb, image_ids: &[i64], trashed: bool) -> AppResult<u64> {
@@ -954,7 +982,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::{NoopReporter, service};
+    use crate::library::{NoopReporter, import::ensure_folder, service};
 
     struct Fixture {
         _temp: tempfile::TempDir,

@@ -476,6 +476,14 @@ pub fn undo_to_operation(
 }
 
 #[tauri::command]
+pub fn redo_to_operation(
+    state: State<'_, AppState>,
+    target_id: i64,
+) -> Result<TaskStartResult, String> {
+    AppError::command(state.redo_to(target_id))
+}
+
+#[tauri::command]
 pub fn clear_operation_history(state: State<'_, AppState>) -> Result<TaskStartResult, String> {
     AppError::command(state.clear_history())
 }
@@ -564,12 +572,15 @@ pub async fn save_image_edit(
 ) -> Result<EditResult, String> {
     let guard = state.begin_edit().map_err(|error| error.to_string())?;
     let (database, thumbs, root) = state.edit_handles().map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        edit::save(&database, &root, &thumbs, &request).map_err(|error| error.to_string())
+        edit::save(&database, &root, &thumbs, &request)
     })
     .await
     .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    state.after_file_write();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -799,6 +810,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         empty_trash,
         get_operation_history,
         undo_to_operation,
+        redo_to_operation,
         clear_operation_history,
         get_collections,
         create_collection,

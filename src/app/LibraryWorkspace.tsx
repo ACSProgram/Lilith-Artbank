@@ -135,9 +135,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     void refreshAi();
   }, [taskDataVersion, notify, refreshAi, refreshStatus, reloadFolders]);
 
-  // 撤销可能删除或恢复当前查看的图片，完成后退出查看器，避免停在过期内容上。
+  // 撤销/重做可能删除或恢复当前查看的图片，完成后退出查看器，避免停在过期内容上。
   useEffect(() => {
-    if (lastFinished?.kind === "undo") setViewerSession(null);
+    if (lastFinished?.kind === "undo" || lastFinished?.kind === "redo") {
+      setViewerSession(null);
+    }
   }, [lastFinished]);
 
   const generateDescription = useCallback(async (imageId: number) => {

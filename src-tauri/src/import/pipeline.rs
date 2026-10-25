@@ -22,6 +22,7 @@ use crate::{
     },
     library::{
         db::LibraryDb,
+        history::{self, FolderRef, ImportMerged, ImportRecord, ImportTag},
         import as repository,
         import::ImageInsert,
         paths::{LibraryPaths, join_folder, normalize_folder},
@@ -50,6 +51,7 @@ struct WriterOptions {
     tags: Vec<String>,
     score: u8,
     policy: DuplicatePolicy,
+    operation_id: Option<i64>,
 }
 
 struct Staged {
@@ -168,6 +170,7 @@ fn run_inner(
         tags: request.tags.clone(),
         score: request.score,
         policy: request.duplicate_policy,
+        operation_id: source.operation_id,
     };
 
     let writer = {
@@ -522,7 +525,11 @@ fn flush(
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_ms();
-        let tag_ids = repository::ensure_tags(&transaction, &options.tags)?;
+        let mut created_tags = Vec::new();
+        let tag_ids =
+            repository::ensure_tags_tracked(&transaction, &options.tags, &mut created_tags)?;
+        let mut created_folders: Vec<(i64, String)> = Vec::new();
+        let mut merged: Vec<ImportMerged> = Vec::new();
 
         let mut stats = CommitStats {
             inserted: Vec::new(),
@@ -567,12 +574,18 @@ fn flush(
                 thumb_width: item.thumb.width,
                 thumb_height: item.thumb.height,
                 imported_at: now,
+                origin_operation_id: options.operation_id,
             };
 
             let folder_id = match buffer.folder_ids.get(&item.folder) {
                 Some(id) => *id,
                 None => {
-                    let id = repository::ensure_folder(&transaction, &item.folder, now)?;
+                    let id = repository::ensure_folder_tracked(
+                        &transaction,
+                        &item.folder,
+                        now,
+                        &mut created_folders,
+                    )?;
                     buffer.folder_ids.insert(item.folder.clone(), id);
                     id
                 }
@@ -594,6 +607,7 @@ fn flush(
                         &tag_ids,
                         now,
                         &mut stats,
+                        &mut merged,
                     )?;
                     if item.published {
                         let _ = std::fs::remove_file(&item.destination);
@@ -624,6 +638,7 @@ fn flush(
                 &tag_ids,
                 now,
                 &mut stats,
+                &mut merged,
             )?;
         }
 
@@ -633,6 +648,40 @@ fn flush(
             };
             if let Err(error) = repository::update_thumb_segment_size(&transaction, segment, size) {
                 log::warn!("缩略图段 {segment} 尺寸记录失败：{error}");
+            }
+        }
+
+        if let Some(operation_id) = options.operation_id {
+            let append = |record: ImportRecord| -> crate::app::error::AppResult<()> {
+                history::append_live_in_tx(
+                    &transaction,
+                    operation_id,
+                    history::ChunkFormat::Json,
+                    &serde_json::to_vec(&record)?,
+                )
+            };
+            if !created_folders.is_empty() {
+                append(ImportRecord::Folders {
+                    items: created_folders
+                        .into_iter()
+                        .map(|(id, path)| FolderRef { id, path })
+                        .collect(),
+                })?;
+            }
+            if !created_tags.is_empty() {
+                append(ImportRecord::Tags {
+                    items: created_tags
+                        .into_iter()
+                        .map(|(id, name)| ImportTag { id, name })
+                        .collect(),
+                })?;
+            }
+            if !merged.is_empty() {
+                append(ImportRecord::Merged { items: merged })?;
+            }
+            let affected = (stats.inserted.len() + stats.merged) as u64;
+            if affected > 0 {
+                history::add_live_affected_in_tx(&transaction, operation_id, affected)?;
             }
         }
 
@@ -699,10 +748,29 @@ fn resolve_existing(
     tag_ids: &[i64],
     now: i64,
     stats: &mut CommitStats,
+    merged: &mut Vec<ImportMerged>,
 ) -> AppResult<()> {
     match repository::find_by_hash(connection, hash)? {
         Some(id) if options.policy == DuplicatePolicy::Merge => {
+            let (old_score, old_modified_at): (i64, i64) = connection.query_row(
+                "SELECT score, modified_at FROM images WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let old_tag_ids: Vec<i64> = {
+                let mut statement = connection
+                    .prepare("SELECT tag_id FROM image_tags WHERE image_id = ?1 ORDER BY tag_id")?;
+                statement
+                    .query_map([id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
             repository::merge_metadata(connection, id, options.score, tag_ids, now)?;
+            merged.push(ImportMerged {
+                image_id: id,
+                old_score,
+                old_modified_at,
+                old_tag_ids,
+            });
             stats.merged += 1;
         }
         _ => stats.duplicates += 1,
@@ -763,6 +831,7 @@ mod tests {
             database: session.db.clone(),
             thumbs: session.thumbs.clone(),
             root: root.to_path_buf(),
+            operation_id: None,
         }
     }
 

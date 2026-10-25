@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type RefObject } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type RefObject,
+} from "react";
 import { History, Trash2, X } from "lucide-react";
 import { useNotices } from "../../app/noticeContext";
 import { useTaskCenter } from "../../app/taskContext";
@@ -6,11 +13,23 @@ import type { TaskStartResult } from "../../app/taskTypes";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Popover } from "../../shared/components/Popover";
 import { Spinner } from "../../shared/components/Spinner";
-import { confirmClearHistory, confirmUndoTo } from "../../shared/confirm";
+import {
+  confirmClearHistory,
+  confirmRedoTo,
+  confirmUndoTo,
+} from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
 import { formatBytes } from "../../shared/format";
 import { libraryApi } from "./api";
-import type { HistoryPage } from "./types";
+import type { HistoryEntry, HistoryPage } from "./types";
+
+function affectedUnit(kind: string): string {
+  return kind.startsWith("folder") ? "项" : "张";
+}
+
+function isRedoStatus(entry: HistoryEntry): boolean {
+  return entry.status === "undone" || entry.status === "redoing";
+}
 
 interface OperationHistoryPanelProps {
   open: boolean;
@@ -62,33 +81,69 @@ export function OperationHistoryPanel({
     if (open) void load();
   }, [open, dataVersion, load]);
 
-  const undoTask = active.find((task) => task.kind === "undo") ?? null;
+  const historyTask =
+    active.find((task) => task.kind === "undo" || task.kind === "redo") ?? null;
   const selectedIndex =
     page?.entries.findIndex((entry) => entry.id === selectedId) ?? -1;
+  // 列表按新到旧排列；最上面连续的 undone/redoing 就是可重做区，分隔线是当前状态。
+  const boundary = useMemo(() => {
+    if (!page) return 0;
+    const index = page.entries.findIndex((entry) => !isRedoStatus(entry));
+    return index < 0 ? page.entries.length : index;
+  }, [page]);
+
   const selection = useMemo(() => {
     if (!page || selectedIndex < 0) return null;
-    const chain = page.entries.slice(0, selectedIndex + 1);
-    return {
-      target: page.entries[selectedIndex],
-      count: chain.length,
-      affected: chain.reduce((sum, entry) => sum + entry.affected, 0),
-      failed: chain.find((entry) => entry.status === "undoFailed") ?? null,
-    };
-  }, [page, selectedIndex]);
+    const target = page.entries[selectedIndex];
+    if (
+      isRedoStatus(target) &&
+      selectedIndex < boundary
+    ) {
+      const chain = page.entries.slice(selectedIndex, boundary);
+      return {
+        mode: "redo" as const,
+        target,
+        count: chain.length,
+        affected: chain.reduce((sum, entry) => sum + entry.affected, 0),
+        unit: chain.some((entry) => entry.kind.startsWith("folder")) ? "项" : "张",
+        failed: null,
+      };
+    }
+    if (target.status === "applied") {
+      const chain = page.entries.slice(0, selectedIndex + 1);
+      // 已经变灰的记录不会再次撤销；真正回退的是这条及其上方仍为 applied 的记录。
+      const active = chain.filter((entry) => entry.status === "applied");
+      return {
+        mode: "undo" as const,
+        target,
+        count: active.length,
+        affected: active.reduce((sum, entry) => sum + entry.affected, 0),
+        unit: active.some((entry) => entry.kind.startsWith("folder")) ? "项" : "张",
+        failed:
+          chain.find(
+            (entry) =>
+              entry.status === "undoFailed" || (isRedoStatus(entry) && entry.error),
+          ) ?? null,
+      };
+    }
+    return null;
+  }, [page, selectedIndex, boundary]);
 
-  const undoDisabled =
+  const actionDisabled =
     !page?.canUndo ||
     busy ||
-    undoTask != null ||
+    historyTask != null ||
     !selection ||
-    selection.target.status !== "applied" ||
-    selection.failed != null;
+    (selection.mode === "undo" &&
+      (selection.target.status !== "applied" || selection.failed != null));
 
-  const undoReason =
+  const actionReason =
     page?.blockedReason ??
     (selection?.failed
-      ? "有一条记录上次撤销失败，需要先处理它"
-      : selection && selection.target.status !== "applied"
+      ? selection.failed.status === "undoFailed"
+        ? "有一条记录上次撤销失败，需要先处理它"
+        : "有一条记录上次重做失败，需要先重试它"
+      : selection?.mode === "undo" && selection.target.status !== "applied"
         ? "这条记录不能作为撤销目标"
         : null);
 
@@ -106,24 +161,42 @@ export function OperationHistoryPanel({
     return true;
   };
 
-  const undo = async () => {
-    if (!page || !selection || undoDisabled) return;
-    const accepted = await confirmUndoTo(
-      confirm,
-      selection.target.label,
-      selection.count,
-      selection.affected,
-    );
+  const runAction = async () => {
+    if (!page || !selection || actionDisabled) return;
+    const redo = selection.mode === "redo";
+    const accepted = redo
+      ? await confirmRedoTo(
+          confirm,
+          selection.target.label,
+          selection.count,
+          selection.affected,
+          selection.unit,
+        )
+      : await confirmUndoTo(
+          confirm,
+          selection.target.label,
+          selection.count,
+          selection.affected,
+          selection.unit,
+        );
     if (!accepted) return;
     setBusy(true);
     try {
-      const result = await libraryApi.undoToOperation(selection.target.id);
-      if (handleResult(result, "已开始撤销", "现在不能撤销")) {
+      const result = redo
+        ? await libraryApi.redoToOperation(selection.target.id)
+        : await libraryApi.undoToOperation(selection.target.id);
+      if (
+        handleResult(
+          result,
+          redo ? "已开始重做" : "已开始撤销",
+          redo ? "现在不能重做" : "现在不能撤销",
+        )
+      ) {
         setSelectedId(null);
         onChanged();
       }
     } catch (cause) {
-      notify("撤销失败", "error", errorMessage(cause));
+      notify(redo ? "重做失败" : "撤销失败", "error", errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -153,7 +226,7 @@ export function OperationHistoryPanel({
       open={open}
       anchorRef={anchorRef}
       placement="bottom-end"
-      minWidth={360}
+      minWidth={380}
       className="operation-history-popover"
       onClose={onClose}
       closeOnScroll={false}
@@ -169,11 +242,13 @@ export function OperationHistoryPanel({
           </IconButton>
         </header>
 
-        {undoTask ? (
+        {historyTask ? (
           <div className="operation-history-progress">
             <Spinner size={13} />
             <span>
-              {undoTask.message || "正在撤销"} {undoTask.completed}/{undoTask.total}
+              {historyTask.message ||
+                (historyTask.kind === "redo" ? "正在重做" : "正在撤销")}{" "}
+              {historyTask.completed}/{historyTask.total}
             </span>
           </div>
         ) : null}
@@ -184,28 +259,51 @@ export function OperationHistoryPanel({
               <Spinner size={14} /> 正在读取…
             </div>
           ) : page && page.entries.length > 0 ? (
-            page.entries.map((entry) => (
-              <button
-                key={entry.id}
-                type="button"
-                className={`operation-history-row${selectedId === entry.id ? " is-selected" : ""}`}
-                aria-pressed={selectedId === entry.id}
-                onClick={() =>
-                  setSelectedId((current) => (current === entry.id ? null : entry.id))
-                }
-              >
-                <span className="operation-history-label">{entry.label}</span>
-                <span className="operation-history-meta">
-                  {formatTime(entry.createdAt)}
-                  {entry.affected > 0 ? ` · ${entry.affected.toLocaleString()} 张` : ""}
-                </span>
-                {entry.status === "undoFailed" ? (
-                  <span className="operation-history-status">
-                    撤销失败{entry.error ? `：${entry.error}` : ""}
-                  </span>
-                ) : null}
-              </button>
-            ))
+            <>
+              {page.entries.map((entry, index) => (
+                <Fragment key={entry.id}>
+                  {index === boundary ? (
+                    <div className="operation-history-current" role="separator">
+                      <span>当前状态</span>
+                    </div>
+                  ) : null}
+                  <button
+                    type="button"
+                    className={`operation-history-row${
+                      selectedId === entry.id ? " is-selected" : ""
+                    }${isRedoStatus(entry) ? " is-undone" : ""}`}
+                    aria-pressed={selectedId === entry.id}
+                    onClick={() =>
+                      setSelectedId((current) =>
+                        current === entry.id ? null : entry.id,
+                      )
+                    }
+                  >
+                    <span className="operation-history-label">{entry.label}</span>
+                    <span className="operation-history-meta">
+                      {formatTime(entry.createdAt)}
+                      {entry.affected > 0
+                        ? ` · ${entry.affected.toLocaleString()} ${affectedUnit(entry.kind)}`
+                        : ""}
+                    </span>
+                    {entry.status === "undoFailed" ? (
+                      <span className="operation-history-status">
+                        撤销失败{entry.error ? `：${entry.error}` : ""}
+                      </span>
+                    ) : isRedoStatus(entry) && entry.error ? (
+                      <span className="operation-history-status">
+                        上次重做失败{entry.error ? `：${entry.error}` : ""}
+                      </span>
+                    ) : null}
+                  </button>
+                </Fragment>
+              ))}
+              {boundary === page.entries.length ? (
+                <div className="operation-history-current" role="separator">
+                  <span>当前状态</span>
+                </div>
+              ) : null}
+            </>
           ) : (
             <div className="operation-history-empty">
               {page?.blockedReason ?? "还没有操作记录"}
@@ -218,17 +316,19 @@ export function OperationHistoryPanel({
             <Button
               size="sm"
               variant="secondary"
-              disabled={undoDisabled}
-              loading={busy && undoTask == null}
-              title={undoReason ?? undefined}
-              onClick={() => void undo()}
+              disabled={actionDisabled}
+              loading={busy && historyTask == null}
+              title={actionReason ?? undefined}
+              onClick={() => void runAction()}
             >
-              撤销这条及之后
+              {selection?.mode === "redo" ? "重做到这条" : "撤销到这条之前"}
             </Button>
             <span className="operation-history-hint">
               {selection
-                ? `共 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} 张图片`
-                : "选择一条记录后撤销"}
+                ? selection.mode === "redo"
+                  ? `将重做 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
+                  : `共 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
+                : "选择一条记录后撤销或重做"}
             </span>
           </div>
         ) : null}
@@ -244,7 +344,7 @@ export function OperationHistoryPanel({
             size="sm"
             variant="danger"
             icon={<Trash2 size={13} />}
-            disabled={busy || undoTask != null || !page || page.entries.length === 0}
+            disabled={busy || historyTask != null || !page || page.entries.length === 0}
             onClick={() => void clear()}
           >
             清空记录
