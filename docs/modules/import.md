@@ -95,7 +95,8 @@
 
 ### 操作记录与导入撤销
 
-- 导入开始前建一条 `pending` 操作记录（`HistoryKind::Import`）；记录 id 随 `ImportSource` / `WriterOptions` 进入写线程。冲突或线程启动失败时删掉空记录。
+- 导入开始前建一条 `pending` 操作记录（`HistoryKind::Import`）；记录 id 随 `ImportSource` / `WriterOptions` 进入写线程。冲突或线程启动失败时删掉空记录，已有的灰色撤销记录不受影响。
+- 只有确实写入内容的批次才清空灰色（可重做）记录：导入被 write lane 冲突拒绝、或整批都是重复跳过时，重做分支必须保留。
 - 每批事务里：新增行写 `origin_operation_id`；`affected` 累加新增与合并数量；新建文件夹/标签与合并快照按批追加 JSON chunk。不在内存里累积整次导入。
 - 任务结束（完成、取消或失败）调用 `history::finish_live`；有任一已提交内容就转为可撤销，否则删除空记录。取消后已完成部分仍可撤销。
 - 崩溃留下的 `pending` 导入记录在下次打开图库时按 `origin_operation_id` 或已有 chunk 判断转 `applied`，没有内容则删除。

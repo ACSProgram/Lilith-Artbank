@@ -1,12 +1,9 @@
-//! 图库操作记录与撤销。
+//! 图库操作记录、撤销与重做。
 //!
 //! 每条操作记录与产生它的写操作处在同一个 SQLite 事务里；批量操作只记一条。
-//! 撤销按记录 id 线性回退：撤销目标及其之后的所有记录，最新的先撤。
+//! 撤销按记录 id 线性回退：撤销目标及其之后仍为 `applied` 的记录，最新的先撤。
+//! 撤销成功的记录不删除，而是标为 `undone` 留在列表里；重做可以从当前状态回到其中一条。
 //! 永久删除与清空回收站只写 `purge_operation_id` 标记，记录过期或清空记录后才真正删行删文件。
-
-// 批次 1 只接入回收站与删除类操作；批次 2/3 要用的 live operation、其余记录类型与解码
-// 辅助先按计划保留，因此整个模块允许未使用项告警。
-#![allow(dead_code)]
 
 use std::{
     borrow::Cow,
@@ -248,24 +245,6 @@ impl OperationDraft {
 
     pub fn affected(&mut self, n: u64) {
         self.affected = n;
-    }
-
-    pub fn add_affected(&mut self, n: u64) {
-        self.affected = self.affected.saturating_add(n);
-    }
-
-    pub fn ids(&mut self, ids: &[i64]) {
-        if ids.is_empty() {
-            return;
-        }
-        let mut data = Vec::with_capacity(ids.len() * 8);
-        for id in ids {
-            data.extend_from_slice(&id.to_le_bytes());
-        }
-        self.chunks.push(Chunk {
-            format: ChunkFormat::Ids,
-            data,
-        });
     }
 
     pub fn triples(&mut self, rows: &[(i64, i64, i64)]) {
@@ -551,10 +530,12 @@ pub fn write<T>(
 }
 
 /// 长任务先建 `pending` 记录，再在每批写入时追加逆数据；任务结束后 `finish_live`。
+///
+/// 这里不结束重做分支：导入可能因为 write lane 冲突根本没启动，或者整批都是重复跳过。
+/// 只有真正写入内容的批次（`discard_redo_in_tx`）才算开启新时间线。
 pub fn begin_live(database: &LibraryDb, op: NewOperation<'_>) -> AppResult<i64> {
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        discard_redo_branch(&transaction)?;
         transaction.execute(
             "INSERT INTO operations(kind, label, created_at, status, task_id, affected, error)
              VALUES (?1, ?2, ?3, 'pending', ?4, 0, '')",
@@ -566,6 +547,7 @@ pub fn begin_live(database: &LibraryDb, op: NewOperation<'_>) -> AppResult<i64> 
     })
 }
 
+/// 删除灰色记录，开启新时间线；由 `write` 与写入内容的导入批次调用。
 fn discard_redo_branch(transaction: &Transaction<'_>) -> AppResult<()> {
     transaction.execute(
         "DELETE FROM operations WHERE status IN ('undone', 'redoing')",
@@ -574,54 +556,12 @@ fn discard_redo_branch(transaction: &Transaction<'_>) -> AppResult<()> {
     Ok(())
 }
 
-pub fn append_live_ids(database: &LibraryDb, op_id: i64, ids: &[i64]) -> AppResult<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let mut data = Vec::with_capacity(ids.len() * 8);
-    for id in ids {
-        data.extend_from_slice(&id.to_le_bytes());
-    }
-    append_live_chunk(database, op_id, ChunkFormat::Ids, &data)
+/// 长任务在**确实写入内容**的那一批事务里调用，与 `write` 的新时间线语义一致。
+pub fn discard_redo_in_tx(tx: &Transaction<'_>) -> AppResult<()> {
+    discard_redo_branch(tx)
 }
 
-pub fn append_live_json<T: Serialize>(
-    database: &LibraryDb,
-    op_id: i64,
-    value: &T,
-) -> AppResult<()> {
-    append_live_chunk(
-        database,
-        op_id,
-        ChunkFormat::Json,
-        &serde_json::to_vec(value)?,
-    )
-}
-
-fn append_live_chunk(
-    database: &LibraryDb,
-    op_id: i64,
-    format: ChunkFormat,
-    data: &[u8],
-) -> AppResult<()> {
-    database.with_writer(|connection| {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        append_live_in_tx(&transaction, op_id, format, data)?;
-        transaction.commit()?;
-        Ok(())
-    })
-}
-
-pub fn add_live_affected(database: &LibraryDb, op_id: i64, n: u64) -> AppResult<()> {
-    database.with_writer(|connection| {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        add_live_affected_in_tx(&transaction, op_id, n)?;
-        transaction.commit()?;
-        Ok(())
-    })
-}
-
-/// 已持有写事务（导入/描述批次内部）时使用，避免再次加写锁造成死锁。
+/// 已持有写事务（导入批次、撤销/重做）时使用，避免再次加写锁造成死锁。
 pub fn append_live_in_tx(
     tx: &Transaction<'_>,
     op_id: i64,
@@ -691,7 +631,8 @@ pub struct HistoryPage {
     pub max_steps: u32,
     pub pending_purge_count: u64,
     pub pending_purge_bytes: u64,
-    pub can_undo: bool,
+    /// 此刻能否开始撤销或重做；不能时的原因在 `blocked_reason`。
+    pub can_run: bool,
     pub blocked_reason: Option<String>,
 }
 
@@ -705,16 +646,10 @@ pub struct EvictedOperation {
 pub struct RecoveryPlan {
     /// 崩溃前 `undoing` 的记录里最小的 id；有值时启动后要续做撤销。
     pub resume_undo: Option<i64>,
-    /// 崩溃前 `redoing` 的记录里最小的 id；有值时启动后要续做重做。
+    /// 崩溃前 `redoing` 的记录里最大的 id，也就是这次重做选中的目标；有值时启动后要续做重做。
     pub resume_redo: Option<i64>,
     /// 是否存在没有记录引用的待释放批次。
     pub release_needed: bool,
-}
-
-impl RecoveryPlan {
-    pub fn is_empty(&self) -> bool {
-        self.resume_undo.is_none() && self.resume_redo.is_none() && !self.release_needed
-    }
 }
 
 pub fn list(database: &LibraryDb) -> AppResult<Vec<HistoryEntry>> {
@@ -912,15 +847,6 @@ pub fn cleanup_undo_dirs(database: &LibraryDb, root: &Path) -> AppResult<()> {
 
 pub fn undo_dir(root: &Path, operation_id: i64) -> PathBuf {
     LibraryPaths::new(root).undo.join(operation_id.to_string())
-}
-
-fn remove_undo_dir(root: &Path, operation_id: i64) {
-    let path = undo_dir(root, operation_id);
-    if path.exists()
-        && let Err(error) = std::fs::remove_dir_all(&path)
-    {
-        log::warn!("清理撤销暂存目录失败 {}：{error}", path.display());
-    }
 }
 
 fn clear_redo_chunks(transaction: &Transaction<'_>, operation_id: i64) -> AppResult<()> {
@@ -1720,7 +1646,8 @@ fn redo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
                 _ => {}
             }
         }
-        if moves.is_empty() {
+        // 只新建了目标文件夹、没有任何图片移动成功的记录也要能重做。
+        if moves.is_empty() && folders.is_empty() {
             return Err(AppError::message("这条记录缺少重做数据"));
         }
         folders::redo_create(&transaction, root, &folders)?;
@@ -2802,16 +2729,6 @@ fn load_chunks(connection: &Connection, operation_id: i64) -> AppResult<Vec<Chun
         .collect()
 }
 
-fn decode_ids(bytes: &[u8]) -> AppResult<Vec<i64>> {
-    if bytes.len() % 8 != 0 {
-        return Err(AppError::message("记录数据长度无效"));
-    }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|slot| i64::from_le_bytes(slot.try_into().expect("8 字节")))
-        .collect())
-}
-
 fn decode_triples(bytes: &[u8]) -> AppResult<Vec<(i64, i64, i64)>> {
     if bytes.len() % 24 != 0 {
         return Err(AppError::message("记录数据长度无效"));
@@ -3071,7 +2988,6 @@ mod tests {
                 NewOperation::new(HistoryKind::Trash, format!("记录 {index}")),
                 |_, draft| {
                     draft.affected(1);
-                    draft.ids(&[index + 1]);
                     Ok(())
                 },
             )
@@ -3260,20 +3176,30 @@ mod tests {
             NewOperation::new(HistoryKind::Import, "有内容导入"),
         )
         .unwrap();
-        add_live_affected(fixture.db(), pending_content, 1).unwrap();
-        append_live_json(
-            fixture.db(),
-            pending_content,
-            &ImportRecord::Merged {
-                items: vec![ImportMerged {
-                    image_id: 1,
-                    old_score: 0,
-                    old_modified_at: 1,
-                    old_tag_ids: Vec::new(),
-                }],
-            },
-        )
-        .unwrap();
+        // 模拟导入中途写入的批次：一个 chunk 加一条 affected。
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                add_live_affected_in_tx(&transaction, pending_content, 1)?;
+                append_live_in_tx(
+                    &transaction,
+                    pending_content,
+                    ChunkFormat::Json,
+                    &serde_json::to_vec(&ImportRecord::Merged {
+                        items: vec![ImportMerged {
+                            image_id: 1,
+                            old_score: 0,
+                            old_modified_at: 1,
+                            old_tag_ids: Vec::new(),
+                        }],
+                    })?,
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
         let undoing = begin_live(
             fixture.db(),
             NewOperation::new(HistoryKind::Trash, "中断的撤销"),
@@ -3412,6 +3338,37 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, OperationStatus::Applied);
         assert_eq!(entries[0].id, entry.id + 1);
+    }
+
+    /// 导入被 write lane 冲突拒绝时会先建一条 `pending` 记录再收掉；
+    /// 这条空记录不能顺手清掉灰色（可重做）记录。
+    #[test]
+    fn pending_import_without_content_keeps_redo_branch() {
+        let fixture = Fixture::new();
+        let image_id = fixture.insert_image("a");
+        metadata::set_trashed(fixture.db(), &[image_id], true).unwrap();
+        let entry = list(fixture.db()).unwrap().remove(0);
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entry.id,
+            task(),
+        )
+        .unwrap();
+
+        let pending = begin_live(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Import, "被拒绝的导入"),
+        )
+        .unwrap();
+        assert_eq!(list(fixture.db()).unwrap().len(), 1);
+        finish_live(fixture.db(), pending, "").unwrap();
+
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, entry.id);
+        assert_eq!(entries[0].status, OperationStatus::Undone);
     }
 
     #[test]
@@ -3909,5 +3866,129 @@ mod tests {
                 .iter()
                 .all(|entry| entry.status == OperationStatus::Undone)
         );
+
+        // 再导入一次并写入内容：灰色记录让位给新时间线，列表只剩这条新导入。
+        let third = begin_live(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Import, "第三次导入"),
+        )
+        .unwrap();
+        run_import(third, false, "重来", 1);
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, third);
+        assert_eq!(entries[0].affected, 2);
+    }
+
+    /// 文件夹五类记录串成一条时间线：创建 → 重命名 → 移动 → 同级排序 → 删除。
+    /// 撤销要按逆序回退到最初，重做要按正序回到最终状态。
+    #[test]
+    fn undoes_and_redoes_folder_records_in_linear_order() {
+        let fixture = Fixture::new();
+        let folder_id = |path: &str| -> Option<i64> {
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection
+                        .query_row("SELECT id FROM folders WHERE path = ?1", [path], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .optional()?)
+                })
+                .unwrap()
+        };
+        let root_id = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(
+                    connection.query_row("SELECT id FROM folders WHERE path = ''", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        let sort_of = |path: &str| -> i64 {
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT sort_index FROM folders WHERE path = ?1",
+                        [path],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let has = |path: &str| -> bool {
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT count(*) FROM folders WHERE path = ?1",
+                        [path],
+                        |row| row.get::<_, i64>(0),
+                    )? > 0)
+                })
+                .unwrap()
+        };
+
+        folders::create(fixture.db(), &fixture.root, "作品").unwrap();
+        let created = list(fixture.db()).unwrap().remove(0).id;
+        folders::create(fixture.db(), &fixture.root, "杂物").unwrap();
+        let work = folder_id("作品").unwrap();
+        let junk = folder_id("杂物").unwrap();
+
+        folders::rename(fixture.db(), &fixture.root, work, "成品").unwrap();
+        assert!(fixture.root.join("成品").is_dir());
+        folders::move_to(fixture.db(), &fixture.root, work, fixture.folder).unwrap();
+        assert!(fixture.root.join("人物").join("成品").is_dir());
+        folders::reorder(fixture.db(), &[junk], root_id, 0).unwrap();
+        assert_eq!(sort_of("杂物"), 0);
+        assert_eq!(sort_of("人物"), 1);
+        folders::delete(fixture.db(), &fixture.root, work).unwrap();
+        let deleted = list(fixture.db()).unwrap().remove(0).id;
+        assert!(!has("人物/成品"));
+        assert!(!fixture.root.join("人物").join("成品").exists());
+
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            created,
+            task(),
+        )
+        .unwrap();
+        assert!(
+            list(fixture.db())
+                .unwrap()
+                .iter()
+                .all(|entry| entry.status == OperationStatus::Undone)
+        );
+        assert!(has("人物"));
+        assert!(!has("作品") && !has("成品") && !has("人物/成品") && !has("杂物"));
+        assert!(!fixture.root.join("作品").exists());
+        assert!(!fixture.root.join("杂物").exists());
+        assert_eq!(sort_of("人物"), 0);
+
+        run_redo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            deleted,
+            task(),
+        )
+        .unwrap();
+        assert!(
+            list(fixture.db())
+                .unwrap()
+                .iter()
+                .all(|entry| entry.status == OperationStatus::Applied)
+        );
+        assert!(has("人物") && has("杂物"));
+        assert!(!has("作品") && !has("成品") && !has("人物/成品"));
+        assert_eq!(sort_of("杂物"), 0);
+        assert_eq!(sort_of("人物"), 1);
+        assert!(fixture.root.join("人物").is_dir());
+        assert!(!fixture.root.join("人物").join("成品").exists());
     }
 }

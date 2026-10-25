@@ -41,7 +41,7 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
     if previous != saved.ai {
         state.ai.apply_settings(&previous, &saved.ai);
     }
-    state.after_settings_changed();
+    state.after_history_write();
     Ok(saved)
 }
 
@@ -579,7 +579,7 @@ pub async fn save_image_edit(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
-    state.after_file_write();
+    state.after_history_write();
     Ok(result)
 }
 

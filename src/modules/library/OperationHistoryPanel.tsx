@@ -23,8 +23,9 @@ import { formatBytes } from "../../shared/format";
 import { libraryApi } from "./api";
 import type { HistoryEntry, HistoryPage } from "./types";
 
-function affectedUnit(kind: string): string {
-  return kind.startsWith("folder") ? "项" : "张";
+// 文件夹记录按“项”计，其余（导入、移动、集合）按图片计。
+function affectedUnit(kinds: string[]): string {
+  return kinds.some((kind) => kind.startsWith("folder")) ? "项" : "张";
 }
 
 function isRedoStatus(entry: HistoryEntry): boolean {
@@ -95,17 +96,14 @@ export function OperationHistoryPanel({
   const selection = useMemo(() => {
     if (!page || selectedIndex < 0) return null;
     const target = page.entries[selectedIndex];
-    if (
-      isRedoStatus(target) &&
-      selectedIndex < boundary
-    ) {
+    if (isRedoStatus(target)) {
       const chain = page.entries.slice(selectedIndex, boundary);
       return {
         mode: "redo" as const,
         target,
         count: chain.length,
         affected: chain.reduce((sum, entry) => sum + entry.affected, 0),
-        unit: chain.some((entry) => entry.kind.startsWith("folder")) ? "项" : "张",
+        unit: affectedUnit(chain.map((entry) => entry.kind)),
         failed: null,
       };
     }
@@ -118,7 +116,7 @@ export function OperationHistoryPanel({
         target,
         count: active.length,
         affected: active.reduce((sum, entry) => sum + entry.affected, 0),
-        unit: active.some((entry) => entry.kind.startsWith("folder")) ? "项" : "张",
+        unit: affectedUnit(active.map((entry) => entry.kind)),
         failed:
           chain.find(
             (entry) =>
@@ -130,7 +128,7 @@ export function OperationHistoryPanel({
   }, [page, selectedIndex, boundary]);
 
   const actionDisabled =
-    !page?.canUndo ||
+    !page?.canRun ||
     busy ||
     historyTask != null ||
     !selection ||
@@ -226,7 +224,6 @@ export function OperationHistoryPanel({
       open={open}
       anchorRef={anchorRef}
       placement="bottom-end"
-      minWidth={380}
       className="operation-history-popover"
       onClose={onClose}
       closeOnScroll={false}
@@ -283,7 +280,7 @@ export function OperationHistoryPanel({
                     <span className="operation-history-meta">
                       {formatTime(entry.createdAt)}
                       {entry.affected > 0
-                        ? ` · ${entry.affected.toLocaleString()} ${affectedUnit(entry.kind)}`
+                        ? ` · ${entry.affected.toLocaleString()} ${affectedUnit([entry.kind])}`
                         : ""}
                     </span>
                     {entry.status === "undoFailed" ? (
@@ -292,7 +289,7 @@ export function OperationHistoryPanel({
                       </span>
                     ) : isRedoStatus(entry) && entry.error ? (
                       <span className="operation-history-status">
-                        上次重做失败{entry.error ? `：${entry.error}` : ""}
+                        上次重做失败：{entry.error}
                       </span>
                     ) : null}
                   </button>

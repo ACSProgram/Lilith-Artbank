@@ -652,6 +652,12 @@ fn flush(
         }
 
         if let Some(operation_id) = options.operation_id {
+            let affected = (stats.inserted.len() + stats.merged) as u64;
+            // 只有真正写入内容才算开启新时间线：导入被冲突拒绝、或整批都是重复跳过时，
+            // 灰色记录（可重做的撤销）必须保留。
+            if affected > 0 || !created_folders.is_empty() || !created_tags.is_empty() {
+                history::discard_redo_in_tx(&transaction)?;
+            }
             let append = |record: ImportRecord| -> crate::app::error::AppResult<()> {
                 history::append_live_in_tx(
                     &transaction,
@@ -679,7 +685,6 @@ fn flush(
             if !merged.is_empty() {
                 append(ImportRecord::Merged { items: merged })?;
             }
-            let affected = (stats.inserted.len() + stats.merged) as u64;
             if affected > 0 {
                 history::add_live_affected_in_tx(&transaction, operation_id, affected)?;
             }

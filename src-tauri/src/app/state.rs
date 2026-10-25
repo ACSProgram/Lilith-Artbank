@@ -531,7 +531,7 @@ impl AppState {
         let (database, _) = self.query_source()?;
         let entries = history::list(&database)?;
         let (pending_purge_count, pending_purge_bytes) = history::pending_summary(&database)?;
-        // 撤销要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
+        // 撤销与重做都要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
         let blocked_reason = match self.tasks.active().first() {
             Some(task) => Some(format!("「{}」正在进行，完成后才能撤销或重做", task.label)),
             None if entries.is_empty() => Some("还没有操作记录".to_owned()),
@@ -542,7 +542,7 @@ impl AppState {
             max_steps: self.settings.snapshot().history.max_steps,
             pending_purge_count,
             pending_purge_bytes,
-            can_undo: blocked_reason.is_none(),
+            can_run: blocked_reason.is_none(),
             blocked_reason,
         })
     }
@@ -681,28 +681,17 @@ impl AppState {
             })
     }
 
-    /// 设置里的最大步数变化后立即裁剪；失败只记日志，不影响设置保存。
-    pub fn after_settings_changed(&self) {
-        self.after_history_write();
-    }
-
-    /// 后台任务（导入）收尾后按最大步数裁剪；失败只记日志。
-    pub(crate) fn after_background_write(&self) {
-        self.after_history_write();
-    }
-
-    /// 编辑保存成功后按最大步数裁剪；命令里没有经过 `mutate`。
-    pub(crate) fn after_file_write(&self) {
-        self.after_history_write();
-    }
-
     /// 图库可用后的收尾：先续做中断的撤销（撤销不可排队，要先占 write lane），再按上限裁剪。
     fn after_library_open(&self) {
         self.schedule_recovery();
         self.after_history_write();
     }
 
-    fn after_history_write(&self) {
+    /// 历史或保留步数变化后按上限裁剪、安排释放；失败只记日志。
+    ///
+    /// 触发点：经 `mutate` 的写命令、编辑保存（命令里没有经过 `mutate`）、
+    /// 导入收尾线程、保存设置（步数可能调小）。
+    pub(crate) fn after_history_write(&self) {
         let Some((database, _, root)) = self.library_handles() else {
             return;
         };

@@ -171,7 +171,7 @@ pub fn start(
                 }
             }
             if let Some(state) = history_app.try_state::<AppState>() {
-                state.after_background_write();
+                state.after_history_write();
             }
             let _ = app.emit("import-progress", job.progress());
             let _ = app.emit("import-finished", job.snapshot());

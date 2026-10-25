@@ -1040,7 +1040,7 @@ export function mockOperationHistory(): HistoryPage {
     maxSteps: 100,
     pendingPurgeCount: 0,
     pendingPurgeBytes: 0,
-    canUndo: entries.length > 0,
+    canRun: entries.length > 0,
     blockedReason: entries.length > 0 ? null : "还没有操作记录",
   };
 }

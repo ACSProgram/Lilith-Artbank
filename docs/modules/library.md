@@ -245,15 +245,15 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 历史保存在当前图库的 SQLite（`operations` / `operation_chunks` / `undo_runs`），换库后各自独立；最大步数来自设置 `history.maxSteps`。
 
 - 已接入：移入回收站、恢复、永久删除、清空回收站（批次 1）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序（批次 2），以及这些记录的撤销与重做。元数据、标签、集合与 AI 描述在批次 3 接入；`HistoryKind` 已覆盖全部类型。
-- 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，不留下空记录。`write` / `begin_live` 在同一个事务里删除 `undone` / `redoing` 记录：新操作开启新时间线，灰色记录与其暂存文件不再可重做。
-- 长任务用 `begin_live` + 每批 `append_live_*` / `add_live_affected`，结束时 `finish_live`；目前只有导入使用。崩溃留下的 `pending` 导入记录在下次打开时按 `origin_operation_id` 或已有 chunk 转为 `applied`，没有内容则删除；其他 pending 记录按 `affected` / chunk 判断。
+- 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，不留下空记录。`write` 在同一个事务里删除 `undone` / `redoing` 记录：新操作开启新时间线，灰色记录与其暂存文件不再可重做。
+- 长任务用 `begin_live` 建 `pending` 记录、每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据、结束时 `finish_live`；目前只有导入使用。`begin_live` 不结束重做分支：导入可能因 write lane 冲突根本没启动，或整批都是重复跳过；只有确实写入内容的批次才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 导入记录在下次打开时按 `origin_operation_id` 或已有 chunk 转为 `applied`，没有内容则删除；其他 pending 记录按 `affected` / chunk 判断。
 - 撤销是线性回退：选中第 N 条 = 依次撤回当前仍为 `applied` 的记录，直到 N。成功的记录不再删除，而是标为 `undone`（列表里变灰）；`undone` 记录保持原 chunks，并通过 `redo` chunks 保存撤销前的状态。多条记录的撤销只在记录之间检查取消。
 - 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
 - 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重试成功或清空记录。所有逆操作与重做操作都可重复执行。
 - 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
 - `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；可重复执行，不可取消。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件。
 - 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canUndo, blockedReason }`；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有任务占用 write lane 且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
 - 待释放行对查询不可见：回收站视图与“全库搜索”显式加 `images.purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
 - 界面入口在浏览工具栏“记录”按钮：灰色 `undone` 记录可选中重做，“当前状态”分隔线标出撤销位置；新操作后灰色记录消失。见 [浏览与检索](browse-and-query.md#操作记录)。
 
@@ -299,7 +299,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - P4 查询：6 级排序跨页无重复无遗漏（重复值 + 混合方向 + 两个文件夹）、文件夹排序走 id 游标、锚点包含目标行、排序级数/重复指标/游标长度校验；文件夹同级重排、跨父级拒绝；
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
 - S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复、永久删除与清空回收站的延迟标记与释放；
-- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读；批次 2 覆盖移动撤销（文件与行、部分恢复后续做）、编辑撤销（文件、行、缩略图、`feature_blobs`、暂存目录）、文件夹创建/重命名/移动/删除/排序撤销，以及导入新增/合并撤销（新建文件夹与标签清理、合并快照恢复）；重做覆盖回收站/恢复、永久删除标记、移动、编辑、文件夹全套与导入新增/合并，另测“重做到较旧记录时保留更新记录为灰”、新操作清空重做分支、`redoing` 启动续做。
+- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读；批次 2 覆盖移动撤销（文件与行、部分恢复后续做）、编辑撤销（文件、行、缩略图、`feature_blobs`、暂存目录）、文件夹创建/重命名/移动/删除/排序撤销，以及导入新增/合并撤销（新建文件夹与标签清理、合并快照恢复）；重做覆盖回收站/恢复、永久删除标记、移动、编辑、文件夹创建/重命名/移动/排序/删除链条与导入新增/合并，另测“重做到较旧记录时保留更新记录为灰”、新操作清空重做分支、写入内容的导入清空重做分支而空 `pending` 导入保留、`redoing` 启动续做。
 - S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
 - S4 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
 - S4 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。

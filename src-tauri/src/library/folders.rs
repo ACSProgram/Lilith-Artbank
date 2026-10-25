@@ -20,7 +20,6 @@ use crate::{
     },
 };
 
-/// 撤销量不在用户取消粒度内；所有逆操作都通过 `_inner` 或专用恢复函数完成，不再写历史。
 fn folder_id(connection: &Connection, path: &str) -> AppResult<Option<i64>> {
     connection
         .query_row(

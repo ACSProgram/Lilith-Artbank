@@ -50,10 +50,26 @@
 - 撤销不再删除记录：成功记录标为 `undone`、写入 `undone_at`，列表里变灰；“当前状态”分隔线标出当前撤销位置。
 - 撤销时把撤销前状态写成 `format='redo'` chunks，原始逆数据不动；编辑的新原图与导入的原图改为移入 `.artbank/undo/<op>/`，重做时移回。
 - 新增 `TaskKind::Redo`、`AppState::redo_to`、`redo_to_operation` 与 `run_redo`。重做目标是“重做到这里”，处理目标及下方连续的 `undone` 记录；开始前整批标为 `redoing`，崩溃后按最大 `redoing` id 续做，不会越过用户选择的目标。
-- `history::write` / `begin_live` 在同一事务里删除 `undone` / `redoing` 记录；新的图库操作清空灰色分支，暂存目录由 `cleanup_undo_dirs` 清理。
+- `history::write` 在同一事务里删除 `undone` / `redoing` 记录；新的图库操作清空灰色分支，暂存目录由 `cleanup_undo_dirs` 清理。导入在确实写入内容的批次里调用 `discard_redo_in_tx`（详见下方整理记录）。
 - 前端历史面板：灰色记录、当前状态分隔线、动态“撤销到这条之前 / 重做到这条”、重做失败摘要与重试；查看器在撤销/重做后都关闭。
 - 自动检查：`cargo fmt --check`、`cargo check`、`cargo test --lib`（176 通过、4 ignored）通过；前端检查见本轮最终结果。
 - 未做：真实窗口手工验收；批次 3 仍需接入元数据、标签、集合、AI 描述与收尾。
+
+## 批次 2 整理与修正（2026-10-25）
+
+代码整理（不改行为契约）：
+
+- `library/history.rs`：删掉为后续批次预留但无人调用的死代码（`OperationDraft::add_affected` / `ids`、`append_live_ids` / `append_live_json` / `add_live_affected`、`RecoveryPlan::is_empty`、`remove_undo_dir`、`decode_ids`），去掉模块级 `#![allow(dead_code)]`；长任务统一走 `append_live_in_tx` / `add_live_affected_in_tx`。`RecoveryPlan.resume_redo` 的注释原来写成“最小 id”，实际取最大（用户选中的目标）。
+- `app/state.rs`：`after_background_write` / `after_file_write` / `after_settings_changed` 三个同义别名合并成 `pub(crate) after_history_write`，注释列明四个触发点。
+- `HistoryPage.canUndo` 改名 `canRun`：这个门禁同时管撤销与重做，旧名会让人以为重做另有条件。
+- `library/folders.rs` 删掉错位在 `folder_id` 上的撤销说明；`library/metadata.rs` 的 `crate::library::history::FolderRef` 改用已导入的 `history`；`OperationHistoryPanel` 去掉冗余条件与重复三元、宽度只由 CSS 决定、单位判断合并成一个函数。
+
+修正：
+
+- **导入被 write lane 冲突拒绝时会清掉灰色记录**：`begin_live` 原来在同一个事务里删除 `undone` / `redoing`，而导入是先建记录再 `tasks.launch`——冲突被拒绝时什么都没写，用户可重做的记录却已经没了。现在 `begin_live` 只建 `pending` 记录，由确实写入内容（新增/合并/新建文件夹或标签）的导入批次调用新的 `discard_redo_in_tx`。回归测试 `pending_import_without_content_keeps_redo_branch`。
+- `redo_move` 原来要求 `moves` 非空：只新建了目标文件夹、没有任何图片移动成功的移动记录无法重做。现在允许只有文件夹行的记录。
+- 文件夹撤销/重做（`undo_create` / `undo_path_change` / `undo_delete` / `undo_reorder` 与对应的 `redo_*`）此前没有任何测试，文档却写成已覆盖。新增 `undoes_and_redoes_folder_records_in_linear_order`，串起创建 → 重命名 → 移动 → 同级排序 → 删除的整条撤销与重做。
+- 自动检查：`npm run typecheck`、`npm run build`、`cargo fmt --check`、`cargo check`、`cargo test --lib`、`npm run test:web`、`git diff --check`（结果见提交信息）。
 
 ## 批次 1 收尾（2026-10-25）
 

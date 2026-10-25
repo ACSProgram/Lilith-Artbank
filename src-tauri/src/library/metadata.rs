@@ -550,7 +550,7 @@ pub fn move_images(
                 draft.json(
                     &created_folders
                         .into_iter()
-                        .map(|(id, path)| crate::library::history::FolderRef { id, path })
+                        .map(|(id, path)| history::FolderRef { id, path })
                         .collect::<Vec<_>>(),
                 )?;
             }

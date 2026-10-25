@@ -229,7 +229,8 @@ export interface HistoryPage {
   maxSteps: number;
   pendingPurgeCount: number;
   pendingPurgeBytes: number;
-  canUndo: boolean;
+  /** 此刻能否开始撤销或重做。 */
+  canRun: boolean;
   blockedReason: string | null;
 }
 
