@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,6 +25,7 @@ use crate::{
             TaskKind, TaskLane, TaskPhase, TaskSnapshot, TaskStartResult, TaskSummary,
         },
     },
+    imageops::optimize::OptimizeOptions,
     import::{
         ImportRequest, ImportSource,
         job::{ImportJob, ImportSnapshot},
@@ -38,6 +40,7 @@ use crate::{
         history::{self, HistoryKind, HistoryPage, NewOperation, RecoveryPlan},
         manifest::{LibraryInspection, inspect},
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
+        optimize_estimate::{self, OptimizeEstimate},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
         thumbs::{self, ThumbPack},
@@ -54,6 +57,7 @@ pub struct AppState {
     import_job: Mutex<Option<Arc<ImportJob>>>,
     managed: AtomicBool,
     recovery: Mutex<RecoveryPlan>,
+    optimize_estimates: Arc<Mutex<VecDeque<(String, OptimizeEstimate)>>>,
 }
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
@@ -70,6 +74,7 @@ impl AppState {
             import_job: Mutex::new(None),
             managed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryPlan::default()),
+            optimize_estimates: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -220,6 +225,7 @@ impl AppState {
         );
         *self.library.lock() = Some(session);
         *self.recovery.lock() = RecoveryPlan::default();
+        self.optimize_estimates.lock().clear();
         query::clear_page_cache();
         Ok(info)
     }
@@ -242,6 +248,7 @@ impl AppState {
         );
         *self.library.lock() = Some(session);
         *self.recovery.lock() = plan;
+        self.optimize_estimates.lock().clear();
         query::clear_page_cache();
         if self.managed.load(Ordering::SeqCst) {
             self.after_library_open();
@@ -280,6 +287,7 @@ impl AppState {
         self.ai.library_closed();
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
+        self.optimize_estimates.lock().clear();
         query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())
@@ -1001,6 +1009,7 @@ impl AppState {
                 },
                 request.conflict,
             ),
+            BatchTaskKind::OptimizeEstimate => self.start_optimize_estimate(app, request),
         }
     }
 
@@ -1066,6 +1075,75 @@ impl AppState {
             })
     }
 
+    /// 空间优化估算：只读扫描与抽样编码，结果按任务 id 缓存在内存里。
+    fn start_optimize_estimate(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        let options = request.optimize.clone().unwrap_or_default();
+        options.validate()?;
+        let sample_size = request.estimate_sample_size.unwrap_or(200);
+        if !optimize_estimate::SAMPLE_CHOICES.contains(&sample_size) {
+            return Err(AppError::message("估算抽样必须是 100 / 200 / 500 张"));
+        }
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let ids = request.scope.resolve(&database)?;
+        if ids.is_empty() {
+            return Err(AppError::message("当前范围没有图片"));
+        }
+        let fingerprint = optimize_fingerprint(&request.scope, &options);
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::OptimizeEstimate,
+            request.scope.label(),
+        );
+        let task_id = handle.id().to_owned();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let estimates = self.optimize_estimates.clone();
+        self.tasks
+            .launch(app, handle, request.conflict, move |guard| {
+                let _ =
+                    tasks.spawn_worker("optimize-estimate".to_owned(), worker.clone(), move || {
+                        let _guard: LaneGuard = guard;
+                        worker.set_phase(TaskPhase::Running);
+                        let result = optimize_estimate::estimate(
+                            &database,
+                            &root,
+                            &task_id,
+                            &ids,
+                            &options,
+                            sample_size,
+                            &fingerprint,
+                            &*worker,
+                        );
+                        match result {
+                            Ok(Some(estimate)) => {
+                                store_estimate(&estimates, estimate);
+                                worker.set_message("估算完成");
+                                worker.finish_from(&Ok(()));
+                            }
+                            Ok(None) => worker.finish_from(&Ok(())),
+                            Err(error) => {
+                                worker.set_message(error.to_string());
+                                worker.finish(TaskPhase::Failed);
+                            }
+                        }
+                    });
+            })
+    }
+
+    pub fn optimize_estimate(&self, task_id: &str) -> Option<OptimizeEstimate> {
+        self.optimize_estimates
+            .lock()
+            .iter()
+            .find(|(id, _)| id == task_id)
+            .map(|(_, estimate)| estimate.clone())
+    }
+
     pub fn tasks_snapshot(&self) -> Vec<TaskSnapshot> {
         self.tasks.list()
     }
@@ -1073,6 +1151,21 @@ impl AppState {
     pub fn similarity_groups_result(&self, task_id: &str) -> Option<SimilarityGroupsResult> {
         self.ai.groups_result(task_id)
     }
+}
+
+fn store_estimate(store: &Mutex<VecDeque<(String, OptimizeEstimate)>>, estimate: OptimizeEstimate) {
+    const MAX_ESTIMATES: usize = 5;
+    let mut entries = store.lock();
+    entries.push_front((estimate.task_id.clone(), estimate));
+    entries.truncate(MAX_ESTIMATES);
+}
+
+/// 估算与执行共用同一份参数指纹；批次 2 的执行命令据此校验估算凭证。
+fn optimize_fingerprint(scope: &crate::app::tasks::TaskScope, options: &OptimizeOptions) -> String {
+    let options = serde_json::to_string(options).unwrap_or_default();
+    blake3::hash(format!("{scope:?}|{options}").as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 fn conflict_error(active: &[TaskSummary]) -> AppError {

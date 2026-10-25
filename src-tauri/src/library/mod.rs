@@ -8,6 +8,7 @@ pub mod history;
 pub mod import;
 pub mod manifest;
 pub mod metadata;
+pub mod optimize_estimate;
 pub mod paths;
 pub mod query;
 pub mod schema;
@@ -32,6 +33,8 @@ pub(crate) fn placeholders(count: usize) -> String {
 pub trait BatchReporter: Send + Sync {
     fn report(&self, completed: usize, total: usize);
     fn cancelled(&self) -> bool;
+    /// 可选的进度文案；不关心文案的调用方用默认实现。
+    fn message(&self, _message: &str) {}
 }
 
 #[cfg(test)]

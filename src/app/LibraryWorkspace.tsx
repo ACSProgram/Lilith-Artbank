@@ -13,6 +13,7 @@ import { browserPreview } from "./api";
 import { useSimilarityBrowse } from "./useSimilarityBrowse";
 import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { BatchTaskDialog } from "./BatchTaskDialog";
+import { OptimizeDialog } from "./OptimizeDialog";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { useTaskCenter } from "./taskContext";
 import { useNotices } from "./noticeContext";
@@ -43,6 +44,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
+  const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
   const browse = useLibraryBrowse(settings?.ui.sort);
   const importFolder = useMemo(() => {
     const selected = browse.browse.filters.folderIds;
@@ -327,6 +329,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 setSimilarityGroupsOpen(true);
               }}
               onOpenBatchTasks={setBatchContext}
+              onOpenOptimize={setOptimizeContext}
               onGenerateDescription={generateDescription}
               semanticBlockedReason={semanticBlockedReason}
             />
@@ -395,6 +398,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             context={batchContext}
             status={aiStatus}
             onRefreshStatus={refreshAi}
+          />
+          <OptimizeDialog
+            open={optimizeContext !== null}
+            onClose={() => setOptimizeContext(null)}
+            context={optimizeContext}
           />
           <ImportDialog
             open={importOpen}

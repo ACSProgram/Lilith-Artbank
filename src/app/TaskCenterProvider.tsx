@@ -47,8 +47,11 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
         if (disposed) return;
         merge(event.payload);
         setLastFinished(event.payload);
-        // 相似分组不改图库数据，不需要刷新浏览页面。
-        if (event.payload.kind !== "similarityGroups") {
+        // 相似分组与空间优化估算不改图库数据，不需要刷新浏览页面。
+        if (
+          event.payload.kind !== "similarityGroups" &&
+          event.payload.kind !== "optimizeEstimate"
+        ) {
           setDataVersion((value) => value + 1);
         }
       });

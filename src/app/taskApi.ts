@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { SimilarityGroupsResult } from "../modules/ai/types";
-import type { BatchTaskRequest, TaskSnapshot, TaskStartResult } from "./taskTypes";
+import type {
+  BatchTaskRequest,
+  OptimizeEstimate,
+  TaskSnapshot,
+  TaskStartResult,
+} from "./taskTypes";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -23,5 +28,10 @@ export const taskApi = {
   async similarityGroupsResult(taskId: string): Promise<SimilarityGroupsResult | null> {
     if (!isTauri()) return null;
     return invoke<SimilarityGroupsResult | null>("get_similarity_groups_result", { taskId });
+  },
+
+  async optimizeEstimate(taskId: string): Promise<OptimizeEstimate | null> {
+    if (!isTauri()) return null;
+    return invoke<OptimizeEstimate | null>("get_optimize_estimate", { taskId });
   },
 };

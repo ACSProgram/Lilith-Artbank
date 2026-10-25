@@ -5482,6 +5482,465 @@ body.is-drag-sorting * {
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------------------ */
+/* 图片空间优化估算                                                   */
+/* ------------------------------------------------------------------ */
+
+.optimize-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.optimize-tiers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.optimize-choice-row {
+  display: flex;
+  gap: 6px;
+}
+
+.optimize-choice {
+  flex: 1;
+  min-height: 32px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.optimize-choice.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 三个重算开关做成一行胶囊：比三条独立开关省一半高度。 */
+.optimize-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.optimize-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.optimize-check input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.optimize-check:has(input:checked) {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.optimize-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid var(--warning-border);
+  border-radius: 7px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.optimize-loading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+
+.optimize-result-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-result-head strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* 左：处理/跳过占比；右：预计节省与耗时。 */
+.optimize-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.82fr);
+  gap: 10px;
+  align-items: stretch;
+}
+
+.optimize-share {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.optimize-donut {
+  width: 116px;
+  height: 116px;
+  flex: none;
+}
+
+.optimize-donut-track,
+.optimize-donut-arc {
+  fill: none;
+}
+
+.optimize-donut-track {
+  stroke: var(--border-strong);
+}
+
+.optimize-donut-arc {
+  stroke: var(--accent);
+}
+
+.optimize-donut-value {
+  fill: var(--text);
+  font-size: 21px;
+  font-weight: 650;
+}
+
+.optimize-donut-label {
+  fill: var(--text-faint);
+  font-size: 10px;
+}
+
+.optimize-legend {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto auto;
+  gap: 5px 8px;
+  align-items: center;
+  font-size: 10.5px;
+}
+
+.optimize-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.optimize-legend i.is-process {
+  background: var(--accent);
+}
+
+.optimize-legend i.is-skip {
+  background: var(--border-strong);
+}
+
+.optimize-legend i.is-sub {
+  width: 5px;
+  height: 5px;
+  justify-self: center;
+  background: var(--border-strong);
+}
+
+.optimize-legend span {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optimize-legend span.is-sub {
+  color: var(--text-faint);
+}
+
+.optimize-legend strong {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.optimize-legend em {
+  color: var(--text-faint);
+  font-style: normal;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.optimize-outcome {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-soft);
+}
+
+.optimize-outcome-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.optimize-outcome-main span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-outcome-main strong {
+  color: var(--accent);
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.optimize-outcome-main em {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-style: normal;
+}
+
+.optimize-outcome-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--accent-border);
+}
+
+.optimize-outcome-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+}
+
+.optimize-outcome-row span {
+  color: var(--text-muted);
+}
+
+.optimize-outcome-row strong {
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optimize-curve {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 左：曲线；右：里程碑表，耗时写在曲线旁边。 */
+.optimize-curve-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 176px;
+  gap: 10px;
+  align-items: start;
+}
+
+.optimize-curve-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.optimize-chart-grid {
+  stroke: var(--border);
+}
+
+.optimize-chart-area {
+  fill: var(--accent-soft);
+}
+
+.optimize-chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.optimize-chart-dot {
+  fill: var(--accent);
+  stroke: var(--panel);
+}
+
+.optimize-chart-axis {
+  fill: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.optimize-chart-mark {
+  fill: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+.optimize-curve-side {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  font-size: 10.5px;
+}
+
+.optimize-curve-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.optimize-curve-row.is-head {
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+}
+
+.optimize-curve-row span {
+  color: var(--text-muted);
+}
+
+.optimize-curve-row strong {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+}
+
+.optimize-curve-row em {
+  color: var(--text-faint);
+  font-style: normal;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.optimize-quality {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.optimize-quality-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.optimize-quality-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 10.5px;
+}
+
+.optimize-quality-chip em {
+  color: var(--text-faint);
+  font-style: normal;
+}
+
+.optimize-folders {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-folders summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.optimize-folder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding-top: 6px;
+}
+
+.optimize-folder-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 3px 4px;
+  border-radius: 4px;
+}
+
+.optimize-folder-row:nth-child(odd) {
+  background: var(--panel);
+}
+
+.optimize-folder-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optimize-folder-row em {
+  color: var(--text-faint);
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.optimize-folder-row strong {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.optimize-folders .optimize-folder-row:has(> span:only-child) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .similarity-scan-progress {
   display: flex;
   flex-direction: column;

@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Crop,
   FolderOpen,
+  HardDrive,
   History,
   ImageOff,
   LayoutGrid,
@@ -118,6 +119,7 @@ interface LibraryViewProps {
   onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
   onOpenSimilarityGroups?: () => void;
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
+  onOpenOptimize?: (context: BatchTaskContextInfo) => void;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
   /** 语义搜索不可用的原因；为空表示可用。 */
   semanticBlockedReason?: string | null;
@@ -173,6 +175,7 @@ export function LibraryView({
   onFindSimilar,
   onOpenSimilarityGroups,
   onOpenBatchTasks,
+  onOpenOptimize,
   onGenerateDescription,
   semanticBlockedReason = null,
 }: LibraryViewProps) {
@@ -692,10 +695,8 @@ export function LibraryView({
     clearSelection();
   }, [clearSelection]);
 
-  /** 打开批量任务前先算好各范围的数量；id 集合仍由 Rust 侧解析。 */
-  const openBatchTasks = useCallback(async () => {
-    setTaskMenuOpen(false);
-    if (!onOpenBatchTasks) return;
+  /** 打开任务前先算好各范围的数量；id 集合仍由 Rust 侧解析。 */
+  const buildTaskContext = useCallback(async (): Promise<BatchTaskContextInfo | null> => {
     const folderId =
       browse.filters.folderIds.length === 1 ? browse.filters.folderIds[0] : null;
     const folder = folderId != null ? folders.find((item) => item.id === folderId) : undefined;
@@ -711,7 +712,7 @@ export function LibraryView({
         viewTotal = null;
       }
     }
-    onOpenBatchTasks({
+    return {
       selectedIds: [...selected],
       query: similarityActive ? null : query,
       viewTotal,
@@ -722,7 +723,7 @@ export function LibraryView({
       collectionName: collection?.name ?? null,
       collectionTotal: collection?.imageCount ?? null,
       libraryTotal: current?.imageCount ?? 0,
-    });
+    };
   }, [
     browse.filters.folderIds,
     collections,
@@ -730,11 +731,24 @@ export function LibraryView({
     effectiveCollectionId,
     effectiveView,
     folders,
-    onOpenBatchTasks,
     query,
     selected,
     similarityActive,
   ]);
+
+  const openBatchTasks = useCallback(async () => {
+    setTaskMenuOpen(false);
+    if (!onOpenBatchTasks) return;
+    const context = await buildTaskContext();
+    if (context) onOpenBatchTasks(context);
+  }, [buildTaskContext, onOpenBatchTasks]);
+
+  const openOptimize = useCallback(async () => {
+    setTaskMenuOpen(false);
+    if (!onOpenOptimize) return;
+    const context = await buildTaskContext();
+    if (context) onOpenOptimize(context);
+  }, [buildTaskContext, onOpenOptimize]);
 
   const resolveResultIds = useCallback(async () => {
     if (similarityActive && similarity) return similarity.ids();
@@ -1475,6 +1489,15 @@ export function LibraryView({
               >
                 <Sparkles size={14} />
                 <span>批量任务…</span>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={!onOpenOptimize}
+                onClick={() => void openOptimize()}
+              >
+                <HardDrive size={14} />
+                <span>优化图片空间…</span>
               </button>
               <button
                 type="button"

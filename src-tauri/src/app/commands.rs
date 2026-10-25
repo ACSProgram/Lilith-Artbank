@@ -23,6 +23,7 @@ use crate::{
         history::HistoryPage,
         manifest::LibraryInspection,
         metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
+        optimize_estimate::OptimizeEstimate,
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::LibraryInfo,
         viewer::{self, PoseData, ViewerSource},
@@ -667,6 +668,14 @@ pub fn get_similarity_groups_result(
 }
 
 #[tauri::command]
+pub fn get_optimize_estimate(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Option<OptimizeEstimate> {
+    state.optimize_estimate(&task_id)
+}
+
+#[tauri::command]
 pub fn get_image_capabilities(
     state: State<'_, AppState>,
     image_ids: Vec<i64>,
@@ -844,6 +853,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         list_tasks,
         cancel_task,
         get_similarity_groups_result,
+        get_optimize_estimate,
         get_image_capabilities,
         get_feature_summary,
         ai_describe_image,

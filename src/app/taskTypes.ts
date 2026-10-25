@@ -12,7 +12,8 @@ export type TaskKind =
   | "emptyTrash"
   | "undo"
   | "redo"
-  | "releaseGarbage";
+  | "releaseGarbage"
+  | "optimizeEstimate";
 
 export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =
@@ -25,7 +26,78 @@ export type TaskPhase =
 
 export type ConflictPolicy = "fail" | "queue" | "cancelActive";
 export type BatchTaskKind = "thumbnail" | "aiEmbedding" | "aiPose" | "aiDescription";
-export type TaskRequestKind = BatchTaskKind | "similarityGroups";
+export type TaskRequestKind = BatchTaskKind | "similarityGroups" | "optimizeEstimate";
+
+export type OptimizeTier = "extreme" | "high" | "medium";
+export type OptimizeOutputFormat = "jpeg" | "webp";
+
+export interface OptimizeOptions {
+  tier: OptimizeTier;
+  outputFormat: OptimizeOutputFormat;
+  maxLongEdge: number | null;
+  skipOptimized: boolean;
+  regenerateThumbnails: boolean;
+  recomputePhash: boolean;
+  recomputeColors: boolean;
+}
+
+export interface OptimizeSkipBucket {
+  count: number;
+  bytes: number;
+}
+
+export interface OptimizeQualityCount {
+  quality: number;
+  count: number;
+}
+
+export interface OptimizeCurvePoint {
+  /** 已处理的候选体积占比。 */
+  coverage: number;
+  savingsBytes: number;
+  /** 按像素折算的累计耗时；与执行顺序一致。 */
+  elapsedSeconds: number;
+}
+
+export interface OptimizeFolderEstimate {
+  folderId: number;
+  path: string;
+  count: number;
+  bytes: number;
+  savingsBytes: number;
+}
+
+export interface OptimizeEstimate {
+  taskId: string;
+  createdAt: number;
+  optionsFingerprint: string;
+  sampleCount: number;
+  sampleBytes: number;
+  coverage: number;
+  sampleBadPixelRatio: number;
+  totalCount: number;
+  totalBytes: number;
+  candidateCount: number;
+  candidateBytes: number;
+  processCount: number;
+  processBytes: number;
+  skipCompact: OptimizeSkipBucket;
+  skipOptimized: OptimizeSkipBucket;
+  skipTransparent: OptimizeSkipBucket;
+  skipDepth: OptimizeSkipBucket;
+  skipQuality: OptimizeSkipBucket;
+  skipNotSmaller: OptimizeSkipBucket;
+  failedCount: number;
+  failedBytes: number;
+  savingsBytes: number;
+  savingsMarginBytes: number;
+  predictedBytes: number;
+  estimatedSeconds: number;
+  qualityCounts: OptimizeQualityCount[];
+  curve: OptimizeCurvePoint[];
+  folders: OptimizeFolderEstimate[];
+  sampleFailures: string[];
+}
 
 export interface TaskFailure {
   imageId: number | null;
@@ -81,6 +153,9 @@ export interface BatchTaskRequest {
   phashThreshold?: number | null;
   groupEmbedding?: boolean;
   embeddingThreshold?: number | null;
+  /** 空间优化估算参数。 */
+  optimize?: OptimizeOptions | null;
+  estimateSampleSize?: number | null;
   conflict: ConflictPolicy;
 }
 

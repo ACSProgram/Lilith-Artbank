@@ -19,9 +19,15 @@ import {
   type BatchTaskKind,
   type BatchTaskRequest,
   type ConflictPolicy,
-  type TaskScope,
   type TaskSummary,
 } from "./taskTypes";
+import {
+  buildScope,
+  defaultScopeChoice,
+  scopeAvailability,
+  scopeCountLabel,
+  type ScopeChoice,
+} from "./taskScope";
 
 interface BatchTaskDialogProps {
   open: boolean;
@@ -30,8 +36,6 @@ interface BatchTaskDialogProps {
   status: AiStatus | null;
   onRefreshStatus: () => Promise<AiStatus | null>;
 }
-
-type ScopeChoice = "selected" | "folder" | "collection" | "view" | "library";
 
 const KIND_LABELS: Record<BatchTaskKind, string> = {
   thumbnail: "重建缩略图",
@@ -52,27 +56,6 @@ const AI_CAPABILITY: Partial<Record<BatchTaskKind, string>> = {
   aiPose: "pose",
   aiDescription: "description",
 };
-
-function buildScope(choice: ScopeChoice, context: BatchTaskContextInfo): TaskScope | null {
-  switch (choice) {
-    case "selected":
-      return context.selectedIds.length > 0
-        ? { type: "selected", imageIds: context.selectedIds }
-        : null;
-    case "folder":
-      return context.folderId != null
-        ? { type: "folder", folderId: context.folderId, includeSubfolders: true }
-        : null;
-    case "collection":
-      return context.collectionId != null
-        ? { type: "collection", collectionId: context.collectionId }
-        : null;
-    case "view":
-      return context.query ? { type: "view", query: context.query } : null;
-    case "library":
-      return { type: "library" };
-  }
-}
 
 export function BatchTaskDialog({
   open,
@@ -98,13 +81,7 @@ export function BatchTaskDialog({
   useEffect(() => {
     if (!open) return;
     setKind("thumbnail");
-    setScope(
-      context && context.selectedIds.length > 0
-        ? "selected"
-        : context?.query
-          ? "view"
-          : "library",
-    );
+    setScope(defaultScopeChoice(context));
     setOverwrite(false);
     setRecalcVisuals(false);
     setPrompt(DEFAULT_DESCRIPTION_PROMPT);
@@ -132,47 +109,7 @@ export function BatchTaskDialog({
     return map;
   }, [online, descriptionConfigured]);
 
-  const scopeAvailability = useMemo(() => {
-    const map = {} as Record<ScopeChoice, ActionAvailability>;
-    map.selected =
-      context && context.selectedIds.length > 0
-        ? { enabled: true }
-        : { enabled: false, reason: "还没有选择图片" };
-    map.folder =
-      context?.folderId != null
-        ? { enabled: true }
-        : { enabled: false, reason: "请在侧栏选择单个文件夹" };
-    map.collection =
-      context?.collectionId != null
-        ? { enabled: true }
-        : { enabled: false, reason: "当前不在集合视图" };
-    map.view =
-      context?.query != null
-        ? { enabled: true }
-        : { enabled: false, reason: "相似结果不能作为任务范围" };
-    map.library = { enabled: true };
-    return map;
-  }, [context]);
-
-  const countLabel = (choice: ScopeChoice): string => {
-    if (!context) return "";
-    switch (choice) {
-      case "selected":
-        return `${context.selectedIds.length.toLocaleString()} 张`;
-      case "folder":
-        return context.folderTotal != null
-          ? `${context.folderTotal.toLocaleString()} 张（含子文件夹）`
-          : "";
-      case "collection":
-        return context.collectionTotal != null
-          ? `${context.collectionTotal.toLocaleString()} 张`
-          : "";
-      case "view":
-        return context.viewTotal != null ? `${context.viewTotal.toLocaleString()} 张` : "";
-      case "library":
-        return `${context.libraryTotal.toLocaleString()} 张`;
-    }
-  };
+  const scopeOptions = useMemo(() => scopeAvailability(context), [context]);
 
   const capability = AI_CAPABILITY[kind];
   const capabilityInfo = capability ? status?.health?.capabilities[capability] : undefined;
@@ -250,7 +187,7 @@ export function BatchTaskDialog({
         variant="primary"
         icon={<Play size={13} />}
         loading={starting}
-        disabled={!kindAvailability[kind].enabled || !scopeAvailability[scope].enabled}
+        disabled={!kindAvailability[kind].enabled || !scopeOptions[scope].enabled}
         onClick={() => void launch("fail")}
       >
         开始任务
@@ -291,8 +228,8 @@ export function BatchTaskDialog({
 
         <Field label="处理范围">
           <div className="batch-task-scopes">
-            {(Object.keys(scopeAvailability) as ScopeChoice[]).map((value) => {
-              const availability = scopeAvailability[value];
+            {(Object.keys(scopeOptions) as ScopeChoice[]).map((value) => {
+              const availability = scopeOptions[value];
               return (
                 <label
                   key={value}
@@ -319,7 +256,9 @@ export function BatchTaskDialog({
                             ? "当前视图"
                             : "整个图库"}
                   </span>
-                  <em>{availability.enabled ? countLabel(value) : availability.reason}</em>
+                  <em>
+                    {availability.enabled ? scopeCountLabel(value, context) : availability.reason}
+                  </em>
                 </label>
               );
             })}

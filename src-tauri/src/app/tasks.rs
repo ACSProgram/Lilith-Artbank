@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{
     app::error::{AppError, AppResult},
+    imageops::optimize::OptimizeOptions,
     library::{
         BatchReporter,
         db::LibraryDb,
@@ -48,6 +49,7 @@ pub enum TaskKind {
     Undo,
     Redo,
     ReleaseGarbage,
+    OptimizeEstimate,
 }
 
 impl TaskKind {
@@ -62,7 +64,7 @@ impl TaskKind {
             | Self::Redo
             | Self::ReleaseGarbage => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription => TaskLane::Ai,
-            Self::SimilarityGroups => TaskLane::Scan,
+            Self::SimilarityGroups | Self::OptimizeEstimate => TaskLane::Scan,
         }
     }
 
@@ -80,6 +82,7 @@ impl TaskKind {
             Self::Undo => "撤销操作",
             Self::Redo => "重做操作",
             Self::ReleaseGarbage => "释放删除文件",
+            Self::OptimizeEstimate => "估算压缩空间",
         }
     }
 }
@@ -354,6 +357,10 @@ impl BatchReporter for TaskHandle {
 
     fn cancelled(&self) -> bool {
         self.should_cancel()
+    }
+
+    fn message(&self, message: &str) {
+        self.set_message(message);
     }
 }
 
@@ -817,6 +824,7 @@ pub enum BatchTaskKind {
     AiPose,
     AiDescription,
     SimilarityGroups,
+    OptimizeEstimate,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -833,6 +841,9 @@ pub struct BatchTaskRequest {
     pub phash_threshold: Option<u32>,
     pub group_embedding: bool,
     pub embedding_threshold: Option<f32>,
+    /// 空间优化：档位、输出格式与重算开关。
+    pub optimize: Option<OptimizeOptions>,
+    pub estimate_sample_size: Option<usize>,
     pub conflict: ConflictPolicy,
 }
 
