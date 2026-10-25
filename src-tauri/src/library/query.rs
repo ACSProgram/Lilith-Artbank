@@ -604,6 +604,17 @@ pub fn filter_counts(database: &LibraryDb, query: LibraryQuery) -> AppResult<Fil
     })
 }
 
+/// 只算命中总数，不取行；用于搜索结果头部的 `total`。
+pub fn query_total(database: &LibraryDb, query: LibraryQuery) -> AppResult<u64> {
+    let (query, _) = normalize(query)?;
+    database.with_reader(|connection| {
+        let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+        let prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
+        let (sql, params) = count_sql(&prepared);
+        count_rows(connection, &sql, &params)
+    })
+}
+
 pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
     database.with_reader(|connection| {
         let folders = all_folders(connection)?;

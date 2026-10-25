@@ -15,14 +15,20 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 arboard = "3"
+base64 = "0.22"
 blake3 = "1"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 half = "2"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga", "tiff", "webp"] }
 memmap2 = "0.9"
 log = "0.4"
 parking_lot = "0.12"
 rayon = "1"
+rmcp = { version = "3.7", features = ["transport-streamable-http-server"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,6 +37,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-single-instance = "2"
 thiserror = "2"
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
 webp = { version = "0.3", default-features = false }

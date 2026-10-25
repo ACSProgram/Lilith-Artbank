@@ -21,6 +21,8 @@ src-tauri/gen/
 
 # Portable runtime layout (generated or user-provided)
 /settings.json
+/mcp-runtime.json
+/mcp-runtime.json.tmp
 /logs/
 /release/
 /python_embeded/

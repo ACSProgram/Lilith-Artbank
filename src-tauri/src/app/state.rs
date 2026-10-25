@@ -46,18 +46,21 @@ use crate::{
         thumbs::{self, ThumbPack},
         viewer::PoseData,
     },
+    mcp::{context::ReadContext, runtime::McpRuntime, sheet::SheetCache},
 };
 
 pub struct AppState {
     pub settings: SettingsStore,
     pub ai: AiRuntime,
     pub tasks: TaskBus,
+    pub mcp: McpRuntime,
     app: AppHandle,
     library: Mutex<Option<LibrarySession>>,
     import_job: Mutex<Option<Arc<ImportJob>>>,
     managed: AtomicBool,
     recovery: Mutex<RecoveryPlan>,
     optimize_estimates: Arc<Mutex<VecDeque<(String, OptimizeEstimate)>>>,
+    mcp_sheets: Arc<Mutex<SheetCache>>,
 }
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
@@ -69,12 +72,14 @@ impl AppState {
             settings,
             ai: AiRuntime::new(),
             tasks: TaskBus::new(),
+            mcp: McpRuntime::new(),
             app,
             library: Mutex::new(None),
             import_job: Mutex::new(None),
             managed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryPlan::default()),
             optimize_estimates: Arc::new(Mutex::new(VecDeque::new())),
+            mcp_sheets: Arc::new(Mutex::new(SheetCache::default())),
         }
     }
 
@@ -209,6 +214,35 @@ impl AppState {
     pub fn after_manage(&self) {
         self.managed.store(true, Ordering::SeqCst);
         self.after_library_open();
+        self.mcp
+            .apply(self.app.clone(), &self.settings.snapshot().mcp);
+    }
+
+    /// 设置保存后按新的 MCP 配置重启服务；关闭时删除运行时文件。
+    pub fn apply_mcp_settings(&self, settings: &crate::app::settings::McpSettings) {
+        self.mcp.apply(self.app.clone(), settings);
+    }
+
+    pub fn mcp_status(&self) -> crate::mcp::runtime::McpStatus {
+        self.mcp.status(&self.settings.snapshot().mcp)
+    }
+
+    /// 只读工具的一次快照：图库句柄、计数、设置与拼图映射缓存。
+    pub(crate) fn mcp_context(&self) -> AppResult<ReadContext> {
+        let info = self
+            .status()?
+            .ok_or_else(|| AppError::message("尚未打开图库，请先在 Lilith Artbank 中打开图库"))?;
+        let (database, thumbs, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库，请先在 Lilith Artbank 中打开图库"))?;
+        Ok(ReadContext {
+            database,
+            thumbs,
+            root,
+            info,
+            settings: self.settings.snapshot(),
+            sheets: self.mcp_sheets.clone(),
+        })
     }
 
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
@@ -226,6 +260,7 @@ impl AppState {
         *self.library.lock() = Some(session);
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.mcp_sheets.lock().clear();
         query::clear_page_cache();
         Ok(info)
     }
@@ -249,6 +284,7 @@ impl AppState {
         *self.library.lock() = Some(session);
         *self.recovery.lock() = plan;
         self.optimize_estimates.lock().clear();
+        self.mcp_sheets.lock().clear();
         query::clear_page_cache();
         if self.managed.load(Ordering::SeqCst) {
             self.after_library_open();
@@ -288,6 +324,7 @@ impl AppState {
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.mcp_sheets.lock().clear();
         query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())

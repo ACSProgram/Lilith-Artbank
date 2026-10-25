@@ -14,6 +14,7 @@
 - 找相似、相似分组、pHash/主色/embedding/pose 相似度：读 `docs/modules/ai-service.md` 的“本地检索”，再进入 `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`。
 - 清理、缩略图重建、描述导入导出：读 `docs/modules/maintenance.md`。
 - 图片空间优化（估算与执行）：读 `docs/modules/maintenance.md` 的“图片空间优化”，再进入 `src-tauri/src/imageops/optimize.rs`、`src-tauri/src/library/optimize_estimate.rs`、`src-tauri/src/library/optimize.rs`、`src-tauri/src/app/state.rs`、`src/app/OptimizeDialog.tsx`。
+- MCP 服务、stdio 小桥、只读工具、selector 与拼图：读 `docs/modules/mcp.md`，再进入 `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/SettingsDialog.tsx`。
 - 构建、测试、性能基准：读 `docs/guides/validation.md`、`docs/guides/performance.md`。
 - 当前阶段状态与未完成事项：读 `docs/planning/current-handoff.md`、`docs/planning/todo.md`；阶段划分看 `docs/planning/roadmap.md`。
 
@@ -25,6 +26,7 @@
 - 缩略图写追加式 `.pack`，数据库只记录 segment/offset/length；不要改成 20 万个独立小文件。
 - 浏览器只解码当前页缩略图；Rust 不做 DDS/BC 缩略图管线。
 - AI 能力统一走本机 HTTP 服务；应用负责进程生命周期。接口以 `docs/modules/ai-service.md` 为准。
+- MCP 服务在应用进程内运行，直接调用 `AppState`，只绑定 `127.0.0.1` 并要求 Bearer 口令；不另起 headless 图库写进程。批次 1 只注册只读工具。
 - 设置、日志与相对资源路径都以程序根目录为准（`src-tauri/src/app/paths.rs`）；不读旧 AppData 设置，也不做迁移。
 - Python 环境与模型文件不打包、不下载；只产出便携文件夹（`npm run pack:portable`），不生成 NSIS 安装器。
 - 姿势相似度按旧程序 `MediaPipePoseData::similarity` 1:1 移植：权重、landmark 索引与“镜像取较大值”都不许自行改动，`ai/pose_similarity.rs` 的 golden 值测试必须保持通过。

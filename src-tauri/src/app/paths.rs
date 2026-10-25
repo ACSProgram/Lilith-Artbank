@@ -33,6 +33,14 @@ pub fn ai_server_log_path() -> PathBuf {
     log_dir().join("ai-server.log")
 }
 
+pub fn mcp_runtime_path() -> PathBuf {
+    app_root().join("mcp-runtime.json")
+}
+
+pub fn mcp_log_path() -> PathBuf {
+    log_dir().join("mcp.log")
+}
+
 /// 相对路径按程序根目录解析；绝对路径保持原样。
 pub fn resolve(value: &str) -> PathBuf {
     let path = Path::new(value.trim());

@@ -10,6 +10,7 @@ import {
   Monitor,
   Moon,
   Palette,
+  Plug,
   SlidersHorizontal,
   Sparkles,
   Sun,
@@ -21,7 +22,7 @@ import { appApi, browserPreview } from "./api";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
-import type { Settings, ThemeMode, ThumbFit } from "./types";
+import type { McpStatus, Settings, ThemeMode, ThumbFit } from "./types";
 import { errorMessage } from "../shared/errors";
 import { aiApi, aiBrowserPreview } from "../modules/ai/api";
 import type { AiStatus } from "../modules/ai/types";
@@ -37,13 +38,21 @@ const FIT_CHOICES: { value: ThumbFit; label: string }[] = [
   { value: "contain", label: "完整显示" },
 ];
 
-type SettingsTab = "general" | "appearance" | "library" | "ai" | "performance" | "about";
+type SettingsTab =
+  | "general"
+  | "appearance"
+  | "library"
+  | "ai"
+  | "mcp"
+  | "performance"
+  | "about";
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Sun }[] = [
   { id: "general", label: "通用", icon: SlidersHorizontal },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "library", label: "图库", icon: Database },
   { id: "ai", label: "AI 服务", icon: Sparkles },
+  { id: "mcp", label: "MCP", icon: Plug },
   { id: "performance", label: "性能", icon: Gauge },
   { id: "about", label: "关于", icon: Info },
 ];
@@ -131,6 +140,8 @@ export function SettingsDialog({
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -139,10 +150,15 @@ export function SettingsDialog({
     setError(null);
     setSaving(false);
     setAiError(null);
+    setMcpError(null);
     void aiApi
       .getStatus()
       .then(setAiStatus)
       .catch((cause: unknown) => setAiError(errorMessage(cause)));
+    void appApi
+      .getMcpStatus()
+      .then(setMcpStatus)
+      .catch((cause: unknown) => setMcpError(errorMessage(cause)));
   }, [isOpen, settings]);
 
   useEffect(() => {
@@ -312,6 +328,9 @@ export function SettingsDialog({
       value.history.maxSteps > 500
     ) {
       return "操作记录步数必须在 10-500 之间";
+    }
+    if (!Number.isInteger(value.mcp.port) || value.mcp.port < 1 || value.mcp.port > 65535) {
+      return "MCP 端口必须在 1-65535 之间";
     }
     return null;
   };
@@ -754,6 +773,65 @@ export function SettingsDialog({
                     模型在第一次用到时自动加载；图像塔与文本塔轮流驻留，空闲 5 分钟后释放。
                   </div>
                   <div className="settings-note">服务离线时，AI 相关按钮不可用，浏览与编辑不受影响。</div>
+                </Panel>
+              ) : null}
+
+              {tab === "mcp" ? (
+                <Panel title="MCP 服务">
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.mcp.enabled}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          mcp: { ...current.mcp, enabled: event.target.checked },
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>启用 MCP 服务</strong>
+                      <small>只从本机 127.0.0.1 接受连接，AI 客户端可以读取当前图库。</small>
+                    </span>
+                  </label>
+                  <Field label="端口">
+                    <input
+                      className="input"
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={draft.mcp.port}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          mcp: { ...current.mcp, port: Number(event.target.value) },
+                        }))
+                      }
+                    />
+                  </Field>
+                  <div className="settings-note">保存后生效。</div>
+                  <div className="ai-settings-status">
+                    <div>
+                      <strong>
+                        {mcpStatus?.running
+                          ? "服务运行中"
+                          : mcpStatus?.enabled
+                            ? "服务未运行"
+                            : "服务已关闭"}
+                      </strong>
+                      <span>
+                        {mcpError ??
+                          mcpStatus?.error ??
+                          `127.0.0.1:${mcpStatus?.port ?? draft.mcp.port}`}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="settings-note">
+                    权限：只读。当前只开放浏览、搜索、详情与拼图；修改、撤销与导入尚未开放。
+                  </div>
+                  <div className="settings-note">
+                    支持 stdio 的客户端用本程序加 --mcp-stdio 启动。
+                  </div>
                 </Panel>
               ) : null}
 

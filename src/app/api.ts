@@ -4,13 +4,14 @@ import type {
   AppInfo,
   LibraryInfo,
   LibraryInspection,
+  McpStatus,
   Settings,
 } from "./types";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 5,
+  settingsVersion: 6,
   libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
@@ -27,6 +28,11 @@ const defaultSettings: Settings = {
   },
   history: {
     maxSteps: 100,
+  },
+  mcp: {
+    enabled: false,
+    port: 18767,
+    mode: "ask",
   },
   ui: {
     theme: "system",
@@ -145,6 +151,20 @@ export const appApi = {
       };
     }
     return invoke<AppInfo>("get_app_info");
+  },
+
+  async getMcpStatus(): Promise<McpStatus> {
+    if (!isTauri()) {
+      return {
+        enabled: false,
+        running: false,
+        port: 18767,
+        mode: "ask",
+        runtimePath: "(浏览器预览模式)",
+        error: null,
+      };
+    }
+    return invoke<McpStatus>("get_mcp_status");
   },
 
   /** 在系统文件管理器里定位文件或打开目录。 */

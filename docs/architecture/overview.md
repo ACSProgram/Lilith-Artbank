@@ -35,7 +35,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 
 - 单实例：再次启动只聚焦已有窗口，避免两个进程同时写同一图库。
 - 窗口使用无边框 + 40px 自绘标题栏；最小化/最大化/关闭由 Rust 命令控制。
-- 设置 v5 只保存一个 `libraryPath`；文件在程序根目录（release 为 exe 旁），不读旧 AppData 设置；启动时尝试打开它，失败则退回欢迎页并提示，不阻塞启动。操作记录不写设置，保留在每个图库自己的 SQLite 里。
+- 设置 v6 只保存一个 `libraryPath`（`mcp` 字段控制应用内 MCP 服务）；文件在程序根目录（release 为 exe 旁），不读旧 AppData 设置；启动时尝试打开它，失败则退回欢迎页并提示，不阻塞启动。操作记录不写设置，保留在每个图库自己的 SQLite 里。
 - 同一时间只有一个图库会话。打开或创建新库成功后才替换旧会话；关闭只释放连接并清空 `libraryPath`，不改文件。
 - 导入期间禁止关闭、创建或切换图库；任务完成后恢复。应用退出时已提交批次保留，未完成临时文件在下次打开时清理。
 - 文件夹的创建/重命名/移动/删除与物理目录同步，和导入、图像保存、回收站操作共用 `maintenance` 守卫。
@@ -156,5 +156,7 @@ S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）�
 2026-10-25 图片空间优化（智能压缩）两批已实现：`imageops/optimize.rs` 的三档判据、阶梯编码与 EXIF/ICC 搬运；`library/optimize_estimate.rs` 的分层估算与只读报告；schema v6 的 `images.optimized_at`；`library/optimize.rs` 的候选收集、分批编码发布与旧图清理；`HistoryKind::Optimize` 不可撤销记录与 `update_label`；`start_batch_task(kind = "optimize")` 的估算凭证校验；`OptimizeDialog` 的估算 → 确认执行两阶段界面。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化) 与 [当前阶段状态](../planning/current-handoff.md)。
 
 2026-10-25 图片空间优化第三阶段已实现：长边改 64–65535 自由输入，抽样改 50–2000 离散滑块；估算取结果改为依赖任务原始值并带 5 秒超时重试，进度按阶段推进（统计候选只报百分比，编码样本按张显示，百分比加权不回退）；执行在并行编码内部按张上报，编码与提交前分别显示文案；导入管线新增可选的 `optimize` 参数，在解码后、发布前复用同一套压缩内核，去重语义改为压缩后内容哈希，`optimized_at` 标记导入即压缩的行。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化)、[导入与缩略图](../modules/import.md) 与 [当前阶段状态](../planning/current-handoff.md)。
+
+2026-10-26 MCP 图库控制批次 1（只读）已实现：设置 v6 的 `mcp` 配置、应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）、同 exe 的 `--mcp-stdio` 小桥、8 个只读工具（图库概况、文件夹、标签、集合、搜索、找相似、详情、拼图）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存。写入、撤销/重做、导入与询问档确认队列未实现。详见 [MCP 图库控制](../modules/mcp.md) 与 [当前阶段状态](../planning/current-handoff.md)。
 
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图包压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

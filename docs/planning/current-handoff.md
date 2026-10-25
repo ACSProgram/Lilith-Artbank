@@ -1,7 +1,7 @@
 # 当前阶段状态
 
 日期：2026-10-25
-阶段：**图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
+阶段：**MCP 图库控制批次 1（只读）已完成（2026-10-26），待真实 MCP 客户端验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
 历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
 
@@ -44,6 +44,33 @@
 - 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（213 通过、5 ignored）、`npm run typecheck`、`npm run test:web`（21 通过）、`npm run build`、`git diff --check`。
 - 未做：真实窗口连跑 20 次估算、全库执行观察按张进度与取消、导入 50 张含透明/宽色域/超长图的磁盘增量核对。
 
+## MCP 图库控制批次 1（2026-10-26）
+
+只读批次；写入、撤销/重做、导入与询问档确认队列属于后续批次。
+
+- `src-tauri/src/mcp/runtime.rs`：rmcp 3.7 stateless Streamable HTTP，只绑定 `127.0.0.1`，每个请求校验 Bearer 口令；服务启动时生成随机口令，把配置端口与口令写进 `mcp-runtime.json`，关闭或重启时删除/覆盖；`get_mcp_status` 返回启用、运行、端口、档位、错误。
+- `src-tauri/src/mcp/bridge.rs`：`--mcp-stdio` 在 Tauri 初始化前接管 stdio，逐行代理到应用内 HTTP；维护协商版本，stdout 只写协议消息，诊断写 `logs/mcp.log`。
+- `src-tauri/src/mcp/server.rs`：8 个只读工具 `library_info`、`folders_list`、`tags_list`、`collections_list`、`search_images`、`find_similar`、`images_get`、`image_sheet`；工具级错误返回可读文本。
+- `src-tauri/src/mcp/tools/read.rs`、`selection.rs`、`sheet.rs`：结构化查询与总数、浏览器同款筛选/排序/游标、query/ids/sheet/similarity selector、`excludeIds`/`excludeCells`、缺失 id、相似结果单槽失效；拼图映射缓存 128 份、TTL 2 小时，只存格子与图片 id。
+- `src-tauri/src/imageops/contact_sheet.rs`：1–5 格拼图，长边约 1600px、等比 contain、深灰背景、内置 5×7 位图字体编号 A1–E5、缺图占位、JPEG 88；`thumb` 读缩略图包，`detail` 直接解码原图且最多 3×3。两种清晰度都按格子逐张解码，画完即释放。
+- 设置 v6：新增 `mcp { enabled, port, mode }`，默认关闭、18767、ask；v5→v6 迁移补默认值。设置页新增 MCP 分类（开关、端口、运行状态、只读说明）。
+- 与计划的差异：批次 1 没有注册任何写工具，因此 `library_info` 的实际 `mode` 固定为 `readOnly`，`configuredMode` 单独返回；`library_info` 的 AI 部分只报配置与特征数量，不做会阻塞的 live health 检查；`find_similar` 的 `threshold` 只对 pHash 生效，其余相似度沿用现有实现；拼图同时实现了 `detail` 清晰度。
+- 测试：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector、搜索总数与分页、临时图库只读工具、拼图布局/缺图/缓存、相似 token 失效、bridge SSE/版本解析。
+- 未做：真实 MCP 客户端与 `--mcp-stdio` 小桥实测；真实窗口设置页状态；批次 2 的写工具、询问档、撤销/重做；批次 3 的导入与审计日志。
+
+## MCP 批次 1 收尾整理（2026-10-26）
+
+代码整理（不改行为契约）：
+
+- `mcp/sheet.rs`：`thumb_missing` 只由渲染结果回填一次，去掉先按缩略图指针判断、随后又被覆盖的临时值；`MAX_SHEETS` 与 `SHEET_TTL` 收回模块内。
+- `mcp/selection.rs`：id 上限与分页上限共用一个常量；query selector 只转换一次 `LibraryQuery`。
+- `mcp/runtime.rs`：`stop()` 等服务任务退出后再返回，避免 Windows 下保存设置后立刻按新端口重启时误报端口占用；测试用同一信号验证端口可立即重绑。
+- `mcp/bridge.rs`：移除未使用的 `Mcp-Session-Id` 状态；stateless 会话不返回 session id，只维护协商的协议版本。
+- 构建：`tauri-build` 只把含 comctl32 v6 manifest 的资源链接进 bin，`cargo test --lib` 的测试二进制会加载 comctl32 v5，在 `TaskDialogIndirect` 导入处直接退出（0xc0000139）。`build.rs` 改为不生成默认 manifest 资源，统一用 `windows-app.manifest` 链接到所有最终产物。
+- 文档纠正：`mcp.md` 与计划里的运行时文件写入时机、bridge session id、随机端口、拼图编码格式；设置页分类数改为七个。
+
+自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（244 通过、5 ignored）、`cargo clippy --all-targets`（7 条警告都位于本批次未修改的 `library/edit.rs` 与 `library/history.rs`）、`npm run typecheck`、`npm run test:web`（21 通过）、`npm run build`、`git diff --check`。
+
 ## AI 服务端与便携化（待验收）
 
 - `server/` 实现 `/v1`：health、models/ensure、embed/image、embed/text、pose、shutdown；描述本轮不实现。
@@ -58,7 +85,7 @@
 ## 基线
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
-- 存储版本：schema v6（v1→v2→v3→v4→v5→v6 链式迁移）、设置 v5（v1→v2→v3→v4→v5）；设置与日志位于程序目录，不读旧 AppData 设置。
+- 存储版本：schema v6（v1→v2→v3→v4→v5→v6 链式迁移）、设置 v6（v1→v2→v3→v4→v5→v6）；设置与日志位于程序目录，不读旧 AppData 设置。MCP 运行时文件为程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
 - 20 万行元数据基准（`cargo test --lib -- --ignored --nocapture perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms、schema v3→v4 建两个索引 459 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 
@@ -170,6 +197,7 @@
 - **操作撤销批次 2（真实窗口）**：导入（含重复合并、取消后已完成部分）→ 撤销，图片、原图文件、本次新建的空文件夹与标签正确回退；编辑保存 → 撤销，原图、缩略图、`feature_blobs` 与预览缓存一致；批量移动 → 撤销，文件回到原文件夹；文件夹创建/重命名/移动/删除/排序逐项撤销；撤销到一半关闭应用，重开后能继续且不留下可见孤儿文件；线性组合（导入 → 编辑 → 移动 → 回收站 → 清空）逐层撤销结果正确。
 - **撤销后重做（真实窗口）**：撤销几条后记录变灰、“当前状态”位置正确；选中灰色记录重做到指定位置，更新记录仍保持灰色；编辑与导入重做后原图/缩略图/标签/文件夹恢复；重做到一半关闭应用，重开后只续做本次选中的记录；任意新操作后灰色记录消失、暂存文件释放；重做失败提示与再次重试。
 - **操作撤销批次 3（真实窗口）**：评分/描述/标签设置/批量加删标签/标签改名/删除逐项撤销与重做；集合创建/改名/删除/排序/加入/移出/并集交集差集撤销与重做，条目顺序与 `updated_at` 正确；相似分组“每组一个集合”和“合并保存”各只出现一条记录，撤销整批消失、重做整批恢复；批量 AI 描述（服务可用时）取消后已写描述可撤销；历史面板中集合结构记录显示“项”、图片记录显示“张”。
+- **MCP 批次 1（真实客户端）**：设置 → MCP 开启服务后状态为运行中；stdio 小桥能完成 initialize 并调用 8 个只读工具；`image_sheet` 编号与映射一致，`detail` 仅 3×3 及以下；`find_similar` 旧 token 失效提示可读；关闭服务后客户端收到明确连接错误；重启应用后 `mcp-runtime.json` 口令更新；设置页保存端口冲突时状态显示启动失败且设置不丢。
 - **图片空间优化（真实窗口）**：估算数字合理；改任一参数后估算清空、必须重估；确认执行后的进度、取消与失败清单；完成后记录标题显示「N 张 · 省 X」且选中它时撤销被禁用并提示不可撤销；抽查 PNG→JPEG 的平涂区域无明显色带；执行前后磁盘体积差与估算接近；网格缩略图不闪烁（默认沿用旧图）；主库首次打开会把 schema v5 升到 v6。
 - **图片空间优化第三阶段（真实窗口）**：连跑 20 次估算，中途切标签或启动别的任务，确认不再停在「正在读取估算结果…」；统计候选阶段只显示百分比（不再出现图库总张数），编码样本时分母是样本数；估算末尾能看到「正在汇总结果…」而不是停在 `k / n`；长边输入 63 / 64 / 65535 / 65536 与空值的行为；WebP + 超过 16383 的提示；抽样滑块拖动后 300ms 内按钮不可点、提示耗时随格式变化；全库执行时进度按张平滑推进、批间短暂停顿有「正在写入第 k 批」文案、取消后停在真实张数；任务胶囊与对话框的进度一致；导入时压缩开启与关闭各导入一批，确认真实窗口完成页「其中 N 张已压缩，省 X」；导入透明 PNG + JPG、宽色域图、超长图，确认保留原图；同一源图同参数重复导入与改档位后的条数符合预期。
 - **主库真实窗口**：应用打开 `G:\Lilith Image Library`（设置已指向该库），首次打开会把 schema v5 升到 v6（只新增一列）。检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述/编辑/AI/S7。
@@ -193,7 +221,7 @@
 
 1. 按上面的清单在 `npm run tauri dev` 下手工验收；真实库只读用于验收，测试、基准和演示仍用临时目录或复制样本。
 2. 在便携目录中实测 AI 服务：设置 Python/脚本/模型路径，分别加载图片塔与文本塔，跑批量 embedding、pose、语义搜索，并观察空闲卸载。
-3. 待决策项见 [待办与待决策](todo.md)；新阶段按 [路线图](roadmap.md) 继续。
+3. 用真实 MCP 客户端验收批次 1 的 stdio 小桥、8 个只读工具与拼图；之后按计划进入批次 2（写工具、询问档、撤销/重做）。待决策项见 [待办与待决策](todo.md)。
 4. 需要标定相似度阈值时，用复制出来的小样本跑基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
 
 ## 约束

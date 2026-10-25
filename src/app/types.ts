@@ -27,6 +27,23 @@ export interface HistorySettings {
   maxSteps: number;
 }
 
+export type McpMode = "readOnly" | "ask" | "full";
+
+export interface McpSettings {
+  enabled: boolean;
+  port: number;
+  mode: McpMode;
+}
+
+export interface McpStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  mode: McpMode;
+  runtimePath: string;
+  error: string | null;
+}
+
 /** 排序方案：全局共享，存设置，数量上限 50 是存储上限。 */
 export interface SortProfile {
   id: string;
@@ -51,6 +68,7 @@ export interface Settings {
   ai: AiSettings;
   performance: PerformanceSettings;
   history: HistorySettings;
+  mcp: McpSettings;
   ui: UiSettings;
 }
 

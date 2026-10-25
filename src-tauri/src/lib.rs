@@ -3,9 +3,15 @@ mod app;
 mod imageops;
 mod import;
 mod library;
+mod mcp;
 mod platform;
 
 use tauri::Manager;
+
+/// `--mcp-stdio` 分支：在 Tauri 初始化与 single-instance 插件之前接管 stdio。
+pub fn run_stdio_bridge() -> i32 {
+    mcp::bridge::run()
+}
 
 pub fn run() {
     let log_dir = app::paths::log_dir();
@@ -82,6 +88,7 @@ pub fn run() {
             let state = app_handle.state::<app::state::AppState>();
             let settings = state.settings.snapshot().ai;
             state.ai.shutdown(&settings);
+            state.mcp.stop();
         }
     });
 }

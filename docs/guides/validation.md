@@ -38,6 +38,7 @@ git diff --check
 - 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
 - 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同时跑 `npm run test:web`（旋转/翻转对裁剪的映射、尺寸按新基底换算）与 typecheck/build，查看器布局、缩放、裁剪拖拽映射、撤销栈、胶片带与上下张由用户手工验收。
+- MCP 改动跑 `cargo test --lib mcp`：设置 v5→v6 迁移、Bearer 校验、stateless HTTP initialize/tools/list、selector、搜索总数/分页、临时图库只读工具、拼图布局/缺图/缓存、相似 token 失效；真实 MCP 客户端与 `--mcp-stdio` 小桥由用户手工验收，代理不启动应用。
 - AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
 - `server/` 只做一次性检查，不加入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。一次性检查命令见下方“AI 服务端”。
 - 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。

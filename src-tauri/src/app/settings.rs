@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 5;
+pub const SETTINGS_VERSION: u32 = 6;
 /// 操作记录保留步数范围；下限保证撤销至少能回到上一步，上限限制历史库体积。
 pub const MIN_HISTORY_STEPS: u32 = 10;
 pub const MAX_HISTORY_STEPS: u32 = 500;
 pub const DEFAULT_HISTORY_STEPS: u32 = 100;
+pub const DEFAULT_MCP_PORT: u16 = 18767;
 
 const THEMES: [&str; 3] = ["light", "dark", "system"];
 const THUMB_FITS: [&str; 2] = ["cover", "contain"];
@@ -39,6 +40,7 @@ pub struct Settings {
     pub ai: AiSettings,
     pub performance: PerformanceSettings,
     pub history: HistorySettings,
+    pub mcp: McpSettings,
     pub ui: UiSettings,
 }
 
@@ -50,7 +52,47 @@ impl Default for Settings {
             ai: AiSettings::default(),
             performance: PerformanceSettings::default(),
             history: HistorySettings::default(),
+            mcp: McpSettings::default(),
             ui: UiSettings::default(),
+        }
+    }
+}
+
+/// MCP 服务默认关闭，开启后使用询问档；批次 1 尚未注册写工具，实际能力为只读。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum McpMode {
+    ReadOnly,
+    #[default]
+    Ask,
+    Full,
+}
+
+impl McpMode {
+    /// 与 serde 的 camelCase 输出一致的字符串，供工具返回值复用。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "readOnly",
+            Self::Ask => "ask",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub mode: McpMode,
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_MCP_PORT,
+            mode: McpMode::default(),
         }
     }
 }
@@ -289,6 +331,9 @@ impl Settings {
                 "操作记录步数必须在 {MIN_HISTORY_STEPS}-{MAX_HISTORY_STEPS} 之间"
             )));
         }
+        if self.mcp.port == 0 {
+            return Err(AppError::message("MCP 端口必须在 1-65535 之间"));
+        }
         if !THEMES.contains(&self.ui.theme.as_str()) {
             return Err(AppError::message("主题只能是 light、dark 或 system"));
         }
@@ -439,6 +484,9 @@ fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
     if version < 5 {
         value = migrate_v4(value);
     }
+    if version < 6 {
+        value = migrate_v5(value);
+    }
     Ok(serde_json::from_value(value)?)
 }
 
@@ -507,13 +555,30 @@ fn migrate_v3(mut value: serde_json::Value) -> serde_json::Value {
 /// v4 → v5：补操作记录最大步数；缺失时用默认值，旧字段全部保留。
 fn migrate_v4(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
+        object.insert("settingsVersion".into(), serde_json::json!(5));
+        object
+            .entry("history")
+            .or_insert_with(|| serde_json::json!({ "maxSteps": DEFAULT_HISTORY_STEPS }));
+    }
+    value
+}
+
+/// v5 → v6：新增 MCP 服务配置；默认关闭，开启后端口 18767、权限档为询问。
+fn migrate_v5(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
         object.insert(
             "settingsVersion".into(),
             serde_json::json!(SETTINGS_VERSION),
         );
-        object
-            .entry("history")
-            .or_insert_with(|| serde_json::json!({ "maxSteps": DEFAULT_HISTORY_STEPS }));
+        object.entry("mcp").or_insert_with(|| {
+            serde_json::to_value(McpSettings::default()).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "enabled": false,
+                    "port": DEFAULT_MCP_PORT,
+                    "mode": "ask",
+                })
+            })
+        });
     }
     value
 }
@@ -554,6 +619,10 @@ mod tests {
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
         assert_eq!(loaded.history.max_steps, DEFAULT_HISTORY_STEPS);
+        assert_eq!(loaded.mcp, McpSettings::default());
+        assert!(!loaded.mcp.enabled);
+        assert_eq!(loaded.mcp.port, DEFAULT_MCP_PORT);
+        assert_eq!(loaded.mcp.mode, McpMode::Ask);
         assert_eq!(loaded.ui.sort, vec![SortSpec::default()]);
         assert_eq!(
             loaded.ai.python_path.as_deref(),
@@ -622,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v5_and_drops_dead_cache_field() {
+    fn migrates_v2_to_v6_and_drops_dead_cache_field() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -653,11 +722,11 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));
-        assert!(written.contains("\"settingsVersion\": 5"));
+        assert!(written.contains("\"settingsVersion\": 6"));
     }
 
     #[test]
-    fn migrates_v3_to_v5_and_replaces_executable_path() {
+    fn migrates_v3_to_v6_and_replaces_executable_path() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -692,12 +761,12 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("executablePath"));
-        assert!(written.contains("\"settingsVersion\": 5"));
+        assert!(written.contains("\"settingsVersion\": 6"));
         assert!(written.contains("\"maxSteps\": 100"));
     }
 
     #[test]
-    fn migrates_v4_to_v5_and_adds_history_defaults() {
+    fn migrates_v4_to_v6_and_adds_history_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -719,10 +788,61 @@ mod tests {
         assert_eq!(loaded.ui.theme, "dark");
         assert_eq!(loaded.ui.grid_thumb_px, 300);
         assert_eq!(loaded.performance.reader_connections, 6);
+        assert_eq!(loaded.mcp, McpSettings::default());
 
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("\"settingsVersion\": 5"));
+        assert!(written.contains("\"settingsVersion\": 6"));
         assert!(written.contains("\"maxSteps\": 100"));
+    }
+
+    #[test]
+    fn migrates_v5_to_v6_and_adds_mcp_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 5,
+                "libraryPath": "G:\\Lilith Image Library",
+                "history": {"maxSteps": 250}
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(loaded.history.max_steps, 250);
+        assert_eq!(loaded.mcp, McpSettings::default());
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"settingsVersion\": 6"));
+        assert!(written.contains("\"mcp\""));
+        assert!(written.contains("\"enabled\": false"));
+        assert!(written.contains("\"port\": 18767"));
+        assert!(written.contains("\"mode\": \"ask\""));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settingsVersion": 6, "mcp": {"enabled": true, "port": 0}}"#,
+        )
+        .unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("MCP 端口"));
+    }
+
+    #[test]
+    fn mcp_mode_strings_match_serialization() {
+        for mode in [McpMode::ReadOnly, McpMode::Ask, McpMode::Full] {
+            let serialized = serde_json::to_value(mode).unwrap();
+            assert_eq!(serialized, serde_json::json!(mode.as_str()));
+        }
     }
 
     #[test]

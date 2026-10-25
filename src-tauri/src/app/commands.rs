@@ -37,13 +37,21 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
-    let previous = state.settings.snapshot().ai;
+    let previous = state.settings.snapshot();
     let saved = AppError::command(state.settings.replace(settings))?;
-    if previous != saved.ai {
-        state.ai.apply_settings(&previous, &saved.ai);
+    if previous.ai != saved.ai {
+        state.ai.apply_settings(&previous.ai, &saved.ai);
+    }
+    if previous.mcp != saved.mcp {
+        state.apply_mcp_settings(&saved.mcp);
     }
     state.after_history_write();
     Ok(saved)
+}
+
+#[tauri::command]
+pub fn get_mcp_status(state: State<'_, AppState>) -> crate::mcp::runtime::McpStatus {
+    state.mcp_status()
 }
 
 #[tauri::command]
@@ -861,6 +869,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         semantic_search,
         find_similar_images,
         get_similarity_page,
-        get_similarity_ids
+        get_similarity_ids,
+        get_mcp_status
     ]
 }
