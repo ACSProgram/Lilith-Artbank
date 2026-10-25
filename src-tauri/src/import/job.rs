@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use parking_lot::Mutex;
@@ -61,6 +61,10 @@ pub struct ImportProgress {
     pub merged: usize,
     pub failed: usize,
     pub similar: usize,
+    /// 勾选「导入时压缩」后实际被替换为压缩版本的新增图片数。
+    pub optimized: usize,
+    /// 这些图片省下的字节数。
+    pub optimized_bytes: u64,
     pub current: String,
     pub elapsed_ms: i64,
 }
@@ -89,6 +93,8 @@ pub struct ImportJob {
     merged: AtomicUsize,
     failed: AtomicUsize,
     similar: AtomicUsize,
+    optimized: AtomicUsize,
+    optimized_bytes: AtomicU64,
     current: Mutex<String>,
     failures: Mutex<Vec<ImportFailure>>,
     hints: Mutex<Vec<ImportHint>>,
@@ -122,6 +128,8 @@ impl ImportJob {
             merged: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             similar: AtomicUsize::new(0),
+            optimized: AtomicUsize::new(0),
+            optimized_bytes: AtomicU64::new(0),
             current: Mutex::new(String::new()),
             failures: Mutex::new(Vec::new()),
             hints: Mutex::new(Vec::new()),
@@ -204,6 +212,12 @@ impl ImportJob {
         self.similar.fetch_add(count, Ordering::Relaxed);
     }
 
+    pub fn inc_optimized(&self, count: usize, saved_bytes: u64) {
+        self.optimized.fetch_add(count, Ordering::Relaxed);
+        self.optimized_bytes
+            .fetch_add(saved_bytes, Ordering::Relaxed);
+    }
+
     pub fn set_current(&self, current: impl Into<String>) {
         let current = current.into();
         self.handle.set_message(current.clone());
@@ -255,6 +269,8 @@ impl ImportJob {
             merged: self.merged.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             similar: self.similar.load(Ordering::Relaxed),
+            optimized: self.optimized.load(Ordering::Relaxed),
+            optimized_bytes: self.optimized_bytes.load(Ordering::Relaxed),
             current: self.current.lock().clone(),
             elapsed_ms: now_ms().saturating_sub(self.started_at),
         }

@@ -91,6 +91,20 @@ export function confirmClearHistory(
   });
 }
 
+/** 导入时压缩：原图不落盘；压不动的图仍保留原图。 */
+export function confirmImportOptimize(
+  confirm: ConfirmFn,
+  pathCount: number,
+): Promise<boolean> {
+  return confirm({
+    title: "导入时压缩这些图片？",
+    message: `会压缩本次从 ${count(pathCount)} 个路径导入的图片；压不动的图保留原图。`,
+    detail: "压缩后的原图不会保留，无法还原。",
+    confirmLabel: "导入并压缩",
+    danger: true,
+  });
+}
+
 /** 空间优化执行：替换原图且有损；执行中可以取消，但已完成的图片不会恢复。 */
 export function confirmOptimize(
   confirm: ConfirmFn,

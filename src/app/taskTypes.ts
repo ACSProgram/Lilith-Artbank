@@ -123,6 +123,8 @@ export interface TaskSnapshot {
   completed: number;
   failed: number;
   skipped: number;
+  /** 后端按阶段耗时加权的百分比；null 表示按 completed / total 计算。 */
+  progressPercent: number | null;
   message: string;
   currentImageId: number | null;
   startedAt: number;
@@ -185,8 +187,11 @@ export function isTaskActive(task: TaskSnapshot): boolean {
   return task.phase !== "completed" && task.phase !== "cancelled" && task.phase !== "failed";
 }
 
-/** 已完成 + 失败 + 跳过 视为已处理，用于进度条百分比。 */
+/** 进度条百分比：后端给了加权值就用它，否则按「已完成 + 失败 + 跳过 / 总数」计算。 */
 export function taskPercent(task: TaskSnapshot): number {
+  if (task.progressPercent !== null) {
+    return Math.min(100, Math.max(0, task.progressPercent));
+  }
   if (task.total <= 0) return isTaskActive(task) ? 0 : 100;
   const done = task.completed + task.failed + task.skipped;
   return Math.min(100, Math.round((done / task.total) * 100));

@@ -143,6 +143,8 @@ pub struct TaskSnapshot {
     pub completed: usize,
     pub failed: usize,
     pub skipped: usize,
+    /// 后端给出的加权百分比；`None` 表示按 `completed / total` 计算。
+    pub progress_percent: Option<u8>,
     pub message: String,
     pub current_image_id: Option<i64>,
     pub started_at: i64,
@@ -174,6 +176,8 @@ pub struct TaskHandle {
     completed: AtomicUsize,
     failed: AtomicUsize,
     skipped: AtomicUsize,
+    /// 后端按耗时加权后的百分比；`None` 时前端按 completed / total 计算。
+    percent: Mutex<Option<u8>>,
     current: Mutex<Option<i64>>,
     message: Mutex<String>,
     failures: Mutex<Vec<TaskFailure>>,
@@ -194,6 +198,7 @@ impl TaskHandle {
             completed: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             skipped: AtomicUsize::new(0),
+            percent: Mutex::new(None),
             current: Mutex::new(None),
             message: Mutex::new(String::new()),
             failures: Mutex::new(Vec::new()),
@@ -254,6 +259,11 @@ impl TaskHandle {
 
     pub fn set_completed(&self, completed: usize) {
         self.completed.store(completed, Ordering::Relaxed);
+    }
+
+    /// 按阶段加权后的百分比；只在阶段单位不可比时使用。
+    pub fn set_percent(&self, percent: u8) {
+        *self.percent.lock() = Some(percent.min(100));
     }
 
     pub fn inc_completed(&self) {
@@ -331,6 +341,7 @@ impl TaskHandle {
             completed: self.completed.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
+            progress_percent: *self.percent.lock(),
             message: self.message.lock().clone(),
             current_image_id: *self.current.lock(),
             started_at: self.started_at,
@@ -364,6 +375,10 @@ impl BatchReporter for TaskHandle {
 
     fn message(&self, message: &str) {
         self.set_message(message);
+    }
+
+    fn percent(&self, percent: u8) {
+        self.set_percent(percent);
     }
 }
 

@@ -14,6 +14,7 @@ use crate::{
         state::AppState,
         tasks::LaneGuard,
     },
+    imageops::optimize::{OptimizeFormat, OptimizeOptions, QualityTier},
     library::{db::LibraryDb, history, paths::normalize_folder, thumbs::ThumbPack},
 };
 
@@ -27,6 +28,25 @@ pub enum FolderMode {
     Flat,
     /// 保留每个输入目录下的相对目录层级。
     Preserve,
+}
+
+/// 导入时顺带压缩：只选档位与输出格式，长边不缩放、重算开关全关。
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImportOptimize {
+    pub tier: QualityTier,
+    pub output_format: OptimizeFormat,
+}
+
+impl ImportOptimize {
+    /// 导入时的图片是新的：不缩放、不重算特征，也不存在“已处理过”。
+    pub fn options(self) -> OptimizeOptions {
+        OptimizeOptions {
+            tier: self.tier,
+            output_format: self.output_format,
+            ..OptimizeOptions::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +65,9 @@ pub struct ImportRequest {
     pub duplicate_policy: DuplicatePolicy,
     #[serde(default = "default_threshold")]
     pub perceptual_threshold: u8,
+    /// 勾选后导入即压缩；`None` 表示不压缩，行为与以前完全一致。
+    #[serde(default)]
+    pub optimize: Option<ImportOptimize>,
     #[serde(default)]
     pub worker_threads: Option<usize>,
     #[cfg(test)]
@@ -215,6 +238,7 @@ mod tests {
             score: 0,
             duplicate_policy: DuplicatePolicy::Skip,
             perceptual_threshold: 6,
+            optimize: None,
             worker_threads: None,
             cancel_after: None,
         }

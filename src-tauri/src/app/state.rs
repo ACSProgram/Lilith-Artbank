@@ -1085,8 +1085,13 @@ impl AppState {
         let options = request.optimize.clone().unwrap_or_default();
         options.validate()?;
         let sample_size = request.estimate_sample_size.unwrap_or(200);
-        if !optimize_estimate::SAMPLE_CHOICES.contains(&sample_size) {
-            return Err(AppError::message("估算抽样必须是 100 / 200 / 500 张"));
+        if !optimize_estimate::sample_size_valid(sample_size) {
+            return Err(AppError::message(format!(
+                "估算抽样必须是 {}-{} 之间、步长 {} 的整数",
+                optimize_estimate::SAMPLE_MIN,
+                optimize_estimate::SAMPLE_MAX,
+                optimize_estimate::SAMPLE_STEP
+            )));
         }
         let (database, _, root) = self
             .library_handles()
@@ -1267,7 +1272,7 @@ impl AppState {
 }
 
 fn store_estimate(store: &Mutex<VecDeque<(String, OptimizeEstimate)>>, estimate: OptimizeEstimate) {
-    const MAX_ESTIMATES: usize = 5;
+    const MAX_ESTIMATES: usize = 10;
     let mut entries = store.lock();
     entries.push_front((estimate.task_id.clone(), estimate));
     entries.truncate(MAX_ESTIMATES);

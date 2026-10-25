@@ -3435,6 +3435,16 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.import-optimize {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
 .import-policy-option {
   display: flex;
   flex-direction: column;
@@ -5517,6 +5527,56 @@ body.is-drag-sorting * {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.input.is-invalid {
+  border-color: var(--danger-border);
+}
+
+.input-unit {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.optimize-slider-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.optimize-slider-head strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.optimize-slider-head span {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.optimize-slider-marks {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.optimize-error-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.optimize-error-row .form-error {
+  flex: 1;
 }
 
 /* 三个重算开关做成一行胶囊：比三条独立开关省一半高度。 */

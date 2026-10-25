@@ -14,7 +14,11 @@ use uuid::Uuid;
 
 use crate::{
     app::error::{AppError, AppResult},
-    imageops::{colors, phash, thumbnail},
+    imageops::{
+        colors,
+        optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SourceInfo},
+        phash, thumbnail,
+    },
     import::{
         FolderMode, ImportRequest, ImportSource, decode,
         job::{DuplicatePolicy, ImportHint, ImportJob, ImportPhase},
@@ -77,6 +81,9 @@ struct Prepared {
     colors8: [u8; 32],
     thumb: thumbnail::EncodedThumbnail,
     similar: Option<(i64, u32)>,
+    optimized_at: i64,
+    /// 导入时压缩成功后省下的字节数；`None` 表示保留原图。
+    optimized_savings: Option<u64>,
 }
 
 /// 工作线程交给写线程的结果。`Prepared` 是热点载荷，装箱会为每张图多一次分配，
@@ -100,6 +107,8 @@ struct WorkerContext {
     folder: String,
     folder_mode: FolderMode,
     threshold: u8,
+    /// 勾选「导入时压缩」后的编码参数；`None` 表示原样入库。
+    optimize: Option<OptimizeOptions>,
     inflight: Arc<Mutex<HashSet<String>>>,
     index: Arc<RwLock<PhashIndex>>,
     sender: mpsc::SyncSender<Outcome>,
@@ -118,6 +127,8 @@ struct CommitStats {
     failures: Vec<(String, String)>,
     duplicates: usize,
     merged: usize,
+    optimized: usize,
+    optimized_bytes: u64,
 }
 
 pub fn run(source: ImportSource, job: Arc<ImportJob>, request: ImportRequest) -> AppResult<()> {
@@ -207,6 +218,7 @@ fn run_inner(
             folder: request.folder.clone(),
             folder_mode: request.folder_mode,
             threshold: request.perceptual_threshold,
+            optimize: request.optimize.map(|value| value.options()),
             inflight,
             index,
             sender,
@@ -344,29 +356,102 @@ fn build_prepared(
         }
         _ => context.folder.clone(),
     };
-    let file_ext = content_extension(decoded.format).to_owned();
-    let file_name = format!("{}.{}", staged.hash, file_ext);
+
+    // 缩略图、pHash、主色都来自同一张解码图，压缩前后字节不同但像素相同，
+    // 所以这三样不需要因为压缩而重算。任何一步不满足判据都保留原图。
+    let mut content = staged.path.clone();
+    let mut content_hash = staged.hash.clone();
+    let mut file_ext = content_extension(decoded.format).to_owned();
+    let mut file_size = staged.size;
+    let mut format = decoded.format.to_owned();
+    let mut has_alpha = decoded.has_alpha;
+    let mut optimized_at = 0_i64;
+    let mut optimized_savings = None;
+    if let Some(options) = &context.optimize {
+        match optimize_for_import(&staged.path, &decoded, options) {
+            Ok(Some(candidate)) => {
+                let bytes = candidate.bytes;
+                content = write_encoded(&bytes, &staged.path)?;
+                content_hash = blake3::hash(&bytes).to_hex().to_string();
+                file_ext = options.output_format.extension().to_owned();
+                file_size = bytes.len() as u64;
+                format = options.output_format.name().to_owned();
+                // JPEG 装不下透明通道；能在这一步拿到结果的带 alpha 图只会是 WebP。
+                has_alpha = options.output_format != OptimizeFormat::Jpeg && decoded.has_alpha;
+                optimized_at = now_ms();
+                optimized_savings = Some(staged.size.saturating_sub(file_size));
+            }
+            // 判据不满足：保留原图，导入照常成功。
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!(
+                    "导入时压缩失败，保留原图：{}：{error}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+
+    let file_name = format!("{content_hash}.{file_ext}");
     let destination = context.paths.content_file(&folder, &file_name);
-    let published = publish(&staged.path, &destination)?;
+    let published = publish(&content, &destination)?;
 
     Ok(Some(Outcome::Prepared(Prepared {
         source_path: source_path.to_path_buf(),
         destination,
         folder,
         published,
-        content_hash: staged.hash.clone(),
+        content_hash,
         file_ext,
-        file_size: staged.size,
+        file_size,
         width: decoded.width,
         height: decoded.height,
-        format: decoded.format.to_owned(),
-        has_alpha: decoded.has_alpha,
+        format,
+        has_alpha,
         phash: hash,
         colors4,
         colors8,
         thumb,
         similar,
+        optimized_at,
+        optimized_savings,
     })))
+}
+
+/// 导入时的压缩：完整 PSNR 阶梯与批量压缩共用同一份实现。
+///
+/// 返回 `Ok(None)` 表示按判据保留原图（透明/非 sRGB/超大/16 位/省不到 5%）。
+fn optimize_for_import(
+    staged: &Path,
+    decoded: &decode::DecodedImage,
+    options: &OptimizeOptions,
+) -> AppResult<Option<optimize::EncodedCandidate>> {
+    // ICC 判据与 JPEG→JPEG 的 EXIF 搬运都要原始字节，所以这里再读一遍临时副本。
+    let source_bytes = std::fs::read(staged)?;
+    let source_size = source_bytes.len() as u64;
+    if optimize::color_profile_guard(&source_bytes, decoded.format, options).is_err() {
+        return Ok(None);
+    }
+    let source = SourceInfo {
+        format: decoded.format.to_owned(),
+        file_size: source_size as i64,
+        width: decoded.width,
+        height: decoded.height,
+        has_alpha: decoded.has_alpha,
+        optimized_at: 0,
+        bit_depth: optimize::bit_depth(&decoded.image),
+    };
+    let Ok(plan) = optimize::plan(&source, options) else {
+        return Ok(None);
+    };
+    // 只有 JPEG → JPEG 会搬运源文件的 EXIF；其他组合由编码器写新头。
+    let source_jpeg = (options.output_format == OptimizeFormat::Jpeg
+        && matches!(decoded.format, "jpeg" | "jpg"))
+    .then_some(source_bytes.as_slice());
+    match optimize::encode_ladder(&decoded.image, &plan, options, source_size, source_jpeg)? {
+        LadderOutcome::Encoded(candidate) => Ok(Some(candidate)),
+        LadderOutcome::Skipped(_) => Ok(None),
+    }
 }
 
 fn find_similar(index: &PhashIndex, hash: &[u64; 4], threshold: u8) -> Option<(i64, u32)> {
@@ -438,6 +523,10 @@ fn copy_and_hash(source: &Path, destination: &Path) -> AppResult<(String, u64)> 
     Ok((hasher.finalize().to_hex().to_string(), size))
 }
 
+/// 把待发布文件 rename 成目标内容文件。
+///
+/// `temp` 是导入临时目录里的文件：原图副本，或压缩结果。目标已存在时删掉临时文件，
+/// 由调用方按“内容重复”处理。
 fn publish(temp: &Path, destination: &Path) -> AppResult<bool> {
     if destination.is_file() {
         std::fs::remove_file(temp)?;
@@ -452,8 +541,24 @@ fn publish(temp: &Path, destination: &Path) -> AppResult<bool> {
             let _ = std::fs::remove_file(temp);
             Ok(false)
         }
-        Err(error) => Err(AppError::message(format!("发布原图失败：{error}"))),
+        Err(error) => Err(AppError::message(format!("发布图片文件失败：{error}"))),
     }
+}
+
+/// 压缩结果先落到导入临时目录，再走与原图相同的发布路径。
+fn write_encoded(bytes: &[u8], staged: &Path) -> AppResult<PathBuf> {
+    let path = staged.with_extension("optimized");
+    let write = || -> std::io::Result<()> {
+        let mut file = BufWriter::with_capacity(READ_BUFFER, File::create(&path)?);
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.get_ref().sync_all()
+    };
+    if let Err(error) = write() {
+        let _ = std::fs::remove_file(&path);
+        return Err(AppError::message(format!("写入压缩结果失败：{error}")));
+    }
+    Ok(path)
 }
 
 /// 原图扩展名取自解码后的格式，不跟源文件名：否则把 PNG 改名成 `.jpg` 入库后，
@@ -536,6 +641,8 @@ fn flush(
             failures: Vec::new(),
             duplicates: 0,
             merged: 0,
+            optimized: 0,
+            optimized_bytes: 0,
         };
         let mut segments = HashSet::new();
 
@@ -574,6 +681,7 @@ fn flush(
                 thumb_width: item.thumb.width,
                 thumb_height: item.thumb.height,
                 imported_at: now,
+                optimized_at: item.optimized_at,
                 origin_operation_id: options.operation_id,
             };
 
@@ -598,6 +706,10 @@ fn flush(
                         similar: item.similar,
                         phash: item.phash,
                     });
+                    if let Some(saved) = item.optimized_savings {
+                        stats.optimized += 1;
+                        stats.optimized_bytes += saved;
+                    }
                 }
                 Ok(None) => {
                     resolve_existing(
@@ -699,6 +811,7 @@ fn flush(
             job.inc_imported(stats.inserted.len());
             job.inc_duplicates(stats.duplicates);
             job.inc_merged(stats.merged);
+            job.inc_optimized(stats.optimized, stats.optimized_bytes);
             {
                 let mut hashes = index.write();
                 for row in &stats.inserted {
@@ -787,11 +900,15 @@ fn resolve_existing(
 mod tests {
     use std::time::Instant;
 
-    use image::{DynamicImage, Rgb, RgbImage};
+    use image::{DynamicImage, Rgb, RgbImage, Rgba, RgbaImage};
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::{service, thumbs};
+    use crate::{
+        imageops::optimize::QualityTier,
+        import::job::ImportSnapshot,
+        library::{service, thumbs},
+    };
 
     fn sample_image(seed: u32, width: u32, height: u32) -> DynamicImage {
         let mut image = RgbImage::new(width, height);
@@ -849,6 +966,7 @@ mod tests {
             score: 3,
             duplicate_policy: DuplicatePolicy::Skip,
             perceptual_threshold: 6,
+            optimize: None,
             worker_threads: Some(4),
             #[cfg(test)]
             cancel_after: None,
@@ -864,6 +982,237 @@ mod tests {
         run(source(session, root), job.clone(), request(dir)).unwrap();
         job.finish(ImportPhase::Completed);
         Arc::try_unwrap(job).ok().unwrap()
+    }
+
+    /// 平滑渐变：PNG 转 JPEG 后能同时满足画质底线与 5% 体积差。
+    fn smooth_image(seed: u32, width: u32, height: u32) -> DynamicImage {
+        let mut image = RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let value = (x * 3 + y * 2 + seed) % 256;
+            *pixel = Rgb([
+                value as u8,
+                ((value + 60) % 256) as u8,
+                ((value + 120) % 256) as u8,
+            ]);
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    fn optimized_request(
+        directory: &Path,
+        tier: QualityTier,
+        output_format: OptimizeFormat,
+    ) -> ImportRequest {
+        ImportRequest {
+            optimize: Some(crate::import::ImportOptimize {
+                tier,
+                output_format,
+            }),
+            ..request(directory)
+        }
+    }
+
+    fn run_with(
+        session: &crate::library::service::LibrarySession,
+        root: &Path,
+        request: ImportRequest,
+    ) -> ImportSnapshot {
+        let job = Arc::new(ImportJob::new("optimized-job", "测试样本"));
+        run(source(session, root), job.clone(), request).unwrap();
+        job.finish(ImportPhase::Completed);
+        job.snapshot()
+    }
+
+    #[test]
+    fn compresses_content_when_import_optimize_is_enabled() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let path = source_dir.join("smooth.png");
+        smooth_image(7, 192, 128).save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let original_hash = blake3::hash(&original).to_hex().to_string();
+
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let snapshot = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+
+        assert_eq!(snapshot.progress.imported, 1, "{snapshot:?}");
+        assert_eq!(snapshot.progress.optimized, 1, "{snapshot:?}");
+        assert!(snapshot.progress.optimized_bytes > 0, "{snapshot:?}");
+
+        let (hash, ext, format, size, optimized_at): (String, String, String, i64, i64) =
+            session
+                .db
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                    "SELECT content_hash, file_ext, format, file_size, optimized_at FROM images",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )?)
+                })
+                .unwrap();
+        assert_ne!(hash, original_hash);
+        assert_eq!(ext, "jpg");
+        assert_eq!(format, "jpeg");
+        assert!(optimized_at > 0);
+        assert!(size < original.len() as i64);
+
+        let content = library_root.join("导入").join(format!("{hash}.jpg"));
+        assert!(content.is_file(), "缺少压缩后的内容文件");
+        assert_eq!(std::fs::metadata(&content).unwrap().len(), size as u64);
+        assert!(
+            !library_root
+                .join("导入")
+                .join(format!("{original_hash}.png"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn keeps_transparent_source_when_output_is_jpeg() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let path = source_dir.join("alpha.png");
+        let mut image = RgbaImage::new(96, 96);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                x as u8,
+                y as u8,
+                ((x + y) % 256) as u8,
+                ((x * 2 + y * 3) % 256) as u8,
+            ]);
+        }
+        DynamicImage::ImageRgba8(image).save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let original_hash = blake3::hash(&original).to_hex().to_string();
+
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let snapshot = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+
+        assert_eq!(snapshot.progress.imported, 1, "{snapshot:?}");
+        assert_eq!(snapshot.progress.optimized, 0, "{snapshot:?}");
+        let (hash, ext, optimized_at): (String, String, i64) = session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT content_hash, file_ext, optimized_at FROM images",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(hash, original_hash);
+        assert_eq!(ext, "png");
+        assert_eq!(optimized_at, 0);
+        assert!(
+            library_root
+                .join("导入")
+                .join(format!("{hash}.png"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn optimized_import_dedupes_same_params_and_splits_on_tier_change() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        smooth_image(3, 160, 120)
+            .save(source_dir.join("smooth.png"))
+            .unwrap();
+
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let first = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+        assert_eq!(first.progress.imported, 1, "{first:?}");
+
+        let repeat = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+        assert_eq!(repeat.progress.imported, 0, "{repeat:?}");
+        assert_eq!(repeat.progress.duplicates, 1, "{repeat:?}");
+
+        let changed = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::Medium, OptimizeFormat::Jpeg),
+        );
+        assert_eq!(changed.progress.imported, 1, "{changed:?}");
+        let rows: i64 = session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row("SELECT count(*) FROM images", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn compression_keeps_thumbnail_phash_and_colors() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        smooth_image(11, 200, 140)
+            .save(source_dir.join("smooth.png"))
+            .unwrap();
+
+        let plain_root = temp.path().join("plain");
+        let plain = open_library(&plain_root);
+        run_import(&plain, &plain_root, &source_dir);
+
+        let optimized_root = temp.path().join("optimized");
+        let optimized = open_library(&optimized_root);
+        run_with(
+            &optimized,
+            &optimized_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+
+        let read_row = |session: &crate::library::service::LibrarySession| {
+            session
+                .db
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT phash, colors4, colors8 FROM images",
+                        [],
+                        |row| {
+                            let phash: Vec<u8> = row.get(0)?;
+                            let colors4: Vec<u8> = row.get(1)?;
+                            let colors8: Vec<u8> = row.get(2)?;
+                            Ok((phash, colors4, colors8))
+                        },
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(read_row(&plain), read_row(&optimized));
+
+        let plain_thumb = {
+            let pointer = thumbs::load_pointer(&plain.db, 1).unwrap().unwrap();
+            plain.thumbs.read(pointer.location).unwrap()
+        };
+        let optimized_thumb = {
+            let pointer = thumbs::load_pointer(&optimized.db, 1).unwrap().unwrap();
+            optimized.thumbs.read(pointer.location).unwrap()
+        };
+        assert_eq!(plain_thumb, optimized_thumb);
     }
 
     #[test]

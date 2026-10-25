@@ -1051,6 +1051,7 @@ function mockHistoryTask(kind: TaskKind, label: string, scope: string): TaskSnap
     completed: 0,
     failed: 0,
     skipped: 0,
+    progressPercent: null,
     message: "",
     currentImageId: null,
     startedAt: Date.now(),

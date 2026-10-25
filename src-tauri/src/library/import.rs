@@ -27,6 +27,8 @@ pub struct ImageInsert {
     pub thumb_width: u32,
     pub thumb_height: u32,
     pub imported_at: i64,
+    /// 导入时压缩过就写当前时间；以后跑全库压缩会跳过这些行。
+    pub optimized_at: i64,
     /// 导入记录 id；撤销导入时按它找回本次新增的行。
     pub origin_operation_id: Option<i64>,
 }
@@ -160,10 +162,10 @@ pub fn insert_image(
             content_hash, file_ext, folder_id, file_size, width, height, format,
             has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at,
             thumb_segment, thumb_offset, thumb_length, thumb_format,
-            thumb_width, thumb_height, thumb_version, origin_operation_id
+            thumb_width, thumb_height, thumb_version, optimized_at, origin_operation_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', ?13, ?13,
-            ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20
+            ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21
          )
          ON CONFLICT(content_hash) DO NOTHING",
         params![
@@ -186,6 +188,7 @@ pub fn insert_image(
             image.thumb_format,
             image.thumb_width,
             image.thumb_height,
+            image.optimized_at,
             image.origin_operation_id,
         ],
     )?;
@@ -327,6 +330,7 @@ mod tests {
                         thumb_width: 4,
                         thumb_height: 3,
                         imported_at: 1,
+                        optimized_at: 0,
                         origin_operation_id: None,
                     },
                 )?;
@@ -369,6 +373,7 @@ mod tests {
                             thumb_width: 4,
                             thumb_height: 3,
                             imported_at: 2,
+                            optimized_at: 0,
                             origin_operation_id: None,
                         },
                     )?

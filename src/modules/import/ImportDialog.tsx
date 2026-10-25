@@ -6,11 +6,16 @@ import { Field } from "../../shared/components/Field";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Modal } from "../../shared/components/Modal";
 import { thumbnailUrl } from "../../shared/thumbUrl";
+import { formatBytes } from "../../shared/format";
+import { confirmImportOptimize } from "../../shared/confirm";
+import { useNotices } from "../../app/noticeContext";
 import { importApi } from "./api";
 import type {
   DuplicatePolicy,
   FolderMode,
   ImportFolder,
+  ImportOptimizeFormat,
+  ImportOptimizeTier,
   ImportPhase,
   ImportProgress,
   ImportSnapshot,
@@ -18,6 +23,12 @@ import type {
 import { errorMessage } from "../../shared/errors";
 
 const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff", "tga", "gif"];
+
+const OPTIMIZE_TIERS: Array<{ value: ImportOptimizeTier; label: string }> = [
+  { value: "extreme", label: "极高" },
+  { value: "high", label: "高" },
+  { value: "medium", label: "中" },
+];
 
 type View = "options" | "running" | "done";
 
@@ -80,6 +91,7 @@ export function ImportDialog({
   onClose,
   onFinished,
 }: ImportDialogProps) {
+  const { confirm } = useNotices();
   const [paths, setPaths] = useState<string[]>([]);
   const [folder, setFolder] = useState("");
   const [folderMode, setFolderMode] = useState<FolderMode>("flat");
@@ -87,6 +99,9 @@ export function ImportDialog({
   const [tagsText, setTagsText] = useState("");
   const [score, setScore] = useState(0);
   const [policy, setPolicy] = useState<DuplicatePolicy>("skip");
+  const [optimizeEnabled, setOptimizeEnabled] = useState(false);
+  const [optimizeFormat, setOptimizeFormat] = useState<ImportOptimizeFormat>("jpeg");
+  const [optimizeTier, setOptimizeTier] = useState<ImportOptimizeTier>("high");
   const [view, setView] = useState<View>("options");
   const [jobId, setJobId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
@@ -137,6 +152,9 @@ export function ImportDialog({
     setTagsText("");
     setScore(0);
     setPolicy("skip");
+    setOptimizeEnabled(false);
+    setOptimizeFormat("jpeg");
+    setOptimizeTier("high");
     setView("options");
     setJobId(null);
     setProgress(null);
@@ -250,6 +268,10 @@ export function ImportDialog({
       setError("请先选择图片或目录");
       return;
     }
+    if (optimizeEnabled) {
+      const accepted = await confirmImportOptimize(confirm, paths.length);
+      if (!accepted) return;
+    }
     setStarting(true);
     setError(null);
     try {
@@ -261,6 +283,9 @@ export function ImportDialog({
         score,
         duplicatePolicy: policy,
         perceptualThreshold: 6,
+        optimize: optimizeEnabled
+          ? { tier: optimizeTier, outputFormat: optimizeFormat }
+          : null,
       });
       jobIdRef.current = snapshot.jobId;
       setJobId(snapshot.jobId);
@@ -457,6 +482,67 @@ export function ImportDialog({
             </div>
           </div>
 
+          <div className="field">
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={optimizeEnabled}
+                onChange={(event) => setOptimizeEnabled(event.target.checked)}
+              />
+              <span>
+                <strong>导入时压缩</strong>
+                <small>原图不会保留，无法还原。</small>
+              </span>
+            </label>
+            {optimizeEnabled ? (
+              <div className="import-optimize">
+                <Field
+                  label="输出格式"
+                  hint={
+                    optimizeFormat === "webp"
+                      ? "WebP 不保留 EXIF 与色彩配置；超过 16383 px 的图会保留原图。"
+                      : "透明图会保留原图。"
+                  }
+                >
+                  <div className="optimize-choice-row">
+                    <button
+                      type="button"
+                      className={`optimize-choice${optimizeFormat === "jpeg" ? " is-active" : ""}`}
+                      onClick={() => setOptimizeFormat("jpeg")}
+                    >
+                      JPG
+                    </button>
+                    <button
+                      type="button"
+                      className={`optimize-choice${optimizeFormat === "webp" ? " is-active" : ""}`}
+                      onClick={() => setOptimizeFormat("webp")}
+                    >
+                      WebP
+                    </button>
+                  </div>
+                </Field>
+                <div className="field">
+                  <span className="field-label">质量档位</span>
+                  <div className="optimize-choice-row">
+                    {OPTIMIZE_TIERS.map((item) => (
+                      <button
+                        key={item.value}
+                        type="button"
+                        className={`optimize-choice${optimizeTier === item.value ? " is-active" : ""}`}
+                        onClick={() => setOptimizeTier(item.value)}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <span className="field-hint">
+                  压不动的图保留原图；同一源图用同样参数重复导入仍然去重，改档位或格式会变成两条记录。
+                </span>
+              </div>
+            ) : null}
+          </div>
+
           {error ? (
             <div className="import-error">
               <AlertTriangle size={15} />
@@ -518,6 +604,14 @@ export function ImportDialog({
               <span>疑似重复</span>
             </div>
           </div>
+
+          {summary && (summary.optimized > 0 || optimizeEnabled) ? (
+            <div className="import-note">
+              {summary.optimized > 0
+                ? `其中 ${summary.optimized} 张已压缩，省 ${formatBytes(summary.optimizedBytes)}。`
+                : "没有图片被压缩：都已足够紧凑，或不满足压缩条件。"}
+            </div>
+          ) : null}
 
           <div className="import-progress-meta">
             <span>

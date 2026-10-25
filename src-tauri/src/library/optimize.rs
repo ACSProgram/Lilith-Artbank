@@ -7,6 +7,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use rayon::prelude::*;
@@ -269,23 +270,29 @@ pub fn optimize(
     let pool = encode_pool("压缩")?;
 
     reporter.report(0, total);
-    let mut completed = 0_usize;
+    // 按张上报：整批 1000 张并行编码时也持续前进，用户能看到真实停在哪一张。
+    let done = AtomicUsize::new(0);
     let mut consecutive_failures = 0_usize;
     let mut stopped = false;
 
-    for batch in jobs.chunks(BATCH_SIZE) {
+    for (batch_index, batch) in jobs.chunks(BATCH_SIZE).enumerate() {
         if reporter.cancelled() {
             report.cancelled = true;
             break;
         }
+        reporter.message("正在编码…");
         let results = pool.install(|| {
             batch
                 .par_iter()
                 .map(|row| {
+                    // 取消后剩余的图不再编码，也不再计入进度：进度条停在真实张数。
                     if reporter.cancelled() {
                         return Ok(None);
                     }
-                    encode_one(&paths, row, options)
+                    let result = encode_one(&paths, row, options);
+                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    reporter.report(completed, total);
+                    result
                 })
                 .collect::<Vec<AppResult<Option<EncodedItem>>>>()
         });
@@ -317,11 +324,10 @@ pub fn optimize(
                     }
                 }
             }
-            completed += 1;
-            reporter.report(completed, total);
         }
 
         if !items.is_empty() {
+            reporter.message(&format!("正在写入第 {} 批", batch_index + 1));
             let (published, duplicates) =
                 commit_batch(database, &paths, thumbs, operation_id, items)?;
             // 目标内容已存在（别的行已占用同样字节）时不再落盘，按跳过计。
@@ -573,11 +579,10 @@ fn commit_batch(
     });
 
     // 提交失败时删掉本批已发布的新文件：事务已回滚，没有行指向它们。
-    result.map_err(|error| {
+    result.inspect_err(|_| {
         for destination in destinations {
             let _ = std::fs::remove_file(destination);
         }
-        error
     })
 }
 
@@ -676,6 +681,21 @@ mod tests {
             hash,
             path,
         )
+    }
+
+    #[derive(Default)]
+    struct CountingReporter {
+        calls: AtomicUsize,
+    }
+
+    impl crate::library::BatchReporter for CountingReporter {
+        fn report(&self, _completed: usize, _total: usize) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn cancelled(&self) -> bool {
+            false
+        }
     }
 
     fn run(fixture: &Fixture, ids: &[i64], options: &OptimizeOptions) -> OptimizeReport {
@@ -797,6 +817,74 @@ mod tests {
             })
             .unwrap();
         assert_eq!(operation, ("optimize".to_owned(), 1, "applied".to_owned()));
+    }
+
+    #[test]
+    fn reports_progress_per_image_instead_of_per_batch() {
+        let (fixture, first_id, _, _) = fixture();
+        let mut ids = vec![first_id];
+        for index in 1..12_u32 {
+            let mut image = RgbImage::new(96, 64);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                *pixel = Rgb([
+                    ((x * 7 + index * 11) % 256) as u8,
+                    ((y * 5 + index * 17) % 256) as u8,
+                    ((x + y + index * 29) % 256) as u8,
+                ]);
+            }
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgb8(image)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            fs::write(fixture.root.join(format!("{hash}.png")), &bytes).unwrap();
+            let id = fixture
+                .session
+                .db
+                .with_writer(|connection| {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description, imported_at,
+                            modified_at
+                         ) VALUES (?1, 'png', 1, ?2, 96, 64, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        params![hash, bytes.len() as i64],
+                    )?;
+                    Ok(connection.last_insert_rowid())
+                })
+                .unwrap();
+            ids.push(id);
+        }
+
+        let operation = crate::library::history::begin_live(
+            &fixture.session.db,
+            NewOperation::new(
+                crate::library::history::HistoryKind::Optimize,
+                "优化图片空间",
+            ),
+        )
+        .unwrap();
+        let candidates = collect_candidates(&fixture.session.db, &ids).unwrap();
+        let reporter = CountingReporter::default();
+        optimize(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            candidates.clone(),
+            &OptimizeOptions::default(),
+            operation,
+            &reporter,
+        )
+        .unwrap();
+        crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
+
+        // 一次初始上报 + 每张一次；按批上报只会是 1 次。
+        assert_eq!(
+            reporter.calls.load(Ordering::Relaxed),
+            candidates.len() + 1,
+            "进度没有按张上报"
+        );
     }
 
     #[test]

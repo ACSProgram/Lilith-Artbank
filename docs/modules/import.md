@@ -27,7 +27,8 @@
   → 512px WebP 缩略图
   → 256 位 pHash
   → 4 色 / 8 色主色
-  → 原子发布原图 <folder>/<hash>.<ext>
+  → 可选：导入时压缩（阶梯编码与 PSNR 裁决）
+  → 原子发布原图或压缩结果 <folder>/<hash>.<ext>
   → 结果送入单写通道，批量入库
 ```
 
@@ -36,6 +37,16 @@
 - 目标文件已存在（通常是上次崩溃留下的同内容文件）时复用，不覆盖；发布用 `rename`，不跨卷。
 - 解码上限：单边 65535、总像素 1 亿、解码分配 512 MiB。超限进入失败清单。
 - EXIF 方向由 `image` crate 的 `ImageDecoder::orientation()` 读取并 `apply_orientation`，只影响缩略图、pHash、主色与后续显示，不改原图字节。
+
+### 导入时压缩（默认关闭）
+
+- `ImportRequest.optimize` 为 `null` 时不压缩，行为与以前完全一致；勾选后只选输出格式（JPG / WebP）与质量档位（极高 / 高 / 中），复用批量压缩的 `QualityTier`、阶梯编码与 PSNR 裁决。勾选框旁写明「原图不会保留，无法还原」，开始导入前再确认一次。
+- 位置在解码之后、发布之前；缩略图、pHash、主色都从同一张解码图计算，压缩前后像素相同，因此不需要重算。
+- 压缩成功时：内容文件改用压缩结果，`content_hash` 取压缩后字节的 BLAKE3，扩展名与 `format` 跟随输出格式，`file_size` 用新长度，`optimized_at` 写当前时间；以后跑全库压缩会跳过这些行。
+- 以下情形保留原图并照常导入（`optimized_at = 0`）：带透明通道但输出 JPEG、非 sRGB 色彩配置而输出装不下、单边超过 16383 且输出 WebP、16 位源、省不到 5%、编码失败。单张失败只写日志，不阻塞整批。
+- 去重语义：内容哈希变成压缩后字节的哈希。同一源图用同样参数重复导入仍判重复（第二次会重新编码后在入库时命中同内容）；改档位或格式会变成两条记录。
+- 不生成独立的 `optimize` 操作记录；导入撤销仍按 `origin_operation_id` 处理，压缩结果与原图走同一条导入记录。
+- 完成页在勾选过压缩时显示「其中 N 张已压缩，省 X」；`N` 只统计真正入库的压缩版本，重复项不计。
 
 ### pHash（256 位）
 
@@ -127,11 +138,13 @@ tags: string[]             初始标签
 score: number              0-5
 duplicatePolicy: "skip" | "merge"
 perceptualThreshold: number 默认 6，后端限制在 0-64
+optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "webp" }
+                            勾选导入时压缩才传对象；null 表示不压缩
 ```
 
 `workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
 
 事件名：`import-progress`、`import-finished`。
 

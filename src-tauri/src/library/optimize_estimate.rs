@@ -38,7 +38,42 @@ const BOOTSTRAP_ROUNDS: usize = 300;
 const MAX_SAMPLE_FAILURES: usize = 20;
 const CHUNK: usize = 400;
 
-pub const SAMPLE_CHOICES: [usize; 3] = [100, 200, 500];
+pub const SAMPLE_MIN: usize = 50;
+pub const SAMPLE_MAX: usize = 2000;
+pub const SAMPLE_STEP: usize = 50;
+
+/// 抽样数量必须是范围内的整步长；前后端共用这组边界。
+pub fn sample_size_valid(size: usize) -> bool {
+    (SAMPLE_MIN..=SAMPLE_MAX).contains(&size) && size.is_multiple_of(SAMPLE_STEP)
+}
+
+/// 统计候选只占进度条前 25%：这一段只按 id 读数据库行，样本编码才是耗时主体。
+const SCAN_PERCENT: u8 = 25;
+/// 编码样本从 26% 走到 100%。
+const SAMPLE_PERCENT_START: u8 = SCAN_PERCENT + 1;
+
+/// 统计阶段的百分比；超过总数（例如传入的 id 有已删除行）也不会超过 `SCAN_PERCENT`。
+fn scan_percentage(scanned: usize, scan_total: usize) -> u8 {
+    if scan_total == 0 {
+        return SCAN_PERCENT;
+    }
+    ((scanned.min(scan_total) * usize::from(SCAN_PERCENT)) / scan_total) as u8
+}
+
+/// 编码样本的百分比；完成全部样本时正好 100。
+fn sample_percentage(completed: usize, sample_total: usize) -> u8 {
+    if sample_total == 0 {
+        return 100;
+    }
+    let span = usize::from(100 - SAMPLE_PERCENT_START);
+    (usize::from(SAMPLE_PERCENT_START) + completed.min(sample_total) * span / sample_total) as u8
+}
+
+/// 收尾文案与满进度：汇总、外推、构造结果都在 100% 之后，不能让用户以为卡住了。
+fn finish_progress(reporter: &dyn BatchReporter) {
+    reporter.message("正在汇总结果…");
+    reporter.percent(100);
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,8 +272,12 @@ pub fn estimate(
     let mut total_bytes = 0_u64;
     let mut skips = PrefilterSkips::default();
 
+    // 统计阶段只报百分比、不报张数：这一段的“张数”就是整个范围，当成抽样进度会让人
+    // 以为在重跑全库。真正能按张数计的只有样本编码。
+    let scan_total = image_ids.len();
     reporter.message("正在统计候选图片…");
     reporter.report(0, 0);
+    reporter.percent(scan_percentage(0, scan_total));
     let mut scanned = 0_usize;
     for chunk in image_ids.chunks(CHUNK) {
         if reporter.cancelled() {
@@ -280,17 +319,14 @@ pub fn estimate(
             folder.stratum_bytes[stratum] += bytes;
             strata_ids[stratum].push(row.id);
         }
-        reporter.message(&format!(
-            "正在统计候选图片… {}/{}",
-            scanned.min(image_ids.len()),
-            image_ids.len()
-        ));
+        reporter.percent(scan_percentage(scanned, scan_total));
     }
 
     let candidate_count: u64 = totals.iter().map(|stratum| stratum.count).sum();
     let candidate_bytes: u64 = totals.iter().map(|stratum| stratum.bytes).sum();
     let candidate_pixels: u64 = totals.iter().map(|stratum| stratum.pixels).sum();
     if candidate_count == 0 {
+        finish_progress(reporter);
         return Ok(Some(empty_estimate(
             task_id,
             options_fingerprint,
@@ -315,7 +351,11 @@ pub fn estimate(
         }
     }
     let sample_total = sample_tasks.len();
+    reporter.message("正在挑选样本…");
+    reporter.report(0, sample_total);
+    reporter.percent(SAMPLE_PERCENT_START);
     if sample_total == 0 {
+        finish_progress(reporter);
         return Ok(Some(empty_estimate(
             task_id,
             options_fingerprint,
@@ -334,8 +374,7 @@ pub fn estimate(
     let pool = encode_pool("估算")?;
     let threads = pool.current_num_threads();
 
-    reporter.message(&format!("正在编码样本 0 / {sample_total} 张"));
-    reporter.report(0, sample_total);
+    reporter.message("正在编码样本…");
     let done = AtomicUsize::new(0);
     let started = Instant::now();
     let records = pool.install(|| {
@@ -361,7 +400,7 @@ pub fn estimate(
                 };
                 let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
                 reporter.report(completed, sample_total);
-                reporter.message(&format!("正在编码样本 {completed} / {sample_total} 张"));
+                reporter.percent(sample_percentage(completed, sample_total));
                 Some((*stratum, *id, outcome, error))
             })
             .collect::<Vec<_>>()
@@ -370,6 +409,10 @@ pub fn estimate(
     if reporter.cancelled() {
         return Ok(None);
     }
+
+    // 样本编码完还有汇总、外推与构造结果；先把进度推满并换文案，避免看起来卡在最后一张。
+    reporter.report(sample_total, sample_total);
+    finish_progress(reporter);
 
     let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
     let mut sample_bytes = 0_u64;
@@ -944,6 +987,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         completed: std::sync::atomic::AtomicUsize,
+        percent: std::sync::atomic::AtomicU8,
         messages: std::sync::Mutex<Vec<String>>,
     }
 
@@ -957,6 +1001,11 @@ mod tests {
             false
         }
 
+        fn percent(&self, percent: u8) {
+            self.percent
+                .store(percent, std::sync::atomic::Ordering::Relaxed);
+        }
+
         fn message(&self, message: &str) {
             self.messages.lock().unwrap().push(message.to_owned());
         }
@@ -968,6 +1017,29 @@ mod tests {
             bytes,
             pixels: count * 1_000_000,
         }
+    }
+
+    #[test]
+    fn sample_size_accepts_only_range_and_step_multiples() {
+        assert!(sample_size_valid(50));
+        assert!(sample_size_valid(200));
+        assert!(sample_size_valid(2000));
+        assert!(!sample_size_valid(49));
+        assert!(!sample_size_valid(55));
+        assert!(!sample_size_valid(2050));
+    }
+
+    #[test]
+    fn progress_percentages_stay_inside_their_phase() {
+        // 统计阶段只走到 25%，越界（含已删除的行）也不会越过它。
+        assert_eq!(scan_percentage(0, 390_542), 0);
+        assert_eq!(scan_percentage(390_542, 390_542), SCAN_PERCENT);
+        assert_eq!(scan_percentage(400_000, 390_542), SCAN_PERCENT);
+        // 编码样本从 26% 起步，正好在最后一张到 100%。
+        assert_eq!(sample_percentage(0, 200), SAMPLE_PERCENT_START);
+        assert_eq!(sample_percentage(200, 200), 100);
+        assert!(sample_percentage(100, 200) > scan_percentage(390_542, 390_542));
+        assert_eq!(sample_percentage(0, 0), 100);
     }
 
     #[test]
@@ -1119,6 +1191,7 @@ mod tests {
             .unwrap();
 
         let options = OptimizeOptions::default();
+        let reporter = Recorder::default();
         let estimate = estimate(
             &session.db,
             &root,
@@ -1127,13 +1200,18 @@ mod tests {
             &options,
             10,
             "fingerprint",
-            &Recorder::default(),
+            &reporter,
         )
         .unwrap()
         .unwrap();
         assert_eq!(estimate.total_count, 3);
         assert_eq!(estimate.candidate_count, 3);
         assert!(estimate.sample_count > 0);
+        assert_eq!(
+            reporter.percent.load(std::sync::atomic::Ordering::Relaxed),
+            100,
+            "估算结束时进度应到 100%"
+        );
 
         let after: Vec<(i64, String, i64, i64)> = session
             .db

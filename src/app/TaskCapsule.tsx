@@ -43,7 +43,7 @@ function TaskRow({
         </span>
       </div>
 
-      {task.total > 0 ? (
+      {task.total > 0 || task.progressPercent !== null ? (
         <div className="task-progress">
           <span style={{ width: `${percent}%` }} />
         </div>

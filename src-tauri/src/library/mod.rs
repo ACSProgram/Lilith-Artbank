@@ -38,6 +38,8 @@ pub trait BatchReporter: Send + Sync {
     fn cancelled(&self) -> bool;
     /// 可选的进度文案；不关心文案的调用方用默认实现。
     fn message(&self, _message: &str) {}
+    /// 可选的百分比：阶段之间单位不同（读行 vs 编码）时用它给进度条加权。
+    fn percent(&self, _percent: u8) {}
 }
 
 /// 压缩与估算共用的编码线程上限：两者都是整图编码，再多的线程在单块盘上也不会更快。

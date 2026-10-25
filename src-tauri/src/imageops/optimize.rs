@@ -18,6 +18,9 @@ pub const MAX_SIZE_RATIO: f64 = 0.95;
 pub const BAD_PIXEL_DELTA: u8 = 6;
 /// WebP（VP8）单边上限；超过这个尺寸编码器会直接拒绝。
 pub const WEBP_MAX_EDGE: u32 = 16_383;
+/// 长边上限的合法范围；上限对齐导入解码上限，超过它的图本来就解不进来。
+pub const MIN_LONG_EDGE: u32 = 64;
+pub const MAX_LONG_EDGE: u32 = 65_535;
 
 /// 编码器存在量化误差，完全相同的图也可能只到 50-60 dB；用 99 表示“无差异”。
 const PSNR_CAP: f64 = 99.0;
@@ -113,9 +116,11 @@ impl Default for OptimizeOptions {
 impl OptimizeOptions {
     pub fn validate(&self) -> AppResult<()> {
         if let Some(edge) = self.max_long_edge
-            && edge < 64
+            && !(MIN_LONG_EDGE..=MAX_LONG_EDGE).contains(&edge)
         {
-            return Err(AppError::message("长边上限不能小于 64"));
+            return Err(AppError::message(format!(
+                "长边上限必须在 {MIN_LONG_EDGE}-{MAX_LONG_EDGE} 之间"
+            )));
         }
         Ok(())
     }
@@ -875,6 +880,19 @@ mod tests {
         jpeg_metadata_segments(data)
             .iter()
             .any(|segment| segment[..2] == [0xFF, 0xE1])
+    }
+
+    #[test]
+    fn validates_long_edge_range() {
+        let options = |edge| OptimizeOptions {
+            max_long_edge: Some(edge),
+            ..OptimizeOptions::default()
+        };
+        assert!(options(MIN_LONG_EDGE).validate().is_ok());
+        assert!(options(MIN_LONG_EDGE - 1).validate().is_err());
+        assert!(options(MAX_LONG_EDGE).validate().is_ok());
+        assert!(options(MAX_LONG_EDGE + 1).validate().is_err());
+        assert!(OptimizeOptions::default().validate().is_ok());
     }
 
     #[test]

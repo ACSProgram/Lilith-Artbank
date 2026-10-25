@@ -4879,6 +4879,7 @@ mod tests {
                 DuplicatePolicy::Skip
             },
             perceptual_threshold: 0,
+            optimize: None,
             worker_threads: Some(2),
             #[cfg(test)]
             cancel_after: None,
