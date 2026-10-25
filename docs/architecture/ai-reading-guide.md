@@ -8,7 +8,7 @@
 | 导入、BLAKE3、pHash、主色、缩略图包 | `docs/modules/import.md` | `src-tauri/src/import/`、`src-tauri/src/imageops/` |
 | 网格/列表、分页、搜索、筛选、排序、集合、回收站、元数据编辑 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/query.rs`、`metadata.rs`、`collections.rs` |
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
-| description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/` |
+| description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/`、`server/` |
 | 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts` |
 | 清理、缩略图重建、描述导入导出 | `docs/modules/maintenance.md` | `src-tauri/src/` 对应领域模块 |
 | 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
@@ -28,6 +28,8 @@
 - SQLite 写入只走单写连接；不要从读连接写库。
 - 颜色只在 `src/styles/tokens.css` 定义（`:root` 浅色 / `html[data-theme="dark"]` 深色）；`index.css` 只引用语义变量，不写字面色值。主题切换走 `src/app/theme.ts`，不要在组件里判断主题。
 - 破坏性操作的确认文案走 `src/shared/confirm.ts`，不要在调用点各写一套标题。
+- 程序根目录、`settings.json` 与 `logs/` 的解析在 `app/paths.rs`；不要在其他模块各自拼 AppData 路径。
+- AI 服务端只改 `server/`；`/v1` 契约变化时同步 `docs/modules/ai-service.md`。
 - 任何全量载入/全量扫描方案先对照 `docs/guides/performance.md`。
 - 真实仓库 `G:\Lilith Image Library` 只读；测试用临时目录。
 - 不做 PinBoard/PasteBoard/调色盘/色彩测试/截屏，不建版本/CHANGELOG/法务文件。

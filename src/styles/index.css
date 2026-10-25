@@ -282,6 +282,17 @@ code {
   border-color: var(--danger-fill-hover);
 }
 
+.button-success {
+  background: var(--success-fill);
+  border-color: var(--success-fill);
+  color: var(--on-accent);
+}
+
+.button-success:hover:not(:disabled) {
+  background: var(--success-fill-hover);
+  border-color: var(--success-fill-hover);
+}
+
 .icon-button {
   width: 30px;
   height: 26px;
@@ -1337,8 +1348,8 @@ textarea:focus-visible {
 }
 
 .library-toolbar-right .search-field {
-  flex: 0 1 190px;
-  min-width: 120px;
+  flex: 0 1 600px;
+  min-width: 200px;
 }
 
 .segmented {
@@ -2345,9 +2356,9 @@ textarea:focus-visible {
   align-items: center;
   gap: 4px;
   height: 29px;
-  min-width: 180px;
-  max-width: 340px;
-  flex: 1 1 240px;
+  min-width: 200px;
+  max-width: 680px;
+  flex: 1 1 600px;
   padding: 0 4px 0 8px;
   border: 1px solid var(--control-border);
   border-radius: 6px;
@@ -2374,6 +2385,43 @@ textarea:focus-visible {
 .search-field .icon-button {
   width: 22px;
   height: 22px;
+}
+
+.search-mode {
+  display: inline-flex;
+  flex-shrink: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+}
+
+.search-mode button {
+  height: 19px;
+  padding: 0 5px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  line-height: 1;
+}
+
+.search-mode button + button {
+  border-left: 1px solid var(--border);
+}
+
+.search-mode button:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.search-mode button.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.search-mode button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .search-scope {
@@ -3062,7 +3110,7 @@ textarea:focus-visible {
   }
 
   .library-toolbar-right .search-field {
-    flex-basis: 150px;
+    flex-basis: 440px;
   }
 
   .library-topbar-actions .selection-summary span {
@@ -4240,37 +4288,6 @@ textarea:focus-visible {
 
 /* ---------- AI ---------- */
 
-.semantic-search-bar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 7px 10px;
-  border: 1px solid var(--accent-border);
-  border-radius: 7px;
-  background: var(--accent-soft);
-}
-
-.semantic-search-bar > svg {
-  color: var(--accent);
-  flex-shrink: 0;
-}
-
-.semantic-search-bar .input {
-  flex: 1;
-  min-width: 160px;
-  height: 28px;
-}
-
-.semantic-hint {
-  max-width: 40%;
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 10.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .semantic-summary {
   border-color: var(--accent-border);
   background: var(--accent-soft);
@@ -4279,6 +4296,21 @@ textarea:focus-visible {
 
 .semantic-summary > svg {
   flex-shrink: 0;
+}
+
+.similarity-target {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.similarity-target:hover {
+  color: var(--accent);
 }
 
 /* 相似分组对话框：每组一行，id 列表只做单行省略，不换行撑高对话框。 */

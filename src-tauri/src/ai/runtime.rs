@@ -37,7 +37,7 @@ use super::{
     job::{self, AiJobRequest, JobContext},
     pack::FeatureStore,
     pose,
-    process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus},
+    process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus, launch_spec},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -134,7 +134,7 @@ impl MeanSlot {
 pub struct AiStatus {
     pub base_url: String,
     pub auto_start: bool,
-    pub executable_configured: bool,
+    pub launch_configured: bool,
     pub online: bool,
     pub process: ProcessStatus,
     pub health: Option<Health>,
@@ -314,10 +314,7 @@ impl AiRuntime {
         if health.is_none()
             && settings.auto_start
             && !self.inner.manual_stop.load(Ordering::SeqCst)
-            && settings
-                .executable_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
+            && settings.launch_configured()
             && process_state == ProcessState::Stopped
         {
             self.spawn_supervisor(settings.clone());
@@ -326,10 +323,7 @@ impl AiRuntime {
         AiStatus {
             base_url: settings.base_url.clone(),
             auto_start: settings.auto_start,
-            executable_configured: settings
-                .executable_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty()),
+            launch_configured: settings.launch_configured(),
             online: health.is_some(),
             process: self.inner.process.lock().status(),
             health,
@@ -338,14 +332,16 @@ impl AiRuntime {
     }
 
     pub fn start_service(&self, settings: &AiSettings) -> AppResult<()> {
-        if settings
-            .executable_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .is_none()
-        {
-            return Err(AppError::message("请先在设置中选择 AI 服务可执行文件"));
+        if settings.python_path().is_none() {
+            return Err(AppError::message("请先在设置中配置 Python 路径"));
+        }
+        if settings.server_script().is_none() {
+            return Err(AppError::message("请先在设置中配置 AI 服务脚本"));
+        }
+        if !settings.base_url_is_local() {
+            return Err(AppError::message(
+                "服务地址不是本机地址，只连接外部服务，不启动 Python",
+            ));
         }
         self.inner.manual_stop.store(false, Ordering::SeqCst);
         self.inner.process.lock().reset_failure();
@@ -384,16 +380,26 @@ impl AiRuntime {
         }
     }
 
-    pub fn ensure_models(
-        &self,
-        settings: &AiSettings,
-        capabilities: &[String],
-    ) -> AppResult<AiStatus> {
-        let client = AiClient::new(&settings.base_url);
-        client
-            .ensure_models(capabilities)
-            .map_err(|error| AppError::message(format!("加载模型失败：{error}")))?;
-        Ok(self.status(settings))
+    /// 设置页保存后按新配置重启托管的服务；外部服务不动。
+    pub fn apply_settings(&self, previous: &AiSettings, current: &AiSettings) {
+        if previous == current {
+            return;
+        }
+        self.inner
+            .supervisor_generation
+            .fetch_add(1, Ordering::SeqCst);
+        let owned = self.inner.process.lock().is_owned_running();
+        if owned {
+            let client = AiClient::new(&previous.base_url);
+            let _ = client.shutdown();
+            self.inner.process.lock().stop(true);
+        } else {
+            self.inner.process.lock().mark_stopped(None);
+        }
+        self.inner.manual_stop.store(false, Ordering::SeqCst);
+        if current.auto_start && current.launch_configured() {
+            self.spawn_supervisor(current.clone());
+        }
     }
 
     pub fn describe_image(
@@ -529,16 +535,29 @@ impl AiRuntime {
         let health = client
             .health()
             .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
-        let image_capability = job::ensure_capability(&client, &health, "imageEmbedding")
-            .map_err(|error| AppError::message(format!("无法加载 embedding 模型：{error}")))?;
+        // 语义搜索只需要文本塔；图片模型名与维度直接从 health 读取，
+        // 避免为了拿维度而把图片塔加载进显存。
+        let image_capability = health
+            .capability("imageEmbedding")
+            .ok_or_else(|| AppError::message("AI 服务没有图像 embedding 能力"))?;
         if image_capability.model.trim().is_empty() {
             return Err(AppError::message("embedding 模型名称为空"));
         }
+        let image_model = image_capability.model.clone();
         let dim = image_capability
             .dim
             .ok_or_else(|| AppError::message("embedding 模型没有声明维度"))?;
         let text_capability = job::ensure_capability(&client, &health, "textEmbedding")
             .map_err(|error| AppError::message(format!("无法加载文本 embedding 模型：{error}")))?;
+        if text_capability.model.trim().is_empty() {
+            return Err(AppError::message("文本 embedding 模型名称为空"));
+        }
+        if text_capability.model != image_model {
+            return Err(AppError::message(format!(
+                "文本 embedding 模型 {} 与图片 embedding 模型 {image_model} 不一致",
+                text_capability.model
+            )));
+        }
         if let Some(text_dim) = text_capability.dim
             && text_dim != dim
         {
@@ -546,13 +565,8 @@ impl AiRuntime {
                 "文本 embedding 维度 {text_dim} 与图片 embedding 维度 {dim} 不一致"
             )));
         }
-        let text_model = if text_capability.model.trim().is_empty() {
-            image_capability.model.clone()
-        } else {
-            text_capability.model.clone()
-        };
         let query_embedding = client
-            .embed_text(&text_model, text)
+            .embed_text(&text_capability.model, text)
             .map_err(|error| AppError::message(error.to_string()))?;
         if query_embedding.dim != dim {
             return Err(AppError::message(format!(
@@ -560,12 +574,12 @@ impl AiRuntime {
                 query_embedding.dim
             )));
         }
-        let mean = self.ensure_mean(&handles, &image_capability.model, dim)?;
+        let mean = self.ensure_mean(&handles, &image_model, dim)?;
         let limit = limit.unwrap_or(embedding::DEFAULT_SEARCH_LIMIT);
         let results = embedding::search(
             &handles.database,
             &self.inner.store,
-            &image_capability.model,
+            &image_model,
             dim,
             &query_embedding.vector,
             &mean.vector,
@@ -581,7 +595,7 @@ impl AiRuntime {
         });
         Ok(SemanticSearchResult {
             token,
-            model: image_capability.model,
+            model: image_model,
             dim,
             total: ids.len(),
             elapsed_ms: started.elapsed().as_millis() as i64,
@@ -838,39 +852,35 @@ impl AiRuntime {
         limit: Option<usize>,
     ) -> AppResult<SimilarityPage> {
         let handles = self.handles()?;
-        let cache = self.inner.results.lock();
-        let cache = cache
-            .as_ref()
-            .filter(|cache| {
-                cache.token == token
-                    && cache.generation == handles.generation
-                    && cache.library_id == handles.library_id
-            })
-            .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))?;
+        // 先拷出 id 再查库：查库期间不要占着结果缓存锁，否则并发搜索会被这一页拖住。
+        let ids = self.cached_ids(token, &handles)?;
         let limit = limit.unwrap_or(150).clamp(1, 300);
-        let start = offset.min(cache.ids.len());
-        let end = (start + limit).min(cache.ids.len());
-        let ids = &cache.ids[start..end];
-        let items = query::rows_by_ids(&handles.database, &handles.root, ids)?;
+        let start = offset.min(ids.len());
+        let end = (start + limit).min(ids.len());
+        let items = query::rows_by_ids(&handles.database, &handles.root, &ids[start..end])?;
         Ok(SimilarityPage {
             items,
-            next_offset: (end < cache.ids.len()).then_some(end),
-            total: cache.ids.len(),
+            next_offset: (end < ids.len()).then_some(end),
+            total: ids.len(),
         })
     }
 
     pub fn similarity_ids(&self, token: &str) -> AppResult<Vec<i64>> {
         let handles = self.handles()?;
+        self.cached_ids(token, &handles)
+    }
+
+    fn cached_ids(&self, token: &str, handles: &LibraryHandles) -> AppResult<Vec<i64>> {
         let cache = self.inner.results.lock();
-        let cache = cache
+        cache
             .as_ref()
             .filter(|cache| {
                 cache.token == token
                     && cache.generation == handles.generation
                     && cache.library_id == handles.library_id
             })
-            .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))?;
-        Ok(cache.ids.clone())
+            .map(|cache| cache.ids.clone())
+            .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))
     }
 
     fn handles(&self) -> AppResult<LibraryHandles> {
@@ -994,13 +1004,12 @@ impl AiRuntime {
                 inner.process.lock().mark_online(false);
                 return;
             }
-            let Some(executable) = settings
-                .executable_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-            else {
-                return;
+            let spec = match launch_spec(&settings) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    inner.process.lock().mark_failed(error.to_string());
+                    return;
+                }
             };
 
             let mut online = false;
@@ -1011,7 +1020,7 @@ impl AiRuntime {
                 {
                     let mut process = inner.process.lock();
                     process.note_attempt(attempt);
-                    if let Err(error) = process.spawn(executable, settings.port) {
+                    if let Err(error) = process.spawn(&spec) {
                         process.mark_failed(error.to_string());
                         break;
                     }

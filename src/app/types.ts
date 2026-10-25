@@ -6,9 +6,15 @@ export type ThumbFit = "cover" | "contain";
 
 export interface AiSettings {
   baseUrl: string;
-  executablePath: string | null;
   port: number;
   autoStart: boolean;
+  /** 为空时只连接 baseUrl 上已经启动的服务。 */
+  pythonPath: string | null;
+  serverScript: string | null;
+  /** 模型根目录。 */
+  modelPath: string | null;
+  /** CLIP 模型目录；相对 modelPath，也可以填绝对路径。 */
+  clipModelPath: string | null;
 }
 
 export interface PerformanceSettings {

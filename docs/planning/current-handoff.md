@@ -3,12 +3,23 @@
 日期：2026-10-25
 阶段：**迁移后体验整改 P0–P4 全部完成并归档**。S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
-历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。
+历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
+
+## AI 服务端与便携化（待验收）
+
+- `server/` 实现 `/v1`：health、models/ensure、embed/image、embed/text、pose、shutdown；描述本轮不实现。
+- SigLIP2 图片塔/文本塔从同一份 safetensors 按前缀独立加载，不实例化另一塔；同一时间只驻留一个，空闲 300 秒卸载（`--idle-unload-seconds`，0 关闭）。CUDA 用 fp16，CPU 用 fp32。语义搜索只加载文本塔，图片模型名与维度从 health 读取。
+- MediaPipe Pose 使用 `python_embeded` 内自带的模型，33 点顺序与原项目一致；无人时返回空数组。
+- 设置 v4：新增 `pythonPath`、`serverScript`、`modelPath`、`clipModelPath`，删除 `executablePath`；相对路径按程序根目录解析；填写本机地址、Python 与脚本后随应用启动；保存启动配置会重启托管服务。
+- 设置、主日志与 `ai-server.log` 移到程序目录；不读旧 AppData 设置、不做迁移；程序目录不可写时启动失败。
+- 移除 NSIS；`npm run pack:portable` 产出 exe + `server/`。`python_embeded/` 与 `resources/models/` 由用户放入，不打包、不下载。
+- 模型由首次使用自动加载，设置页与批量任务对话框只显示加载状态；搜索框合并匹配/语义两种模式。
+- 待用户实测：真实模型两塔加载与切换、ensure、批量 embedding、pose、语义搜索、空闲卸载、便携目录运行与日志落点。
 
 ## 基线
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
-- 存储版本：schema v4（v1→v2→v3→v4 链式迁移）、设置 v3（v1→v2→v3）。
+- 存储版本：schema v4（v1→v2→v3→v4 链式迁移）、设置 v4（v1→v2→v3→v4）；设置与日志位于程序目录，不读旧 AppData 设置。
 - 20 万行元数据基准（`cargo test --lib -- --ignored --nocapture perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms、schema v3→v4 建两个索引 459 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 
@@ -61,8 +72,9 @@
 ## 下一步
 
 1. 按上面的清单在 `npm run tauri dev` 下手工验收；真实库只读用于验收，测试、基准和演示仍用临时目录或复制样本。
-2. 待决策项见 [待办与待决策](todo.md)；新阶段按 [路线图](roadmap.md) 继续。
-3. 需要标定相似度阈值时，用复制出来的小样本跑基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
+2. 在便携目录中实测 AI 服务：设置 Python/脚本/模型路径，分别加载图片塔与文本塔，跑批量 embedding、pose、语义搜索，并观察空闲卸载。
+3. 待决策项见 [待办与待决策](todo.md)；新阶段按 [路线图](roadmap.md) 继续。
+4. 需要标定相似度阈值时，用复制出来的小样本跑基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
 
 ## 约束
 

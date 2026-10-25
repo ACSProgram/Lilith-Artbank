@@ -4,7 +4,6 @@ import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
 import { Spinner } from "../shared/components/Spinner";
-import { aiApi, aiBrowserPreview } from "../modules/ai/api";
 import { DEFAULT_DESCRIPTION_PROMPT, type AiStatus } from "../modules/ai/types";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { errorMessage } from "../shared/errors";
@@ -90,7 +89,6 @@ export function BatchTaskDialog({
   const [prompt, setPrompt] = useState(DEFAULT_DESCRIPTION_PROMPT);
   const [maxTokens, setMaxTokens] = useState(160);
   const [starting, setStarting] = useState(false);
-  const [ensuring, setEnsuring] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<TaskSummary[] | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -118,17 +116,21 @@ export function BatchTaskDialog({
     // 只在打开时重置；任务状态变化不应打断用户输入。
   }, [open]);
 
+  const descriptionConfigured = status?.health?.capabilities.description != null;
+
   const kindAvailability = useMemo(() => {
     const map = {} as Record<BatchTaskKind, ActionAvailability>;
     for (const value of Object.keys(KIND_LABELS) as BatchTaskKind[]) {
       if (value === "thumbnail") {
         map[value] = { enabled: true };
+      } else if (value === "aiDescription" && online && !descriptionConfigured) {
+        map[value] = { enabled: false, reason: "本机服务未配置描述模型" };
       } else {
         map[value] = aiTaskAvailability(online);
       }
     }
     return map;
-  }, [online]);
+  }, [online, descriptionConfigured]);
 
   const scopeAvailability = useMemo(() => {
     const map = {} as Record<ScopeChoice, ActionAvailability>;
@@ -175,20 +177,6 @@ export function BatchTaskDialog({
   const capability = AI_CAPABILITY[kind];
   const capabilityInfo = capability ? status?.health?.capabilities[capability] : undefined;
   const capabilityReady = capabilityInfo?.ready === true;
-
-  const ensureModel = async () => {
-    if (!capability) return;
-    setEnsuring(true);
-    setError(null);
-    try {
-      await aiApi.ensureModels([capability]);
-      await onRefreshStatus();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setEnsuring(false);
-    }
-  };
 
   const launch = async (policy: ConflictPolicy) => {
     if (!context) return;
@@ -348,18 +336,9 @@ export function BatchTaskDialog({
                   }`
                 : ""}
             </span>
-            {online && capability && !capabilityReady ? (
-              <Button
-                size="sm"
-                variant="secondary"
-                loading={ensuring}
-                disabled={aiBrowserPreview}
-                onClick={() => void ensureModel()}
-              >
-                加载模型
-              </Button>
+            {online && capability ? (
+              <em>{capabilityReady ? "模型已加载" : "开始任务时自动加载"}</em>
             ) : null}
-            {online && capabilityReady ? <em>已就绪</em> : null}
           </div>
         ) : null}
 

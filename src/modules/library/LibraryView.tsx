@@ -78,6 +78,7 @@ import type {
   FeatureSummary,
   FolderInfo,
   ImageCapabilities,
+  ImageDetails,
   ImageRow,
   LibraryView as LibraryViewType,
   SortKey,
@@ -87,7 +88,11 @@ import { useImageQuery } from "./useImageQuery";
 import { VirtualGrid } from "./VirtualGrid";
 import { VirtualList } from "./VirtualList";
 import type { VirtualViewHandle } from "./virtual";
-import type { ViewerSession, ViewerSessionUpdate } from "../../shared/viewerSession";
+import type {
+  ViewerSession,
+  ViewerSessionItem,
+  ViewerSessionUpdate,
+} from "../../shared/viewerSession";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import type { SimilarKind } from "../../shared/similarity";
 import { SIMILAR_LABELS } from "../../shared/similarity";
@@ -131,6 +136,23 @@ function initialViewMode(): ViewMode {
   }
 }
 
+type SearchMode = "match" | "semantic";
+
+function initialSearchMode(): SearchMode {
+  try {
+    return localStorage.getItem("lilith.searchMode") === "semantic"
+      ? "semantic"
+      : "match";
+  } catch {
+    return "match";
+  }
+}
+
+function fileNameOf(path: string): string {
+  const index = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return index >= 0 ? path.slice(index + 1) : path;
+}
+
 export function LibraryView({
   browse,
   canGoBack,
@@ -155,6 +177,10 @@ export function LibraryView({
   const { notify, confirm } = useNotices();
 
   const [searchDraft, setSearchDraft] = useState(browse.search);
+  const [searchMode, setSearchMode] = useState<SearchMode>(initialSearchMode);
+  // 记住的是用户偏好；AI 离线或全库没有 embedding 时退回匹配模式，
+  // 否则重启后会停在一个永远禁用的搜索框里。
+  const semanticMode = searchMode === "semantic" && !semanticBlockedReason;
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
   const [filterOpen, setFilterOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -178,8 +204,8 @@ export function LibraryView({
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
   const [emptyingTrash, setEmptyingTrash] = useState(false);
   const [viewBusy, setViewBusy] = useState(false);
-  const [semanticOpen, setSemanticOpen] = useState(false);
   const [semanticDraft, setSemanticDraft] = useState("");
+  const [similarityTarget, setSimilarityTarget] = useState<ImageDetails | null>(null);
   const [contextCaps, setContextCaps] = useState<ImageCapabilities | null>(null);
   const [featureSummary, setFeatureSummary] = useState<FeatureSummary | null>(null);
 
@@ -255,10 +281,32 @@ export function LibraryView({
   const hasMoreRef = useRef(hasMore);
   hasMoreRef.current = hasMore;
   const viewerListeners = useRef(new Set<() => void>());
+  const targetViewerItems = useRef<ViewerSessionItem[]>([]);
 
   useEffect(() => {
     for (const listener of viewerListeners.current) listener();
   }, [items]);
+
+  // 相似结果的目标图不在结果里，单独取一次详情用于标题与“打开比较图”。
+  useEffect(() => {
+    const targetId = similarMode ? (similarity?.targetId ?? null) : null;
+    if (targetId == null) {
+      setSimilarityTarget(null);
+      return;
+    }
+    let disposed = false;
+    void libraryApi
+      .getImageDetail(targetId)
+      .then((details) => {
+        if (!disposed) setSimilarityTarget(details);
+      })
+      .catch(() => {
+        if (!disposed) setSimilarityTarget(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [similarMode, similarity?.targetId]);
 
   /** 界面偏好（填充方式、详情面板）改了就存，不弹“设置已保存”。 */
   const persistUi = useCallback(
@@ -391,10 +439,19 @@ export function LibraryView({
   }, [viewMode]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem("lilith.searchMode", searchMode);
+    } catch {
+      // 忽略无法持久化搜索模式的浏览器限制。
+    }
+  }, [searchMode]);
+
+  useEffect(() => {
     setSearchDraft(browse.search);
   }, [browse.search]);
 
   useEffect(() => {
+    if (semanticMode) return;
     const timer = window.setTimeout(() => {
       const next = searchDraft.trim();
       const currentState = browseRef.current;
@@ -406,7 +463,7 @@ export function LibraryView({
       });
     }, 260);
     return () => window.clearTimeout(timer);
-  }, [searchDraft]);
+  }, [searchDraft, semanticMode]);
 
   useEffect(() => {
     if (!collectionsLoaded || browse.view !== "collection" || browse.collectionId == null) return;
@@ -494,6 +551,28 @@ export function LibraryView({
   const setSearchScope = (scope: BrowseState["searchScope"]) => {
     applyBrowse({ ...browseRef.current, searchScope: scope });
   };
+
+  const switchSearchMode = (mode: SearchMode) => {
+    if (mode === searchMode) return;
+    if (mode === "semantic") {
+      if (!similarity || semanticBlockedReason) return;
+      // 语义搜索接管网格：先撤掉“找相似”结果与文字匹配条件，避免三种结果混在一起。
+      if (similarityActive) similarityClear?.();
+      if (browseRef.current.search) {
+        applyBrowse({ ...browseRef.current, search: "", searchScope: "view" }, false);
+      }
+    } else {
+      similarityClear?.();
+    }
+    setSearchMode(mode);
+    searchInputRef.current?.focus();
+  };
+
+  const submitSemanticSearch = useCallback(() => {
+    const text = semanticDraft.trim();
+    if (!text || !similarity || semanticBlockedReason) return;
+    similarity.search(text);
+  }, [semanticBlockedReason, semanticDraft, similarity]);
 
   /** 调整排序：立即生效，并把全局排序写回设置。 */
   const applySort = useCallback(
@@ -964,6 +1043,84 @@ export function LibraryView({
     ],
   );
 
+  /** 打开“找相似”的比较图：目标图不在结果里，单独用它的详情组装查看器。 */
+  const openSimilarityTarget = useCallback(async () => {
+    const targetId = similarity?.targetId;
+    if (targetId == null) return;
+    let details = similarityTarget?.id === targetId ? similarityTarget : null;
+    if (!details) {
+      try {
+        details = await libraryApi.getImageDetail(targetId);
+      } catch (cause) {
+        notify("打开比较图失败", "error", errorMessage(cause));
+        return;
+      }
+    }
+    if (!details) return;
+    const row: ImageRow = {
+      id: details.id,
+      contentHash: details.contentHash,
+      fileExt: details.fileExt,
+      folderId: details.folderId,
+      folderPath: details.folderPath,
+      filePath: details.filePath,
+      fileSize: details.fileSize,
+      width: details.width,
+      height: details.height,
+      format: details.format,
+      hasAlpha: details.hasAlpha,
+      score: details.score,
+      importedAt: details.importedAt,
+      modifiedAt: details.modifiedAt,
+      deletedAt: details.deletedAt,
+      thumbVersion: details.thumbVersion,
+      thumbWidth: details.thumbWidth,
+      thumbHeight: details.thumbHeight,
+      tags: details.tags.map((tag) => tag.name),
+    };
+    targetViewerItems.current = [row];
+    const session: ViewerSession = {
+      initialId: row.id,
+      folders,
+      currentCollectionId: null,
+      getItems: () => targetViewerItems.current,
+      hasMore: () => false,
+      subscribe: () => () => {},
+      loadMore: () => {},
+      onActiveChange: () => {},
+      onSaved: (imageId, update) => patchSavedImage(imageId, update),
+      refresh: () => refreshData(),
+      filterByTag,
+      folderScopeLabel,
+      collectionScopeLabel,
+      filterTagIds: browseRef.current.filters.tagIds,
+      addToCollection: (ids) => {
+        setSelected(new Set(ids));
+        setCollectionPickerOpen(true);
+      },
+      removeFromCollection: (ids) => removeFromCurrentCollection(ids),
+      trash: trashSelected,
+      restore: restoreSelected,
+      delete: deleteSelected,
+    };
+    onOpenViewer(session);
+  }, [
+    collectionScopeLabel,
+    deleteSelected,
+    filterByTag,
+    folderScopeLabel,
+    folders,
+    notify,
+    onOpenViewer,
+    patchSavedImage,
+    refreshData,
+    removeFromCurrentCollection,
+    restoreSelected,
+    similarity?.targetId,
+    similarityTarget,
+    trashSelected,
+  ]);
+
   const handleCollectionAdded = useCallback(() => {
     void reloadCollections();
     refreshData();
@@ -1197,6 +1354,11 @@ export function LibraryView({
   }, [browse]);
 
   const filterCount = activeFilterCount(browse.filters);
+  const similarityTargetLabel = similarityTarget
+    ? fileNameOf(similarityTarget.filePath)
+    : similarity?.targetId != null
+      ? `#${similarity.targetId}`
+      : "比较图";
   const noResults = status === "ready" && items.length === 0;
   const selectedIds = useMemo(() => [...selected], [selected]);
   const contextHasDeleted = contextMenu?.items.some((item) => item.deletedAt != null) ?? false;
@@ -1347,29 +1509,70 @@ export function LibraryView({
         <div className="library-toolbar-right">
           <div className="search-field">
             <Search size={14} />
+            <div className="search-mode" role="group" aria-label="搜索模式">
+              <button
+                type="button"
+                className={semanticMode ? "" : "is-active"}
+                aria-pressed={!semanticMode}
+                title="匹配描述、标签与文件夹名称"
+                onClick={() => switchSearchMode("match")}
+              >
+                匹配
+              </button>
+              <button
+                type="button"
+                className={semanticMode ? "is-active" : ""}
+                aria-pressed={semanticMode}
+                disabled={!similarity || Boolean(semanticBlockedReason)}
+                title={semanticBlockedReason ?? "用一句话描述想找的画面"}
+                onClick={() => switchSearchMode("semantic")}
+              >
+                语义
+              </button>
+            </div>
             <input
               ref={searchInputRef}
               className="input"
-              value={searchDraft}
-              placeholder="搜索描述、标签、文件夹"
-              aria-label="搜索图片"
-              disabled={similarityActive}
-              onChange={(event) => setSearchDraft(event.target.value)}
+              value={semanticMode ? semanticDraft : searchDraft}
+              placeholder={
+                semanticMode
+                  ? "描述想找的画面，例如：红色斗篷的侧身人物"
+                  : "搜索描述、标签、文件夹"
+              }
+              aria-label={semanticMode ? "语义搜索" : "搜索图片"}
+              disabled={
+                semanticMode ? !similarity || Boolean(semanticBlockedReason) : similarityActive
+              }
+              onChange={(event) =>
+                semanticMode
+                  ? setSemanticDraft(event.target.value)
+                  : setSearchDraft(event.target.value)
+              }
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
                   // 只清空搜索框，不触发容器的“清空选择”。
                   event.stopPropagation();
-                  setSearchDraft("");
+                  if (semanticMode) setSemanticDraft("");
+                  else setSearchDraft("");
                   event.currentTarget.blur();
+                }
+                if (event.key === "Enter" && semanticMode) {
+                  event.preventDefault();
+                  submitSemanticSearch();
                 }
               }}
             />
-            {searchDraft ? (
+            {semanticMode && semanticDraft ? (
+              <IconButton label="清除语义搜索" onClick={() => setSemanticDraft("")}>
+                <X size={12} />
+              </IconButton>
+            ) : null}
+            {!semanticMode && searchDraft ? (
               <IconButton label="清除搜索" onClick={() => setSearchDraft("")}>
                 <X size={12} />
               </IconButton>
             ) : null}
-            {searchDraft.trim() ? (
+            {!semanticMode && searchDraft.trim() ? (
               <button
                 type="button"
                 className={`search-scope${
@@ -1387,18 +1590,16 @@ export function LibraryView({
                 {browse.searchScope === "library" ? "全库" : "当前视图"}
               </button>
             ) : null}
+            {semanticMode ? (
+              <IconButton
+                label="开始语义搜索"
+                disabled={!semanticDraft.trim() || Boolean(semanticBlockedReason) || similarity?.busy}
+                onClick={submitSemanticSearch}
+              >
+                {similarity?.busy ? <Spinner size={13} /> : <Sparkles size={13} />}
+              </IconButton>
+            ) : null}
           </div>
-
-          <Button
-            size="sm"
-            variant={similarityActive ? "primary" : "secondary"}
-            icon={<Sparkles size={14} />}
-            disabled={!similarity || Boolean(semanticBlockedReason)}
-            title={!similarity ? "当前不可用" : (semanticBlockedReason ?? undefined)}
-            onClick={() => setSemanticOpen((open) => !open)}
-          >
-            语义
-          </Button>
 
           <div className="filter-anchor" ref={filterAnchorRef}>
             <Button
@@ -1490,64 +1691,31 @@ export function LibraryView({
         </div>
       </div>
 
-      {semanticOpen && similarity ? (
-        <div className="semantic-search-bar">
-          <Sparkles size={14} />
-          <input
-            className="input"
-            value={semanticDraft}
-            placeholder="描述想找的画面，例如：红色斗篷的侧身人物"
-            aria-label="语义搜索"
-            autoFocus
-            onChange={(event) => setSemanticDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                similarity.search(semanticDraft);
-                setSemanticOpen(false);
-              }
-              if (event.key === "Escape") {
-                event.stopPropagation();
-                setSemanticOpen(false);
-              }
-            }}
-          />
-          <Button
-            size="sm"
-            variant="primary"
-            loading={similarity.busy}
-            disabled={!semanticDraft.trim()}
-            onClick={() => {
-              similarity.search(semanticDraft);
-              setSemanticOpen(false);
-            }}
-          >
-            搜索
-          </Button>
-          <span className="semantic-hint">
-            {similarity.error ??
-              (similarity.busy ? "正在理解描述…" : "描述只用于这次搜索，不会写入图库。")}
-          </span>
-          <IconButton label="关闭语义搜索" onClick={() => setSemanticOpen(false)}>
-            <X size={13} />
-          </IconButton>
-        </div>
-      ) : null}
-
       {similarityActive && similarity ? (
         <div className="filter-summary semantic-summary">
           {similarMode ? <ScanSearch size={14} /> : <Sparkles size={14} />}
           <span>
-            {similarMode
-              ? `相似于 ${similarity.text} · ${
-                  similarity.kind ? SIMILAR_LABELS[similarity.kind] : "相似"
-                }`
-              : `语义搜索「${similarity.text}」`}{" "}
+            {similarMode ? (
+              <>
+                相似于{" "}
+                <button
+                  type="button"
+                  className="similarity-target"
+                  title="打开这张比较图"
+                  onClick={() => void openSimilarityTarget()}
+                >
+                  {similarityTargetLabel}
+                </button>
+                {similarity.kind ? ` · ${SIMILAR_LABELS[similarity.kind]}` : ""}
+              </>
+            ) : (
+              `语义搜索「${similarity.text}」`
+            )}{" "}
             · {similarity.total.toLocaleString()} 张结果
           </span>
           <Button
             size="sm"
-            variant="secondary"
+            variant="success"
             icon={<X size={12} />}
             onClick={() => similarity.clear()}
           >
@@ -1585,7 +1753,11 @@ export function LibraryView({
                   : "正在读取图片"}
               </strong>
               <span>
-                {similarityActive ? "正在搜索…" : "正在读取…"}
+                {similarityActive
+                  ? similarMode
+                    ? "正在搜索…"
+                    : "首次搜索需要先加载文本模型，请稍候。"
+                  : "正在读取…"}
               </span>
             </div>
           ) : null}

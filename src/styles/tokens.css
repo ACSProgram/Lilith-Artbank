@@ -45,6 +45,8 @@
   --danger-border: rgba(162, 59, 53, 0.3);
 
   --success: #2f7d5c;
+  --success-fill: #2f7d5c;
+  --success-fill-hover: #276a4e;
   --success-soft: rgba(47, 125, 92, 0.07);
   --success-border: rgba(47, 125, 92, 0.3);
 
@@ -115,6 +117,8 @@ html[data-theme="dark"] {
   --danger-border: rgba(212, 112, 106, 0.36);
 
   --success: #58b98d;
+  --success-fill: #2e7d5f;
+  --success-fill-hover: #37916f;
   --success-soft: rgba(88, 185, 141, 0.14);
   --success-border: rgba(88, 185, 141, 0.36);
 

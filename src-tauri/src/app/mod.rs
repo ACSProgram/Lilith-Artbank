@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod error;
 pub mod img_protocol;
+pub mod paths;
 pub mod settings;
 pub mod state;
 pub mod tasks;

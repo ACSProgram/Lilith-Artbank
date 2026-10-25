@@ -16,7 +16,7 @@
 
 **S4 已实现（自动验收通过）**：全屏查看器（缩放/平移/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、`img://` 原图与预览协议、复制图片到剪贴板、可编辑详情侧栏。
 
-**S6 已实现（自动验收通过）**：本机 `/v1` AI 客户端与服务进程托管、feature pack（embedding fp16 / pose f32）、打开图库计算全库均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务（进度/取消/失败清单）、查看器姿势生成与叠加、详情侧栏 AI 描述。
+**S6 已实现（自动验收通过）**：本机 `/v1` AI 客户端与服务进程托管、feature pack（embedding fp16 / pose f32）、打开图库计算全库均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务（进度/取消/失败清单）、查看器姿势生成与叠加、详情侧栏 AI 描述入口。本轮服务端没有描述模型，描述功能置灰，见 [AI 服务](docs/modules/ai-service.md)。
 
 S5 图像处理（色彩/LUT/DFT/卷积）已按用户决定取消。真实 WebView2 的 150 张门槛已由用户确认；真实窗口中的导入、浏览、编辑、集合、回收站、查看器、AI 服务与语义搜索待手工验收。尚未实现：S7 的颜色/pHash/向量/pose 相似度与高级集合。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
 
@@ -31,7 +31,23 @@ S5 图像处理（色彩/LUT/DFT/卷积）已按用户决定取消。真实 WebV
 - 旧图库格式的读取与数据迁移（后续单独做一次性脚本，不在应用内）；
 - 公开版本号、CHANGELOG、LICENSE 等发布材料。
 
-AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应用负责托管服务进程；服务器实现与 Python 环境不在本仓库。
+AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应用负责托管 Python 进程；服务端在 `server/`，Python 环境与模型文件不随包，由用户放进程序目录。描述本轮未实现。
+
+## 程序目录与便携包
+
+release 下设置、日志与 AI 服务日志都写在 exe 旁，不读取旧 AppData 设置。完整目录：
+
+```text
+Lilith Artbank\
+  lilith-artbank.exe
+  server\                   随包分发
+  python_embeded\           用户提供，不打包
+  resources\models\         用户提供，不打包
+  settings.json             首次运行生成
+  logs\
+```
+
+`npm run pack:portable` 生成 exe + `server/` 的便携文件夹，不生成 NSIS 安装器；把 `python_embeded/` 与 `resources/models/` 放进去即可运行。
 
 ## 技术栈
 

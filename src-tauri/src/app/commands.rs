@@ -35,7 +35,12 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
-    AppError::command(state.settings.replace(settings))
+    let previous = state.settings.snapshot().ai;
+    let saved = AppError::command(state.settings.replace(settings))?;
+    if previous != saved.ai {
+        state.ai.apply_settings(&previous, &saved.ai);
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -120,13 +125,11 @@ pub struct AppInfo {
     pub log_path: String,
 }
 
-/// 日志文件名与 `lib.rs` 里 `TargetKind::LogDir` 的 `file_name` 一致。
+/// 日志文件名与 `lib.rs` 里 `TargetKind::Folder` 的 `file_name` 一致。
 const LOG_FILE_STEM: &str = "lilith-artbank";
 
-fn log_file_path(app: &AppHandle) -> String {
-    let Ok(dir) = app.path().app_log_dir() else {
-        return String::new();
-    };
+fn log_file_path() -> String {
+    let dir = crate::app::paths::log_dir();
     // 插件按给定文件名落盘，不同版本对扩展名的处理不一致，两个候选都试一次。
     for candidate in [
         dir.join(format!("{LOG_FILE_STEM}.log")),
@@ -142,11 +145,11 @@ fn log_file_path(app: &AppHandle) -> String {
 }
 
 #[tauri::command]
-pub fn get_app_info(app: AppHandle, state: State<'_, AppState>) -> AppInfo {
+pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         settings_path: state.settings.path().to_string_lossy().into_owned(),
-        log_path: log_file_path(&app),
+        log_path: log_file_path(),
     }
 }
 
@@ -581,19 +584,6 @@ pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, Strin
 }
 
 #[tauri::command]
-pub async fn ai_ensure_models(
-    state: State<'_, AppState>,
-    capabilities: Vec<String>,
-) -> Result<AiStatus, String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.ensure_models(&settings, &capabilities))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub fn ai_start_service(state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.snapshot().ai;
     AppError::command(state.ai.start_service(&settings))
@@ -801,7 +791,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_image_pose,
         copy_image,
         get_ai_status,
-        ai_ensure_models,
         ai_start_service,
         ai_stop_service,
         start_batch_task,

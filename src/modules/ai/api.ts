@@ -21,7 +21,7 @@ function offlineStatus(): AiStatus {
   return {
     baseUrl: "http://127.0.0.1:18766",
     autoStart: false,
-    executableConfigured: false,
+    launchConfigured: false,
     online: false,
     process: {
       state: "stopped",
@@ -44,11 +44,6 @@ export const aiApi = {
   async getStatus(): Promise<AiStatus> {
     if (aiBrowserPreview) return offlineStatus();
     return invoke<AiStatus>("get_ai_status");
-  },
-
-  async ensureModels(capabilities: string[]): Promise<AiStatus> {
-    requireTauri("加载模型");
-    return invoke<AiStatus>("ai_ensure_models", { capabilities });
   },
 
   async startService(): Promise<void> {

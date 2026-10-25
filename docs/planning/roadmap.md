@@ -7,9 +7,9 @@
 - 只做图库本体：导入/去重、浏览、元数据、筛选排序、集合、回收站、查看器、裁剪/旋转/调尺寸、维护；图像处理（色彩/LUT/DFT/卷积）已按用户决定取消。
 - 不做 PinBoard/PasteBoard/ImagePaste、调色盘、色彩测试、截屏小工具。
 - 元数据 SQLite；原图 BLAKE3 内容寻址；缩略图追加式 pack；浏览器解码 WebP/JPEG。
-- AI（description/embedding/pose）走本机 HTTP `/v1`；应用托管服务进程，但本阶段不打包 Python 环境。
+- AI（description/embedding/pose）走本机 HTTP `/v1`；应用托管 Python 服务进程，`server/` 代码随便携包分发；Python 环境与模型文件由用户放入程序目录，不打包、不下载。
 - image/text embedding 使用 `siglip2-giant-opt-patch16-384`，1536 维、fp16 落盘；检索前减去打开图库时计算的全库均值，再算余弦。向量包 mmap 扫描，不整体载入内存。
-- pose 继续用 MediaPipe Pose，相似度按原程序 1:1 移植；description 换模型但 `/v1/describe` 契约不变。
+- pose 用 MediaPipe Pose，相似度按原程序 1:1 移植；description 本轮不实现，`/v1/describe` 契约保留。
 - 不读旧 `.data`，不做应用内数据迁移；迁移脚本后续单独立项。
 - 无公开版本号、CHANGELOG、LICENSE/法务材料。
 
@@ -178,10 +178,10 @@
 
 **目标**：description / embedding / pose 可用，服务离线时图库不受影响。
 
-- 设置：baseUrl、executablePath、port、autoStart；进程启动/探活/重启/退出/日志。
+- 设置：baseUrl、port、autoStart、pythonPath、serverScript、modelPath、clipModelPath；Python 进程启动/探活/重启/退出/日志。
 - HTTP 客户端：`/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/describe`；超时/重试/取消。
-- 模型：image/text embedding 为 `siglip2-giant-opt-patch16-384`（1536 维）；pose 为 MediaPipe Pose；description 模型以服务端 health 为准，接口不变。
-- 任务：为选中/当前视图/缺失项生成 embedding、pose、描述；进度、取消、失败清单；默认只填空描述。
+- 模型：image/text embedding 为 `siglip2-giant-opt-patch16-384`（1536 维）；pose 为 MediaPipe Pose；description 本轮未实现，接口保留。
+- 任务：为选中/当前视图/缺失项生成 embedding、pose；进度、取消、失败清单。描述待有模型后再接。
 - 存储：feature pack + `feature_blobs`；embedding 一律 L2 归一化后存 fp16，pose 存 f32；描述写 `images.description`，带 source/model。
 - 均值：打开图库后计算全库 embedding 均值（fp32），语义搜索使用 `cosine(v - mean, q - mean)`；会话内不随新增/编辑更新。
 - 语义搜索 UI：text→embedding→mmap 向量包分块扫描 top-K；结果按 id 回页，不把向量发给前端。
@@ -254,12 +254,12 @@
 
 ## S9 规模化验收、性能硬化与打包
 
-**目标**：在 20-50 万张规模上交付可用的单文件 exe。
+**目标**：在 20-50 万张规模上交付可直接运行的便携文件夹。
 
 - 20 万条合成库 + 真实小样本（复制到临时目录）；冷/热启动、滚动、筛选、缩略图、导入、导出。
 - 冷磁盘缓存测量；WebView2 自定义协议复测；内存峰值；GDI/句柄/线程数。
 - 崩溃/取消/断电语义检查（不承诺断电自动化验证）。
-- 打包：release 构建、单 exe、确认无额外 DLL；WebView2 系统运行时依赖写入文档。
+- 打包：release 构建、单 exe、确认无额外 DLL；`npm run pack:portable` 产出 exe + `server/` 的便携文件夹，不生成 NSIS；`python_embeded/` 与 `resources/models/` 由用户放入；WebView2 系统运行时依赖写入文档。
 - 最终 UX 打磨、空状态、错误文案、可访问性基础。
 - 更新架构/性能/交接文档。
 

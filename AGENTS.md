@@ -9,6 +9,7 @@
 - 网格/列表、分页、筛选、排序、集合、回收站：读 `docs/modules/browse-and-query.md`，再进入 `src/modules/library/`、`src-tauri/src/library/query.rs`、`src-tauri/src/library/`。
 - 查看器、裁剪/旋转/调尺寸、图像处理：读 `docs/modules/viewer-and-editor.md`，再进入 `src/modules/viewer/`、`src/modules/editor/`、`src-tauri/src/imageops/`。
 - description / embedding / pose、AI 服务进程：读 `docs/modules/ai-service.md`，再进入 `src-tauri/src/ai/`、`src/modules/ai/`。
+- AI 服务端与便携打包：读 `docs/modules/ai-service.md` 的“服务端实现”，再进入 `server/`、`tools/package-portable.mjs`、`src-tauri/src/app/paths.rs`。
 - 找相似、相似分组、pHash/主色/embedding/pose 相似度：读 `docs/modules/ai-service.md` 的“本地检索”，再进入 `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`。
 - 清理、缩略图重建、描述导入导出：读 `docs/modules/maintenance.md`。
 - 构建、测试、性能基准：读 `docs/guides/validation.md`、`docs/guides/performance.md`。
@@ -21,6 +22,8 @@
 - 缩略图写追加式 `.pack`，数据库只记录 segment/offset/length；不要改成 20 万个独立小文件。
 - 浏览器只解码当前页缩略图；Rust 不做 DDS/BC 缩略图管线。
 - AI 能力统一走本机 HTTP 服务；应用负责进程生命周期。接口以 `docs/modules/ai-service.md` 为准。
+- 设置、日志与相对资源路径都以程序根目录为准（`src-tauri/src/app/paths.rs`）；不读旧 AppData 设置，也不做迁移。
+- Python 环境与模型文件不打包、不下载；只产出便携文件夹（`npm run pack:portable`），不生成 NSIS 安装器。
 - 姿势相似度按旧程序 `MediaPipePoseData::similarity` 1:1 移植：权重、landmark 索引与“镜像取较大值”都不许自行改动，`ai/pose_similarity.rs` 的 golden 值测试必须保持通过。
 - pHash 与 4/8 主色常驻内存只用于相似度扫描；全库相似对必须走分段索引收窄候选，不允许直接 O(n²) 两两比较。
 - 不做 PinBoard、ImagePaste、PasteBoard、调色盘、色彩测试、截屏小工具。

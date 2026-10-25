@@ -39,6 +39,7 @@ git diff --check
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
 - 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同时跑 `npm run test:web`（旋转/翻转对裁剪的映射、尺寸按新基底换算）与 typecheck/build，查看器布局、缩放、裁剪拖拽映射、撤销栈、胶片带与上下张由用户手工验收。
 - AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
+- `server/` 只做一次性检查，不加入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。一次性检查命令见下方“AI 服务端”。
 - 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 
@@ -101,10 +102,36 @@ S6 AI 的真实窗口验收：
 
 ```bash
 npm run tauri dev
-# 设置 → AI 服务 → 检测/启动/加载模型 → 确认 health 能力与维度
-# 选中图片或当前视图 → AI 任务 → embedding/pose/description 批量任务
-# 确认进度、取消、失败清单、手写描述不被覆盖；语义搜索输入文本并翻页
-# 查看器无 pose 时点击“生成姿势骨架”；详情侧栏点击“AI 生成”
+# 设置 → AI 服务 → 检测/启动 → 确认状态行显示图像塔/文本塔/姿势的“已加载 / 未加载”
+# 确认设置页没有手动加载模型的按钮；模型由首次使用自动加载
+# 选中图片或当前视图 → AI 任务 → embedding/pose 批量任务（确认“开始任务时自动加载”）
+# 确认进度、取消、失败清单；搜索框切到“语义”输入文本并 Enter，首次搜索应提示正在加载文本模型
+# 查看器无 pose 时点击“生成姿势骨架”
+# 右键图片“找相似” → 点击结果条里的比较图文件名打开查看器 → 绿色“退出相似结果”
+# 描述本轮未实现：批量任务里的描述项应置灰
+```
+
+AI 服务端（一次性检查，不进入常驻测试）：
+
+```bash
+python_embeded\python.exe -m py_compile server\main.py server\clip_cache.py server\pose_engine.py server\image_io.py
+python_embeded\python.exe server\main.py --port 18766 --model-dir resources\models\siglip2-giant-opt-patch16-384
+curl.exe http://127.0.0.1:18766/v1/health
+# 另开一个终端：
+curl.exe -X POST -H "Content-Type: application/json" -d "{\"capabilities\":[\"imageEmbedding\"]}" http://127.0.0.1:18766/v1/models/ensure
+curl.exe -X POST http://127.0.0.1:18766/v1/shutdown
+```
+
+- 图片塔与文本塔应分别加载；加载另一塔时旧塔让位。
+- 空闲 300 秒后 health 的两个塔都变回 `ready=false`；可用 `--idle-unload-seconds` 调短验证。
+- Python 服务与模型路径必须由用户环境提供；不要把它写成 CI 或常驻测试。
+
+便携包：
+
+```bash
+npm run pack:portable
+# 把 python_embeded\ 与 resources\models\ 放进 release\Lilith Artbank\ 后直接运行 lilith-artbank.exe
+# 确认 settings.json 与 logs\ 生成在 exe 旁，不出现 NSIS 安装器
 ```
 
 浏览器预览的检查方式（不驱动真实窗口）：

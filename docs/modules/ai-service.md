@@ -2,29 +2,40 @@
 
 description、image/text embedding、pose 都通过本机 HTTP 服务完成。图库本体不依赖模型进程；服务离线时相关按钮灰显，浏览、导入、编辑不受影响。
 
-服务实现与 Python 环境不在本仓库。应用只依赖下面的 `/v1` 契约，因此服务端可以复用现有 OnnxRuntimeEngine、另写 Python 包装，或换成别的实现。
+服务端代码在仓库 `server/`，实现下面的 `/v1` 契约；Python 环境与模型文件不随包分发，由用户放进程序目录。应用仍只依赖 `/v1`，因此也可以连接其他实现。
 
 ## 进程托管
 
-设置项：
+设置项（设置 v4）：
 
 ```text
 ai.baseUrl         默认 http://127.0.0.1:18766；探活与所有请求都走这里
-ai.executablePath  可执行文件；为空时只连接外部已启动的服务
-ai.port            启动子进程时传 `--port`；与 baseUrl 的端口需保持一致
+ai.port            默认 18766；启动 Python 时传 `--port`，与本机 baseUrl 的端口需一致
 ai.autoStart       随应用启动
+ai.pythonPath      默认 python_embeded\python.exe；为空时只连接外部已启动的服务
+ai.serverScript    默认 server\main.py
+ai.modelPath       模型根目录，默认 resources\models
+ai.clipModelPath   CLIP 模型目录，默认 siglip2-giant-opt-patch16-384；相对 modelPath，也可填绝对路径
 ```
+
+- 相对路径以程序根目录解析：release 为 exe 所在目录，debug 为仓库根目录；两种模式都可用 `LILITH_ARTBANK_ROOT` 覆盖。
+- 设置文件固定为程序根目录的 `settings.json`；日志在 `logs/`，Python 的 stdout/stderr 写入 `logs/ai-server.log`。
+- 启动命令为 `<pythonPath> <serverScript> --port <port> --model-dir <解析后的 CLIP 目录>`，工作目录为程序根目录，不弹控制台。
+- 保存启动相关设置后，托管的服务会按新配置重启；外部服务不受影响。
+- 程序目录不可写时直接报错，不回退到 AppData，也不从旧 AppData 设置迁移。
 
 生命周期：
 
 1. 启动后先 `GET /v1/health` 探活。成功则标记在线，不重复拉起。
-2. `autoStart` 且 `executablePath` 非空、探活失败时启动进程；等待健康检查最多 60 秒。
+2. `autoStart`、本机 `baseUrl`、Python 与脚本都配置好且探活失败时启动进程；等待健康检查最多 60 秒。
 3. 端口被其他程序占用且健康检查不是本服务格式 → 标记不可用，提示端口冲突；不尝试杀进程。
-4. 启动失败按 1s、2s 退避重试，最多 3 次；仍失败则记录状态与错误并保持离线，由用户在设置页或 AI 任务里手动重启。运行中被托管的进程退出时标记为失败，不自动重启。
-5. 退出时优先调用 `POST /v1/shutdown`（可选端点，返回 2xx 即视为已关闭），超时后终止子进程。
-6. 服务只绑定 `127.0.0.1`。v1 不做鉴权；`baseUrl` 不是本机地址时在界面给出警告。
+4. 启动失败按 2s、4s 退避重试，最多 3 次；仍失败则记录状态与错误并保持离线，由用户在设置页或 AI 任务里手动重启。运行中被托管的进程退出时标记为失败，不自动重启。
+5. 退出时优先调用 `POST /v1/shutdown`（返回 2xx 即视为已关闭），超时后终止子进程。
+6. 服务只绑定 `127.0.0.1`。v1 不做鉴权；`baseUrl` 不是本机地址时只连接外部服务。
 
-不打包 Python 环境是当前决定；未来若打包，只改进程托管与安装布局，不改 `/v1` 契约。
+模型由首次使用自动加载：批量任务、单张 pose/描述与语义搜索在需要时调用 `/v1/models/ensure`；设置页与批量任务对话框只显示“已加载 / 未加载”，不提供手动加载按钮。
+
+Python 环境与模型文件不打包、不下载；`server/` 代码随便携包分发。
 
 ## 通用约定
 
@@ -65,15 +76,16 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
   "version": "1",
   "capabilities": {
     "imageEmbedding": { "ready": true, "model": "siglip2-giant-opt-patch16-384", "dim": 1536 },
-    "textEmbedding": { "ready": true, "model": "siglip2-giant-opt-patch16-384", "dim": 1536 },
-    "pose": { "ready": true, "model": "mediapipe-pose" },
-    "description": { "ready": false, "model": "" }
+    "textEmbedding": { "ready": false, "model": "siglip2-giant-opt-patch16-384", "dim": 1536 },
+    "pose": { "ready": true, "model": "mediapipe-pose" }
   }
 }
 ```
 
 - 未加载的模型 `ready=false`；应用可调用 `/v1/models/ensure` 再试。
-- 没有该能力时整个字段可省略。
+- CLIP 能力在未加载时仍必须返回 `model` 与 `dim`，语义搜索据此校验向量，不必为了拿维度去加载图片塔。
+- 图片塔与文本塔同一时间最多一个 `ready=true`；空闲卸载后两个都为 false。
+- 没有该能力时整个字段可省略。本轮服务端不提供 `description`，`/v1/describe` 返回 404；没有可读的 CLIP 模型目录时，两个 CLIP 能力也整体缺省，此时客户端报“没有图像 embedding 能力”。
 
 ### POST /v1/models/ensure
 
@@ -83,7 +95,11 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
 { "capabilities": ["imageEmbedding", "pose"] }
 ```
 
-响应 `{ "capabilities": { ... } }`，结构同 health。加载失败返回 422/503 并保留旧模型。
+响应 `{ "capabilities": { ... } }`，结构同 health。加载失败返回 422/503；失败的塔不会保留半加载状态。
+
+- 一次请求最多接受一个 CLIP 塔；同时请求 `imageEmbedding` 与 `textEmbedding` 返回 400。应用分别加载图片塔与文本塔。
+- 请求 `description` 返回 404；当前服务端没有描述模型。
+- 加载图片塔会让已驻留的文本塔让位，反之亦然。
 
 ### POST /v1/embed/image
 
@@ -104,13 +120,15 @@ Content-Type: application/octet-stream
 }
 ```
 
+图片塔未加载时返回 503；批量 embedding 任务在开始前调用 `/v1/models/ensure` 加载图片塔。
+
 ### POST /v1/embed/text
 
 ```json
 { "text": "穿红色斗篷的侧身人物", "model": "siglip2-giant-opt-patch16-384" }
 ```
 
-响应同 image embedding。服务端负责分词与长度截断；超长文本应截断而不是报错（在 `truncated` 字段说明）。
+响应同 image embedding。服务端负责分词与长度截断（当前按 64 token 截断），超长文本不报错，在 `truncated` 字段说明。文本塔未加载时返回 503；应用在单次语义搜索前调用 ensure。
 
 ### POST /v1/pose
 
@@ -157,6 +175,7 @@ Content-Type: application/octet-stream
 
 - 同步返回；长任务由客户端队列控制并发。
 - 服务端可对图片做内部缩放，但输入已由客户端尽量控制在 1536px 以内。
+- 本轮服务端不实现描述，`/v1/describe` 返回 404；批量任务里的描述项置灰。
 
 ## 应用侧任务
 
@@ -164,7 +183,7 @@ Content-Type: application/octet-stream
 
 - `embedding`：为选中/当前视图/全库缺失的图片生成 image embedding。
 - `pose`：为选中/当前视图/全库缺失的图片生成 pose。
-- `description`：为选中/当前视图/描述为空的图片生成描述；默认只填空，可选覆盖。
+- `description`：为选中/当前视图/描述为空的图片生成描述；默认只填空，可选覆盖。本轮服务端没有描述模型，界面置灰。
 - `textSearch`：只做一次 text embedding，然后本地扫描。
 
 ### 队列与进度
@@ -193,6 +212,16 @@ Content-Type: application/octet-stream
 - embedding 磁盘上每条 `dim × 2` 字节（仅存 fp16）；读入后立即转 fp32，均值、点积、范数与余弦全部用 f32 在 CPU 计算。pose 每条 33 × 4 × 4 字节（f32，x/y/z/visibility）。
 - 读取向量不整体载入：扫描按 `pack_offset` 排序后 mmap 顺序读，数据库只做一次批量查询；单条读取（查看器 pose）按偏移定位。
 
+## 服务端实现（server/）
+
+- 入口 `server/main.py`：标准库 `ThreadingHTTPServer`，只绑 `127.0.0.1`；路由 `/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/shutdown`；`/v1/describe` 返回 404。
+- `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。
+- `pose_engine.py`：MediaPipe Pose（`model_complexity=2`、`static_image_mode=True`、`min_detection_confidence=0.3`）。模型随 `python_embeded` 携带，不读 `resources/models`；未检测到人体返回空数组。
+- `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；解码失败返回 422。
+- 运行环境为 Python 3.11 + torch 2.5.1+cu121 + transformers 4.57.6 + mediapipe 0.10.14，依赖已在 `python_embeded` 内，不做运行时下载。
+- 日志写 `logs/ai-server.log`；只记录启动参数、模型加载/卸载、耗时与错误，不记录图片内容或向量。
+- 描述能力本轮未实现；`/v1/describe` 返回 404，批量任务里的描述项置灰。
+
 ## 本地检索
 
 相似度有三类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding）、feature pack（pose）。三者都只返回 id + 分数，按 token 分页后再回填元数据。
@@ -201,7 +230,7 @@ Content-Type: application/octet-stream
 - **pHash 相似**：目标图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。
 - **主色相似**：目标图 4/8 色与索引逐项做对称加权 OKLab 距离（每项匹配对方最近色、按自身权重平均，两个方向再取均值），距离升序。
 - **均值中心化**：打开图库后在后台扫描当前 model/dim 的全部 image embeddings，求 fp32 均值并保存在内存；会话内不随新增/编辑更新。关闭并重新打开图库刷新。
-- **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。
+- **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
 - **相似 embedding**：目标图的 image embedding 同样减均值后扫描。目标图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
 - **姿势相似**：按原程序 `MediaPipePoseData::similarity` 1:1 移植（`ai/pose_similarity.rs`），33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。原实现源码见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md` 的记录路径。
 - **全库相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。
@@ -216,16 +245,15 @@ Content-Type: application/octet-stream
 - 模型不兼容：语义搜索提示“需要重算 embedding”，不混用不同模型向量。
 - 日志不得写入图片内容、完整描述或向量；只记录 id、耗时、状态与错误摘要。
 
-## 当前实现（S6 客户端 + S7 本地相似度）
+## 当前实现（S6 客户端 + S7 本地相似度 + 本机服务端）
 
-本仓库只实现客户端；服务端与模型环境不在仓库内。
+客户端、本机 Python 服务端与便携打包脚本都在本仓库；Python 环境与模型文件不随包。
 
 命令：
 
 | 命令 | 说明 |
 | --- | --- |
 | `get_ai_status` | 探活、进程状态、health、均值状态；`autoStart` 的拉起也由它触发（任务进度不在这里，看 `list_tasks` 与 `task-progress`） |
-| `ai_ensure_models` | 调用 `/v1/models/ensure` |
 | `ai_start_service` / `ai_stop_service` | 托管进程；外部服务也可直接连接 |
 | `start_ai_job` / `cancel_ai_job` / `get_ai_job_status` | 已删除；批量任务统一走 `start_batch_task` |
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
@@ -242,7 +270,12 @@ Content-Type: application/octet-stream
 实现位置：
 
 - `src-tauri/src/ai/client.rs`：`/v1` 客户端、超时、重试、响应校验。
-- `src-tauri/src/ai/process.rs` + `runtime.rs`：进程启动/探活/退避重启/退出；`--port <port>`；`find_similar_images` 与结果缓存；相似分组任务（`start_groups_task`）与扫描结果缓存。
+- `src-tauri/src/ai/process.rs` + `runtime.rs`：Python 启动/探活/退避重启/退出；解析 Python、脚本与模型路径；stdout/stderr 写 `logs/ai-server.log`；保存设置后重启；`find_similar_images` 与结果缓存；相似分组任务（`start_groups_task`）与扫描结果缓存。
+- `src-tauri/src/app/paths.rs`：程序根目录、`settings.json`、`logs/`、相对路径与 CLIP 模型目录解析。
+- `server/main.py`：`/v1` HTTP 路由、错误映射、health 与 shutdown。
+- `server/clip_cache.py`：SigLIP2 图片塔/文本塔独立加载、单塔驻留、空闲卸载。
+- `server/pose_engine.py`：MediaPipe Pose 33 点。
+- `server/image_io.py`：图片字节解码与 EXIF 方向。
 - `src-tauri/src/app/tasks.rs`：任务总线、lane 规则、冲突/排队/取消与统一事件。
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
@@ -264,13 +297,20 @@ Content-Type: application/octet-stream
 - 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。
 - 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。
+- 图片塔与文本塔同一时间只驻留一个；切换任务类型需要重新加载，最后一次使用后空闲 5 分钟自动卸载。塔未加载时 `/v1/embed/*` 返回 503，下一次任务开始前的 ensure 会重新加载。
+- 语义搜索依赖 health 在 `ready=false` 时仍返回图片模型名与维度；外部服务实现必须遵守这一点。
+- 描述能力本轮未实现；批量任务中的描述项按缺少能力置灰。
+- 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。
+- 便携包只包含 exe、`server/` 与资源清单，不包含 `python_embeded/`、`resources/models/`；不生成 NSIS 安装器。
 - 真实服务、真实模型与 WebView2 界面待用户手工验收。
 
 ## 验收
 
 - 用 mock HTTP 服务覆盖成功、400、422、503、超时与重试；任务可取消。
-- 真实服务接入后：单张 embedding/pose/description 成功；批量任务进度可见；断网/关服务时 UI 正确降级。
-- 描述只填空模式不会覆盖用户手写描述。
+- 真实服务接入后：health、ensure、单张 embedding、单张 pose 成功；批量任务进度可见；断网/关服务时 UI 正确降级。
+- 服务端：图片塔与文本塔切换后只驻留一个；空闲后卸载；health 在未加载时仍返回模型名与维度。
+- 便携目录：exe、`server/`、`python_embeded/`、`resources/models/` 放齐后直接运行；设置与日志生成在 exe 旁；无 NSIS 安装器。
+- 描述本轮未实现：health 不返回 `description`，批量任务中描述置灰，`/v1/describe` 返回 404。
 - 语义搜索只用同一 model/dim 的向量，并且 image/text 两侧都减去同一均值；结果 id 能正确分页。
 - 找相似：`phash`/`color4`/`color8`/`embedding`/`pose` 都能排除目标图并按分数排序；目标图缺数据时给出可行动的提示，而不是返回空列表。
 - 全库相似组：20 万条库上不 O(n²) 卡死；`truncated` 与 `missing` 计数正确；embedding 复核能把 pHash 命中但语义不一致的图片拆开。

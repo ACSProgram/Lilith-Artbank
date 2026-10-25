@@ -8,6 +8,10 @@ mod platform;
 use tauri::Manager;
 
 pub fn run() {
+    let log_dir = app::paths::log_dir();
+    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("无法创建日志目录 {}：{error}", log_dir.display());
+    }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |application, _args, _cwd| {
@@ -22,7 +26,8 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::LogDir {
+                    tauri_plugin_log::TargetKind::Folder {
+                        path: log_dir,
                         file_name: Some("lilith-artbank".into()),
                     },
                 ))
@@ -39,17 +44,24 @@ pub fn run() {
 
     let application = builder
         .setup(|application| {
-            let config_dir = application.path().app_config_dir()?;
-            std::fs::create_dir_all(&config_dir)?;
-            let settings =
-                app::settings::SettingsStore::load_or_create(config_dir.join("settings.json"))?;
+            let root = app::paths::app_root();
+            let settings_path = app::paths::settings_path();
+            if let Some(parent) = settings_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    std::io::Error::other(format!(
+                        "无法在程序目录创建设置文件（{}）：{error}。请把程序放到可写目录。",
+                        parent.display()
+                    ))
+                })?;
+            }
+            let settings = app::settings::SettingsStore::load_or_create(settings_path)?;
             let state = app::state::AppState::new(settings);
             state.open_configured_library();
             application.manage(state);
             log::info!(
-                "Lilith Artbank starting: version={}, config={}",
+                "Lilith Artbank starting: version={}, root={}",
                 env!("CARGO_PKG_VERSION"),
-                config_dir.display()
+                root.display()
             );
             // autoStart 在后台触发；健康检查不阻塞窗口出现。
             let handle = application.handle().clone();

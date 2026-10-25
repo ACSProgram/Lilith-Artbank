@@ -38,7 +38,7 @@ export interface AiMeanStatus {
 export interface AiStatus {
   baseUrl: string;
   autoStart: boolean;
-  executableConfigured: boolean;
+  launchConfigured: boolean;
   online: boolean;
   process: AiProcessStatus;
   health: AiHealth | null;

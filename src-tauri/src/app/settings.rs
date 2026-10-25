@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 3;
+pub const SETTINGS_VERSION: u32 = 4;
 
 const THEMES: [&str; 3] = ["light", "dark", "system"];
 const THUMB_FITS: [&str; 2] = ["cover", "contain"];
@@ -49,24 +49,80 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AiSettings {
     pub base_url: String,
-    pub executable_path: Option<String>,
     pub port: u16,
     pub auto_start: bool,
+    /// 为空时只连接 `base_url` 上已经启动的服务。
+    pub python_path: Option<String>,
+    pub server_script: Option<String>,
+    /// 模型根目录。
+    pub model_path: Option<String>,
+    /// CLIP 模型目录；相对 `model_path`，也可以填绝对路径。
+    pub clip_model_path: Option<String>,
 }
 
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:18766".into(),
-            executable_path: None,
             port: 18766,
             auto_start: true,
+            python_path: Some(r"python_embeded\python.exe".into()),
+            server_script: Some(r"server\main.py".into()),
+            model_path: Some(r"resources\models".into()),
+            clip_model_path: Some("siglip2-giant-opt-patch16-384".into()),
         }
     }
+}
+
+impl AiSettings {
+    pub fn python_path(&self) -> Option<&str> {
+        self.python_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn server_script(&self) -> Option<&str> {
+        self.server_script
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn launch_configured(&self) -> bool {
+        self.base_url_is_local() && self.python_path().is_some() && self.server_script().is_some()
+    }
+
+    /// 只识别本机 HTTP 地址；`https://` 与外部主机都算外部服务。
+    pub fn base_url_is_local(&self) -> bool {
+        local_authority(self.base_url.trim()).is_some()
+    }
+}
+
+/// 拆出本机 HTTP 地址的端口；不是本机地址或没有端口时返回 `None`。
+fn local_base_port(url: &str) -> Option<u16> {
+    local_authority(url).and_then(|(_, port)| port)
+}
+
+/// 返回 `(host, port)`；不是本机 HTTP 地址时返回 `None`。
+///
+/// 主机必须是 `127.0.0.1`、`localhost` 或 `[::1]`，`127.0.0.10`、
+/// `localhost.example.com` 这类前缀相同的外部主机不算本机。
+fn local_authority(url: &str) -> Option<(&str, Option<u16>)> {
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse().ok()?)),
+        None => (authority, None),
+    };
+    let is_local = host.eq_ignore_ascii_case("127.0.0.1")
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "[::1]";
+    is_local.then_some((host, port))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +244,16 @@ impl Settings {
         }
         if self.ai.port == 0 {
             return Err(AppError::message("AI 服务端口无效"));
+        }
+        if self.ai.python_path().is_some() && self.ai.server_script().is_none() {
+            return Err(AppError::message("填写 Python 路径时也要填写服务脚本"));
+        }
+        if let Some(url_port) = local_base_port(url)
+            && url_port != self.ai.port
+        {
+            return Err(AppError::message(
+                "AI 服务地址端口与启动端口不一致，请改成同一个端口",
+            ));
         }
         if !(1..=16).contains(&self.performance.reader_connections) {
             return Err(AppError::message("读取连接数必须在 1-16 之间"));
@@ -341,6 +407,9 @@ fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
     if version < 3 {
         value = migrate_v2(value);
     }
+    if version < 4 {
+        value = migrate_v3(value);
+    }
     Ok(serde_json::from_value(value)?)
 }
 
@@ -381,15 +450,29 @@ fn migrate_v1(value: &serde_json::Value) -> AppResult<serde_json::Value> {
 /// v2 → v3：删掉从未生效的 `performance.thumbnailCacheMb`，新字段由 serde 默认值补齐。
 fn migrate_v2(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "settingsVersion".into(),
-            serde_json::json!(SETTINGS_VERSION),
-        );
+        object.insert("settingsVersion".into(), serde_json::json!(3));
         if let Some(performance) = object
             .get_mut("performance")
             .and_then(serde_json::Value::as_object_mut)
         {
             performance.remove("thumbnailCacheMb");
+        }
+    }
+    value
+}
+
+/// v3 → v4：`ai.executablePath` 换成 Python 启动配置；旧字段直接丢弃。
+fn migrate_v3(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "settingsVersion".into(),
+            serde_json::json!(SETTINGS_VERSION),
+        );
+        if let Some(ai) = object
+            .get_mut("ai")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            ai.remove("executablePath");
         }
     }
     value
@@ -431,6 +514,17 @@ mod tests {
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
         assert_eq!(loaded.ui.sort, vec![SortSpec::default()]);
+        assert_eq!(
+            loaded.ai.python_path.as_deref(),
+            Some(r"python_embeded\python.exe")
+        );
+        assert_eq!(loaded.ai.server_script.as_deref(), Some(r"server\main.py"));
+        assert_eq!(loaded.ai.model_path.as_deref(), Some(r"resources\models"));
+        assert_eq!(
+            loaded.ai.clip_model_path.as_deref(),
+            Some("siglip2-giant-opt-patch16-384")
+        );
+        assert!(loaded.ai.launch_configured());
     }
 
     #[test]
@@ -487,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v3_and_drops_dead_cache_field() {
+    fn migrates_v2_to_v4_and_drops_dead_cache_field() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -518,7 +612,118 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));
-        assert!(written.contains("\"settingsVersion\": 3"));
+        assert!(written.contains("\"settingsVersion\": 4"));
+    }
+
+    #[test]
+    fn migrates_v3_to_v4_and_replaces_executable_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 3,
+                "libraryPath": "G:\\Lilith Image Library",
+                "ai": {
+                    "baseUrl": "http://127.0.0.1:19000",
+                    "port": 19000,
+                    "autoStart": true,
+                    "executablePath": "C:\\Lilith Server\\server.exe"
+                }
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.settings_version, 4);
+        assert_eq!(loaded.ai.port, 19000);
+        assert!(loaded.ai.auto_start);
+        assert_eq!(
+            loaded.ai.python_path.as_deref(),
+            Some(r"python_embeded\python.exe")
+        );
+        assert_eq!(
+            loaded.ai.clip_model_path.as_deref(),
+            Some("siglip2-giant-opt-patch16-384")
+        );
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("executablePath"));
+        assert!(written.contains("\"settingsVersion\": 4"));
+    }
+
+    #[test]
+    fn rejects_python_without_server_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 4,
+                "ai": {
+                    "pythonPath": "python_embeded\\python.exe",
+                    "serverScript": ""
+                }
+            }"#,
+        )
+        .unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("服务脚本"));
+    }
+
+    #[test]
+    fn rejects_local_base_url_port_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 4,
+                "ai": {
+                    "baseUrl": "http://127.0.0.1:19000",
+                    "port": 18766
+                }
+            }"#,
+        )
+        .unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("端口"));
+    }
+
+    #[test]
+    fn recognises_only_real_local_base_urls() {
+        let local = |url: &str| AiSettings {
+            base_url: url.to_owned(),
+            ..Default::default()
+        };
+        for url in [
+            "http://127.0.0.1:18766",
+            "http://127.0.0.1",
+            "http://localhost:18766/v1",
+            "http://LOCALHOST:18766",
+            "http://[::1]:18766",
+        ] {
+            assert!(local(url).base_url_is_local(), "{url} 应当是本机地址");
+        }
+        for url in [
+            "https://127.0.0.1:18766",
+            "http://127.0.0.10:18766",
+            "http://localhost.example.com:18766",
+            "http://192.168.1.5:18766",
+            "http://127.0.0.1:not-a-port",
+        ] {
+            assert!(!local(url).base_url_is_local(), "{url} 不应当是本机地址");
+        }
+    }
+
+    #[test]
+    fn reads_port_only_from_local_http_urls() {
+        assert_eq!(local_base_port("http://127.0.0.1:19000"), Some(19000));
+        assert_eq!(local_base_port("http://localhost:19000/v1"), Some(19000));
+        assert_eq!(local_base_port("http://127.0.0.1"), None);
+        assert_eq!(local_base_port("http://192.168.1.5:19000"), None);
     }
 
     #[test]

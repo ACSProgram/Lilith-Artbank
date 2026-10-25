@@ -19,6 +19,17 @@ src-tauri/gen/
 # its own docs, tools and history. It is kept out of product history and CI.
 /research/
 
+# Portable runtime layout (generated or user-provided)
+/settings.json
+/logs/
+/release/
+/python_embeded/
+/resources/models/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Test and benchmark scratch data
 /tmp/
 /perf-data/

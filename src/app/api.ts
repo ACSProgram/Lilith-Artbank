@@ -10,13 +10,16 @@ import type {
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 3,
+  settingsVersion: 4,
   libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
-    executablePath: null,
     port: 18766,
     autoStart: true,
+    pythonPath: "python_embeded\\python.exe",
+    serverScript: "server\\main.py",
+    modelPath: "resources\\models",
+    clipModelPath: "siglip2-giant-opt-patch16-384",
   },
   performance: {
     readerConnections: 4,

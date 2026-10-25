@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v3、schema v4 与多级文件夹；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v4、schema v4 与多级文件夹；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -96,20 +96,33 @@ thumb_width / thumb_height / thumb_version
 
 ## 设置
 
-设置文件由 Tauri `app_config_dir` 下的 `settings.json` 保存，原子替换（临时文件 + rename）。字段：
+设置文件固定为程序根目录的 `settings.json`，原子替换（临时文件 + rename）。程序根目录在 release 下是 exe 所在目录，debug 下是仓库根目录，两种模式都可用 `LILITH_ARTBANK_ROOT` 覆盖。日志在程序根目录的 `logs/`，不再写 AppData。
+
+字段：
 
 ```text
-settingsVersion    当前为 3
+settingsVersion    当前为 4
 libraryPath        当前图库绝对路径；null 表示未打开。由后端维护
-ai                 { baseUrl, executablePath, port, autoStart }
+ai                 { baseUrl, port, autoStart, pythonPath, serverScript,
+                     modelPath, clipModelPath }
 performance        { readerConnections, workerThreads }
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
                      sort, sortProfiles, viewerFilmstrip }
 ```
 
+- 不使用旧 `%APPDATA%\com.lilith.artbank\settings.json`，也不做迁移；第一次启动在程序目录生成新文件。
+- 程序目录不可写时启动失败并提示放到可写目录，不静默回退 AppData。
+- `ai` 路径规则：
+  - `pythonPath` 默认 `python_embeded\python.exe`；为空时只连接 `baseUrl` 上已启动的服务。
+  - `serverScript` 默认 `server\main.py`；填了 Python 就必须填脚本。
+  - `modelPath` 是模型根目录，默认 `resources\models`。
+  - `clipModelPath` 是 CLIP 模型目录，默认 `siglip2-giant-opt-patch16-384`；相对 `modelPath`，也可填绝对路径。
+  - 相对路径一律以程序根目录解析；本机 `baseUrl` 的端口必须与 `port` 一致。
 - 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。
+- 保存启动相关 AI 设置后，应用会按新配置重启托管的 Python 服务。
 - v1 的 `libraries[]` 与 `lastLibraryId` 在读取时迁移为单个 `libraryPath`：优先 `lastLibraryId` 对应条目，否则取第一个条目。迁移后不再写回旧字段。
 - v2 → v3：删掉从未被任何代码读取的 `performance.thumbnailCacheMb`；新增的 `ui` 字段用默认值补齐（`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{key:"importedAt",descending:true}]`、`sortProfiles=[]`、`viewerFilmstrip=true`）；`theme` 增加 `system` 并成为默认值。`ai`、`performance`、`theme`、`gridThumbPx` 的旧值原样保留。
+- v3 → v4：删除旧 `ai.executablePath`，换成 `pythonPath` / `serverScript` / `modelPath` / `clipModelPath`，缺失字段用默认值补齐；`baseUrl`、`port`、`autoStart` 保留。
 - P0 曾加过 `ui.detailPanelMode`（`overlay`/`push`）；P1 确认详情面板只有“挤压画布 + 列数变化锚定”一种实现，字段已删除。旧设置文件里的 `detailPanelMode` 由 serde 忽略，不报错、不回写。
 - 图库路径必须绝对；保存时去掉尾部路径分隔符，但保留盘符根（`G:\`）。
 - `readerConnections` 1-16；`workerThreads` 为空表示自动。
@@ -117,6 +130,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
 - 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
+- 主日志为 `logs/lilith-artbank.log`；AI 服务 stdout/stderr 为 `logs/ai-server.log`。
 
 ## 命令契约
 
@@ -224,7 +238,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v4（含 v1→v2→v3→v4 迁移）、连接池、设置 v3（含 v1→v2→v3 迁移）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v4（含 v1→v2→v3→v4 迁移）、连接池、设置 v4（含 v1→v2→v3→v4 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 

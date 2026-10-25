@@ -30,8 +30,7 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": ["nsis"],
+    "active": false,
     "icon": ["icons/icon.ico"],
     "shortDescription": "大规模本地美术素材图库",
     "longDescription": "面向数十万张图片与数百 GB 素材的本地图库，负责导入、检索、浏览与编辑。"
