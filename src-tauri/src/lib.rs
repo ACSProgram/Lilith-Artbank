@@ -55,9 +55,10 @@ pub fn run() {
                 })?;
             }
             let settings = app::settings::SettingsStore::load_or_create(settings_path)?;
-            let state = app::state::AppState::new(settings);
+            let state = app::state::AppState::new(settings, application.handle().clone());
             state.open_configured_library();
             application.manage(state);
+            application.state::<app::state::AppState>().after_manage();
             log::info!(
                 "Lilith Artbank starting: version={}, root={}",
                 env!("CARGO_PKG_VERSION"),

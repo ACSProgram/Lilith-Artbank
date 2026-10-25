@@ -50,7 +50,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return folders.find((folder) => folder.id === selected[0])?.path ?? "";
   }, [browse.browse.filters.folderIds, folders]);
   const similarity = useSimilarityBrowse();
-  const { dataVersion: taskDataVersion } = useTaskCenter();
+  const { dataVersion: taskDataVersion, lastFinished } = useTaskCenter();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
@@ -134,6 +134,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     });
     void refreshAi();
   }, [taskDataVersion, notify, refreshAi, refreshStatus, reloadFolders]);
+
+  // 撤销可能删除或恢复当前查看的图片，完成后退出查看器，避免停在过期内容上。
+  useEffect(() => {
+    if (lastFinished?.kind === "undo") setViewerSession(null);
+  }, [lastFinished]);
 
   const generateDescription = useCallback(async (imageId: number) => {
     const result = await aiApi.describeImage(imageId);

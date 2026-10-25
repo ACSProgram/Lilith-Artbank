@@ -1,10 +1,14 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use parking_lot::Mutex;
+use rusqlite::OptionalExtension;
 use tauri::AppHandle;
 
 use crate::{
@@ -31,6 +35,7 @@ use crate::{
         content,
         db::LibraryDb,
         folders as folder_service,
+        history::{self, HistoryPage, RecoveryPlan},
         manifest::{LibraryInspection, inspect},
         metadata::{self, DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
@@ -44,21 +49,27 @@ pub struct AppState {
     pub settings: SettingsStore,
     pub ai: AiRuntime,
     pub tasks: TaskBus,
+    app: AppHandle,
     library: Mutex<Option<LibrarySession>>,
     import_job: Mutex<Option<Arc<ImportJob>>>,
+    managed: AtomicBool,
+    recovery: Mutex<RecoveryPlan>,
 }
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 
 impl AppState {
-    pub fn new(settings: SettingsStore) -> Self {
+    pub fn new(settings: SettingsStore, app: AppHandle) -> Self {
         Self {
             settings,
             ai: AiRuntime::new(),
             tasks: TaskBus::new(),
+            app,
             library: Mutex::new(None),
             import_job: Mutex::new(None),
+            managed: AtomicBool::new(false),
+            recovery: Mutex::new(RecoveryPlan::default()),
         }
     }
 
@@ -169,6 +180,12 @@ impl AppState {
         self.tasks.acquire_immediate(TaskLane::Write)
     }
 
+    /// `application.manage(state)` 之后调用：启动时打开的库要等状态注册完再安排恢复任务。
+    pub fn after_manage(&self) {
+        self.managed.store(true, Ordering::SeqCst);
+        self.after_library_open();
+    }
+
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
         self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
@@ -182,6 +199,7 @@ impl AppState {
             PathBuf::from(&info.path),
         );
         *self.library.lock() = Some(session);
+        *self.recovery.lock() = RecoveryPlan::default();
         query::clear_page_cache();
         Ok(info)
     }
@@ -191,6 +209,10 @@ impl AppState {
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let session = service::open(path, read_connections)?;
         let info = session.info.clone();
+        let plan = history::recover_on_open(&session.db)?;
+        if let Err(error) = history::cleanup_undo_dirs(&session.db, Path::new(&info.path)) {
+            log::warn!("清理撤销暂存目录失败：{error}");
+        }
         self.settings.set_library_path(Some(info.path.clone()))?;
         self.ai.library_opened(
             info.id.clone(),
@@ -199,7 +221,11 @@ impl AppState {
             PathBuf::from(&info.path),
         );
         *self.library.lock() = Some(session);
+        *self.recovery.lock() = plan;
         query::clear_page_cache();
+        if self.managed.load(Ordering::SeqCst) {
+            self.after_library_open();
+        }
         Ok(info)
     }
 
@@ -233,6 +259,7 @@ impl AppState {
         }
         self.ai.library_closed();
         *self.library.lock() = None;
+        *self.recovery.lock() = RecoveryPlan::default();
         query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())
@@ -270,6 +297,7 @@ impl AppState {
         let result = operation();
         if result.is_ok() {
             query::clear_page_cache();
+            self.after_history_write();
         }
         result
     }
@@ -413,16 +441,15 @@ impl AppState {
         image_ids: &[i64],
         reporter: &dyn BatchReporter,
     ) -> AppResult<DeleteReport> {
-        let (database, root) = self.query_source()?;
-        let report =
-            self.mutate(|| metadata::delete_images(&database, &root, image_ids, reporter))?;
+        let (database, _) = self.query_source()?;
+        let report = self.mutate(|| metadata::delete_images(&database, image_ids, reporter))?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
 
     pub fn empty_trash(&self, reporter: &dyn BatchReporter) -> AppResult<DeleteReport> {
-        let (database, root) = self.query_source()?;
-        let report = self.mutate(|| metadata::empty_trash(&database, &root, reporter))?;
+        let (database, _) = self.query_source()?;
+        let report = self.mutate(|| metadata::empty_trash(&database, reporter))?;
         self.ai.invalidate_similarity();
         Ok(report)
     }
@@ -434,12 +461,12 @@ impl AppState {
 
     pub fn create_collection(&self, name: &str) -> AppResult<CollectionInfo> {
         let (database, _) = self.query_source()?;
-        collections::create(&database, name)
+        self.mutate(|| collections::create(&database, name))
     }
 
     pub fn rename_collection(&self, collection_id: i64, name: &str) -> AppResult<()> {
         let (database, _) = self.query_source()?;
-        collections::rename(&database, collection_id, name)
+        self.mutate(|| collections::rename(&database, collection_id, name))
     }
 
     pub fn delete_collection(&self, collection_id: i64) -> AppResult<u64> {
@@ -449,7 +476,7 @@ impl AppState {
 
     pub fn reorder_collections(&self, collection_ids: &[i64]) -> AppResult<()> {
         let (database, _) = self.query_source()?;
-        collections::reorder(&database, collection_ids)
+        self.mutate(|| collections::reorder(&database, collection_ids))
     }
 
     pub fn add_images_to_collection(
@@ -478,6 +505,262 @@ impl AppState {
     ) -> AppResult<CollectionInfo> {
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::combine(&database, mode, collection_ids, name))
+    }
+
+    pub fn history_page(&self) -> AppResult<HistoryPage> {
+        let (database, _) = self.query_source()?;
+        let entries = history::list(&database)?;
+        let (pending_purge_count, pending_purge_bytes) = history::pending_summary(&database)?;
+        // 撤销要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
+        let blocked_reason = match self.tasks.active().first() {
+            Some(task) => Some(format!("「{}」正在进行，完成后才能撤销", task.label)),
+            None if entries.is_empty() => Some("还没有可撤销的操作".to_owned()),
+            None => None,
+        };
+        Ok(HistoryPage {
+            entries,
+            max_steps: self.settings.snapshot().history.max_steps,
+            pending_purge_count,
+            pending_purge_bytes,
+            can_undo: blocked_reason.is_none(),
+            blocked_reason,
+        })
+    }
+
+    pub fn undo_to(&self, target_id: i64) -> AppResult<TaskStartResult> {
+        let (database, _) = self.query_source()?;
+        let (status, failed, count) = database.with_reader(|connection| {
+            let status: Option<String> = connection
+                .query_row(
+                    "SELECT status FROM operations WHERE id = ?1",
+                    [target_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let failed: i64 = connection.query_row(
+                "SELECT count(*) FROM operations
+                 WHERE id >= ?1 AND status = 'undoFailed'",
+                [target_id],
+                |row| row.get(0),
+            )?;
+            let count: i64 = connection.query_row(
+                "SELECT count(*) FROM operations
+                 WHERE id >= ?1 AND status IN ('applied', 'undoing')",
+                [target_id],
+                |row| row.get(0),
+            )?;
+            Ok((status, failed, count))
+        })?;
+        match status.as_deref() {
+            Some("applied") => {}
+            Some("undoFailed") => {
+                return Err(AppError::message(
+                    "这条记录上次撤销失败，需要先处理失败原因",
+                ));
+            }
+            Some(_) => return Err(AppError::message("只能撤销已经完成的操作")),
+            None => return Err(AppError::message("操作记录不存在")),
+        }
+        if failed > 0 {
+            return Err(AppError::message(
+                "之后有一条记录上次撤销失败，不能继续回退；请先处理失败原因或清空记录",
+            ));
+        }
+        if count <= 0 {
+            return Err(AppError::message("没有可撤销的记录"));
+        }
+        self.start_undo_task(target_id, count as usize)
+    }
+
+    pub fn clear_history(&self) -> AppResult<TaskStartResult> {
+        let (database, root) = self.query_source()?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::ReleaseGarbage,
+            "清空操作记录",
+        );
+        handle.set_cancellable(false);
+        let app = self.app.clone();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        self.tasks
+            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+                let database = database.clone();
+                let root = root.clone();
+                let task = worker.clone();
+                let tasks = tasks.clone();
+                let ai = ai.clone();
+                let _ = tasks.spawn_worker(
+                    "clear-operation-history".to_owned(),
+                    task.clone(),
+                    move || {
+                        let _guard: LaneGuard = guard;
+                        task.set_phase(TaskPhase::Running);
+                        let result = history::clear(&database, &root)
+                            .and_then(|_| history::run_release(&database, &root, task.clone()));
+                        query::clear_page_cache();
+                        ai.invalidate_similarity();
+                        task.finish_from(&result);
+                    },
+                );
+            })
+    }
+
+    /// 设置里的最大步数变化后立即裁剪；失败只记日志，不影响设置保存。
+    pub fn after_settings_changed(&self) {
+        self.after_history_write();
+    }
+
+    /// 图库可用后的收尾：先续做中断的撤销（撤销不可排队，要先占 write lane），再按上限裁剪。
+    fn after_library_open(&self) {
+        self.schedule_recovery();
+        self.after_history_write();
+    }
+
+    fn after_history_write(&self) {
+        let Some((database, _, root)) = self.library_handles() else {
+            return;
+        };
+        let max_steps = self.settings.snapshot().history.max_steps;
+        match history::trim(&database, max_steps) {
+            Ok(evicted) => {
+                if evicted
+                    .iter()
+                    .any(|operation| operation.kind.keeps_staged_files())
+                {
+                    if let Err(error) = history::cleanup_undo_dirs(&database, &root) {
+                        log::warn!("清理撤销暂存目录失败：{error}");
+                    }
+                }
+                if evicted
+                    .iter()
+                    .any(|operation| operation.kind.releases_files())
+                {
+                    self.schedule_release();
+                }
+            }
+            Err(error) => log::warn!("裁剪操作记录失败：{error}"),
+        }
+    }
+
+    fn schedule_recovery(&self) {
+        let plan = {
+            let mut guard = self.recovery.lock();
+            std::mem::take(&mut *guard)
+        };
+        if let Some(target_id) = plan.resume_undo {
+            let Ok((database, _)) = self.query_source() else {
+                return;
+            };
+            let count = database.with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM operations
+                     WHERE id >= ?1 AND status IN ('applied', 'undoing')",
+                    [target_id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            });
+            match count {
+                Ok(count) if count > 0 => {
+                    if let Err(error) = self.start_undo_task(target_id, count as usize) {
+                        log::warn!("恢复中断的撤销失败：{error}");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("读取未完成撤销记录失败：{error}"),
+            }
+        }
+        if plan.release_needed {
+            self.schedule_release();
+        }
+    }
+
+    fn schedule_release(&self) {
+        if self
+            .tasks
+            .active()
+            .iter()
+            .any(|task| task.kind == TaskKind::ReleaseGarbage)
+        {
+            return;
+        }
+        let Some((database, _, _)) = self.library_handles() else {
+            return;
+        };
+        match history::has_orphan_purge(&database) {
+            Ok(true) => {
+                if let Err(error) = self.start_release_task("释放删除文件", ConflictPolicy::Queue)
+                {
+                    log::warn!("安排释放任务失败：{error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!("检查待释放文件失败：{error}"),
+        }
+    }
+
+    fn start_undo_task(&self, target_id: i64, count: usize) -> AppResult<TaskStartResult> {
+        let (database, root) = self.query_source()?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::Undo,
+            format!("撤销 {count} 条记录"),
+        );
+        handle.set_cancellable(count > 1);
+        let app = self.app.clone();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        self.tasks
+            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+                let database = database.clone();
+                let root = root.clone();
+                let task = worker.clone();
+                let tasks = tasks.clone();
+                let ai = ai.clone();
+                let _ = tasks.spawn_worker("undo-history".to_owned(), task.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    task.set_phase(TaskPhase::Running);
+                    let result = history::run_undo(&database, &root, target_id, task.clone());
+                    query::clear_page_cache();
+                    ai.invalidate_similarity();
+                    task.finish_from(&result);
+                });
+            })
+    }
+
+    fn start_release_task(
+        &self,
+        scope: &str,
+        policy: ConflictPolicy,
+    ) -> AppResult<TaskStartResult> {
+        let (database, root) = self.query_source()?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::ReleaseGarbage,
+            scope,
+        );
+        handle.set_cancellable(false);
+        let app = self.app.clone();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        self.tasks.launch(app, handle, policy, move |guard| {
+            let database = database.clone();
+            let root = root.clone();
+            let task = worker.clone();
+            let tasks = tasks.clone();
+            let ai = ai.clone();
+            let _ = tasks.spawn_worker("release-garbage".to_owned(), task.clone(), move || {
+                let _guard: LaneGuard = guard;
+                task.set_phase(TaskPhase::Running);
+                let result = history::run_release(&database, &root, task.clone());
+                query::clear_page_cache();
+                ai.invalidate_similarity();
+                task.finish_from(&result);
+            });
+        })
     }
 
     pub fn image_pose(&self, image_id: i64) -> AppResult<Option<PoseData>> {

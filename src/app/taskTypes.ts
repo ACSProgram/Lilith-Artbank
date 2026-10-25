@@ -9,7 +9,9 @@ export type TaskKind =
   | "similarityGroups"
   | "folderMove"
   | "permanentDelete"
-  | "emptyTrash";
+  | "emptyTrash"
+  | "undo"
+  | "releaseGarbage";
 
 export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =

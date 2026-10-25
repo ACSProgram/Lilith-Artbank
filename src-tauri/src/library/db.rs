@@ -79,7 +79,8 @@ impl LibraryDb {
                 |row| row.get(0),
             )?;
             let trash: u64 = connection.query_row(
-                "SELECT count(*) FROM images WHERE deleted_at IS NOT NULL",
+                "SELECT count(*) FROM images
+                 WHERE deleted_at IS NOT NULL AND purge_operation_id IS NULL",
                 [],
                 |row| row.get(0),
             )?;

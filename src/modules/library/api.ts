@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { TaskStartResult } from "../../app/taskTypes";
 import {
   mockAddTags,
   mockAddToCollection,
+  mockClearOperationHistory,
   mockCollections,
   mockCombineCollections,
   mockCreateCollection,
@@ -17,6 +19,7 @@ import {
   mockLibraryCounts,
   mockMoveFolder,
   mockMoveImages,
+  mockOperationHistory,
   mockQueryIds,
   mockQueryPage,
   mockRemoveFromCollection,
@@ -32,6 +35,7 @@ import {
   mockSetScores,
   mockTags,
   mockTrashImages,
+  mockUndoToOperation,
   mockUpdateDescription,
   mockUpdateScore,
 } from "./mock";
@@ -42,6 +46,7 @@ import type {
   FilterCounts,
   FeatureSummary,
   FolderInfo,
+  HistoryPage,
   ImageCapabilities,
   ImageDetails,
   ImagePage,
@@ -190,6 +195,21 @@ export const libraryApi = {
   async emptyTrash(): Promise<DeleteReport> {
     if (!isTauri()) return mockEmptyTrash();
     return invoke<DeleteReport>("empty_trash");
+  },
+
+  async getOperationHistory(): Promise<HistoryPage> {
+    if (!isTauri()) return mockOperationHistory();
+    return invoke<HistoryPage>("get_operation_history");
+  },
+
+  async undoToOperation(targetId: number): Promise<TaskStartResult> {
+    if (!isTauri()) return mockUndoToOperation(targetId);
+    return invoke<TaskStartResult>("undo_to_operation", { targetId });
+  },
+
+  async clearOperationHistory(): Promise<TaskStartResult> {
+    if (!isTauri()) return mockClearOperationHistory();
+    return invoke<TaskStartResult>("clear_operation_history");
   },
 
   async getCollections(): Promise<CollectionInfo[]> {

@@ -22,6 +22,11 @@ export interface PerformanceSettings {
   workerThreads: number | null;
 }
 
+/** 每个图库保留的操作记录步数。 */
+export interface HistorySettings {
+  maxSteps: number;
+}
+
 /** 排序方案：全局共享，存设置，数量上限 50 是存储上限。 */
 export interface SortProfile {
   id: string;
@@ -45,6 +50,7 @@ export interface Settings {
   libraryPath: string | null;
   ai: AiSettings;
   performance: PerformanceSettings;
+  history: HistorySettings;
   ui: UiSettings;
 }
 

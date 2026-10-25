@@ -217,13 +217,8 @@ export function folderLabel(path: string): string {
   return path || "根目录";
 }
 
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+// 体积格式化与查看器共用一份实现；`node --test` 直接跑 .ts 时需要显式扩展名。
+export { formatBytes } from "../../shared/format.ts";
 
 export function formatDimensions(width: number, height: number): string {
   return `${width.toLocaleString()} × ${height.toLocaleString()}`;

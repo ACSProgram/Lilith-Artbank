@@ -45,6 +45,8 @@ pub enum TaskKind {
     FolderMove,
     PermanentDelete,
     EmptyTrash,
+    Undo,
+    ReleaseGarbage,
 }
 
 impl TaskKind {
@@ -54,7 +56,9 @@ impl TaskKind {
             | Self::Thumbnail
             | Self::FolderMove
             | Self::PermanentDelete
-            | Self::EmptyTrash => TaskLane::Write,
+            | Self::EmptyTrash
+            | Self::Undo
+            | Self::ReleaseGarbage => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription => TaskLane::Ai,
             Self::SimilarityGroups => TaskLane::Scan,
         }
@@ -71,6 +75,8 @@ impl TaskKind {
             Self::FolderMove => "移动图片",
             Self::PermanentDelete => "永久删除",
             Self::EmptyTrash => "清空回收站",
+            Self::Undo => "撤销操作",
+            Self::ReleaseGarbage => "释放删除文件",
         }
     }
 }
@@ -152,7 +158,7 @@ pub struct TaskHandle {
     id: String,
     kind: TaskKind,
     scope: String,
-    cancellable: bool,
+    cancellable: AtomicBool,
     cancel: AtomicBool,
     phase: Mutex<TaskPhase>,
     total: AtomicUsize,
@@ -172,7 +178,7 @@ impl TaskHandle {
             id: id.into(),
             kind,
             scope: scope.into(),
-            cancellable: true,
+            cancellable: AtomicBool::new(true),
             cancel: AtomicBool::new(false),
             phase: Mutex::new(TaskPhase::Queued),
             total: AtomicUsize::new(0),
@@ -208,7 +214,18 @@ impl TaskHandle {
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        if self.is_cancellable() {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 单条记录的撤销、释放任务不允许中途取消；必须在任务启动前设置。
+    pub fn set_cancellable(&self, value: bool) {
+        self.cancellable.store(value, Ordering::SeqCst);
+    }
+
+    pub fn is_cancellable(&self) -> bool {
+        self.cancellable.load(Ordering::SeqCst)
     }
 
     pub fn should_cancel(&self) -> bool {
@@ -310,7 +327,7 @@ impl TaskHandle {
             started_at: self.started_at,
             finished_at: *self.finished_at.lock(),
             failures: self.failures.lock().clone(),
-            cancellable: self.cancellable,
+            cancellable: self.is_cancellable(),
         }
     }
 
@@ -459,6 +476,9 @@ impl TaskBus {
             .ok_or_else(|| AppError::message("任务不存在或已结束"))?;
         if handle.is_finished() {
             return Err(AppError::message("任务已经结束"));
+        }
+        if !handle.is_cancellable() {
+            return Err(AppError::message("该任务不能中途取消"));
         }
         handle.request_cancel();
         // 排队中的任务也要立刻醒来，看到取消标记后结束。
@@ -892,5 +912,30 @@ mod tests {
         assert_eq!(value["status"], "conflict");
         assert_eq!(value["active"][0]["taskId"], "a");
         assert_eq!(value["active"][0]["lane"], "write");
+    }
+
+    #[test]
+    fn non_cancellable_tasks_ignore_cancel_requests() {
+        let bus = TaskBus::new();
+        let handle = TaskHandle::new("u1", TaskKind::Undo, "撤销 1 条记录");
+        handle.set_cancellable(false);
+        handle.set_phase(TaskPhase::Running);
+        bus.register(handle.clone());
+        assert!(bus.cancel("u1").is_err());
+        assert!(!handle.should_cancel());
+        assert!(!handle.snapshot().cancellable);
+
+        handle.set_cancellable(true);
+        bus.cancel("u1").unwrap();
+        assert!(handle.should_cancel());
+        assert!(handle.snapshot().cancellable);
+    }
+
+    #[test]
+    fn undo_and_release_run_on_write_lane() {
+        assert_eq!(TaskKind::Undo.lane(), TaskLane::Write);
+        assert_eq!(TaskKind::ReleaseGarbage.lane(), TaskLane::Write);
+        assert_eq!(TaskKind::Undo.label(), "撤销操作");
+        assert_eq!(TaskKind::ReleaseGarbage.label(), "释放删除文件");
     }
 }

@@ -306,6 +306,13 @@ export function SettingsDialog({
     ) {
       return "缩略图缓存张数必须在 256-8192 之间";
     }
+    if (
+      !Number.isInteger(value.history.maxSteps) ||
+      value.history.maxSteps < 10 ||
+      value.history.maxSteps > 500
+    ) {
+      return "操作记录步数必须在 10-500 之间";
+    }
     return null;
   };
 
@@ -437,6 +444,25 @@ export function SettingsDialog({
                       }
                     />
                   </ValueField>
+
+                  <Field
+                    label="操作记录步数"
+                    hint="减少后更早的记录会立即清理，永久删除的文件随之释放。"
+                  >
+                    <input
+                      className="input"
+                      type="number"
+                      min={10}
+                      max={500}
+                      value={draft.history.maxSteps}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          history: { ...current.history, maxSteps: Number(event.target.value) },
+                        }))
+                      }
+                    />
+                  </Field>
                 </Panel>
               ) : null}
 

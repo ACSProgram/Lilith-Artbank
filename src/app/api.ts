@@ -10,7 +10,7 @@ import type {
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
@@ -24,6 +24,9 @@ const defaultSettings: Settings = {
   performance: {
     readerConnections: 4,
     workerThreads: null,
+  },
+  history: {
+    maxSteps: 100,
   },
   ui: {
     theme: "system",

@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -50,7 +50,11 @@ CREATE TABLE images (
     thumb_format TEXT NOT NULL DEFAULT 'jpeg',
     thumb_width INTEGER NOT NULL DEFAULT 0,
     thumb_height INTEGER NOT NULL DEFAULT 0,
-    thumb_version INTEGER NOT NULL DEFAULT 1
+    thumb_version INTEGER NOT NULL DEFAULT 1,
+    -- 待释放：只标记，文件与行在操作记录过期或清空记录后才真正删除。
+    purge_operation_id INTEGER,
+    -- 导入批次；导入撤销按它找回本次新增的行。
+    origin_operation_id INTEGER
 ) STRICT;
 
 CREATE INDEX idx_images_active_score
@@ -144,6 +148,43 @@ CREATE TRIGGER images_search_update AFTER UPDATE OF description ON images BEGIN
 END;
 "#;
 
+/// 操作记录相关结构：新建库与 v4→v5 迁移共用一份 DDL，避免两处漂移。
+///
+/// 要点：`operations.id` 用 `AUTOINCREMENT`，记录清理后 id 不复用（待释放标记与
+/// `.artbank/undo/<id>/` 都按 id 引用）；两个标记列不建外键，记录行删除后标记仍要能被释放扫描读到。
+const HISTORY_SCHEMA_SQL: &str = r#"
+CREATE INDEX idx_images_purge
+    ON images(purge_operation_id) WHERE purge_operation_id IS NOT NULL;
+
+CREATE TABLE operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    task_id TEXT,
+    affected INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    undone_at INTEGER
+) STRICT;
+
+CREATE TABLE operation_chunks (
+    operation_id INTEGER NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (operation_id, seq)
+) STRICT;
+
+CREATE TABLE undo_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_operation_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER
+) STRICT;
+"#;
+
 pub fn configure(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -169,6 +210,7 @@ pub fn initialize(connection: &mut Connection, manifest: &LibraryManifest) -> Ap
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_SQL)?;
+    transaction.execute_batch(HISTORY_SCHEMA_SQL)?;
     let now = chrono::Utc::now().timestamp_millis();
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('appFormat', ?1), ('schemaVersion', ?2), ('libraryId', ?3), ('createdAt', ?4)",
@@ -201,16 +243,23 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             verify_meta(connection, manifest)?;
             migrate_v1_to_v2(connection)?;
             migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)
+            migrate_v3_to_v4(connection)?;
+            migrate_v4_to_v5(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
             migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)
+            migrate_v3_to_v4(connection)?;
+            migrate_v4_to_v5(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
-            migrate_v3_to_v4(connection)
+            migrate_v3_to_v4(connection)?;
+            migrate_v4_to_v5(connection)
+        }
+        4 => {
+            verify_meta(connection, manifest)?;
+            migrate_v4_to_v5(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -310,9 +359,23 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> AppResult<()> {
          CREATE INDEX IF NOT EXISTS idx_images_active_pixels
              ON images(deleted_at, (width * height) DESC, id DESC);",
     )?;
+    mark_version(&transaction, 4)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v3 升级到 v4");
+    Ok(())
+}
+
+/// v4 → v5：操作记录、待释放标记与导入来源；只新增表、列与索引，不改现有行。
+fn migrate_v4_to_v5(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE images ADD COLUMN purge_operation_id INTEGER;
+         ALTER TABLE images ADD COLUMN origin_operation_id INTEGER;",
+    )?;
+    transaction.execute_batch(HISTORY_SCHEMA_SQL)?;
     mark_version(&transaction, SCHEMA_VERSION)?;
     transaction.commit()?;
-    log::info!("图库 schema 已从 v3 升级到 v{SCHEMA_VERSION}");
+    log::info!("图库 schema 已从 v4 升级到 v{SCHEMA_VERSION}");
     Ok(())
 }
 
@@ -391,6 +454,7 @@ mod tests {
     }
 
     fn downgrade_to_v1(connection: &Connection) {
+        downgrade_to_v4(connection);
         connection
             .execute("DROP INDEX idx_folders_path_nocase", [])
             .unwrap();
@@ -407,6 +471,7 @@ mod tests {
     }
 
     fn downgrade_to_v2(connection: &Connection) {
+        downgrade_to_v4(connection);
         connection
             .execute("ALTER TABLE folders DROP COLUMN sort_index", [])
             .unwrap();
@@ -414,6 +479,26 @@ mod tests {
         connection
             .execute(
                 "UPDATE meta SET value = '2' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v4(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP INDEX idx_images_purge;
+             ALTER TABLE images DROP COLUMN purge_operation_id;
+             ALTER TABLE images DROP COLUMN origin_operation_id;
+             DROP TABLE undo_runs;
+             DROP TABLE operation_chunks;
+             DROP TABLE operations;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '4' WHERE key = 'schemaVersion'",
                 [],
             )
             .unwrap();
@@ -548,5 +633,98 @@ mod tests {
         let error = ensure(&mut connection, &manifest()).unwrap_err();
         assert!(error.to_string().contains("大小写冲突"));
         assert_eq!(read_version(&connection).unwrap(), 1);
+    }
+
+    #[test]
+    fn new_library_has_operation_tables_and_purge_columns() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+
+        for table in ["operations", "operation_chunks", "undo_runs"] {
+            let found: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "缺少表 {table}");
+        }
+        let columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('images')
+                 WHERE name IN ('purge_operation_id', 'origin_operation_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2);
+        let indexes: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_images_purge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+    }
+
+    #[test]
+    fn migrates_v4_to_v5_and_keeps_existing_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v4(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 4);
+
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'jpg', 1, 10, 4, 3, 'jpeg', 0, zeroblob(32), zeroblob(16),
+                           zeroblob(32), 3, '迁移前描述', 1, 1)",
+                [("a".repeat(64))],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schemaVersion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+
+        let (hash, score, purge): (String, i64, Option<i64>) = connection
+            .query_row(
+                "SELECT content_hash, score, purge_operation_id FROM images WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(hash, "a".repeat(64));
+        assert_eq!(score, 3);
+        assert_eq!(purge, None);
+
+        connection
+            .execute(
+                "INSERT INTO operations(kind, label, created_at, status)
+                 VALUES ('trash', '移入回收站', 1, 'applied')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO operation_chunks(operation_id, seq, format, data)
+                 VALUES (1, 0, 'ids', X'0000000000000000')",
+                [],
+            )
+            .unwrap();
     }
 }

@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Crop,
   FolderOpen,
+  History,
   ImageOff,
   LayoutGrid,
   List,
@@ -30,6 +31,7 @@ import {
 } from "lucide-react";
 import { useAppRuntime } from "../../app/runtimeContext";
 import { useNotices } from "../../app/noticeContext";
+import { useTaskCenter } from "../../app/taskContext";
 import { Button, IconButton } from "../../shared/components/Button";
 import { MenuSection } from "../../shared/components/MenuSection";
 import { Popover } from "../../shared/components/Popover";
@@ -49,6 +51,7 @@ import {
 import { FilterPanel } from "./FilterPanel";
 import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
+import { OperationHistoryPanel } from "./OperationHistoryPanel";
 import { SortMenu } from "./SortMenu";
 import { TagManagerDialog } from "./TagManagerDialog";
 import { ViewBar } from "./ViewBar";
@@ -175,6 +178,7 @@ export function LibraryView({
 }: LibraryViewProps) {
   const { settings, current, refreshStatus, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
+  const { active: activeTasks } = useTaskCenter();
 
   const [searchDraft, setSearchDraft] = useState(browse.search);
   const [searchMode, setSearchMode] = useState<SearchMode>(initialSearchMode);
@@ -201,6 +205,7 @@ export function LibraryView({
   const [combineOpen, setCombineOpen] = useState(false);
   const [viewCount, setViewCount] = useState<number | null>(null);
   const [taskMenuOpen, setTaskMenuOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
   const [emptyingTrash, setEmptyingTrash] = useState(false);
   const [viewBusy, setViewBusy] = useState(false);
@@ -213,6 +218,7 @@ export function LibraryView({
   const contextCapsTarget = useRef<number | null>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
   const taskAnchorRef = useRef<HTMLButtonElement>(null);
+  const historyAnchorRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const browseRef = useRef(browse);
   browseRef.current = browse;
@@ -858,9 +864,13 @@ export function LibraryView({
         const report = await libraryApi.deleteImagesPermanently(ids);
         const failed = report.failures.length;
         notify(
-          `已永久删除 ${report.deleted.toLocaleString()} 张`,
+          `已从回收站移除 ${report.deleted.toLocaleString()} 张`,
           failed > 0 ? "error" : "success",
-          failed > 0 ? `${failed} 个文件删除失败：${report.failures[0].reason}` : undefined,
+          failed > 0
+            ? `${failed} 个文件删除失败：${report.failures[0].reason}`
+            : report.deferred && report.deleted > 0
+              ? "文件会在操作记录清除后释放。"
+              : undefined,
         );
         refreshData({ clearSelection: true });
         return report.deleted > 0;
@@ -884,11 +894,13 @@ export function LibraryView({
     try {
       const report = await libraryApi.emptyTrash();
       notify(
-        `已清空回收站：删除 ${report.deleted.toLocaleString()} 张`,
+        `已清空回收站：移出 ${report.deleted.toLocaleString()} 张`,
         report.failures.length > 0 ? "error" : "success",
         report.failures.length > 0
           ? `${report.failures.length} 个文件删除失败：${report.failures[0].reason}`
-          : undefined,
+          : report.deferred && report.deleted > 0
+            ? "文件会在操作记录清除后释放。"
+            : undefined,
       );
       refreshData({ clearSelection: true });
     } catch (cause) {
@@ -1425,6 +1437,28 @@ export function LibraryView({
             <Wrench size={14} />
             任务
           </button>
+          <button
+            ref={historyAnchorRef}
+            type="button"
+            className="button button-secondary button-sm"
+            aria-expanded={historyOpen}
+            disabled={activeTasks.length > 0}
+            title={
+              activeTasks.length > 0
+                ? `「${activeTasks[0].label}」正在进行，完成后才能撤销`
+                : "最近的操作记录"
+            }
+            onClick={() => setHistoryOpen((open) => !open)}
+          >
+            <History size={14} />
+            记录
+          </button>
+          <OperationHistoryPanel
+            open={historyOpen}
+            anchorRef={historyAnchorRef}
+            onClose={() => setHistoryOpen(false)}
+            onChanged={() => refreshData()}
+          />
           <Popover
             open={taskMenuOpen}
             anchorRef={taskAnchorRef}

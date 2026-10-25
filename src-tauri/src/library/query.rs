@@ -476,7 +476,7 @@ pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<
                 images.thumb_width, images.thumb_height
          FROM images
          JOIN folders ON folders.id = images.folder_id
-         WHERE images.id IN ({placeholders})"
+         WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"
     );
     let values: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
     database.with_reader(|connection| {
@@ -511,7 +511,7 @@ fn rows_for_ids(connection: &Connection, root: &Path, ids: &[i64]) -> AppResult<
                 images.thumb_width, images.thumb_height
          FROM images
          JOIN folders ON folders.id = images.folder_id
-         WHERE images.id IN ({placeholders})"
+         WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"
     );
     let values: Vec<Value> = ids.iter().map(|id| Value::Integer(*id)).collect();
     let mut statement = connection.prepare(&sql)?;
@@ -609,7 +609,7 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
         let folders = all_folders(connection)?;
         let mut statement = connection.prepare(
             "SELECT folder_id, count(*) FROM images
-             WHERE deleted_at IS NULL GROUP BY folder_id",
+             WHERE deleted_at IS NULL AND purge_operation_id IS NULL GROUP BY folder_id",
         )?;
         let direct = statement
             .query_map([], |row| {
@@ -963,6 +963,16 @@ impl PreparedQuery {
                         .push("images.deleted_at IS NULL".to_owned());
                 }
             }
+        }
+        // 待释放行已经从回收站移除：回收站视图与全库搜索没有 `deleted_at IS NULL` 兜底，
+        // 必须显式排除；其余视图由 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）。
+        // 不能无条件加这条：`purge_operation_id` 不在排序 id 列表的覆盖索引里，20 万行
+        // 按文件夹排序的首页会从 39 ms 涨到 81 ms。
+        if library_scope || query.view == LibraryView::Trash {
+            prepared
+                .filters
+                .clauses
+                .push("images.purge_operation_id IS NULL".to_owned());
         }
         prepared.filters.push_search(&query.search, search_mode);
         prepared
@@ -2815,5 +2825,66 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn purge_marked_rows_are_hidden_everywhere() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET description = '已释放', purge_operation_id = 99 WHERE id = 5",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 普通视图不额外加 `purge_operation_id` 条件，靠 `deleted_at IS NULL` 挡住待释放行。
+        let all = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::All,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(all.items.iter().all(|row| row.id != 5));
+
+        let trash = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::Trash,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(trash.items.is_empty());
+
+        // 全库搜索包含回收站，但不应重新显示已从回收站移除的待释放行。
+        let search = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                search: "已释放".into(),
+                search_scope: SearchScope::Library,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(search.items.is_empty());
+
+        let rows = rows_by_ids(&fixture.session.db, &fixture.root, &[5, 1]).unwrap();
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1]);
+
+        let (_, trash_count) = fixture.session.db.counts().unwrap();
+        assert_eq!(trash_count, 0);
     }
 }

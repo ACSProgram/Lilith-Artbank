@@ -12,6 +12,7 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
   const { notify } = useNotices();
   const [tasks, setTasks] = useState<TaskSnapshot[]>([]);
   const [dataVersion, setDataVersion] = useState(0);
+  const [lastFinished, setLastFinished] = useState<TaskSnapshot | null>(null);
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
 
@@ -45,6 +46,7 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
       const finished = await listen<TaskSnapshot>("task-finished", (event) => {
         if (disposed) return;
         merge(event.payload);
+        setLastFinished(event.payload);
         // 相似分组不改图库数据，不需要刷新浏览页面。
         if (event.payload.kind !== "similarityGroups") {
           setDataVersion((value) => value + 1);
@@ -87,8 +89,8 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
   const active = useMemo(() => tasks.filter(isTaskActive), [tasks]);
 
   const value = useMemo<TaskCenter>(
-    () => ({ tasks, active, dataVersion, start, cancel, find }),
-    [tasks, active, dataVersion, start, cancel, find],
+    () => ({ tasks, active, dataVersion, start, cancel, find, lastFinished }),
+    [tasks, active, dataVersion, start, cancel, find, lastFinished],
   );
 
   return (

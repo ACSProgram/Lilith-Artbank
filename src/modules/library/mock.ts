@@ -1,5 +1,6 @@
 import { MOCK_IMAGE_COUNT } from "./mockConfig";
 import { isSameOrDescendant } from "./folderTreeModel";
+import type { TaskKind, TaskSnapshot, TaskStartResult } from "../../app/taskTypes";
 import type {
   ColorEntry,
   CollectionInfo,
@@ -8,6 +9,8 @@ import type {
   FilterCounts,
   FolderCount,
   FolderInfo,
+  HistoryEntry,
+  HistoryPage,
   ImageDetails,
   ImagePage,
   ImageRow,
@@ -843,7 +846,7 @@ export function mockDeleteImages(ids: number[], onlyTrashed = false): DeleteRepo
     descriptions.delete(id);
     palettes.delete(id);
   }
-  return { deleted: targetIds.size, filesRemoved: targetIds.size, failures: [] };
+  return { deleted: targetIds.size, filesRemoved: 0, deferred: true, failures: [] };
 }
 
 export function mockEmptyTrash(): DeleteReport {
@@ -977,4 +980,88 @@ export function mockCombineCollections(
   const info = mockCreateCollection(name);
   mockAddToCollection(info.id, combined);
   return collectionInfo(info);
+}
+
+let mockOperations: HistoryEntry[] = [
+  {
+    id: 3,
+    kind: "score",
+    label: "设置评分",
+    createdAt: Date.now() - 60_000,
+    affected: 4,
+    status: "applied",
+    error: "",
+  },
+  {
+    id: 2,
+    kind: "tagAdd",
+    label: "添加标签",
+    createdAt: Date.now() - 3_600_000,
+    affected: 12,
+    status: "applied",
+    error: "",
+  },
+  {
+    id: 1,
+    kind: "trash",
+    label: "移入回收站",
+    createdAt: Date.now() - 7_200_000,
+    affected: 2,
+    status: "applied",
+    error: "",
+  },
+];
+
+function mockHistoryTask(kind: TaskKind, label: string, scope: string): TaskSnapshot {
+  return {
+    taskId: crypto.randomUUID(),
+    kind,
+    label,
+    scope,
+    lane: "write",
+    phase: "running",
+    total: 0,
+    completed: 0,
+    failed: 0,
+    skipped: 0,
+    message: "",
+    currentImageId: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+    failures: [],
+    cancellable: false,
+  };
+}
+
+export function mockOperationHistory(): HistoryPage {
+  const entries = [...mockOperations].sort((left, right) => right.id - left.id);
+  return {
+    entries,
+    maxSteps: 100,
+    pendingPurgeCount: 0,
+    pendingPurgeBytes: 0,
+    canUndo: entries.length > 0,
+    blockedReason: entries.length > 0 ? null : "还没有可撤销的操作",
+  };
+}
+
+export function mockUndoToOperation(targetId: number): TaskStartResult {
+  const removed = mockOperations.filter((entry) => entry.id >= targetId);
+  mockOperations = mockOperations.filter((entry) => entry.id < targetId);
+  return {
+    status: "started",
+    task: mockHistoryTask(
+      "undo",
+      "撤销操作",
+      `撤销 ${Math.max(1, removed.length)} 条记录`,
+    ),
+  };
+}
+
+export function mockClearOperationHistory(): TaskStartResult {
+  mockOperations = [];
+  return {
+    status: "started",
+    task: mockHistoryTask("releaseGarbage", "释放删除文件", "清空操作记录"),
+  };
 }

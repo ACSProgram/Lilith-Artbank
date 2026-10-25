@@ -20,6 +20,7 @@ use crate::{
         capability::{FeatureSummary, ImageCapabilities},
         collections::{CollectionInfo, CombineMode},
         edit::{self, EditRequest, EditResult, EditSizeEstimate},
+        history::HistoryPage,
         manifest::LibraryInspection,
         metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
@@ -40,6 +41,7 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
     if previous != saved.ai {
         state.ai.apply_settings(&previous, &saved.ai);
     }
+    state.after_settings_changed();
     Ok(saved)
 }
 
@@ -461,6 +463,24 @@ pub async fn empty_trash(app: AppHandle) -> Result<DeleteReport, String> {
 }
 
 #[tauri::command]
+pub fn get_operation_history(state: State<'_, AppState>) -> Result<HistoryPage, String> {
+    AppError::command(state.history_page())
+}
+
+#[tauri::command]
+pub fn undo_to_operation(
+    state: State<'_, AppState>,
+    target_id: i64,
+) -> Result<TaskStartResult, String> {
+    AppError::command(state.undo_to(target_id))
+}
+
+#[tauri::command]
+pub fn clear_operation_history(state: State<'_, AppState>) -> Result<TaskStartResult, String> {
+    AppError::command(state.clear_history())
+}
+
+#[tauri::command]
 pub fn get_collections(state: State<'_, AppState>) -> Result<Vec<CollectionInfo>, String> {
     AppError::command(state.collections())
 }
@@ -777,6 +797,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         restore_images,
         delete_images_permanently,
         empty_trash,
+        get_operation_history,
+        undo_to_operation,
+        clear_operation_history,
         get_collections,
         create_collection,
         rename_collection,

@@ -11,6 +11,7 @@ use crate::{
     library::{
         BatchReporter,
         db::LibraryDb,
+        history::{self, HistoryKind, NewOperation},
         import::{ensure_folder, ensure_tags},
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
         placeholders,
@@ -91,6 +92,8 @@ pub struct MoveReport {
 pub struct DeleteReport {
     pub deleted: u64,
     pub files_removed: u64,
+    /// 永久删除/清空回收站只做标记时仍为 true；文件在记录过期或清空记录后释放。
+    pub deferred: bool,
     pub failures: Vec<BatchFailure>,
 }
 
@@ -531,100 +534,196 @@ pub fn move_images(
 
 pub fn set_trashed(database: &LibraryDb, image_ids: &[i64], trashed: bool) -> AppResult<u64> {
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
-    database.with_writer(|connection| {
-        let now = now_ms();
-        let mut changed = 0_u64;
-        for chunk in ids.chunks(SQL_CHUNK) {
-            let marks = placeholders(chunk.len());
-            changed += if trashed {
-                connection.execute(
+    let (kind, label) = if trashed {
+        (HistoryKind::Trash, "移入回收站")
+    } else {
+        (HistoryKind::Restore, "恢复图片")
+    };
+    // 只处理仍处于目标状态的行；待释放行不参与，否则会把标记中的图片恢复成正常图片。
+    let matches = if trashed {
+        "deleted_at IS NULL"
+    } else {
+        "deleted_at IS NOT NULL"
+    };
+    let assigned = if trashed { "?1" } else { "NULL" };
+    history::write(
+        database,
+        NewOperation::new(kind, label),
+        |transaction, draft| {
+            let now = now_ms();
+            let mut triples = Vec::new();
+            let mut changed = 0_u64;
+            for chunk in ids.chunks(SQL_CHUNK) {
+                let marks = placeholders(chunk.len());
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT id, deleted_at, modified_at FROM images
+                     WHERE id IN ({marks}) AND {matches} AND purge_operation_id IS NULL"
+                ))?;
+                let rows = statement
+                    .query_map(params_from_iter(chunk.iter()), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                for (image_id, old_deleted_at, old_modified_at) in rows {
+                    triples.push((image_id, old_deleted_at.unwrap_or(0), old_modified_at));
+                }
+                changed += transaction.execute(
                     &format!(
-                        "UPDATE images SET deleted_at = ?1, modified_at = ?1
-                         WHERE id IN ({marks}) AND deleted_at IS NULL"
+                        "UPDATE images SET deleted_at = {assigned}, modified_at = ?1
+                         WHERE id IN ({marks}) AND {matches}
+                           AND purge_operation_id IS NULL"
                     ),
                     params_from_iter(
                         std::iter::once(Value::Integer(now))
                             .chain(chunk.iter().map(|id| Value::Integer(*id))),
                     ),
-                )?
-            } else {
-                connection.execute(
-                    &format!(
-                        "UPDATE images SET deleted_at = NULL, modified_at = ?1
-                         WHERE id IN ({marks}) AND deleted_at IS NOT NULL"
-                    ),
-                    params_from_iter(
-                        std::iter::once(Value::Integer(now))
-                            .chain(chunk.iter().map(|id| Value::Integer(*id))),
-                    ),
-                )?
-            } as u64;
-        }
-        Ok(changed)
-    })
+                )? as u64;
+            }
+            draft.triples(&triples);
+            draft.affected(changed);
+            Ok(changed)
+        },
+    )
 }
 
+/// 永久删除：整批都必须在回收站里，否则拒绝（避免绕过界面隐藏正常图片）。
+/// 只写待释放标记，原图与数据库行由释放任务删除。
 pub fn delete_images(
     database: &LibraryDb,
-    root: &Path,
     image_ids: &[i64],
     reporter: &dyn BatchReporter,
 ) -> AppResult<DeleteReport> {
     let ids = validate_ids_for_files(image_ids)?;
-    delete_internal(database, root, Some(&ids), false, reporter)
+    mark_for_purge(database, Some(&ids), reporter)
 }
 
-pub fn empty_trash(
-    database: &LibraryDb,
-    root: &Path,
-    reporter: &dyn BatchReporter,
-) -> AppResult<DeleteReport> {
-    delete_internal(database, root, None, true, reporter)
+/// 清空回收站：给全部可删行写待释放标记，文件同样等释放任务。
+pub fn empty_trash(database: &LibraryDb, reporter: &dyn BatchReporter) -> AppResult<DeleteReport> {
+    mark_for_purge(database, None, reporter)
 }
 
-/// 按块删除：每块先删数据库行并提交，再删除对应原图。
-/// 取消发生在块边界，已完成的块保持“行与文件都已删除”，不会留下半删状态。
-fn delete_internal(
+/// 永久删除/清空回收站只写待释放标记；文件在对应记录过期或清空记录后由释放任务删除。
+fn mark_for_purge(
     database: &LibraryDb,
-    root: &Path,
     image_ids: Option<&[i64]>,
-    only_trashed: bool,
     reporter: &dyn BatchReporter,
 ) -> AppResult<DeleteReport> {
-    let paths = LibraryPaths::new(root);
+    let targets = purge_targets(database, image_ids)?;
+    let (kind, label) = if image_ids.is_some() {
+        (HistoryKind::PermanentDelete, "永久删除")
+    } else {
+        (HistoryKind::EmptyTrash, "清空回收站")
+    };
+    if targets.is_empty() {
+        return Ok(DeleteReport {
+            deferred: true,
+            ..Default::default()
+        });
+    }
+    let total = targets.len();
+    reporter.report(0, total);
 
+    history::write(
+        database,
+        NewOperation::new(kind, label),
+        |transaction, draft| {
+            let mut changed = 0_u64;
+            let mut done = 0_usize;
+            for chunk in targets.chunks(SQL_CHUNK) {
+                if reporter.cancelled() {
+                    break;
+                }
+                let marks = placeholders(chunk.len());
+                changed += transaction.execute(
+                    &format!(
+                        "UPDATE images SET purge_operation_id = ?1
+                     WHERE id IN ({marks}) AND deleted_at IS NOT NULL
+                       AND purge_operation_id IS NULL"
+                    ),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(draft.id()))
+                            .chain(chunk.iter().map(|id| Value::Integer(*id))),
+                    ),
+                )? as u64;
+                done += chunk.len();
+                reporter.report(done, total);
+            }
+            draft.affected(changed);
+            Ok(DeleteReport {
+                deleted: changed,
+                files_removed: 0,
+                deferred: true,
+                failures: Vec::new(),
+            })
+        },
+    )
+}
+
+/// 永久删除要求整批都在回收站（否则拒绝，避免绕过界面隐藏正常图片）；清空回收站取全部可删行。
+fn purge_targets(database: &LibraryDb, image_ids: Option<&[i64]>) -> AppResult<Vec<i64>> {
+    let Some(ids) = image_ids else {
+        return database.with_reader(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id FROM images
+                 WHERE deleted_at IS NOT NULL AND purge_operation_id IS NULL",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(ids)
+        });
+    };
+    let mut eligible = Vec::with_capacity(ids.len());
+    database.with_reader(|connection| {
+        for chunk in ids.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            let mut statement = connection.prepare(&format!(
+                "SELECT id FROM images
+                 WHERE id IN ({marks}) AND deleted_at IS NOT NULL
+                   AND purge_operation_id IS NULL"
+            ))?;
+            eligible.extend(
+                statement
+                    .query_map(params_from_iter(chunk.iter()), |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(())
+    })?;
+    if eligible.len() != ids.len() {
+        return Err(AppError::message("只能永久删除回收站中的图片"));
+    }
+    Ok(eligible)
+}
+
+/// 释放任务：按 `purge_operation_id` 删行并删原图；每块先提交删行，再删文件。
+pub fn purge_by_operation(
+    database: &LibraryDb,
+    root: &Path,
+    operation_ids: &[i64],
+    reporter: &dyn BatchReporter,
+) -> AppResult<DeleteReport> {
+    if operation_ids.is_empty() {
+        return Err(AppError::message("没有指定待释放的操作记录"));
+    }
+    let paths = LibraryPaths::new(root);
     let selected = database.with_reader(|connection| {
         let mut selected = Vec::new();
-        if let Some(ids) = image_ids {
-            for chunk in ids.chunks(SQL_CHUNK) {
-                let marks = placeholders(chunk.len());
-                let mut statement = connection.prepare(&format!(
-                    "SELECT images.id, images.content_hash, images.file_ext, folders.path
-                     FROM images JOIN folders ON folders.id = images.folder_id
-                     WHERE images.id IN ({marks})"
-                ))?;
-                selected.extend(
-                    statement
-                        .query_map(params_from_iter(chunk.iter()), |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?,
-                );
-            }
-        } else if only_trashed {
-            let mut statement = connection.prepare(
+        for chunk in operation_ids.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            let mut statement = connection.prepare(&format!(
                 "SELECT images.id, images.content_hash, images.file_ext, folders.path
                  FROM images JOIN folders ON folders.id = images.folder_id
-                 WHERE images.deleted_at IS NOT NULL",
-            )?;
+                 WHERE images.purge_operation_id IN ({marks})"
+            ))?;
             selected.extend(
                 statement
-                    .query_map([], |row| {
+                    .query_map(params_from_iter(chunk.iter()), |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
@@ -642,8 +741,6 @@ fn delete_internal(
     for (image_id, content_hash, file_ext, folder_path) in selected {
         match content_path(&paths, &folder_path, &content_hash, &file_ext) {
             Ok(path) => files.push((image_id, path)),
-            // 路径未通过校验时保留数据库行：此时无法定位原图，删行只会留下无人追踪的文件。
-            // 正常导入的数据不会出现这种情况，告警用于暴露被外部改坏的库。
             Err(error) => log::warn!("跳过无效图片路径 image={image_id}: {error}"),
         }
     }
@@ -670,7 +767,6 @@ fn delete_internal(
         })?;
         report.deleted += deleted;
 
-        // 行已经删除；这一块的文件必须一并清理，取消只在块边界生效。
         for (image_id, path) in chunk {
             if path.exists() {
                 match remove_content_file(&paths.root, path) {
@@ -1134,11 +1230,31 @@ mod tests {
                 .deleted_at
                 .is_none()
         );
+        // 永久删除只接受回收站里的图片，避免绕过界面隐藏正常图片。
+        assert!(delete_images(&fixture.session.db, &[image_id], &NoopReporter).is_err());
+        set_trashed(&fixture.session.db, &[image_id], true).unwrap();
 
-        let report = delete_images(
+        let report = delete_images(&fixture.session.db, &[image_id], &NoopReporter).unwrap();
+        assert!(report.deferred);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.files_removed, 0);
+        assert!(path.exists());
+        assert!(
+            image_details(&fixture.session.db, &fixture.root, image_id)
+                .unwrap()
+                .deleted_at
+                .is_some()
+        );
+
+        let operation = history::list(&fixture.session.db)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == HistoryKind::PermanentDelete)
+            .unwrap();
+        let report = purge_by_operation(
             &fixture.session.db,
             &fixture.root,
-            &[image_id],
+            &[operation.id],
             &NoopReporter,
         )
         .unwrap();
@@ -1173,13 +1289,35 @@ mod tests {
         let active = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
         let trashed = insert_image(&fixture, "b", "jpg", 1, fixture.folder);
         write_content(&fixture, "人物", "a", "jpg");
-        write_content(&fixture, "人物", "b", "jpg");
+        let trashed_path = write_content(&fixture, "人物", "b", "jpg");
         set_trashed(&fixture.session.db, &[trashed], true).unwrap();
 
-        let report = empty_trash(&fixture.session.db, &fixture.root, &NoopReporter).unwrap();
+        let report = empty_trash(&fixture.session.db, &NoopReporter).unwrap();
+        assert!(report.deferred);
         assert_eq!(report.deleted, 1);
-        assert_eq!(report.files_removed, 1);
+        assert_eq!(report.files_removed, 0);
+        assert!(trashed_path.exists());
         assert!(image_details(&fixture.session.db, &fixture.root, active).is_ok());
+        assert!(
+            image_details(&fixture.session.db, &fixture.root, trashed)
+                .unwrap()
+                .deleted_at
+                .is_some()
+        );
+
+        let operation = history::list(&fixture.session.db)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == HistoryKind::EmptyTrash)
+            .unwrap();
+        purge_by_operation(
+            &fixture.session.db,
+            &fixture.root,
+            &[operation.id],
+            &NoopReporter,
+        )
+        .unwrap();
+        assert!(!trashed_path.exists());
         assert!(image_details(&fixture.session.db, &fixture.root, trashed).is_err());
     }
 

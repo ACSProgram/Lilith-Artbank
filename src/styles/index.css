@@ -2215,6 +2215,130 @@ textarea:focus-visible {
   text-transform: uppercase;
 }
 
+/* ---------- 操作记录 ---------- */
+
+.operation-history-popover {
+  padding: 0;
+}
+
+.operation-history {
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  max-height: 60vh;
+}
+
+.operation-history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.operation-history-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.operation-history-progress {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
+
+.operation-history-list {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.operation-history-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.operation-history-row:hover {
+  background: var(--panel-hover);
+}
+
+.operation-history-row.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.operation-history-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.operation-history-label {
+  font-size: 11.5px;
+}
+
+.operation-history-meta {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.operation-history-status {
+  color: var(--danger);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.operation-history-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 26px 12px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.operation-history-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.operation-history-hint {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.operation-history-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
 /* ---------- S3 views, search and inspector ---------- */
 
 .view-bar {

@@ -321,6 +321,20 @@ WebView2 中的 150 张冷/热加载已由用户手工确认满足 ≤1s 门槛�
 - id 列表在会改变图片集合、排序字段或筛选字段的写入后整体失效（`AppState::mutate` 与导入收尾统一清空），旧 token 再被使用时返回“排序结果已过期”；前端同时通过刷新令牌重新取第一页。
 - 运行方式仍是 `cargo test --lib -- --ignored --nocapture perf_metadata_200k`。
 
+### 待释放标记与分页查询（操作记录批次 1，2026-10-25）
+
+永久删除与清空回收站只给行写 `purge_operation_id`，分页与全库搜索必须把待释放行排除掉。同机 A/B（20 万行，同一台机器前后两次运行）：
+
+| 查询 | 无条件加 `purge_operation_id IS NULL` | 只在该视图需要时加 |
+| --- | --- | --- |
+| 单级 folder 首页 150（id 列表） | 81.07 ms（p95 81.87 ms） | 39.26 ms（p95 40.85 ms） |
+| 单级 importedAt 首页 150 | 0.63 ms | 0.64 ms |
+| 6 级排序首次建 id 列表 | 197.94 ms | 197.94 ms |
+
+- 原因：`purge_operation_id` 不在排序 id 列表用到的覆盖索引里，无条件加条件会让按文件夹排序的 id 列表退化为逐行回表。
+- 现在的做法：回收站视图与“全库搜索”显式加 `purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）。新增视图或改变删除语义时，必须确认这条不变量仍成立。
+- 复测（2026-10-25，同机）：单级 importedAt / modifiedAt / score / size / pixels 0.58-0.72 ms（p95 ≤1.03 ms）、folder 39.26 ms、6 级首次 197.94 ms、后续与深页 0.68-0.72 ms、schema v3→v4 建索引 417 ms。
+
 ## 结论与决策
 
 1. **SQLite 不是瓶颈**。首屏、深分页、文件夹、FTS 都在毫秒级；不需要自研元数据索引。

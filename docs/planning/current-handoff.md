@@ -1,7 +1,7 @@
 # 当前阶段状态
 
 日期：2026-10-25
-阶段：**迁移后体验整改 P0–P4 全部完成并归档**。S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
+阶段：**操作撤销批次 1 已完成（2026-10-25）**，待用户真实窗口验收；批次 2/3 待实施。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
 历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
 
@@ -19,26 +19,37 @@
 ## 基线
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
-- 存储版本：schema v4（v1→v2→v3→v4 链式迁移）、设置 v4（v1→v2→v3→v4）；设置与日志位于程序目录，不读旧 AppData 设置。
+- 存储版本：schema v5（v1→v2→v3→v4→v5 链式迁移）、设置 v5（v1→v2→v3→v4→v5）；设置与日志位于程序目录，不读旧 AppData 设置。
 - 20 万行元数据基准（`cargo test --lib -- --ignored --nocapture perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms、schema v3→v4 建两个索引 459 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 
-## 本阶段收尾（2026-10-25）
+## 操作撤销批次 1（2026-10-25）
 
-代码整理与修正（不改行为契约）：
+- schema v5：`operations` / `operation_chunks` / `undo_runs`，`images.purge_operation_id` / `origin_operation_id` 与待释放索引；v4→v5 只新增结构，不改现有行。
+- 设置 v5：`history.maxSteps`（默认 100，范围 10–500）；保存后立即裁剪当前图库，被裁掉的删除记录安排释放。
+- `library/history.rs`：同步 `write`、live operation、列表/裁剪/启动恢复、撤销引擎与释放引擎；批次 1 逆操作覆盖移入回收站、恢复、永久删除、清空回收站。
+- 永久删除/清空回收站改为只写待释放标记；行与文件在记录过期或清空记录后由 `ReleaseGarbage` 删除。普通视图、回收站、全库搜索与 `rows_by_ids` 都排除待释放行。
+- `TaskKind::Undo` / `ReleaseGarbage` 走 write lane；单条记录撤销与释放不可取消，多条记录撤销只在记录之间检查取消；撤销在 write lane 忙时直接冲突。
+- 前端：工具栏“记录”按钮与 `OperationHistoryPanel`，支持线性撤销、失败摘要、待释放统计与清空记录；撤销完成后关闭查看器并刷新网格/文件夹/计数。确认文案改为“延迟释放”，新增撤销/清空记录确认。
+- 自动检查：`npm run typecheck`、`npm run build`、`cargo fmt --check`、`cargo check`、`cargo test --lib`（168 通过、4 ignored）、`npm run test:web`（21 通过）、`git diff --check` 全部通过；`perf_metadata_200k` 复测见 [性能基准](../guides/performance.md)。
+- 未做：真实窗口手工验收；批次 2（导入/编辑/移动/文件夹）与批次 3（元数据/集合/收尾）尚未接入。
 
-- `library/paths.rs` 新增 `parent_path`，替换 `folders.rs`、`import.rs`、`query.rs` 里四处各自手写的 `rsplit_once('/')`；`next_sort_index` 不再把根目录行算进同级最大值。
-- `folders.rs::reorder` 只保留一次同级扫描，去掉中间 `ordered` 副本与局部 `parent_of`。
-- `app/state.rs` 新增 `mutate` 收口 id 列表失效：写入成功后统一清空缓存，原先 16 处 `if result.is_ok() { ... }` 还原成单行；并补上原先漏掉的失效点——描述、标签增删改、集合增删成员与集合运算、导入收尾（`import/job.rs::finish`）。排序级数上限改为只由 `query::MAX_SORT_LEVELS` 定义，设置侧引用它，并补一条 `SORT_KEYS.len()` 对齐测试。
-- `query.rs::page_from_id_list` 的切片改用 `ids.get(range)`，去掉一段多余的越界分支。
-- 前端：`useDragSort` 删除未使用的 `targetElement`、按 `pointerId` 过滤其它指针、导出 `FOLDER_DRAG_HOVER_EVENT` 供文件夹树共用；`VirtualList` 表头补 `role="columnheader"` 并把 `aria-sort` 从按钮移到列头；`SortMenu` 的“添加一级”提示不再写死指标数量。
-- 注释与文档纠错：`anchorId` 的注释原写“不含自身”，与实现（包含目标行）相反；`useImageQuery` 的说明补上 id 列表游标；`browse-and-query.md` 修正“过期 token 让前端从第一页重取”的实际机制。
-- 测试：`query.rs` 新增排序校验用例（级数上限、重复指标、游标长度、锚点与 token 格式）；`folderTreeModel.test.ts` 补一个手动顺序与拼音顺序相反的文件夹，让“名称排序”用例不再与“手动排序”同解；锚点用例更名为 `anchor_page_starts_at_the_requested_image`（原名称与“包含目标行”相反）。
+## 批次 1 收尾（2026-10-25）
 
-基准与文档：
+代码整理（不改行为契约）：
 
-- `library/perf.rs` 补 P4 路径基准：6 级排序首次建列表 / 后续翻页 / 深页、7 个指标的单级首页、schema v3→v4 建索引；数字写入 [性能基准](../guides/performance.md)。
-- 计划文档与历史批次记录移入归档，见下。
+- `library/schema.rs`：操作记录三张表与待释放索引抽成 `HISTORY_SCHEMA_SQL`，新建库与 v4→v5 迁移共用一份 DDL，避免两处漂移。
+- `library/metadata.rs`：`delete_images` / `empty_trash` 去掉已经用不到的 `root` 参数；取待删除行的分支拆成 `purge_targets`；`set_trashed` 把两组 `deleted_at IS [NOT] NULL` 与赋值表达式提到循环外，去掉 SQL 里内联的 `if` 拼接。
+- `app/state.rs`：`undo_to` 的三次读取合并成一次读事务（`OptionalExtension` 取代吞掉错误的 `.ok()`）；`after_history_write` / `schedule_release` 直接解构 `library_handles`；新增 `after_library_open`（先续做中断的撤销，再按上限裁剪），打开图库时也裁剪一次，与文档写的一致。
+- `library/history.rs`：去掉与模块级 `#![allow(dead_code)]` 重复的逐项允许；新增 `HistoryKind::releases_files` 收口“记录被裁掉要释放文件”的判断；不支持撤销的类型改成用户可读的错误，类型名只进日志。
+- `app/tasks.rs`：删掉只在测试里用的 `register_for_test`，测试直接调用私有的 `register`。
+- 前端：`formatBytes` 收口到 `src/shared/format.ts`（图库、查看器、确认文案与记录面板共用一份实现）；记录面板的冲突提示按“撤销 / 清空记录”分别给标题，进度行不再重复“正在撤销”前缀；延迟释放提示只在真的移出了图片时出现。
+
+性能与文档：
+
+- 修掉一处查询回退：分页查询无条件加 `purge_operation_id IS NULL` 会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（该列不在排序 id 列表的覆盖索引里）。现在只在回收站视图与全库搜索加，普通/集合视图靠 `deleted_at IS NULL` 挡住；A/B 数字与复测结果写进 [性能基准](../guides/performance.md)。
+- 文档纠正：`overview.md` 的设置/schema 版本、`.artbank/undo/` 目录、原图真正删除的时机、分层职责与批次记录；`AGENTS.md` 补操作记录路由与“写路径必须接入记录”的决策；`library.md` 补待释放行的排除方式与打开图库时的裁剪。
+- 原“本阶段收尾”里属于 P1–P4 的整理记录移入 [体验整改 P1–P4 实现记录](archive/2026-10-25-体验整改P1-P4记录.md)。
 
 ## 归档
 
@@ -52,7 +63,8 @@
 
 ## 待验收
 
-- **主库真实窗口**：应用打开 `G:\Lilith Image Library`（设置已指向该库），首次打开会把 schema v3 升到 v4（只建索引）。检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述/编辑/AI/S7。
+- **操作撤销批次 1（真实窗口）**：工具栏“记录”面板滚动与位置；移入回收站 → 清空回收站 → 撤销，图片回到回收站；清空记录后文件真正释放；批量操作只出现一条记录；任务运行时“记录”按钮置灰；撤销后网格/文件夹计数/查看器状态正确。
+- **主库真实窗口**：应用打开 `G:\Lilith Image Library`（设置已指向该库），首次打开会把 schema v4 升到 v5（只新增表、列与索引）。检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述/编辑/AI/S7。
 - **独立测试库**：从设置页切到 `G:\Lilith Test Library`，确认 9 455 张、6 个文件夹、87 pose 与缩略图正常。
 - **体验整改 P1 界面**：1040×640 与 1440 宽度下两行工具栏不换行、面包屑渐隐、缩略图裁剪/适应、详情侧栏开关不丢选中项、右键菜单分组与键盘导航、新建集合预填名称、筛选零值隐藏、设置分类切换时对话框尺寸不变。
 - **体验整改 P3 界面**：先裁剪再旋转/翻转时选区跟随、撤销/重做（标签、50 步、滑块合并）、只改 JPEG 质量能保存且体积变小、体积预估误差（抽样 20 张）、F11 与系统快捷键进出全屏、胶片带滚动/加载/开关持久化、姿势骨架低缩放清晰度、标签筛选后停在原图。
@@ -60,7 +72,7 @@
 - **导入**：文件/目录选择、拖放、进度、取消、结果预览与失败详情；导入期间关库被拒绝、取消后已完成项保留。
 - **浏览与检索**：网格/列表滚动、150 张缩略图从请求到可见、列布局、20 万行帧率与内存；搜索（当前视图/全库）、扩展筛选、筛选计数加载态、键盘与 Shift/Ctrl 选择、Ctrl+A、右键菜单。
 - **详情/批量编辑与集合**：评分、标签自动补全、描述、文件夹移动、复制哈希/路径；标签重命名/删除影响提示；集合 CRUD/排序/运算/加入移出。
-- **回收站**：移入/恢复/永久删除/清空；确认原图文件消失、`thumb://` 返回 404。
+- **回收站**：移入/恢复/永久删除/清空；永久删除/清空后确认图片不在回收站与搜索中、原图仍在；清空操作记录后确认文件释放、`thumb://` 返回 404。
 - **查看器与编辑**：打开/上下张/翻页、方向键、Esc、F/0/1/+/-、全屏、侧栏开关；旋转/翻转/裁剪（含 90° 方向的裁剪映射）/调尺寸/输出格式与质量；保存后原图替换、`img://` 立即刷新、标签/集合/描述保留；大图预览（>24MP、TIFF/TGA、EXIF 方向）首次生成延迟与 `temp/viewer/` 体积；4K 保存耗时与峰值内存；超过 50MP 的拒绝提示。
 - **剪贴板**：复制图片/路径，含透明图与 EXIF 方向。
 - **AI**：真实服务 health/ensure/embed/pose/describe 全链路、模型维度校验；窗口内任务进度、取消、失败清单、手写描述保护；语义搜索分页与 Ctrl+A；找相似五种 kind 与相似分组存为集合。

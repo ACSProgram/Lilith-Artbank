@@ -177,7 +177,60 @@ export interface MoveReport {
 export interface DeleteReport {
   deleted: number;
   filesRemoved: number;
+  /** 永久删除/清空回收站只做标记；文件在记录过期或清空记录后释放。 */
+  deferred: boolean;
   failures: BatchFailure[];
+}
+
+export type HistoryKind =
+  | "import"
+  | "edit"
+  | "move"
+  | "trash"
+  | "restore"
+  | "permanentDelete"
+  | "emptyTrash"
+  | "folderCreate"
+  | "folderRename"
+  | "folderMove"
+  | "folderDelete"
+  | "folderReorder"
+  | "score"
+  | "description"
+  | "tagSet"
+  | "tagAdd"
+  | "tagRemove"
+  | "tagRename"
+  | "tagDelete"
+  | "collectionCreate"
+  | "collectionRename"
+  | "collectionDelete"
+  | "collectionReorder"
+  | "collectionAdd"
+  | "collectionRemove"
+  | "collectionCombine"
+  | "similarityGroups"
+  | "aiDescription";
+
+export type HistoryStatus = "applied" | "undoFailed";
+
+export interface HistoryEntry {
+  id: number;
+  kind: HistoryKind;
+  label: string;
+  createdAt: number;
+  affected: number;
+  status: HistoryStatus;
+  error: string;
+}
+
+export interface HistoryPage {
+  entries: HistoryEntry[];
+  maxSteps: number;
+  pendingPurgeCount: number;
+  pendingPurgeBytes: number;
+  canUndo: boolean;
+  blockedReason: string | null;
 }
 
 export interface CollectionInfo {

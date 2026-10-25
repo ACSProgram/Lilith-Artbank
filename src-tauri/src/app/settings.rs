@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 4;
+pub const SETTINGS_VERSION: u32 = 5;
+/// 操作记录保留步数范围；下限保证撤销至少能回到上一步，上限限制历史库体积。
+pub const MIN_HISTORY_STEPS: u32 = 10;
+pub const MAX_HISTORY_STEPS: u32 = 500;
+pub const DEFAULT_HISTORY_STEPS: u32 = 100;
 
 const THEMES: [&str; 3] = ["light", "dark", "system"];
 const THUMB_FITS: [&str; 2] = ["cover", "contain"];
@@ -34,6 +38,7 @@ pub struct Settings {
     pub library_path: Option<String>,
     pub ai: AiSettings,
     pub performance: PerformanceSettings,
+    pub history: HistorySettings,
     pub ui: UiSettings,
 }
 
@@ -44,7 +49,23 @@ impl Default for Settings {
             library_path: None,
             ai: AiSettings::default(),
             performance: PerformanceSettings::default(),
+            history: HistorySettings::default(),
             ui: UiSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HistorySettings {
+    /// 每个图库保留的操作记录步数；降低上限会立即裁剪并释放旧文件。
+    pub max_steps: u32,
+}
+
+impl Default for HistorySettings {
+    fn default() -> Self {
+        Self {
+            max_steps: DEFAULT_HISTORY_STEPS,
         }
     }
 }
@@ -263,6 +284,11 @@ impl Settings {
         {
             return Err(AppError::message("工作线程数必须在 1-128 之间"));
         }
+        if !(MIN_HISTORY_STEPS..=MAX_HISTORY_STEPS).contains(&self.history.max_steps) {
+            return Err(AppError::message(format!(
+                "操作记录步数必须在 {MIN_HISTORY_STEPS}-{MAX_HISTORY_STEPS} 之间"
+            )));
+        }
         if !THEMES.contains(&self.ui.theme.as_str()) {
             return Err(AppError::message("主题只能是 light、dark 或 system"));
         }
@@ -410,6 +436,9 @@ fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
     if version < 4 {
         value = migrate_v3(value);
     }
+    if version < 5 {
+        value = migrate_v4(value);
+    }
     Ok(serde_json::from_value(value)?)
 }
 
@@ -464,16 +493,27 @@ fn migrate_v2(mut value: serde_json::Value) -> serde_json::Value {
 /// v3 → v4：`ai.executablePath` 换成 Python 启动配置；旧字段直接丢弃。
 fn migrate_v3(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "settingsVersion".into(),
-            serde_json::json!(SETTINGS_VERSION),
-        );
+        object.insert("settingsVersion".into(), serde_json::json!(4));
         if let Some(ai) = object
             .get_mut("ai")
             .and_then(serde_json::Value::as_object_mut)
         {
             ai.remove("executablePath");
         }
+    }
+    value
+}
+
+/// v4 → v5：补操作记录最大步数；缺失时用默认值，旧字段全部保留。
+fn migrate_v4(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "settingsVersion".into(),
+            serde_json::json!(SETTINGS_VERSION),
+        );
+        object
+            .entry("history")
+            .or_insert_with(|| serde_json::json!({ "maxSteps": DEFAULT_HISTORY_STEPS }));
     }
     value
 }
@@ -513,6 +553,7 @@ mod tests {
         assert_eq!(loaded.ui.theme, "system");
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
+        assert_eq!(loaded.history.max_steps, DEFAULT_HISTORY_STEPS);
         assert_eq!(loaded.ui.sort, vec![SortSpec::default()]);
         assert_eq!(
             loaded.ai.python_path.as_deref(),
@@ -581,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v4_and_drops_dead_cache_field() {
+    fn migrates_v2_to_v5_and_drops_dead_cache_field() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -612,11 +653,11 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));
-        assert!(written.contains("\"settingsVersion\": 4"));
+        assert!(written.contains("\"settingsVersion\": 5"));
     }
 
     #[test]
-    fn migrates_v3_to_v4_and_replaces_executable_path() {
+    fn migrates_v3_to_v5_and_replaces_executable_path() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -637,7 +678,7 @@ mod tests {
         let loaded = SettingsStore::load_or_create(path.clone())
             .unwrap()
             .snapshot();
-        assert_eq!(loaded.settings_version, 4);
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
         assert_eq!(loaded.ai.port, 19000);
         assert!(loaded.ai.auto_start);
         assert_eq!(
@@ -651,7 +692,55 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("executablePath"));
-        assert!(written.contains("\"settingsVersion\": 4"));
+        assert!(written.contains("\"settingsVersion\": 5"));
+        assert!(written.contains("\"maxSteps\": 100"));
+    }
+
+    #[test]
+    fn migrates_v4_to_v5_and_adds_history_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 4,
+                "libraryPath": "G:\\Lilith Image Library",
+                "ui": {"theme": "dark", "gridThumbPx": 300},
+                "performance": {"readerConnections": 6}
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert_eq!(loaded.history.max_steps, DEFAULT_HISTORY_STEPS);
+        assert_eq!(loaded.ui.theme, "dark");
+        assert_eq!(loaded.ui.grid_thumb_px, 300);
+        assert_eq!(loaded.performance.reader_connections, 6);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"settingsVersion\": 5"));
+        assert!(written.contains("\"maxSteps\": 100"));
+    }
+
+    #[test]
+    fn rejects_history_steps_out_of_range() {
+        for value in [0, MIN_HISTORY_STEPS - 1, MAX_HISTORY_STEPS + 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            std::fs::write(
+                &path,
+                format!(r#"{{"settingsVersion": 5, "history": {{"maxSteps": {value}}}}}"#),
+            )
+            .unwrap();
+            let error = SettingsStore::load_or_create(path).err().unwrap();
+            assert!(
+                error.to_string().contains("操作记录步数"),
+                "{value} 应被拒绝"
+            );
+        }
     }
 
     #[test]

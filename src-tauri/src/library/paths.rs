@@ -10,6 +10,7 @@ pub const MANIFEST_FILE: &str = "library.json";
 pub const THUMBS_DIR: &str = "thumbs";
 pub const FEATURES_DIR: &str = "features";
 pub const TEMP_DIR: &str = "temp";
+pub const UNDO_DIR: &str = "undo";
 pub const RECYCLE_DIR: &str = "recycle";
 pub const OUTPUT_DIR: &str = "output";
 pub const LIBRARY_FORMAT: &str = "lilith-artbank";
@@ -32,6 +33,7 @@ pub struct LibraryPaths {
     pub thumbs: PathBuf,
     pub features: PathBuf,
     pub temp: PathBuf,
+    pub undo: PathBuf,
 }
 
 impl LibraryPaths {
@@ -44,6 +46,7 @@ impl LibraryPaths {
             thumbs: data.join(THUMBS_DIR),
             features: data.join(FEATURES_DIR),
             temp: data.join(TEMP_DIR),
+            undo: data.join(UNDO_DIR),
             data,
             root,
         }
@@ -54,6 +57,7 @@ impl LibraryPaths {
         std::fs::create_dir_all(&self.thumbs)?;
         std::fs::create_dir_all(&self.features)?;
         std::fs::create_dir_all(&self.temp)?;
+        std::fs::create_dir_all(&self.undo)?;
         Ok(())
     }
 

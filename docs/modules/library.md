@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v4、schema v4 与多级文件夹；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v5、schema v5、多级文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,10 +36,11 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 4；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 5；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
+- v4 → v5 新增 `operations` / `operation_chunks` / `undo_runs` 三张表、`images.purge_operation_id` / `origin_operation_id` 两列与 `idx_images_purge` 索引，不改现有行；v1–v3 库按链式迁移到 v5。
 
 ### 表
 
@@ -52,6 +53,8 @@ PRAGMA mmap_size = 268435456;
 | `collections` / `collection_items` | 手工集合与顺序 |
 | `thumb_segments` | 缩略图包分段；0 号为占位段 |
 | `feature_blobs` | embedding / pose 在 feature pack 中的位置 |
+| `operations` / `operation_chunks` | 操作记录与逆数据；批量操作只记一条，大列表用原始 BLOB |
+| `undo_runs` | 一次撤销运行的起点、状态与起止时间 |
 | `image_search` | FTS5 external-content 表，索引 `images.description` |
 
 `images` 关键字段：
@@ -72,9 +75,13 @@ description_model  AI 生成描述时的模型名；手工/导入为空
 imported_at / modified_at / deleted_at
 thumb_segment / thumb_offset / thumb_length / thumb_format
 thumb_width / thumb_height / thumb_version
+purge_operation_id 非空表示已从回收站移除、等待释放；文件与行暂留
+origin_operation_id 导入批次；用于撤销导入时找回本次新增的行
 ```
 
-- `deleted_at IS NULL` 表示正常；非空表示回收站。软删除不移动原图；永久删除先删数据库行，再删原图文件。
+- `deleted_at IS NULL` 表示正常；非空表示回收站。软删除不移动原图。
+- 永久删除与清空回收站不再立即删行删文件，只写 `purge_operation_id`。这些行不出现在回收站、普通视图与全库搜索中；记录过期或清空操作记录后，`ReleaseGarbage` 任务才删行删原图。
+- `operations.id` 使用 `AUTOINCREMENT`，记录清理后不复用；`purge_operation_id`、`origin_operation_id` 不建外键，记录行删除后标记仍可用于释放扫描。
 - `thumb_segment = 0` 表示还没有缩略图；`thumb_version` 用于 URL 缓存失效。缩略图包追加写入，永久删除图片不会回收包内字节。
 - `feature_blobs` 只存位置与模型/维度，不存向量本体；避免主库膨胀。
 - FTS5 使用 `trigram` tokenizer，支持中文子串；查询少于 3 个字符时回退 `LIKE`（S3 实现）。
@@ -91,6 +98,7 @@ thumb_width / thumb_height / thumb_version
 - `images(folder_id, deleted_at, imported_at DESC, id DESC)`：文件夹页。
 - `folders(path COLLATE NOCASE)` UNIQUE：路径解析、重名检查与 v2 迁移。
 - `images(deleted_at) WHERE deleted_at IS NOT NULL`：回收站。
+- `images(purge_operation_id) WHERE purge_operation_id IS NOT NULL`：待释放批次（schema v5）。
 - `image_tags(tag_id, image_id)`：标签反查。
 - `collection_items(collection_id, position)`：集合顺序。
 
@@ -101,11 +109,12 @@ thumb_width / thumb_height / thumb_version
 字段：
 
 ```text
-settingsVersion    当前为 4
+settingsVersion    当前为 5
 libraryPath        当前图库绝对路径；null 表示未打开。由后端维护
 ai                 { baseUrl, port, autoStart, pythonPath, serverScript,
                      modelPath, clipModelPath }
 performance        { readerConnections, workerThreads }
+history            { maxSteps }  每个图库保留的操作记录步数，默认 100
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
                      sort, sortProfiles, viewerFilmstrip }
 ```
@@ -123,9 +132,11 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - v1 的 `libraries[]` 与 `lastLibraryId` 在读取时迁移为单个 `libraryPath`：优先 `lastLibraryId` 对应条目，否则取第一个条目。迁移后不再写回旧字段。
 - v2 → v3：删掉从未被任何代码读取的 `performance.thumbnailCacheMb`；新增的 `ui` 字段用默认值补齐（`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{key:"importedAt",descending:true}]`、`sortProfiles=[]`、`viewerFilmstrip=true`）；`theme` 增加 `system` 并成为默认值。`ai`、`performance`、`theme`、`gridThumbPx` 的旧值原样保留。
 - v3 → v4：删除旧 `ai.executablePath`，换成 `pythonPath` / `serverScript` / `modelPath` / `clipModelPath`，缺失字段用默认值补齐；`baseUrl`、`port`、`autoStart` 保留。
+- v4 → v5：新增 `history.maxSteps`（默认 100，范围 10–500）；保存后立即按新上限裁剪当前图库，被裁掉的永久删除记录会安排释放文件。
 - P0 曾加过 `ui.detailPanelMode`（`overlay`/`push`）；P1 确认详情面板只有“挤压画布 + 列数变化锚定”一种实现，字段已删除。旧设置文件里的 `detailPanelMode` 由 serde 忽略，不报错、不回写。
 - 图库路径必须绝对；保存时去掉尾部路径分隔符，但保留盘符根（`G:\`）。
 - `readerConnections` 1-16；`workerThreads` 为空表示自动。
+- `history.maxSteps` 10-500；历史保存在各图库自己的 SQLite 中，上限是全局设置，换库后仍使用同一上限。
 - `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
 - 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案。
@@ -168,8 +179,11 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `delete_tag` | `{ tagId }` | 删除关系数 |
 | `move_images_to_folder` | `{ imageIds, folderPath }` | `MoveReport` |
 | `trash_images` / `restore_images` | `{ imageIds }` | 更新行数 |
-| `delete_images_permanently` | `{ imageIds }` | `DeleteReport` |
-| `empty_trash` | — | `DeleteReport` |
+| `delete_images_permanently` | `{ imageIds }` | `DeleteReport`（`deferred=true`） |
+| `empty_trash` | — | `DeleteReport`（`deferred=true`） |
+| `get_operation_history` | — | `HistoryPage` |
+| `undo_to_operation` | `{ targetId }` | `TaskStartResult`（撤销目标及其之后的记录） |
+| `clear_operation_history` | — | `TaskStartResult`（清空记录并释放全部待删除文件） |
 | `get_collections` | — | `CollectionInfo[]` |
 | `create_collection` | `{ name }` | `CollectionInfo` |
 | `rename_collection` | `{ collectionId, name }` | `null` |
@@ -207,8 +221,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
 
 - 元数据写入都走单写连接；批量操作按 400 个 id 分块。
-- 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除与清空回收站按 400 张一块先提交删行事务、再删文件。
-- 文件操作（图片移动、永久删除、清空回收站）挂任务总线的 write lane，有进度与取消；导入、创建/打开图库要求任务总线空闲，关闭图库只拒绝 write lane（ai/scan 任务会被取消并等待退出）。
+- 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除与清空回收站只标记 `purge_operation_id`，真正删行删文件由 `ReleaseGarbage` 任务按 400 张一块执行。
+- 文件操作（图片移动、永久删除、清空回收站、撤销、释放）挂任务总线的 write lane，有进度与取消；导入、创建/打开图库要求任务总线空闲，关闭图库只拒绝 write lane（ai/scan 任务会被取消并等待退出）。单条记录的撤销与释放任务不可中途取消；多条记录的撤销只在记录之间检查取消，单条记录必须撤完。释放任务按队列等待。
 - 集合只引用图片 id；集合运算新建集合，不修改源集合。
 
 ## 文件夹
@@ -225,6 +239,22 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 文件夹计数由 `get_folders` 用一条直接计数查询在内存中沿路径前缀累加到祖先，结果随命令返回。
 - `folders.sort_index` 在新建、移动与手动排序时维护：新建与移动追加到同级末尾；`reorder_folders` 只接受同一父级的子文件夹，在事务里插入到指定位置并重新编号同级。前端“手动”排序模式按 `sortIndex` 显示，名称/图片数排序只是显示顺序，不会改写 `sortIndex`。
 
+## 操作记录与撤销
+
+历史保存在当前图库的 SQLite（`operations` / `operation_chunks` / `undo_runs`），换库后各自独立；最大步数来自设置 `history.maxSteps`。
+
+- 批次 1 已接入：移入回收站、恢复、永久删除、清空回收站。其余内容修改（导入、编辑、移动、文件夹、元数据、集合、AI 描述）的记录与逆操作在批次 2/3 接入；`HistoryKind` 已覆盖全部类型。
+- 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，不留下空记录。
+- 长任务用 `begin_live` + 每批 `append_live_*` / `add_live_affected`，结束时 `finish_live`；崩溃留下的 `pending` 记录在下次打开时按已提交内容转为 `applied`，没有内容则删除。
+- 撤销是线性回退：选中第 N 条 = 依次撤回 N 之后的所有记录，再撤回 N；每条成功后在同一事务里删除记录。多条记录的撤销只在记录之间检查取消。
+- 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能继续向更早记录回退，直到处理失败原因或清空记录。
+- 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置与打开图库后各裁剪一次。被裁掉的编辑记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
+- `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；可重复执行，不可取消。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件。
+- 启动恢复在 `AppState::open_library` 做 DB 部分：`pending` 转 `applied` 或删除、收集 `undoing` 记录、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，`undoing` 记录从最小 id 续做。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canUndo, blockedReason }`；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- 待释放行对查询不可见：回收站视图与“全库搜索”显式加 `images.purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
+- 界面入口在浏览工具栏“记录”按钮，见 [浏览与检索](browse-and-query.md#操作记录)。
+
 ## 生命周期
 
 - `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 打开 → 把路径写入设置。
@@ -238,7 +268,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v4（含 v1→v2→v3→v4 迁移）、连接池、设置 v4（含 v1→v2→v3→v4 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v5（含 v1→v2→v3→v4→v5 迁移）、连接池、设置 v5（含 v1→v2→v3→v4→v5 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -246,8 +276,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 `cargo test` 覆盖：
 
-- 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
+- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝；
@@ -256,7 +286,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；文件夹子树筛选（后代命中、相似前缀不误匹配、根目录等价全库）、直接/子树计数、文件夹分面按子树展开；
 - P4 查询：6 级排序跨页无重复无遗漏（重复值 + 混合方向 + 两个文件夹）、文件夹排序走 id 游标、锚点包含目标行、排序级数/重复指标/游标长度校验；文件夹同级重排、跨父级拒绝；
 - S3 查询：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
-- S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复/永久删除/清空回收站；
+- S3 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复、永久删除与清空回收站的延迟标记与释放；
+- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在记录之间、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读。
 - S3 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
 - S4 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
 - S4 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。

@@ -9,6 +9,8 @@ export interface TaskCenter {
   start: (request: BatchTaskRequest) => Promise<TaskStartResult>;
   cancel: (taskId: string) => Promise<void>;
   find: (taskId: string) => TaskSnapshot | null;
+  /** 最近结束的任务；用于撤销后关闭查看器等一次性收尾。 */
+  lastFinished: TaskSnapshot | null;
 }
 
 export const TaskCenterContext = createContext<TaskCenter | null>(null);

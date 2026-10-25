@@ -7,6 +7,7 @@
 | 设置、图库创建/打开/关闭、schema | `docs/modules/library.md` | `src-tauri/src/app/`、`src-tauri/src/library/` |
 | 导入、BLAKE3、pHash、主色、缩略图包 | `docs/modules/import.md` | `src-tauri/src/import/`、`src-tauri/src/imageops/` |
 | 网格/列表、分页、搜索、筛选、排序、集合、回收站、元数据编辑 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/query.rs`、`metadata.rs`、`collections.rs` |
+| 操作记录、撤销、待释放文件 | `docs/modules/library.md`（操作记录与撤销） | `src-tauri/src/library/history.rs`、`src-tauri/src/app/state.rs`、`src/modules/library/OperationHistoryPanel.tsx` |
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
 | description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/`、`server/` |
 | 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts` |
