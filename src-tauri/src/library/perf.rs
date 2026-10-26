@@ -959,3 +959,303 @@ fn perf_thumb_pack_read() {
         bytes / file_p50.as_secs_f64()
     );
 }
+
+/// 编码线程基准：同一批图、同一档位，比较 4 / 8 / 12 / 核数−1 的吞吐。
+///
+/// 不测磁盘：样本在内存里生成，只衡量解码 + 阶梯编码 + PSNR 的并行扩展性。
+#[test]
+#[ignore = "编码线程基准；cargo test --lib -- --ignored --nocapture perf_encode_threads"]
+fn perf_encode_threads() {
+    use rayon::prelude::*;
+
+    use crate::{
+        imageops::optimize::{self, LadderOutcome, OptimizeOptions, OptimizePlan},
+        import::decode,
+    };
+
+    let mut images = Vec::new();
+    for seed in 0..16_u32 {
+        let mut image = image::RgbImage::new(1200, 900);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let value = ((x * 7 + y * 13 + seed * 29) % 256) as u8;
+            *pixel = image::Rgb([
+                value,
+                value.wrapping_mul(3).wrapping_add((x % 31) as u8),
+                value.wrapping_mul(5).wrapping_add((y % 17) as u8),
+            ]);
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        images.push(bytes);
+    }
+
+    let cores = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let mut candidates = vec![4_usize, 8, 12, cores.saturating_sub(1).max(1)];
+    candidates.sort_unstable();
+    candidates.dedup();
+    for threads in candidates {
+        let pool = super::encode_pool_with(threads, "基准").expect("build pool");
+        let started = Instant::now();
+        let output: u64 = pool.install(|| {
+            images
+                .par_iter()
+                .map(|bytes| {
+                    let decoded = decode::decode_bytes(bytes, Some("png")).expect("decode");
+                    let plan = OptimizePlan {
+                        start_quality: 85,
+                        psnr_floor: 36.0,
+                    };
+                    match optimize::encode_ladder(
+                        &decoded.image,
+                        &plan,
+                        &OptimizeOptions::default(),
+                        bytes.len() as u64,
+                        None,
+                    )
+                    .expect("encode")
+                    {
+                        LadderOutcome::Encoded(candidate) => candidate.bytes.len() as u64,
+                        LadderOutcome::Skipped(_) => 0,
+                    }
+                })
+                .sum()
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "[perf] encode threads={threads} images={} elapsed={elapsed:.2}s rate={:.1} img/s output={} KB",
+            images.len(),
+            images.len() as f64 / elapsed,
+            output / 1024
+        );
+    }
+    println!("[perf] cores={cores} policy={}", super::encode_threads());
+}
+
+/// 批次大小基准：500 / 1000 / 2000 张一批，比较总耗时与提交耗时占比。
+///
+/// 每档都用一份全新的临时库：同一批图压第二次时新内容等于当前内容，会被判为
+/// 「省得太少」而全部跳过，量不到写路径。
+#[test]
+#[ignore = "批次大小基准；cargo test --lib -- --ignored --nocapture perf_optimize_batch_size"]
+fn perf_optimize_batch_size() {
+    use crate::{
+        imageops::optimize::OptimizeOptions,
+        library::{NoopReporter, history, optimize as optimize_write},
+    };
+
+    let count = 600_u32;
+    for batch_size in [500_usize, 1000, 2000] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("library");
+        let (session, _) = service::create(&root, "批次基准", 1).expect("create library");
+
+        let mut ids = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut image = image::RgbImage::new(320, 240);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                *pixel = image::Rgb([
+                    ((x * 3 + index) % 256) as u8,
+                    ((y * 5 + index * 7) % 256) as u8,
+                    ((x + y + index) % 256) as u8,
+                ]);
+            }
+            // 每张图左上角盖一个 8×8 的唯一色块：JPEG 量化不会抹掉它，
+            // 内容哈希不会重复（唯一约束会拒绝插入）。
+            for y in 0..8 {
+                for x in 0..8 {
+                    image.put_pixel(
+                        x,
+                        y,
+                        image::Rgb([(index & 0xff) as u8, (index >> 8) as u8, 200]),
+                    );
+                }
+            }
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .expect("encode png");
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            std::fs::write(root.join(format!("{hash}.png")), &bytes).expect("write content");
+            let id = session
+                .db
+                .with_writer(|connection| {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description, imported_at,
+                            modified_at
+                         ) VALUES (?1, 'png', 1, ?2, 320, 240, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        rusqlite::params![hash, bytes.len() as i64],
+                    )?;
+                    Ok(connection.last_insert_rowid())
+                })
+                .expect("insert row");
+            ids.push(id);
+        }
+
+        let operation = history::begin_live(
+            &session.db,
+            history::NewOperation::new(history::HistoryKind::Optimize, "批次基准"),
+        )
+        .expect("begin operation");
+        let candidates =
+            optimize_write::collect_candidates(&session.db, &ids).expect("collect candidates");
+        let started = Instant::now();
+        let report = optimize_write::optimize_with_batch_size(
+            &session.db,
+            &root,
+            &session.thumbs,
+            candidates,
+            &OptimizeOptions::default(),
+            operation,
+            &NoopReporter,
+            batch_size,
+        )
+        .expect("optimize");
+        let elapsed = started.elapsed().as_secs_f64();
+        history::finish_live(&session.db, operation, "").expect("finish operation");
+        println!(
+            "[perf] batch={batch_size} processed={} elapsed={elapsed:.2}s publish={}ms commit={}ms delete={}ms",
+            report.processed, report.publish_ms, report.commit_ms, report.delete_ms
+        );
+    }
+}
+
+/// 预计耗时 vs 实际耗时：同一份临时库先估算、再执行，打印偏差比例。
+///
+/// 只用于同机同参数的近似校验，不做跨机器比较；复测：
+/// `cargo test --lib -- --ignored --nocapture perf_estimate_vs_actual`。
+#[test]
+#[ignore = "预计/实际耗时对比；cargo test --lib -- --ignored --nocapture perf_estimate_vs_actual"]
+fn perf_estimate_vs_actual() {
+    use crate::{
+        imageops::optimize::OptimizeOptions,
+        library::{
+            NoopReporter, history, optimize as optimize_write,
+            optimize_estimate::{self, OptimizeEstimate},
+        },
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("library");
+    let (session, _) = service::create(&root, "耗时对比", 1).expect("create library");
+
+    let count = 400_u32;
+    let mut ids = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let mut image = image::RgbImage::new(800, 600);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let value = ((x * 5 + y * 3 + index * 11) % 256) as u8;
+            *pixel = image::Rgb([
+                value,
+                value.wrapping_mul(3).wrapping_add((x % 29) as u8),
+                value.wrapping_mul(7).wrapping_add((y % 23) as u8),
+            ]);
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                image.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([(index & 0xff) as u8, (index >> 8) as u8, 90]),
+                );
+            }
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        std::fs::write(root.join(format!("{hash}.png")), &bytes).expect("write content");
+        let id = session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO images(
+                        content_hash, file_ext, folder_id, file_size, width, height, format,
+                        has_alpha, phash, colors4, colors8, score, description, imported_at,
+                        modified_at
+                     ) VALUES (?1, 'png', 1, ?2, 800, 600, 'png', 0,
+                        zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                    rusqlite::params![hash, bytes.len() as i64],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .expect("insert row");
+        ids.push(id);
+    }
+
+    let options = OptimizeOptions::default();
+    let estimate: OptimizeEstimate = optimize_estimate::estimate(
+        &session.db,
+        &root,
+        "perf-estimate",
+        &ids,
+        &options,
+        200,
+        "fingerprint",
+        &NoopReporter,
+    )
+    .expect("estimate")
+    .expect("estimate not cancelled");
+
+    let operation = history::begin_live(
+        &session.db,
+        history::NewOperation::new(history::HistoryKind::Optimize, "耗时对比"),
+    )
+    .expect("begin operation");
+    let candidates =
+        optimize_write::collect_candidates(&session.db, &ids).expect("collect candidates");
+    let started = Instant::now();
+    let report = optimize_write::optimize(
+        &session.db,
+        &root,
+        &session.thumbs,
+        candidates,
+        &options,
+        operation,
+        &NoopReporter,
+    )
+    .expect("optimize");
+    let actual = started.elapsed().as_secs_f64();
+    history::finish_live(&session.db, operation, "").expect("finish operation");
+
+    let estimated = estimate.estimated_seconds as f64;
+    println!(
+        "[perf] estimate={estimated:.1}s (work={}s write={}s finish={}s) actual={actual:.2}s ratio={:.2} processed={}",
+        estimate.estimated_work_seconds,
+        estimate.estimated_write_seconds,
+        estimate.estimated_finish_seconds,
+        if estimated > 0.0 {
+            actual / estimated
+        } else {
+            0.0
+        },
+        report.processed
+    );
+    println!(
+        "[perf] actual split: encode={}ms hash={}ms recalc={}ms write={}ms publish={}ms commit={}ms delete={}ms",
+        report.encode_ms,
+        report.hash_ms,
+        report.recalc_ms,
+        report.write_ms,
+        report.publish_ms,
+        report.commit_ms,
+        report.delete_ms
+    );
+    assert!(report.processed > 0);
+}

@@ -59,6 +59,29 @@ impl LibraryDb {
         operation(&mut connection)
     }
 
+    /// 在破坏性写任务（压缩、永久删除、释放）里临时把 `synchronous` 提到 `FULL`，
+    /// 让提交本身落盘；结束后无论成败都恢复原值。
+    ///
+    /// 默认仍是 `NORMAL`：普通编辑不值得为每次提交多付一次 WAL fsync。
+    pub fn with_durable_writer<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> AppResult<T>,
+    ) -> AppResult<T> {
+        self.with_writer(|connection| {
+            let previous: i64 =
+                connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+            connection.execute_batch("PRAGMA synchronous = FULL;")?;
+            let result = operation(connection);
+            // 恢复失败不能盖掉真正的错误：先取回结果，再决定返回什么。
+            let restore = connection.execute_batch(&format!("PRAGMA synchronous = {previous};"));
+            match (result, restore) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Ok(_), Err(error)) => Err(error.into()),
+                (Err(error), _) => Err(error),
+            }
+        })
+    }
+
     pub fn with_reader<T>(
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
@@ -98,5 +121,41 @@ impl LibraryDb {
             )?;
             Ok((active, trash, temp))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn synchronous(db: &LibraryDb) -> i64 {
+        db.with_writer(|connection| {
+            Ok(connection.pragma_query_value(None, "synchronous", |row| row.get(0))?)
+        })
+        .unwrap()
+    }
+
+    /// 破坏性写任务用 FULL 提交，结束后无论成败都恢复 NORMAL。
+    #[test]
+    fn durable_writer_temporarily_raises_synchronous_then_restores() {
+        let temp = tempdir().unwrap();
+        let db = LibraryDb::create(&temp.path().join("library.db"), 1).unwrap();
+        assert_eq!(synchronous(&db), 1, "默认应是 NORMAL");
+
+        db.with_durable_writer(|connection| {
+            let level: i64 =
+                connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+            assert_eq!(level, 2, "事务期间应是 FULL");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synchronous(&db), 1);
+
+        let failed: AppResult<()> =
+            db.with_durable_writer(|_| Err(crate::app::error::AppError::message("模拟失败")));
+        assert!(failed.is_err());
+        assert_eq!(synchronous(&db), 1, "失败也要恢复原值");
     }
 }

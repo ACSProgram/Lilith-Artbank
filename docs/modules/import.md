@@ -42,7 +42,8 @@
 
 - 临时文件位于 `.artbank/temp/import-<jobId>/`，保留源扩展名：格式先按魔数判断，魔数不认识的格式（TGA）再用扩展名兜底；成功发布后目录整体清理。
 - 原图按 `<content_hash>.<ext>` 命名；扩展名取自解码后的格式（`jpeg → jpg`，其余与格式名一致），不跟源文件名，避免改名文件的扩展名与 `format` 列矛盾。
-- 目标文件已存在（通常是上次崩溃留下的同内容文件）时复用，不覆盖；发布用 `rename`，不跨卷。
+- 目标文件已存在时不直接当成“内容重复”：rename 后、入库前崩溃会留下没有任何行引用的孤儿，文件可能被截断。先按 BLAKE3 核对目标文件——一致就接管（删掉临时副本），不一致就删掉重发；只有这条罕见路径才读目标文件算哈希。
+- 发布顺序与压缩一致：文件数据 `sync_all` → `platform::fs::rename_durable` → 目录 flush → 入库。rename 走 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`，不跨卷。
 - 解码上限：单边 65535、总像素 1 亿、解码分配 512 MiB。超限进入失败清单。
 - EXIF 方向由 `image` crate 的 `ImageDecoder::orientation()` 读取并 `apply_orientation`，只影响缩略图、pHash、主色与后续显示，不改原图字节。
 

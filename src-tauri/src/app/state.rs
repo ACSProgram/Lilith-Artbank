@@ -23,7 +23,7 @@ use crate::{
         settings::SettingsStore,
         tasks::{
             BatchTaskKind, BatchTaskRequest, ConflictPolicy, LaneGuard, TaskBus, TaskHandle,
-            TaskKind, TaskLane, TaskPhase, TaskSnapshot, TaskStartResult, TaskSummary,
+            TaskKind, TaskLane, TaskPhase, TaskScope, TaskSnapshot, TaskStartResult, TaskSummary,
         },
     },
     imageops::optimize::OptimizeOptions,
@@ -1516,6 +1516,7 @@ impl AppState {
     ) -> AppResult<TaskStartResult> {
         let options = request.optimize.clone().unwrap_or_default();
         options.validate()?;
+        ensure_optimizable_scope(&request.scope)?;
         let sample_size = request.estimate_sample_size.unwrap_or(200);
         if !optimize_estimate::sample_size_valid(sample_size) {
             return Err(AppError::message(format!(
@@ -1594,6 +1595,7 @@ impl AppState {
     ) -> AppResult<TaskStartResult> {
         let options = request.optimize.clone().unwrap_or_default();
         options.validate()?;
+        ensure_optimizable_scope(&request.scope)?;
         let estimate_id = request
             .estimate_id
             .as_deref()
@@ -1674,6 +1676,14 @@ impl AppState {
                             if report.failed > 0 {
                                 summary.push_str(&format!("，失败 {} 张", report.failed));
                             }
+                            // 报告里的失败清单要进任务胶囊，否则用户只知道失败了几张。
+                            for failure in &report.failures {
+                                worker.add_failure(
+                                    Some(failure.image_id),
+                                    &failure.path,
+                                    &failure.reason,
+                                );
+                            }
                             worker.set_message(&summary);
                             if report.stop_reason.is_some() {
                                 worker.finish(TaskPhase::Failed);
@@ -1723,6 +1733,15 @@ fn store_estimate(store: &Mutex<VecDeque<(String, OptimizeEstimate)>>, estimate:
 }
 
 /// 估算与执行共用同一份参数指纹；批次 2 的执行命令据此校验估算凭证。
+/// 临时文件夹的图片在关闭图库时整目录清空，压缩它们只会留下一条无用记录，
+/// 所以估算与执行都不接受它作为范围。
+fn ensure_optimizable_scope(scope: &TaskScope) -> AppResult<()> {
+    if matches!(scope, TaskScope::Temp) {
+        return Err(AppError::message("临时文件夹不参与图片空间优化"));
+    }
+    Ok(())
+}
+
 fn optimize_fingerprint(scope: &crate::app::tasks::TaskScope, options: &OptimizeOptions) -> String {
     let options = serde_json::to_string(options).unwrap_or_default();
     blake3::hash(format!("{scope:?}|{options}").as_bytes())

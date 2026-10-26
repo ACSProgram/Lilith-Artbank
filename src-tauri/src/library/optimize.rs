@@ -1,36 +1,51 @@
 //! 图片空间优化的写路径：候选收集、凭证校验、分批编码发布与旧图清理。
 //!
-//! 每张图先编码到统一临时目录，达到判据后才发布为新的内容哈希文件；
-//! 1000 张一个事务，事务内发布并更新行，提交后再删旧图，提交失败则删新图。
+//! 每张图先编码到统一临时目录；达到判据后按固定顺序发布：
+//! 文件数据 fsync → 持久化 rename → 目录 flush → SQLite 事务提交（FULL）→ 删旧图。
+//! 提交返回之前绝不删旧图；提交失败则删掉本批已发布的新文件。
 //! 压缩不可撤销：记录只在时间线上占位并说明原图已删除。
 
 use std::{
+    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use rayon::prelude::*;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::Serialize;
 
 use crate::{
     app::error::{AppError, AppResult},
     imageops::{
         colors,
-        optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SourceInfo},
+        optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SkipReason, SourceInfo},
         phash, thumbnail,
     },
     import::decode,
     library::{
-        BatchReporter, db::LibraryDb, encode_pool, import as repository, metadata,
-        optimize_estimate::OptimizeEstimate, paths::LibraryPaths, service::now_ms,
-        thumbs::ThumbPack, viewer,
+        BatchReporter,
+        calibration::{OptimizeCalibration, RunSample},
+        content,
+        db::LibraryDb,
+        encode_pool, import as repository,
+        metadata::{self, ContentRemover},
+        optimize_estimate::OptimizeEstimate,
+        paths::LibraryPaths,
+        service::now_ms,
+        thumbs::ThumbPack,
+        viewer,
     },
+    platform::fs as durable,
 };
 
 /// 每批编码完成后在同一事务里发布，限制内存峰值与事务时长。
-const BATCH_SIZE: usize = 1000;
+///
+/// 500 / 1000 / 2000 三档在临时库上对比过：更大的批次少提交几次，但事务持有
+/// 写锁更久、失败回滚范围更大；1000 是当前吞吐与回滚成本的折中。
+pub(crate) const BATCH_SIZE: usize = 1000;
 /// 连续失败达到这个数就停止，避免磁盘或解码器故障时把整库刷成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const MAX_REPORTED_FAILURES: usize = 50;
@@ -177,7 +192,14 @@ pub struct OptimizeFailure {
 #[serde(rename_all = "camelCase")]
 pub struct OptimizeReport {
     pub processed: u64,
+    /// 全部跳过数（前置 + 候选内 + 内容重复），等于三个细分字段之和。
     pub skipped: u64,
+    /// 只看数据库列就拦下的张数（GIF、bpp 低、已处理、透明、超 WebP 尺寸）。
+    pub prefilter_skipped: u64,
+    /// 解码或编码后才发现不处理的张数（色彩、16 位、画质、省得太少、动画/多页）。
+    pub candidate_skipped: u64,
+    /// 目标内容已被其他行占用而没有落盘的张数。
+    pub duplicate_skipped: u64,
     pub failed: u64,
     pub old_bytes: u64,
     pub new_bytes: u64,
@@ -186,6 +208,26 @@ pub struct OptimizeReport {
     pub stop_reason: Option<String>,
     pub cancelled: bool,
     pub failures: Vec<OptimizeFailure>,
+    /// 整次执行的墙钟耗时。
+    pub elapsed_ms: u64,
+    /// 解码 + 阶梯编码 + 回读比对。
+    pub encode_ms: u64,
+    /// 成功编码后计算 BLAKE3。
+    pub hash_ms: u64,
+    /// 缩略图 / pHash / 主色重算（按勾选执行）。
+    pub recalc_ms: u64,
+    /// 写临时文件（含 fsync）。
+    pub write_ms: u64,
+    /// 其中 `sync_all` 的部分，用于校准每张 fsync 成本。
+    pub fsync_ms: u64,
+    /// 持久化 rename 与目录 flush。
+    pub publish_ms: u64,
+    /// 事务提交（含缩略图追加与行更新）。
+    pub commit_ms: u64,
+    /// 删旧图与查看器预览。
+    pub delete_ms: u64,
+    pub deleted_files: u64,
+    pub delete_failed: u64,
 }
 
 /// 临时文件句柄：作用域结束时自动删除，成功发布后 `disarm` 交给目标文件。
@@ -230,6 +272,17 @@ struct EncodedItem {
     thumb: Option<thumbnail::EncodedThumbnail>,
     phash: Option<[u8; 32]>,
     colors: Option<([u8; 16], [u8; 32])>,
+    encode_ms: u64,
+    hash_ms: u64,
+    recalc_ms: u64,
+    write_ms: u64,
+    fsync_ms: u64,
+}
+
+/// 单张编码结果：要么可以发布，要么按候选内跳过处理。
+enum EncodeOutcome {
+    Encoded(Box<EncodedItem>),
+    Skipped(SkipReason),
 }
 
 struct Published {
@@ -238,6 +291,14 @@ struct Published {
     old_path: PathBuf,
     old_size: u64,
     new_size: u64,
+}
+
+#[derive(Default)]
+struct CommitOutcome {
+    published: Vec<Published>,
+    duplicates: u64,
+    write_ms: u64,
+    commit_ms: u64,
 }
 
 /// 执行入口；`candidates` 由调用方按同一范围与参数收集，`operation_id` 是 live 记录。
@@ -250,7 +311,31 @@ pub fn optimize(
     operation_id: i64,
     reporter: &dyn BatchReporter,
 ) -> AppResult<OptimizeReport> {
+    optimize_with_batch_size(
+        database,
+        root,
+        thumbs,
+        candidates,
+        options,
+        operation_id,
+        reporter,
+        BATCH_SIZE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_with_batch_size(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    candidates: Vec<CandidateRow>,
+    options: &OptimizeOptions,
+    operation_id: i64,
+    reporter: &dyn BatchReporter,
+    batch_size: usize,
+) -> AppResult<OptimizeReport> {
     options.validate()?;
+    let started = Instant::now();
     let paths = LibraryPaths::new(root);
     std::fs::create_dir_all(&paths.temp)?;
 
@@ -258,7 +343,7 @@ pub fn optimize(
     let mut jobs: Vec<CandidateRow> = Vec::with_capacity(candidates.len());
     for row in candidates {
         if optimize::prefilter(&row.source_info(), options).is_err() {
-            report.skipped += 1;
+            report.prefilter_skipped += 1;
             continue;
         }
         jobs.push(row);
@@ -270,12 +355,13 @@ pub fn optimize(
     let pool = encode_pool("压缩")?;
 
     reporter.report(0, total);
-    // 按张上报：整批 1000 张并行编码时也持续前进，用户能看到真实停在哪一张。
+    // 按张上报：整批并行编码时也持续前进，用户能看到真实停在哪一张。
     let done = AtomicUsize::new(0);
     let mut consecutive_failures = 0_usize;
     let mut stopped = false;
+    let mut batches_committed = 0_u64;
 
-    for (batch_index, batch) in jobs.chunks(BATCH_SIZE).enumerate() {
+    for (batch_index, batch) in jobs.chunks(batch_size.max(1)).enumerate() {
         if reporter.cancelled() {
             report.cancelled = true;
             break;
@@ -292,20 +378,30 @@ pub fn optimize(
                     let result = encode_one(&paths, row, options);
                     let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
                     reporter.report(completed, total);
-                    result
+                    result.map(Some)
                 })
-                .collect::<Vec<AppResult<Option<EncodedItem>>>>()
+                .collect::<Vec<AppResult<Option<EncodeOutcome>>>>()
         });
 
         let mut items = Vec::new();
         for (row, result) in batch.iter().zip(results) {
             match result {
-                Ok(Some(item)) => {
-                    items.push(item);
+                Ok(Some(EncodeOutcome::Encoded(item))) => {
+                    report.encode_ms += item.encode_ms;
+                    report.hash_ms += item.hash_ms;
+                    report.recalc_ms += item.recalc_ms;
+                    report.write_ms += item.write_ms;
+                    report.fsync_ms += item.fsync_ms;
+                    items.push(*item);
+                    consecutive_failures = 0;
+                }
+                Ok(Some(EncodeOutcome::Skipped(reason))) => {
+                    log::debug!("跳过 image={}：{reason:?}", row.id);
+                    report.candidate_skipped += 1;
                     consecutive_failures = 0;
                 }
                 Ok(None) => {
-                    report.skipped += 1;
+                    // 取消后没编码的图既不算处理也不算跳过：进度停在真实张数。
                     consecutive_failures = 0;
                 }
                 Err(error) => {
@@ -328,25 +424,18 @@ pub fn optimize(
 
         if !items.is_empty() {
             reporter.message(&format!("正在写入第 {} 批", batch_index + 1));
-            let (published, duplicates) =
-                commit_batch(database, &paths, thumbs, operation_id, items)?;
-            // 目标内容已存在（别的行已占用同样字节）时不再落盘，按跳过计。
-            report.skipped += duplicates;
-            for item in published {
-                report.processed += 1;
+            let outcome = commit_batch(database, &paths, thumbs, operation_id, items)?;
+            batches_committed += 1;
+            report.publish_ms += outcome.write_ms;
+            report.commit_ms += outcome.commit_ms;
+            report.duplicate_skipped += outcome.duplicates;
+            report.processed += outcome.published.len() as u64;
+            for item in &outcome.published {
                 report.old_bytes += item.old_size;
                 report.new_bytes += item.new_size;
-                // 旧哈希已不再被任何行引用（content_hash 唯一）；删除失败留给维护清理。
-                if let Err(error) = metadata::remove_content_file(root, &item.old_path) {
-                    log::warn!(
-                        "旧原图清理失败 image={} path={}: {error}",
-                        item.row_id,
-                        item.old_path.display()
-                    );
-                }
-                let _ =
-                    std::fs::remove_file(viewer::preview_path(&paths, item.row_id, &item.old_hash));
             }
+            // 提交已持久化，才允许删旧图；删除不持数据库写锁，失败只记日志。
+            delete_replaced(&pool, root, &paths, &outcome.published, &mut report);
         }
 
         if reporter.cancelled() {
@@ -357,7 +446,26 @@ pub fn optimize(
         }
     }
 
+    report.skipped = report.prefilter_skipped + report.candidate_skipped + report.duplicate_skipped;
     report.savings_bytes = report.old_bytes.saturating_sub(report.new_bytes);
+    report.elapsed_ms = started.elapsed().as_millis() as u64;
+
+    // 用本次实测覆盖本库校准值，供下次估算替换保守常数；样本太少时保留旧值。
+    let sample = RunSample {
+        processed: report.processed,
+        output_bytes: report.new_bytes,
+        batches: batches_committed,
+        write_secs: (report.write_ms + report.publish_ms) as f64 / 1000.0,
+        fsync_secs: report.fsync_ms as f64 / 1000.0,
+        commit_secs: report.commit_ms as f64 / 1000.0,
+        delete_secs: report.delete_ms as f64 / 1000.0,
+    };
+    if let Some(calibration) = OptimizeCalibration::from_run(&sample)
+        && let Err(error) = calibration.save(database)
+    {
+        log::warn!("写入压缩校准值失败：{error}");
+    }
+
     Ok(report)
 }
 
@@ -368,22 +476,25 @@ fn display_path(paths: &LibraryPaths, row: &CandidateRow) -> String {
         .unwrap_or_else(|_| format!("{}/{}", row.folder_path, row.content_hash))
 }
 
-/// 单张编码：只写临时文件，不碰数据库与原图；未通过判据时返回 `None`。
+/// 单张编码：只写临时文件，不碰数据库与原图；未通过判据时返回跳过原因。
 fn encode_one(
     paths: &LibraryPaths,
     row: &CandidateRow,
     options: &OptimizeOptions,
-) -> AppResult<Option<EncodedItem>> {
+) -> AppResult<EncodeOutcome> {
     let source_path =
         metadata::content_path(paths, &row.folder_path, &row.content_hash, &row.file_ext)?;
+    // 只读一次盘：色彩配置、动画判据、解码与 EXIF 搬运共用这份字节。
     let bytes = std::fs::read(&source_path)?;
     if optimize::multiframe_guard(&bytes, &row.format).is_err() {
-        return Ok(None);
+        return Ok(EncodeOutcome::Skipped(SkipReason::AnimatedOrMultipage));
     }
     if optimize::color_profile_guard(&bytes, &row.format, options).is_err() {
-        return Ok(None);
+        return Ok(EncodeOutcome::Skipped(SkipReason::ColorProfile));
     }
-    let decoded = decode::decode(&source_path)?;
+
+    let encode_started = Instant::now();
+    let decoded = decode::decode_bytes(&bytes, Some(&row.file_ext))?;
     let source = SourceInfo {
         format: row.format.clone(),
         file_size: row.file_size,
@@ -395,7 +506,7 @@ fn encode_one(
     };
     let plan = match optimize::plan(&source, options) {
         Ok(plan) => plan,
-        Err(_) => return Ok(None),
+        Err(reason) => return Ok(EncodeOutcome::Skipped(reason)),
     };
 
     let prepared = optimize::prepare(decoded.image, options.max_long_edge);
@@ -410,11 +521,15 @@ fn encode_one(
         source_jpeg,
     )? {
         LadderOutcome::Encoded(candidate) => candidate,
-        LadderOutcome::Skipped(_) => return Ok(None),
+        LadderOutcome::Skipped(reason) => return Ok(EncodeOutcome::Skipped(reason)),
     };
+    let encode_ms = encode_started.elapsed().as_millis() as u64;
+    let hash_started = Instant::now();
     let new_hash = blake3::hash(&candidate.bytes).to_hex().to_string();
+    let hash_ms = hash_started.elapsed().as_millis() as u64;
+    // 重新编码出的字节和原文件完全一致：没有任何收益，按“省得太少”计。
     if new_hash == row.content_hash {
-        return Ok(None);
+        return Ok(EncodeOutcome::Skipped(SkipReason::NotSmallEnough));
     }
 
     let (width, height) = (prepared.width(), prepared.height());
@@ -425,12 +540,16 @@ fn encode_one(
         options.output_format.extension()
     ));
     let temp = TempPath::new(temp_path);
-    {
-        let mut file = std::fs::File::create(temp.path())?;
-        file.write_all(&candidate.bytes)?;
-        file.sync_all()?;
-    }
+    let write_started = Instant::now();
+    let mut file = std::fs::File::create(temp.path())?;
+    file.write_all(&candidate.bytes)?;
+    let fsync_started = Instant::now();
+    file.sync_all()?;
+    let fsync_ms = fsync_started.elapsed().as_millis() as u64;
+    let write_ms = write_started.elapsed().as_millis() as u64;
+    drop(file);
 
+    let recalc_started = Instant::now();
     let thumb = if options.regenerate_thumbnails {
         Some(thumbnail::encode(&prepared)?)
     } else {
@@ -440,8 +559,9 @@ fn encode_one(
     let colors = options
         .recompute_colors
         .then(|| colors::dominant(&prepared));
+    let recalc_ms = recalc_started.elapsed().as_millis() as u64;
 
-    Ok(Some(EncodedItem {
+    Ok(EncodeOutcome::Encoded(Box::new(EncodedItem {
         row_id: row.id,
         folder_path: row.folder_path.clone(),
         old_hash: row.content_hash.clone(),
@@ -458,49 +578,97 @@ fn encode_one(
         thumb,
         phash,
         colors,
-    }))
+        encode_ms,
+        hash_ms,
+        recalc_ms,
+        write_ms,
+        fsync_ms,
+    })))
 }
 
-/// 发布一批：事务内发布文件并更新行；提交失败时删掉已发布的新文件。
+/// 发布一批：先把文件持久化到目标内容路径并 flush 目录，再在一个 FULL 事务里更新行。
 ///
-/// 返回已提交的条目，以及因目标内容已存在而没写入的张数——重复内容不落盘、也不改行。
+/// 返回已提交的条目与因目标内容已被占用而跳过的张数。提交失败时删掉本批已发布的
+/// 新文件——事务已回滚，没有行指向它们。
 fn commit_batch(
     database: &LibraryDb,
     paths: &LibraryPaths,
     thumbs: &ThumbPack,
     operation_id: i64,
     items: Vec<EncodedItem>,
-) -> AppResult<(Vec<Published>, u64)> {
-    let mut destinations = Vec::new();
-    let result = database.with_writer(|connection| {
+) -> AppResult<CommitOutcome> {
+    // 一次查出本批新哈希已被哪些行占用；不再逐张 `SELECT`。
+    let referenced = referenced_hashes(database, &items)?;
+
+    let write_started = Instant::now();
+    let mut staged: Vec<EncodedItem> = Vec::with_capacity(items.len());
+    let mut written_files: Vec<PathBuf> = Vec::new();
+    let mut directories: HashSet<PathBuf> = HashSet::new();
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    // 批内也可能有相同的新内容（两张源图编码后完全一致）：内存集合挡住，
+    // 否则事务里的唯一约束会直接报错。
+    let mut batch_hashes: HashSet<String> = HashSet::with_capacity(items.len());
+    let mut duplicates = 0_u64;
+    let mut failure: Option<AppError> = None;
+    for mut item in items {
+        if referenced.contains(&item.new_hash) || !batch_hashes.insert(item.new_hash.clone()) {
+            // 已有行或本批前面的图占用同样内容：不重复落盘，临时文件随 item 删除。
+            duplicates += 1;
+            continue;
+        }
+        let destination =
+            match metadata::content_path(paths, &item.folder_path, &item.new_hash, item.new_ext) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+        if let Some(parent) = destination.parent() {
+            // 同一批目标目录只创建一次。
+            if created_dirs.insert(parent.to_path_buf())
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                failure = Some(error.into());
+                break;
+            }
+            directories.insert(parent.to_path_buf());
+        }
+        match publish(item.temp.path(), &destination, &item.new_hash) {
+            Ok(PublishOutcome::Written) => {
+                item.temp.disarm();
+                written_files.push(destination);
+            }
+            // 孤儿文件内容匹配：接管已有文件，临时文件由守卫删除。
+            Ok(PublishOutcome::Adopted) => {}
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+        staged.push(item);
+    }
+    if let Some(error) = failure {
+        // 已经发布的新文件没有行引用，删掉；完整文件就算留下也会在下次被接管。
+        discard_written(&written_files);
+        return Err(error);
+    }
+    // 每个目标目录只 flush 一次：1000 张图可能落在几十个文件夹里。
+    for directory in &directories {
+        if let Err(error) = durable::flush_directory(directory) {
+            discard_written(&written_files);
+            return Err(error);
+        }
+    }
+    let write_ms = write_started.elapsed().as_millis() as u64;
+
+    let commit_started = Instant::now();
+    let result = database.with_durable_writer(|connection| {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_ms();
         let mut written = Vec::new();
-        let mut duplicates = 0_u64;
-        for mut item in items {
-            let duplicate: Option<i64> = transaction
-                .query_row(
-                    "SELECT id FROM images WHERE content_hash = ?1 AND id <> ?2",
-                    params![item.new_hash, item.row_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if duplicate.is_some() {
-                // 已有相同内容：不重复落盘，临时文件随 item 一起删除。
-                duplicates += 1;
-                continue;
-            }
-            let destination =
-                metadata::content_path(paths, &item.folder_path, &item.new_hash, item.new_ext)?;
-            if !publish(item.temp.path(), &destination)? {
-                // 目标已存在，说明内容重复；当作跳过处理。
-                duplicates += 1;
-                continue;
-            }
-            item.temp.disarm();
-            destinations.push(destination);
-
+        for item in staged {
             let changed = transaction.execute(
                 "UPDATE images SET
                     content_hash = ?1, file_ext = ?2, file_size = ?3, width = ?4, height = ?5,
@@ -578,34 +746,142 @@ fn commit_batch(
             written.len() as u64,
         )?;
         transaction.commit()?;
-        Ok((written, duplicates))
+        Ok(written)
     });
+    let commit_ms = commit_started.elapsed().as_millis() as u64;
 
-    // 提交失败时删掉本批已发布的新文件：事务已回滚，没有行指向它们。
-    result.inspect_err(|_| {
-        for destination in destinations {
-            let _ = std::fs::remove_file(destination);
+    match result {
+        Ok(published) => Ok(CommitOutcome {
+            published,
+            duplicates,
+            write_ms,
+            commit_ms,
+        }),
+        Err(error) => {
+            // 事务已回滚，没有行指向这些新文件；删掉它们，避免留下孤儿。
+            discard_written(&written_files);
+            Err(error)
         }
-    })
+    }
 }
 
-/// 把临时文件移到目标内容路径；目标已存在（内容重复）时删掉临时文件并返回 `false`。
-fn publish(temp: &Path, destination: &Path) -> AppResult<bool> {
-    if destination.is_file() {
-        std::fs::remove_file(temp)?;
-        return Ok(false);
-    }
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::rename(temp, destination) {
-        Ok(()) => Ok(true),
-        Err(_) if destination.is_file() => {
-            let _ = std::fs::remove_file(temp);
-            Ok(false)
+/// 删掉本批已发布却没有行引用的新文件；清理失败只记日志，不盖掉真正的错误。
+fn discard_written(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = std::fs::remove_file(path) {
+            log::warn!("清理未入库的压缩结果失败 {}：{error}", path.display());
         }
-        Err(error) => Err(AppError::message(format!("发布压缩结果失败：{error}"))),
     }
+}
+
+/// 本批新哈希已被哪些行引用；分块查询，避免一次塞进上千个参数。
+fn referenced_hashes(database: &LibraryDb, items: &[EncodedItem]) -> AppResult<HashSet<String>> {
+    let hashes: Vec<&str> = items.iter().map(|item| item.new_hash.as_str()).collect();
+    let mut referenced = HashSet::new();
+    for chunk in hashes.chunks(CHUNK) {
+        let sql = format!(
+            "SELECT content_hash FROM images WHERE content_hash IN ({})",
+            crate::library::placeholders(chunk.len())
+        );
+        database.with_reader(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            referenced.extend(rows);
+            Ok(())
+        })?;
+    }
+    Ok(referenced)
+}
+
+enum PublishOutcome {
+    /// 临时文件已经改名到目标路径。
+    Written,
+    /// 目标路径上已有内容完全相同的文件（上次崩溃留下的孤儿），直接接管。
+    Adopted,
+}
+
+/// 把临时文件发布到目标内容路径；目标已存在时先核对内容。
+///
+/// 目标存在不等于“内容重复”：rename 后、提交前崩溃会留下没有任何行引用的孤儿。
+/// 内容匹配就接管（少见路径才读文件算哈希），不匹配说明是截断或损坏的旧文件，
+/// 删掉再重新发布。正常路径（目标不存在）不增加任何成本。
+fn publish(temp: &Path, destination: &Path, expected_hash: &str) -> AppResult<PublishOutcome> {
+    if destination.is_file() {
+        if content::hash_file(destination)? == expected_hash {
+            log::warn!(
+                "接管没有行引用的内容文件（上次发布未提交）：{}",
+                destination.display()
+            );
+            return Ok(PublishOutcome::Adopted);
+        }
+        log::warn!(
+            "目标内容与预期不符，删除后重新发布：{}",
+            destination.display()
+        );
+        std::fs::remove_file(destination)?;
+    }
+    durable::rename_durable(temp, destination)?;
+    Ok(PublishOutcome::Written)
+}
+
+/// 提交后删旧图与查看器预览：不持有数据库写锁，并行执行，失败只记日志。
+fn delete_replaced(
+    pool: &rayon::ThreadPool,
+    root: &Path,
+    paths: &LibraryPaths,
+    published: &[Published],
+    report: &mut OptimizeReport,
+) {
+    let started = Instant::now();
+    let mut remover = match ContentRemover::new(root) {
+        Ok(remover) => remover,
+        Err(error) => {
+            log::warn!("旧原图路径校验失败，留给维护清理：{error}");
+            report.delete_failed += published.len() as u64;
+            report.delete_ms += started.elapsed().as_millis() as u64;
+            return;
+        }
+    };
+    let mut targets = Vec::with_capacity(published.len());
+    for item in published {
+        match remover.validate(&item.old_path) {
+            Ok(()) => targets.push(item),
+            Err(error) => {
+                report.delete_failed += 1;
+                log::warn!(
+                    "旧原图路径校验失败 image={} path={}: {error}",
+                    item.row_id,
+                    item.old_path.display()
+                );
+            }
+        }
+    }
+    let results = pool.install(|| {
+        targets
+            .par_iter()
+            .map(|item| {
+                let file = std::fs::remove_file(&item.old_path);
+                // 预览按旧哈希命名，删不掉通常是本来就没有。
+                let _ =
+                    std::fs::remove_file(viewer::preview_path(paths, item.row_id, &item.old_hash));
+                (item.row_id, file)
+            })
+            .collect::<Vec<_>>()
+    });
+    for (row_id, file) in results {
+        match file {
+            Ok(()) => report.deleted_files += 1,
+            Err(error) => {
+                report.delete_failed += 1;
+                log::warn!("旧原图清理失败 image={row_id}: {error}");
+            }
+        }
+    }
+    report.delete_ms += started.elapsed().as_millis() as u64;
 }
 
 #[cfg(test)]
@@ -751,6 +1027,13 @@ mod tests {
         assert_eq!(report.failed, 0, "{report:?}");
         assert!(report.savings_bytes > 0);
         assert!(!old_path.exists());
+        // 删旧图发生在提交之后，报告里要能看见这段耗时。
+        assert_eq!(report.deleted_files, 1);
+        assert!(report.elapsed_ms >= report.commit_ms);
+        assert_eq!(
+            report.skipped,
+            report.prefilter_skipped + report.candidate_skipped + report.duplicate_skipped
+        );
 
         let (hash, size, optimized_at, score, description, imported, modified): (
             String,
@@ -897,7 +1180,11 @@ mod tests {
         assert_eq!(first.processed, 1);
 
         let second = run(&fixture, &[image_id], &OptimizeOptions::default());
-        assert_eq!((second.processed, second.skipped), (0, 1), "{second:?}");
+        assert_eq!(
+            (second.processed, second.prefilter_skipped),
+            (0, 1),
+            "{second:?}"
+        );
 
         let forced = run(
             &fixture,
@@ -965,6 +1252,101 @@ mod tests {
                 })
                 .unwrap(),
             old_hash
+        );
+    }
+
+    /// 目标路径上的文件内容与预期哈希一致时直接接管，不重复写盘。
+    #[test]
+    fn publish_adopts_matching_orphan_and_replaces_mismatched_one() {
+        let temp = tempdir().unwrap();
+        let payload = b"published-bytes".to_vec();
+        let hash = blake3::hash(&payload).to_hex().to_string();
+        let destination = temp.path().join(format!("{hash}.jpg"));
+
+        // 孤儿完整：接管，临时文件不再需要。
+        fs::write(&destination, &payload).unwrap();
+        let staged = temp.path().join("staged-1.tmp");
+        fs::write(&staged, &payload).unwrap();
+        assert!(matches!(
+            publish(&staged, &destination, &hash).unwrap(),
+            PublishOutcome::Adopted
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+
+        // 孤儿截断：内容不匹配，删掉后重新发布。
+        fs::write(&destination, &payload[..4]).unwrap();
+        let staged = temp.path().join("staged-2.tmp");
+        fs::write(&staged, &payload).unwrap();
+        assert!(matches!(
+            publish(&staged, &destination, &hash).unwrap(),
+            PublishOutcome::Written
+        ));
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+    }
+
+    /// 提交阶段失败时，本批已发布的新文件必须删掉，旧图保持不动。
+    #[test]
+    fn failed_commit_removes_new_files_and_keeps_old_one() {
+        let (fixture, image_id, old_hash, old_path) = fixture();
+        let row = collect_candidates(&fixture.session.db, &[image_id])
+            .unwrap()
+            .pop()
+            .unwrap();
+        // 指向一个不存在的行：编码与发布都会成功，事务里的 UPDATE 命中 0 行。
+        let mut ghost = row.clone();
+        ghost.id = image_id + 10_000;
+
+        let operation = crate::library::history::begin_live(
+            &fixture.session.db,
+            NewOperation::new(
+                crate::library::history::HistoryKind::Optimize,
+                "优化图片空间",
+            ),
+        )
+        .unwrap();
+        let error = optimize(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            vec![ghost],
+            &OptimizeOptions::default(),
+            operation,
+            &NoopReporter,
+        )
+        .unwrap_err();
+        crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
+        assert!(error.to_string().contains("已被其他操作修改"), "{error}");
+
+        // 旧图还在，行也没变；新文件（内容哈希文件）已被清理。
+        assert!(old_path.exists());
+        let files: Vec<PathBuf> = fs::read_dir(&fixture.root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            files[0].file_name().unwrap().to_string_lossy(),
+            format!("{old_hash}.png")
+        );
+        let temp_files = fs::read_dir(fixture.root.join(".artbank").join("temp"))
+            .unwrap()
+            .count();
+        assert_eq!(temp_files, 0, "临时文件应随守卫删除");
+    }
+
+    /// 一次执行后校准值写进 meta，且数值落在合理量级内。
+    #[test]
+    fn writes_calibration_after_a_run() {
+        let (fixture, image_id, _, _) = fixture();
+        let report = run(&fixture, &[image_id], &OptimizeOptions::default());
+        assert_eq!(report.processed, 1);
+        // 少于 20 张的执行不覆盖校准值：默认库里本来就没有记录。
+        assert_eq!(
+            OptimizeCalibration::load(&fixture.session.db).unwrap(),
+            None
         );
     }
 }

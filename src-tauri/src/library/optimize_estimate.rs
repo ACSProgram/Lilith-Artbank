@@ -23,6 +23,7 @@ use crate::{
     import::decode,
     library::{
         BatchReporter,
+        calibration::{CONSERVATIVE as CONSERVATIVE_CALIBRATION, OptimizeCalibration},
         db::LibraryDb,
         encode_pool, metadata,
         optimize::{CandidateRow, collect_candidates},
@@ -44,13 +45,9 @@ pub const SAMPLE_MIN: usize = 50;
 pub const SAMPLE_MAX: usize = 2000;
 pub const SAMPLE_STEP: usize = 50;
 
-/// 批次 1 的写入侧保守常数：真实执行反馈要到批次 2 才用于校准。
-/// 写入带宽按顺序写单张文件估；`sync_all` 每张一次；提交按每 1000 张一次。
-const WRITE_BYTES_PER_SEC: f64 = 150.0 * 1024.0 * 1024.0;
-const FSYNC_SECS_PER_IMAGE: f64 = 0.004;
-const COMMIT_SECS_PER_BATCH: f64 = 0.08;
-const COMMIT_BATCH_SIZE: u64 = 1000;
-const DELETE_SECS_PER_IMAGE: f64 = 0.0008;
+/// 批次 1 的写入侧保守常数；批次 2 起优先用本库上次执行的实测校准值
+/// （`meta.optimize.calibration.v1`），没有记录时才退回这些常数。
+const COMMIT_BATCH_SIZE: u64 = crate::library::optimize::BATCH_SIZE as u64;
 
 /// 抽样数量必须是范围内的整步长；前后端共用这组边界。
 pub fn sample_size_valid(size: usize) -> bool {
@@ -139,7 +136,8 @@ pub struct CurvePoint {
     /// 已处理的候选体积占比。
     pub coverage: f64,
     pub savings_bytes: u64,
-    /// 按像素折算的累计耗时；与执行顺序一致，最后一点等于总预计耗时。
+    /// 累计耗时：work 按像素、write 按该层预测输出字节、finish 按该层张数，
+    /// 最后一点等于总预计耗时。
     pub elapsed_seconds: u64,
 }
 
@@ -172,7 +170,7 @@ pub struct OptimizeEstimate {
     pub sample_count: u64,
     pub sample_bytes: u64,
     pub coverage: f64,
-    /// 样本编码阶段的墙钟耗时（毫秒），供抽样提示与后续校准使用。
+    /// 样本编码阶段的墙钟耗时（毫秒），界面用它折算抽样大概要等多久。
     pub sample_elapsed_ms: u64,
     /// 样本中编码成功图片的平均局部坏点占比；只作诊断，不参与裁决。
     pub sample_bad_pixel_ratio: f64,
@@ -206,9 +204,9 @@ pub struct OptimizeEstimate {
     pub estimated_seconds: u64,
     /// 读取、解码、阶梯编码、哈希与重算的耗时。
     pub estimated_work_seconds: u64,
-    /// 写新文件与逐张 `sync_all` 的耗时（批次 1 为保守模型）。
+    /// 写新文件与逐张 fsync 的耗时；优先用本库上次执行的实测校准。
     pub estimated_write_seconds: u64,
-    /// 按批提交与删旧图、删预览的耗时（批次 1 为保守模型）。
+    /// 按批提交与删旧图、删预览的耗时；优先用本库上次执行的实测校准。
     pub estimated_finish_seconds: u64,
     pub quality_counts: Vec<QualityCount>,
     /// 按 bpp 从高到低执行时的累计节省；x 轴是候选体积占比。
@@ -239,6 +237,8 @@ struct SampleOutcome {
     quality: Option<u8>,
     skip: Option<SkipReason>,
     failed: bool,
+    /// 失败原因；成功时为 `None`。
+    error: Option<String>,
     source_pixels: u64,
     read_secs: f64,
     /// 解码 + 阶梯编码 + 回读比对；不含读取、哈希与重算。
@@ -541,15 +541,13 @@ pub fn estimate(
                 }
                 let row = sample_rows.get(id);
                 let (outcome, error) = match row {
-                    Some(row) => match sample_one(root, row, options) {
-                        Ok(outcome) => (outcome, None),
-                        Err(error) => (
-                            failed_outcome(*db_pixels, row.file_size.max(0) as u64),
-                            Some(error.to_string()),
-                        ),
-                    },
+                    Some(row) => {
+                        let outcome = sample_one(root, row, options);
+                        let error = outcome.error.clone();
+                        (outcome, error)
+                    }
                     None => (
-                        failed_outcome(*db_pixels, 0),
+                        failed_outcome(*db_pixels, 0, 0.0, "图片行已被删除".to_owned()),
                         Some("图片行已被删除".to_owned()),
                     ),
                 };
@@ -643,6 +641,7 @@ pub fn estimate(
             .then_with(|| right.bytes.cmp(&left.bytes))
     });
 
+    let calibration = OptimizeCalibration::load(database)?.unwrap_or(CONSERVATIVE_CALIBRATION);
     let timing = estimate_seconds(
         elapsed,
         read_secs,
@@ -655,6 +654,7 @@ pub fn estimate(
         process_bytes,
         savings_bytes,
         sample_pixels,
+        calibration,
     );
 
     Ok(Some(OptimizeEstimate {
@@ -764,15 +764,17 @@ fn empty_estimate(
     }
 }
 
-fn failed_outcome(pixels: u64, bytes: u64) -> SampleOutcome {
+fn failed_outcome(pixels: u64, bytes: u64, read_secs: f64, error: String) -> SampleOutcome {
     SampleOutcome {
         old_bytes: bytes,
         new_bytes: bytes,
         quality: None,
         skip: None,
         failed: true,
+        error: Some(error),
         source_pixels: pixels,
-        read_secs: 0.0,
+        // 读取已经发生的时间要留下：全 0 会让 IO 模型偏乐观。
+        read_secs,
         encode_secs: 0.0,
         hash_secs: 0.0,
         recalc_secs: 0.0,
@@ -780,15 +782,33 @@ fn failed_outcome(pixels: u64, bytes: u64) -> SampleOutcome {
     }
 }
 
-fn sample_one(
-    root: &Path,
-    row: &CandidateRow,
-    options: &OptimizeOptions,
-) -> AppResult<SampleOutcome> {
+/// 编码一个样本；失败也返回 `SampleOutcome`，把已经发生的读取/编码耗时带回去。
+fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> SampleOutcome {
     let paths = LibraryPaths::new(root);
-    let path = metadata::content_path(&paths, &row.folder_path, &row.content_hash, &row.file_ext)?;
+    let path =
+        match metadata::content_path(&paths, &row.folder_path, &row.content_hash, &row.file_ext) {
+            Ok(path) => path,
+            Err(error) => {
+                return failed_outcome(
+                    row.pixels(),
+                    row.file_size.max(0) as u64,
+                    0.0,
+                    error.to_string(),
+                );
+            }
+        };
     let read_started = Instant::now();
-    let source_bytes = std::fs::read(&path)?;
+    let source_bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return failed_outcome(
+                row.pixels(),
+                row.file_size.max(0) as u64,
+                read_started.elapsed().as_secs_f64(),
+                format!("无法读取图片：{error}"),
+            );
+        }
+    };
     let read_secs = read_started.elapsed().as_secs_f64();
     let old_bytes = source_bytes.len() as u64;
     let skip_now = |skip: SkipReason| SampleOutcome {
@@ -797,6 +817,7 @@ fn sample_one(
         quality: None,
         skip: Some(skip),
         failed: false,
+        error: None,
         source_pixels: row.pixels(),
         read_secs,
         encode_secs: 0.0,
@@ -805,14 +826,20 @@ fn sample_one(
         bad_pixel_ratio: 0.0,
     };
     if optimize::multiframe_guard(&source_bytes, &row.format).is_err() {
-        return Ok(skip_now(SkipReason::AnimatedOrMultipage));
+        return skip_now(SkipReason::AnimatedOrMultipage);
     }
     if optimize::color_profile_guard(&source_bytes, &row.format, options).is_err() {
-        return Ok(skip_now(SkipReason::ColorProfile));
+        return skip_now(SkipReason::ColorProfile);
     }
 
     let encode_started = Instant::now();
-    let decoded = decode::decode(&path)?;
+    // 已经读过一次盘：解码直接用这份字节，不再按路径读第二遍。
+    let decoded = match decode::decode_bytes(&source_bytes, Some(&row.file_ext)) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return failed_outcome(row.pixels(), old_bytes, read_secs, error.to_string());
+        }
+    };
 
     let source = SourceInfo {
         format: row.format.clone(),
@@ -828,26 +855,32 @@ fn sample_one(
     let plan = match optimize::plan(&source, options) {
         Ok(plan) => plan,
         Err(reason) => {
-            return Ok(SampleOutcome {
+            return SampleOutcome {
                 old_bytes,
                 new_bytes: old_bytes,
                 quality: None,
                 skip: Some(reason),
                 failed: false,
+                error: None,
                 source_pixels,
                 read_secs,
                 encode_secs: encode_started.elapsed().as_secs_f64(),
                 hash_secs: 0.0,
                 recalc_secs: 0.0,
                 bad_pixel_ratio: 0.0,
-            });
+            };
         }
     };
     let prepared = optimize::prepare(decoded.image, options.max_long_edge);
     let source_jpeg = matches!(row.format.as_str(), "jpeg" | "jpg")
         .then_some(source_bytes.as_slice())
         .filter(|_| options.output_format == OptimizeFormat::Jpeg);
-    let ladder = optimize::encode_ladder(&prepared, &plan, options, old_bytes, source_jpeg)?;
+    let ladder = match optimize::encode_ladder(&prepared, &plan, options, old_bytes, source_jpeg) {
+        Ok(ladder) => ladder,
+        Err(error) => {
+            return failed_outcome(source_pixels, old_bytes, read_secs, error.to_string());
+        }
+    };
     let encode_secs = encode_started.elapsed().as_secs_f64();
 
     // 样本也真实执行哈希与三个重算，只丢弃结果，用耗时校准预计耗时。
@@ -882,19 +915,20 @@ fn sample_one(
         (None, LadderOutcome::Skipped(reason)) => (None, old_bytes, Some(*reason)),
         (None, LadderOutcome::Encoded(_)) => unreachable!("已在上面的分支里取出编码结果"),
     };
-    Ok(SampleOutcome {
+    SampleOutcome {
         old_bytes,
         new_bytes,
         quality,
         skip,
         failed: false,
+        error: None,
         source_pixels,
         read_secs,
         encode_secs,
         hash_secs,
         recalc_secs,
         bad_pixel_ratio,
-    })
+    }
 }
 
 /// 按候选体积分配样本；每个有候选的层至少 3 张，余量按字节份额分配。
@@ -1195,7 +1229,7 @@ fn bootstrap_margin(
     (1.96 * variance.sqrt()).round() as u64
 }
 
-/// 预计耗时的三段拆分；批次 1 的写盘、提交与删除都用保守常数。
+/// 预计耗时的三段拆分；写入侧优先用本库实测校准值，没有记录时用保守常数。
 #[derive(Debug, Clone, Copy, Default)]
 struct TimeBreakdown {
     work: u64,
@@ -1222,6 +1256,7 @@ fn estimate_seconds(
     process_bytes: u64,
     savings_bytes: u64,
     sample_pixels: u64,
+    calibration: OptimizeCalibration,
 ) -> TimeBreakdown {
     if candidate_pixels == 0 || sample_pixels == 0 {
         return TimeBreakdown::default();
@@ -1243,12 +1278,14 @@ fn estimate_seconds(
         0.0
     };
     let work = cpu.max(io);
-    // 跳过图不写盘，所以写盘字节按“处理体积 − 预测节省”算，再计每张一次 fsync。
+    // 跳过图不写盘，所以写盘字节按“处理体积 − 预测节省”算，再计每张的 fsync 成本。
     let output_bytes = process_bytes.saturating_sub(savings_bytes) as f64;
-    let write = output_bytes / WRITE_BYTES_PER_SEC + process_count as f64 * FSYNC_SECS_PER_IMAGE;
+    let write = output_bytes * calibration.write_secs_per_byte
+        + process_count as f64 * calibration.fsync_secs_per_image;
     // 提交按批、删除按张。
     let batches = process_count.div_ceil(COMMIT_BATCH_SIZE) as f64;
-    let finish = batches * COMMIT_SECS_PER_BATCH + process_count as f64 * DELETE_SECS_PER_IMAGE;
+    let finish = batches * calibration.commit_secs_per_batch
+        + process_count as f64 * calibration.delete_secs_per_image;
     TimeBreakdown {
         work: work.round() as u64,
         write: write.round() as u64,
@@ -1367,6 +1404,7 @@ mod tests {
                     quality,
                     skip,
                     failed,
+                    error: None,
                     source_pixels: 1_000,
                     read_secs: 0.0,
                     encode_secs: 0.0,
@@ -1409,6 +1447,7 @@ mod tests {
             quality: Some(85),
             skip: None,
             failed: false,
+            error: None,
             source_pixels: 1_000,
             read_secs: 0.0,
             encode_secs: 0.0,
@@ -1442,6 +1481,7 @@ mod tests {
             quality: Some(75),
             skip: None,
             failed: false,
+            error: None,
             source_pixels: 1_000,
             read_secs: 0.0,
             encode_secs: 0.0,

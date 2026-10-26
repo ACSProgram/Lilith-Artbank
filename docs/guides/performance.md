@@ -77,6 +77,39 @@ P2 已删除应用内“缩略图基准”（`app/bench.rs`、`thumb://bench/*` 
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
 ```
 
+### 图片空间优化写路径（2026-10-26）
+
+三个临时库基准，都不写真实库，也不跑 release：
+
+- `perf_encode_threads`：16 张 1200×900 确定性 PNG，在内存里解码并阶梯编码到 JPEG，比较 4 / 8 / 12 / 核数−1 线程的吞吐。只衡量解码 + 编码 + PSNR 的并行扩展性，不含磁盘。
+- `perf_optimize_batch_size`：600 张 320×240 PNG 的临时库，分别按 500 / 1000 / 2000 张一批执行完整写路径，每档都用新库（同一批图压第二次会被判「省得太少」而全部跳过）。
+- `perf_estimate_vs_actual`：400 张 800×600 PNG 的临时库，先估算再执行，比较预计耗时与实际墙钟，并打印执行报告的分段耗时。
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_encode_threads
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_optimize_batch_size
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_estimate_vs_actual
+```
+
+本机（16 核、NVMe、开发档）实测：
+
+| 项目 | 结果 |
+| --- | --- |
+| 编码线程 4 / 8 / 12 / 15 | 9.7 / 16.4 / 15.2 / 16.4 张/秒（16 张 1200×900） |
+| 线程策略 | `min(核数−1, 8)`：8 已是吞吐拐点，再多只增加每线程整图缓冲 |
+| 批次 500 / 1000 / 2000（600 张 320×240，553 张实际处理） | 0.87 s / 1.32 s / 1.01 s（差异主要是缓存与调度噪声） |
+| 其中发布（rename + 目录 flush） | 242 / 376 / 340 ms，约 0.4–0.7 ms 一张 |
+| 其中事务提交 | 7 / 9 / 7 ms（1000 张一批也只有个位数毫秒） |
+| 其中删旧图与预览 | 88 / 121 / 117 ms |
+| 预计 vs 实际（400 张 800×600，无校准记录） | 预计 13.0 s（work 11 s、write 2 s、finish 0 s），实际 11.4 s，比值 0.88 |
+| 实际分段（同上） | 编码 86.6 s（8 线程折算约 10.8 s 墙钟）、写盘 559 ms、发布 173 ms、提交 4 ms、删除 108 ms |
+
+结论：
+
+- 写入侧的断电保护代价主要是 rename + 目录 flush（约 0.4 ms/张），提交本身可忽略；批次大小对总耗时没有决定性影响，保留 1000。
+- 首次估算在无校准记录时略偏高（约 14%），来自保守的写入常数；执行一次后校准记录接管，误差来源只剩编码耗时外推。
+- 这些是开发档、合成图的数字，只用于同机对比；真实库的预计/实际对比仍要由用户手工跑。
+
 ### 查询引擎（S2）
 
 `perf_metadata_200k` 在原有索引基准之后，直接调用 `library::query::query_page`、`filter_counts` 与 `query_ids`，覆盖真实 SQL 构造、文件夹 JOIN、标签摘要批量查询与参数绑定：

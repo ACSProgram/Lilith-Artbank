@@ -25,6 +25,7 @@ use crate::{
         scan,
     },
     library::{
+        content,
         db::LibraryDb,
         history::{self, FolderRef, ImportMerged, ImportRecord, ImportTag},
         import as repository,
@@ -33,6 +34,7 @@ use crate::{
         service::now_ms,
         thumbs::ThumbPack,
     },
+    platform::fs as durable,
 };
 
 const BATCH_SIZE: usize = 64;
@@ -448,7 +450,7 @@ fn build_prepared(
 
     let file_name = format!("{content_hash}.{file_ext}");
     let destination = context.paths.content_file(&folder, &file_name);
-    let published = publish(&content, &destination)?;
+    let published = publish(&content, &destination, &content_hash)?;
 
     Ok(Some(Outcome::Prepared(Prepared {
         source_path: source_path.to_path_buf(),
@@ -577,26 +579,35 @@ fn copy_and_hash(source: &Path, destination: &Path) -> AppResult<(String, u64)> 
     Ok((hasher.finalize().to_hex().to_string(), size))
 }
 
-/// 把待发布文件 rename 成目标内容文件。
+/// 把待发布文件发布为目标内容文件。
 ///
-/// `temp` 是导入临时目录里的文件：原图副本，或压缩结果。目标已存在时删掉临时文件，
-/// 由调用方按“内容重复”处理。
-fn publish(temp: &Path, destination: &Path) -> AppResult<bool> {
+/// `temp` 是导入临时目录里的文件：原图副本，或压缩结果。目标已存在时不能直接
+/// 当成“内容重复”——上次 rename 后、入库前崩溃会留下没有任何行引用的孤儿，文件
+/// 可能被截断。先按 `expected_hash` 核对内容：一致就接管，不一致就删掉重发。
+///
+/// 返回 `true` 表示这次确实由本批写入目标文件；`false` 表示目标已有可用文件，
+/// 调用方在入库失败时不能删它。
+fn publish(temp: &Path, destination: &Path, expected_hash: &str) -> AppResult<bool> {
     if destination.is_file() {
-        std::fs::remove_file(temp)?;
-        return Ok(false);
+        if content::hash_file(destination)? == expected_hash {
+            log::warn!("导入目标已存在且内容一致，接管：{}", destination.display());
+            let _ = std::fs::remove_file(temp);
+            return Ok(false);
+        }
+        log::warn!(
+            "导入目标内容与预期不符，删除后重新发布：{}",
+            destination.display()
+        );
+        std::fs::remove_file(destination)?;
     }
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match std::fs::rename(temp, destination) {
-        Ok(()) => Ok(true),
-        Err(_) if destination.is_file() => {
-            let _ = std::fs::remove_file(temp);
-            Ok(false)
-        }
-        Err(error) => Err(AppError::message(format!("发布图片文件失败：{error}"))),
+    durable::rename_durable(temp, destination)?;
+    if let Some(parent) = destination.parent() {
+        durable::flush_directory(parent)?;
     }
+    Ok(true)
 }
 
 /// 压缩结果先落到导入临时目录，再走与原图相同的发布路径。
@@ -1720,6 +1731,64 @@ mod tests {
         .unwrap();
         let pointer = thumbs::load_pointer(&session.db, 1).unwrap().unwrap();
         assert!(session.thumbs.read(pointer.location).is_err());
+    }
+
+    /// 发布时目标已存在：内容一致才接管，截断的孤儿必须被替换。
+    #[test]
+    fn publish_adopts_matching_orphan_and_replaces_truncated_one() {
+        let temp = tempdir().unwrap();
+        let mut payload = Vec::new();
+        smooth_image(5, 64, 48)
+            .write_to(
+                &mut std::io::Cursor::new(&mut payload),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let hash = blake3::hash(&payload).to_hex().to_string();
+        let destination = temp.path().join(format!("{hash}.png"));
+
+        // 完整孤儿：接管，返回 false 表示目标文件不是本批写的。
+        std::fs::write(&destination, &payload).unwrap();
+        let staged = temp.path().join("staged-1.png");
+        std::fs::write(&staged, &payload).unwrap();
+        assert!(!publish(&staged, &destination, &hash).unwrap());
+        assert!(!staged.exists(), "接管后临时文件应删除");
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+
+        // 截断孤儿：内容不匹配，删掉后重新发布。
+        std::fs::write(&destination, &payload[..payload.len() / 2]).unwrap();
+        let staged = temp.path().join("staged-2.png");
+        std::fs::write(&staged, &payload).unwrap();
+        assert!(publish(&staged, &destination, &hash).unwrap());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    }
+
+    /// 目标位置已有截断的孤儿时，导入不能直接把它登记成正常图片。
+    #[test]
+    fn import_replaces_truncated_orphan_instead_of_registering_it() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let path = source_dir.join("photo.png");
+        smooth_image(9, 96, 64).save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let hash = blake3::hash(&original).to_hex().to_string();
+
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let destination =
+            LibraryPaths::new(&library_root).content_file("导入", &format!("{hash}.png"));
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, &original[..original.len() / 2]).unwrap();
+
+        let snapshot = run_with(&session, &library_root, request(&source_dir));
+        assert_eq!(snapshot.progress.imported, 1, "{snapshot:?}");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            original,
+            "截断的孤儿应被完整内容替换"
+        );
     }
 
     #[test]

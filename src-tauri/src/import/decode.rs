@@ -22,13 +22,30 @@ pub struct DecodedImage {
 /// 格式优先按魔数判断；魔数不认识时（TGA 没有稳定魔数）用文件扩展名兜底，
 /// 这也是临时副本要保留源扩展名的原因。
 pub fn decode(path: &Path) -> AppResult<DecodedImage> {
-    let mut reader = ImageReader::open(path)
-        .map_err(|error| AppError::message(format!("无法打开图片：{error}")))?
+    decode_with(
+        ImageReader::open(path)
+            .map_err(|error| AppError::message(format!("无法打开图片：{error}")))?,
+        path.extension().and_then(|value| value.to_str()),
+    )
+}
+
+/// 从已读进内存的字节解码；调用方已经为色彩配置判断或元数据搬运读过一次文件时用它。
+///
+/// `format_hint` 是数据库里的文件扩展名，只在魔数认不出来时兜底（TGA 依赖它）。
+pub fn decode_bytes(bytes: &[u8], format_hint: Option<&str>) -> AppResult<DecodedImage> {
+    decode_with(ImageReader::new(std::io::Cursor::new(bytes)), format_hint)
+}
+
+fn decode_with<R: std::io::BufRead + std::io::Seek>(
+    reader: ImageReader<R>,
+    format_hint: Option<&str>,
+) -> AppResult<DecodedImage> {
+    let mut reader = reader
         .with_guessed_format()
         .map_err(|error| AppError::message(format!("无法识别图片格式：{error}")))?;
 
     if reader.format().is_none()
-        && let Some(format) = path.extension().and_then(ImageFormat::from_extension)
+        && let Some(format) = format_hint.and_then(ImageFormat::from_extension)
     {
         reader.set_format(format);
     }
@@ -101,7 +118,7 @@ fn format_name(format: ImageFormat) -> Option<&'static str> {
 mod tests {
     use std::io::Cursor;
 
-    use image::{ImageFormat, Rgb, RgbImage};
+    use image::{GenericImageView, ImageFormat, Rgb, RgbImage};
     use tempfile::tempdir;
 
     use super::*;
@@ -197,6 +214,62 @@ mod tests {
         let path = temp.path().join("fake.png");
         std::fs::write(&path, b"not an image").unwrap();
         assert!(decode(&path).is_err());
+        assert!(decode_bytes(b"not an image", Some("png")).is_err());
+    }
+
+    #[test]
+    fn decodes_from_bytes_with_the_same_result_as_the_path() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sample.png");
+        let image = RgbImage::from_fn(32, 20, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        DynamicImage::ImageRgb8(image).save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let from_path = decode(&path).unwrap();
+        let from_bytes = decode_bytes(&bytes, Some("png")).unwrap();
+        assert_eq!((from_bytes.width, from_bytes.height), (32, 20));
+        assert_eq!(from_bytes.format, from_path.format);
+        assert_eq!(from_bytes.has_alpha, from_path.has_alpha);
+        assert_eq!(from_bytes.image.dimensions(), from_path.image.dimensions());
+        assert_eq!(from_bytes.image.to_rgb8(), from_path.image.to_rgb8());
+    }
+
+    #[test]
+    fn decodes_bytes_by_extension_hint_when_magic_is_missing() {
+        let image = RgbImage::from_fn(24, 16, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 40]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, ImageFormat::Tga)
+            .unwrap();
+        let bytes = encoded.into_inner();
+
+        let decoded = decode_bytes(&bytes, Some("tga")).unwrap();
+        assert_eq!(decoded.format, "tga");
+        assert_eq!((decoded.width, decoded.height), (24, 16));
+        // 没有扩展名兜底时认不出 TGA，应当报错而不是猜一个格式。
+        assert!(decode_bytes(&bytes, None).is_err());
+    }
+
+    #[test]
+    fn applies_orientation_when_decoding_bytes() {
+        let bytes = jpeg_with_orientation(40, 20, 6);
+        let decoded = decode_bytes(&bytes, Some("jpg")).unwrap();
+        assert_eq!((decoded.width, decoded.height), (20, 40));
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions_from_bytes() {
+        // 伪造 PNG 头：IHDR 声明 70000×10，超过单边上限；解码器初始化时就会拒绝。
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&70_000_u32.to_be_bytes());
+        ihdr.extend_from_slice(&10_u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes.extend_from_slice(&(ihdr.len() as u32 - 4).to_be_bytes());
+        bytes.extend_from_slice(&ihdr);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(decode_bytes(&bytes, Some("png")).is_err());
     }
 
     #[test]

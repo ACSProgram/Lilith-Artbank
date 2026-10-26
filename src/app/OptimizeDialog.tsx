@@ -482,7 +482,12 @@ export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDi
     setCanRetryEstimate(false);
   }
 
-  const scopeOptions = useMemo(() => scopeAvailability(context), [context]);
+  const scopeOptions = useMemo(() => {
+    const options = scopeAvailability(context);
+    // 临时图片在关闭图库时整目录清空，压缩它们只会留下一条无用记录。
+    options.temp = { enabled: false, reason: "临时图片不参与空间优化" };
+    return options;
+  }, [context]);
 
   useEffect(() => {
     if (estimate) resultRef.current?.scrollIntoView({ block: "start" });

@@ -1204,7 +1204,8 @@ pub fn purge_by_operation(
             break;
         }
         let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
-        let deleted = database.with_writer(|connection| {
+        // 删行提交必须先落盘，之后才允许删文件；否则断电后行还在、原图已没了。
+        let deleted = database.with_durable_writer(|connection| {
             let transaction = connection.transaction()?;
             let marks = placeholders(ids.len());
             let deleted = transaction.execute(
@@ -1254,18 +1255,6 @@ pub(crate) fn content_path(
     Ok(paths.content_file(&normalized_folder, &format!("{content_hash}.{extension}")))
 }
 
-fn ensure_inside_root(root: &Path, path: &Path) -> AppResult<()> {
-    let canonical_root = root.canonicalize()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::message("目标路径没有父目录"))?;
-    let canonical_parent = parent.canonicalize()?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(AppError::message("目标路径位于图库目录之外"));
-    }
-    Ok(())
-}
-
 /// 目标目录必须已经存在，且 canonicalize 后仍是图库根目录或其子目录。
 fn ensure_dir_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
     let canonical_root = root.canonicalize()?;
@@ -1277,14 +1266,44 @@ fn ensure_dir_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
 }
 
 pub(crate) fn remove_content_file(root: &Path, path: &Path) -> AppResult<()> {
-    ensure_inside_root(root, path)?;
-    let canonical_root = root.canonicalize()?;
-    let canonical = path.canonicalize()?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(AppError::message("文件位于图库目录之外"));
-    }
+    let mut remover = ContentRemover::new(root)?;
+    remover.validate(path)?;
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+/// 批量删除原图时的路径守卫：根目录只 canonicalize 一次，父目录按文件夹缓存。
+///
+/// 批量压缩一次删几千张，每张都 canonicalize 根目录和父目录会明显拖慢收尾；
+/// 这里只校验路径确实落在图库内，不改变删除语义。
+pub(crate) struct ContentRemover {
+    root: PathBuf,
+    parents: HashSet<PathBuf>,
+}
+
+impl ContentRemover {
+    pub(crate) fn new(root: &Path) -> AppResult<Self> {
+        Ok(Self {
+            root: root.canonicalize()?,
+            parents: HashSet::new(),
+        })
+    }
+
+    /// 校验目标路径的父目录在图库根目录内；同一目录只做一次 canonicalize。
+    pub(crate) fn validate(&mut self, path: &Path) -> AppResult<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::message("目标路径没有父目录"))?;
+        if self.parents.contains(parent) {
+            return Ok(());
+        }
+        let canonical = parent.canonicalize()?;
+        if !canonical.starts_with(&self.root) {
+            return Err(AppError::message("目标路径位于图库目录之外"));
+        }
+        self.parents.insert(parent.to_path_buf());
+        Ok(())
+    }
 }
 
 fn tag_refs(database: &LibraryDb, image_id: i64) -> AppResult<Vec<TagRef>> {

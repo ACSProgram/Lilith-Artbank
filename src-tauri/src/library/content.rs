@@ -43,6 +43,26 @@ pub fn original_path(database: &LibraryDb, root: &Path, image_id: i64) -> AppRes
     load(database, image_id)?.path(&LibraryPaths::new(root))
 }
 
+/// 流式计算文件的 BLAKE3。
+///
+/// 只用于少见路径：发布时目标已存在、需要判断它是完整内容还是上次崩溃留下的
+/// 孤儿；正常发布不会调用。
+pub(crate) fn hash_file(path: &Path) -> AppResult<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 pub fn load(database: &LibraryDb, image_id: i64) -> AppResult<ContentRow> {
     if image_id <= 0 {
         return Err(AppError::message("图片 id 无效"));

@@ -564,6 +564,10 @@ pub fn prepare(image: DynamicImage, max_long_edge: Option<u32>) -> DynamicImage 
 ///
 /// `prepared` 应已经过 `prepare`，`original_bytes` 是当前原文件大小。
 /// `source_jpeg` 只在“JPEG 输入 → JPEG 输出”时提供，用于搬运 EXIF/ICC。
+///
+/// 体积判据先于画质判据：同一张图、同一输出格式下，质量越高文件通常越大，当前
+/// 质量已经缩不到 95% 时继续往上爬只会更差。这样既省掉回解码与 PSNR，也避免
+/// 「画质不达标」把本来只是「省得太少」的图算成另一种跳过。
 pub fn encode_ladder(
     prepared: &DynamicImage,
     plan: &OptimizePlan,
@@ -575,21 +579,22 @@ pub fn encode_ladder(
     if prepared.color().has_alpha() && options.output_format == OptimizeFormat::Jpeg {
         return Ok(LadderOutcome::Skipped(SkipReason::Transparent));
     }
+    // 像素只转换一次：每轮编码与 PSNR 比对都复用同一份 buffer。
+    let source = PixelBuffer::from_image(prepared);
     for quality in quality_ladder(plan.start_quality) {
-        let bytes = encode(
-            prepared,
+        let bytes = source.encode(
             options.output_format,
             quality,
             source_jpeg.filter(|_| options.output_format == OptimizeFormat::Jpeg),
         )?;
-        let encoded = image::load_from_memory(&bytes)
-            .map_err(|error| AppError::message(format!("无法回读编码结果：{error}")))?;
-        let metrics = compare(prepared, &encoded)?;
-        if metrics.psnr < plan.psnr_floor {
-            continue;
-        }
         if !is_smaller_enough(original_bytes, bytes.len() as u64) {
             return Ok(LadderOutcome::Skipped(SkipReason::NotSmallEnough));
+        }
+        let encoded = image::load_from_memory(&bytes)
+            .map_err(|error| AppError::message(format!("无法回读编码结果：{error}")))?;
+        let metrics = source.compare(&encoded)?;
+        if metrics.psnr < plan.psnr_floor {
+            continue;
         }
         return Ok(LadderOutcome::Encoded(EncodedCandidate {
             bytes,
@@ -607,58 +612,106 @@ pub fn is_smaller_enough(original: u64, encoded: u64) -> bool {
     encoded.saturating_mul(100) < original.saturating_mul(threshold_percent)
 }
 
+/// 一次转换好的像素缓冲：阶梯编码与 PSNR 比对共用，避免每轮重复 `to_rgb8`/`to_rgba8`。
+pub(crate) enum PixelBuffer {
+    Rgb(image::RgbImage),
+    Rgba(image::RgbaImage),
+}
+
+impl PixelBuffer {
+    fn from_image(image: &DynamicImage) -> Self {
+        if image.color().has_alpha() {
+            Self::Rgba(image.to_rgba8())
+        } else {
+            Self::Rgb(image.to_rgb8())
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Rgb(buffer) => buffer.dimensions(),
+            Self::Rgba(buffer) => buffer.dimensions(),
+        }
+    }
+
+    fn encode(
+        &self,
+        format: OptimizeFormat,
+        quality: u8,
+        source_jpeg: Option<&[u8]>,
+    ) -> AppResult<Vec<u8>> {
+        if !(1..=100).contains(&quality) {
+            return Err(AppError::message("输出质量必须在 1-100 之间"));
+        }
+        match format {
+            OptimizeFormat::Jpeg => {
+                let Self::Rgb(rgb) = self else {
+                    return Err(AppError::message("JPEG 输出不接受带透明通道的图片"));
+                };
+                let mut bytes = Vec::new();
+                JpegEncoder::new_with_quality(&mut bytes, quality).write_image(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    ExtendedColorType::Rgb8,
+                )?;
+                Ok(match source_jpeg {
+                    Some(source) => copy_jpeg_metadata(source, &bytes),
+                    None => bytes,
+                })
+            }
+            OptimizeFormat::WebP => {
+                let (width, height) = self.dimensions();
+                if width > WEBP_MAX_EDGE || height > WEBP_MAX_EDGE {
+                    return Err(AppError::message(format!(
+                        "图片尺寸 {width}×{height} 超过 WebP 单边上限 {WEBP_MAX_EDGE}"
+                    )));
+                }
+                // `webp` 的 `encode()` 内部是 `unwrap`：编码器拒绝时会把错误变成 panic。
+                // 这里兜住，让异常落进失败清单，而不是把整个任务线程带走。
+                let encoded =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self {
+                        Self::Rgba(rgba) => {
+                            webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                                .encode(f32::from(quality))
+                        }
+                        Self::Rgb(rgb) => {
+                            webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+                                .encode(f32::from(quality))
+                        }
+                    }))
+                    .map_err(|_| AppError::message("WebP 编码器拒绝了这张图片"))?;
+                if encoded.is_empty() {
+                    return Err(AppError::message("WebP 编码结果为空"));
+                }
+                Ok(encoded.to_vec())
+            }
+        }
+    }
+
+    /// 与解码回来的图逐像素比对；编码结果只转换一次。
+    fn compare(&self, encoded: &DynamicImage) -> AppResult<QualityMetrics> {
+        if self.dimensions() != encoded.dimensions() {
+            return Err(AppError::message("画质比对的两张图尺寸不一致"));
+        }
+        match self {
+            Self::Rgb(source) => Ok(metrics(source.as_raw(), encoded.to_rgb8().as_raw(), 3)),
+            Self::Rgba(source) => Ok(metrics(source.as_raw(), encoded.to_rgba8().as_raw(), 4)),
+        }
+    }
+}
+
 /// 编码一次；输出 JPEG 时搬运源 JPEG 的 EXIF（去掉 Orientation）与 ICC。
+///
+/// 批量路径走 `PixelBuffer` 复用像素；这个单次入口只给测试用。
+#[cfg(test)]
 pub fn encode(
     image: &DynamicImage,
     format: OptimizeFormat,
     quality: u8,
     source_jpeg: Option<&[u8]>,
 ) -> AppResult<Vec<u8>> {
-    if !(1..=100).contains(&quality) {
-        return Err(AppError::message("输出质量必须在 1-100 之间"));
-    }
-    match format {
-        OptimizeFormat::Jpeg => {
-            let rgb = image.to_rgb8();
-            let mut bytes = Vec::new();
-            JpegEncoder::new_with_quality(&mut bytes, quality).write_image(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                ExtendedColorType::Rgb8,
-            )?;
-            Ok(match source_jpeg {
-                Some(source) => copy_jpeg_metadata(source, &bytes),
-                None => bytes,
-            })
-        }
-        OptimizeFormat::WebP => {
-            let (width, height) = (image.width(), image.height());
-            if width > WEBP_MAX_EDGE || height > WEBP_MAX_EDGE {
-                return Err(AppError::message(format!(
-                    "图片尺寸 {width}×{height} 超过 WebP 单边上限 {WEBP_MAX_EDGE}"
-                )));
-            }
-            // `webp` 的 `encode()` 内部是 `unwrap`：编码器拒绝时会把错误变成 panic。
-            // 这里兜住，让异常落进失败清单，而不是把整个任务线程带走。
-            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if image.color().has_alpha() {
-                    let rgba = image.to_rgba8();
-                    webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                        .encode(f32::from(quality))
-                } else {
-                    let rgb = image.to_rgb8();
-                    webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
-                        .encode(f32::from(quality))
-                }
-            }))
-            .map_err(|_| AppError::message("WebP 编码器拒绝了这张图片"))?;
-            if encoded.is_empty() {
-                return Err(AppError::message("WebP 编码结果为空"));
-            }
-            Ok(encoded.to_vec())
-        }
-    }
+    PixelBuffer::from_image(image).encode(format, quality, source_jpeg)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -669,23 +722,14 @@ pub struct QualityMetrics {
 }
 
 /// 逐像素比对；一次遍历同时算 MSE 与局部坏点。
+#[cfg(test)]
 pub fn compare(original: &DynamicImage, encoded: &DynamicImage) -> AppResult<QualityMetrics> {
-    if original.dimensions() != encoded.dimensions() {
-        return Err(AppError::message("画质比对的两张图尺寸不一致"));
-    }
-    let rgba = original.color().has_alpha() || encoded.color().has_alpha();
-    let (source, target) = if rgba {
-        (original.to_rgba8(), encoded.to_rgba8())
-    } else {
-        let source = original.to_rgb8();
-        let target = encoded.to_rgb8();
-        return Ok(metrics(source.as_raw(), target.as_raw(), 3));
-    };
-    Ok(metrics(source.as_raw(), target.as_raw(), 4))
+    PixelBuffer::from_image(original).compare(encoded)
 }
 
 fn metrics(source: &[u8], target: &[u8], channels: usize) -> QualityMetrics {
-    let mut squared_error = 0.0_f64;
+    // 整数累加，最后再转 f64：一张 1 亿像素的图也不会在累加时丢精度。
+    let mut squared_error = 0_u64;
     let mut bad_pixels = 0_u64;
     let mut pixels = 0_u64;
     for (left, right) in source
@@ -696,7 +740,8 @@ fn metrics(source: &[u8], target: &[u8], channels: usize) -> QualityMetrics {
         let mut bad = false;
         for channel in 0..channels {
             let difference = i32::from(left[channel]) - i32::from(right[channel]);
-            squared_error += f64::from(difference * difference);
+            let square = difference * difference;
+            squared_error += square as u64;
             if difference.unsigned_abs() > u32::from(BAD_PIXEL_DELTA) {
                 bad = true;
             }
@@ -706,7 +751,7 @@ fn metrics(source: &[u8], target: &[u8], channels: usize) -> QualityMetrics {
         }
     }
     let samples = (pixels as usize * channels).max(1) as f64;
-    let mse = squared_error / samples;
+    let mse = squared_error as f64 / samples;
     let psnr = if mse <= f64::EPSILON {
         PSNR_CAP
     } else {
@@ -1213,6 +1258,64 @@ mod tests {
             encode_ladder(&image, &easy, &OptimizeOptions::default(), 100, None).unwrap(),
             LadderOutcome::Skipped(SkipReason::NotSmallEnough)
         ));
+    }
+
+    /// 早退的依据是“质量越高文件越大”；这里把这个前提固定成测试，
+    /// 出现反例时说明早退条件需要收紧。
+    #[test]
+    fn higher_quality_never_produces_a_smaller_file() {
+        let images = [textured(96, 96), textured(160, 120), textured(64, 200)];
+        for image in &images {
+            for format in [OptimizeFormat::Jpeg, OptimizeFormat::WebP] {
+                let mut previous = 0_usize;
+                for quality in [75_u8, 82, 85, 90, 95, 97] {
+                    let size = encode(image, format, quality, None).unwrap().len();
+                    assert!(
+                        size >= previous,
+                        "{format:?} q{quality} 比上一档更小：{size} < {previous}"
+                    );
+                    previous = size;
+                }
+            }
+        }
+    }
+
+    /// 当前质量已经缩不到 95% 时只编码一次就返回「省得太少」，
+    /// 不再为了画质底线继续往高质量爬。
+    #[test]
+    fn ladder_returns_not_small_enough_without_climbing() {
+        let image = textured(96, 96);
+        // 原图大小取 q75 的编码结果：q75 恰好不小于原图的 95%，更高只会更大。
+        let first_size = encode(&image, OptimizeFormat::Jpeg, 75, None)
+            .unwrap()
+            .len() as u64;
+        let plan = OptimizePlan {
+            start_quality: 75,
+            // 画质底线故意设成不可能达到：旧顺序会先判画质、继续爬梯，最后报 QualityNotMet。
+            psnr_floor: 100.0,
+        };
+        let outcome =
+            encode_ladder(&image, &plan, &OptimizeOptions::default(), first_size, None).unwrap();
+        assert!(
+            matches!(outcome, LadderOutcome::Skipped(SkipReason::NotSmallEnough)),
+            "{outcome:?}"
+        );
+    }
+
+    /// 早退不改变能处理图片的质量档：第一档就同时满足体积与画质时仍取第一档。
+    #[test]
+    fn ladder_keeps_the_first_quality_when_both_checks_pass() {
+        let image = textured(128, 96);
+        let plan = OptimizePlan {
+            start_quality: 75,
+            psnr_floor: 0.0,
+        };
+        let outcome =
+            encode_ladder(&image, &plan, &OptimizeOptions::default(), 10_000_000, None).unwrap();
+        match outcome {
+            LadderOutcome::Encoded(candidate) => assert_eq!(candidate.quality, 75),
+            LadderOutcome::Skipped(reason) => panic!("不应跳过：{reason:?}"),
+        }
     }
 
     #[test]
