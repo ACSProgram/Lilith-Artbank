@@ -194,6 +194,7 @@ pub fn start(
                 }
             }
             if let Some(state) = history_app.try_state::<AppState>() {
+                state.remember_import_receipt(job.snapshot());
                 state.after_history_write();
             }
             let _ = app.emit("import-progress", job.progress());
@@ -209,6 +210,9 @@ pub fn start(
         fallback_job.add_failure("", format!("无法启动导入任务：{error}"));
         fallback_job.inc_failed();
         fallback_job.finish(ImportPhase::Failed);
+        if let Some(state) = fallback_app.try_state::<AppState>() {
+            state.remember_import_receipt(fallback_job.snapshot());
+        }
         let _ = fallback_app.emit("import-finished", fallback_job.snapshot());
     }
 }

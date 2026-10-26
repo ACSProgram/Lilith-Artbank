@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
     ErrorData, ServerHandler,
@@ -13,10 +15,12 @@ use crate::{
 };
 
 use super::{
+    audit,
     context::ReadContext,
     tools::{
         self, ToolOutcome,
         history::{HistoryListInput, HistoryRunInput},
+        import::{self as import_tool, ImportStartInput},
         read::{
             self, FindSimilarInput, FoldersListInput, ImageSheetInput, ImagesGetInput,
             SearchImagesInput, TagsListInput,
@@ -30,7 +34,7 @@ use super::{
 };
 
 /// 已注册的工具数，由 `library_info` 报给客户端；测试保证它与路由一致。
-const TOOL_COUNT: usize = 20;
+const TOOL_COUNT: usize = 21;
 
 /// 工具适配器只负责取当前 AppState、调用领域函数并把结果编码成 MCP 内容。
 #[derive(Clone)]
@@ -47,34 +51,82 @@ impl McpServer {
         }
     }
 
+    fn mode(&self) -> &'static str {
+        self.app
+            .state::<AppState>()
+            .settings
+            .snapshot()
+            .mcp
+            .mode
+            .as_str()
+    }
+
     /// 在阻塞线程里跑一次工具逻辑：取当前图库快照，再交给领域函数。
-    async fn with_context<T, F>(&self, operation: F) -> Result<AppResult<T>, ErrorData>
+    async fn with_context<T, F>(
+        &self,
+        tool: &'static str,
+        operation: F,
+    ) -> Result<AppResult<T>, ErrorData>
     where
         T: Send + 'static,
         F: FnOnce(&ReadContext, &AiRuntime) -> AppResult<T> + Send + 'static,
     {
+        let started = Instant::now();
+        let mode = self.mode();
         let app = self.app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        let joined = tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
             let context = state.mcp_context()?;
             operation(&context, &state.ai)
         })
-        .await
-        .map_err(|error| ErrorData::internal_error(format!("MCP 工具执行失败：{error}"), None))
+        .await;
+        let elapsed = started.elapsed().as_millis();
+        let result = match joined {
+            Ok(result) => result,
+            Err(error) => {
+                // 线程没能跑完（panic 或运行时关闭）也要留一条审计。
+                let message = format!("MCP 工具执行失败：{error}");
+                audit::tool(tool, mode, elapsed, Err(&message));
+                return Err(ErrorData::internal_error(message, None));
+            }
+        };
+        match &result {
+            Ok(_) => audit::tool(tool, mode, elapsed, Ok(None)),
+            Err(error) => audit::tool(tool, mode, elapsed, Err(&error.to_string())),
+        }
+        Ok(result)
     }
 
     /// 写工具与任务工具需要完整的 `AppState`（任务总线、确认队列、图库句柄）。
-    async fn with_state<F>(&self, operation: F) -> Result<CallToolResult, ErrorData>
+    async fn with_state<F>(
+        &self,
+        tool: &'static str,
+        operation: F,
+    ) -> Result<CallToolResult, ErrorData>
     where
         F: FnOnce(&AppState) -> AppResult<ToolOutcome> + Send + 'static,
     {
+        let started = Instant::now();
+        let mode = self.mode();
         let app = self.app.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || {
+        let joined = tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
             operation(&state)
         })
-        .await
-        .map_err(|error| ErrorData::internal_error(format!("MCP 工具执行失败：{error}"), None))?;
+        .await;
+        let elapsed = started.elapsed().as_millis();
+        let result = match joined {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("MCP 工具执行失败：{error}");
+                audit::tool(tool, mode, elapsed, Err(&message));
+                return Err(ErrorData::internal_error(message, None));
+            }
+        };
+        match &result {
+            Ok(outcome) => audit::tool(tool, mode, elapsed, Ok(Some(&outcome.value))),
+            Err(error) => audit::tool(tool, mode, elapsed, Err(&error.to_string())),
+        }
         Ok(outcome_result(result))
     }
 }
@@ -93,7 +145,9 @@ impl McpServer {
     )]
     async fn library_info(&self) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(|context, _| read::library_info(context, TOOL_COUNT))
+            .with_context("library_info", |context, _| {
+                read::library_info(context, TOOL_COUNT)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -106,7 +160,9 @@ impl McpServer {
         Parameters(input): Parameters<FoldersListInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, _| read::folders_list(context, &input))
+            .with_context("folders_list", move |context, _| {
+                read::folders_list(context, &input)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -119,7 +175,9 @@ impl McpServer {
         Parameters(input): Parameters<TagsListInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, _| read::tags_list(context, &input))
+            .with_context("tags_list", move |context, _| {
+                read::tags_list(context, &input)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -127,7 +185,9 @@ impl McpServer {
     #[tool(description = "列集合及图片数，按用户排序。")]
     async fn collections_list(&self) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(|context, _| read::collections_list(context))
+            .with_context("collections_list", |context, _| {
+                read::collections_list(context)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -140,7 +200,9 @@ impl McpServer {
         Parameters(input): Parameters<SearchImagesInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, _| read::search_images(context, &input))
+            .with_context("search_images", move |context, _| {
+                read::search_images(context, &input)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -153,7 +215,9 @@ impl McpServer {
         Parameters(input): Parameters<FindSimilarInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, ai| read::find_similar(context, ai, &input))
+            .with_context("find_similar", move |context, ai| {
+                read::find_similar(context, ai, &input)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -164,7 +228,9 @@ impl McpServer {
         Parameters(input): Parameters<ImagesGetInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, _| read::images_get(context, &input.ids))
+            .with_context("images_get", move |context, _| {
+                read::images_get(context, &input.ids)
+            })
             .await?;
         Ok(tool_value(result))
     }
@@ -177,7 +243,9 @@ impl McpServer {
         Parameters(input): Parameters<ImageSheetInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = self
-            .with_context(move |context, ai| read::image_sheet(context, ai, &input))
+            .with_context("image_sheet", move |context, ai| {
+                read::image_sheet(context, ai, &input)
+            })
             .await?;
         match result {
             Ok(sheet) => {
@@ -202,8 +270,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<ImagesUpdateInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::images_update(state, &input))
-            .await
+        self.with_state("images_update", move |state| {
+            write::images_update(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -213,8 +283,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<ImagesMoveInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::images_move(state, &input))
-            .await
+        self.with_state("images_move", move |state| {
+            write::images_move(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -224,8 +296,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<ImagesTrashInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::images_trash(state, &input))
-            .await
+        self.with_state("images_trash", move |state| {
+            write::images_trash(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -235,19 +309,23 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<ImagesTrashInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::images_restore(state, &input))
-            .await
+        self.with_state("images_restore", move |state| {
+            write::images_restore(state, &input)
+        })
+        .await
     }
 
     #[tool(
-        description = "创建集合，可选把 selector 解析的图片一起加入（同一次调用只产生一条记录）。带 selector 时正式写入需 confirmedCount；超过 100 张在询问档需确认。"
+        description = "创建集合，可选把 selector 解析的图片一起加入（同一次调用只产生一条记录）。带 selector 时正式写入需 confirmedCount；超过 100 张在询问档需确认。需要向用户展示一组查找结果时，优先用集合而不是复制文件。"
     )]
     async fn collections_create(
         &self,
         Parameters(input): Parameters<CollectionsCreateInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::collections_create(state, &input))
-            .await
+        self.with_state("collections_create", move |state| {
+            write::collections_create(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -257,8 +335,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<CollectionsModifyInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::collections_modify(state, &input))
-            .await
+        self.with_state("collections_modify", move |state| {
+            write::collections_modify(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -268,8 +348,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<CollectionsMembershipInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| write::collections_membership(state, &input))
-            .await
+        self.with_state("collections_membership", move |state| {
+            write::collections_membership(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -279,8 +361,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<HistoryListInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| tools::history::history_list(state, &input))
-            .await
+        self.with_state("history_list", move |state| {
+            tools::history::history_list(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -290,8 +374,10 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<HistoryRunInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| tools::history::history_undo(state, &input))
-            .await
+        self.with_state("history_undo", move |state| {
+            tools::history::history_undo(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -301,18 +387,20 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<HistoryRunInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| tools::history::history_redo(state, &input))
-            .await
+        self.with_state("history_redo", move |state| {
+            tools::history::history_redo(state, &input)
+        })
+        .await
     }
 
     #[tool(
-        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。"
+        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执。"
     )]
     async fn tasks_get(
         &self,
         Parameters(input): Parameters<TasksGetInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| task::tasks_get(state, &input))
+        self.with_state("tasks_get", move |state| task::tasks_get(state, &input))
             .await
     }
 
@@ -323,8 +411,23 @@ impl McpServer {
         &self,
         Parameters(input): Parameters<TasksCancelInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.with_state(move |state| task::tasks_cancel(state, &input))
-            .await
+        self.with_state("tasks_cancel", move |state| {
+            task::tasks_cancel(state, &input)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "从本机绝对路径导入图片或目录，固定不压缩，也不接受 workerThreads。返回 taskId；tasks_get 完成后附带导入回执与 previewIds，整次导入可用 history_undo 撤销。询问档每次都要用户确认，只读档拒绝。"
+    )]
+    async fn import_start(
+        &self,
+        Parameters(input): Parameters<ImportStartInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_state("import_start", move |state| {
+            import_tool::import_start(state, &input)
+        })
+        .await
     }
 }
 
@@ -337,7 +440,7 @@ impl ServerHandler for McpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合，以及查看与撤销/重做操作记录。写入受应用内权限档限制：只读档拒绝全部写入，询问档会把危险或超量操作放入待确认队列；没有永久删除、清空回收站、压缩与导入工具。",
+                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。写入受应用内权限档限制：只读档拒绝全部写入，询问档会把危险或超量操作放入待确认队列；没有永久删除、清空回收站、压缩、像素编辑与批量 AI 生成工具。",
             )
     }
 }
@@ -382,6 +485,7 @@ mod tests {
             "history_redo",
             "tasks_get",
             "tasks_cancel",
+            "import_start",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

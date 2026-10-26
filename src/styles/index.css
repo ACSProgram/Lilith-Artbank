@@ -6267,6 +6267,11 @@ body.is-drag-sorting * {
   color: var(--text-faint);
 }
 
+.mcp-approval-paths span {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+}
+
 .mcp-approval-consequences {
   display: flex;
   flex-direction: column;

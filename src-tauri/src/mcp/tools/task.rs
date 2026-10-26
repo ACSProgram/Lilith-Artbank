@@ -1,7 +1,8 @@
 //! MCP 任务查询与取消。
 //!
 //! `tasks_get` 可以等任务或待确认操作进入终态（单次最多 30 秒）；不带 id 时返回活动任务、
-//! 最近结束的任务与待确认列表。`tasks_cancel` 只能取消 MCP 自己发起的任务或拒绝自己的确认单。
+//! 最近结束的任务与待确认列表。导入任务额外附带回执（统计、预览 id 与失败清单）。
+//! `tasks_cancel` 只能取消 MCP 自己发起的任务或拒绝自己的确认单。
 
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,9 @@ use crate::{
     app::{
         error::{AppError, AppResult},
         state::AppState,
-        tasks::{TaskPhase, TaskSnapshot},
+        tasks::{TaskKind, TaskPhase, TaskSnapshot},
     },
+    import::job::ImportSnapshot,
     mcp::approval::ApprovalView,
 };
 
@@ -64,6 +66,7 @@ pub fn tasks_get(state: &AppState, input: &TasksGetInput) -> AppResult<ToolOutco
     }
     let snapshot = wait_task(state, id, deadline)?;
     Ok(ToolOutcome::value(task_value(
+        state,
         &snapshot,
         include_failures,
         wait_ms > 0,
@@ -95,13 +98,13 @@ fn list_value(state: &AppState, include_failures: bool) -> Value {
     let active = tasks
         .iter()
         .filter(|task| !task.phase.is_terminal())
-        .map(|task| task_value(task, include_failures, false))
+        .map(|task| task_value(state, task, include_failures, false))
         .collect::<Vec<_>>();
     let recent = tasks
         .iter()
         .filter(|task| task.phase.is_terminal())
         .take(RECENT_FINISHED)
-        .map(|task| task_value(task, include_failures, false))
+        .map(|task| task_value(state, task, include_failures, false))
         .collect::<Vec<_>>();
     let approvals = state
         .mcp_approval_views()
@@ -117,7 +120,12 @@ fn list_value(state: &AppState, include_failures: bool) -> Value {
     })
 }
 
-fn task_value(snapshot: &TaskSnapshot, include_failures: bool, waited: bool) -> Value {
+fn task_value(
+    state: &AppState,
+    snapshot: &TaskSnapshot,
+    include_failures: bool,
+    waited: bool,
+) -> Value {
     let mut value = serde_json::to_value(snapshot)
         .unwrap_or_else(|error| json!({ "error": format!("任务快照序列化失败：{error}") }));
     let omitted = !include_failures && !snapshot.failures.is_empty();
@@ -135,8 +143,42 @@ fn task_value(snapshot: &TaskSnapshot, include_failures: bool, waited: bool) -> 
                 Value::Bool(!snapshot.phase.is_terminal()),
             );
         }
+        if snapshot.kind == TaskKind::Import
+            && let Some(receipt) = state.import_receipt(&snapshot.task_id)
+        {
+            object.insert(
+                "import".to_owned(),
+                import_receipt_value(&receipt, include_failures),
+            );
+        }
     }
     value
+}
+
+/// 导入回执只给统计、预览与失败；不返回压缩字段，避免让 AI 以为可以控制压缩。
+fn import_receipt_value(receipt: &ImportSnapshot, include_failures: bool) -> Value {
+    let progress = &receipt.progress;
+    let failure_count = receipt.failures.len();
+    let failures = if include_failures {
+        json!(receipt.failures)
+    } else {
+        Value::Array(Vec::new())
+    };
+    json!({
+        "phase": progress.phase,
+        "total": progress.total,
+        "processed": progress.processed,
+        "imported": progress.imported,
+        "duplicates": progress.duplicates,
+        "merged": progress.merged,
+        "failed": progress.failed,
+        "similar": progress.similar,
+        "previewIds": receipt.preview_ids,
+        "failures": failures,
+        "failureCount": failure_count,
+        "startedAt": receipt.started_at,
+        "finishedAt": receipt.finished_at,
+    })
 }
 
 fn approval_value(view: &ApprovalView) -> Value {
@@ -194,7 +236,7 @@ fn wait_approval(
                 "approval": approval_value(&view),
                 "task": task
                     .as_ref()
-                    .map(|task| task_value(task, include_failures, false)),
+                    .map(|task| task_value(state, task, include_failures, false)),
             });
             if let Value::Object(object) = &mut value {
                 object.insert("waitTimedOut".to_owned(), Value::Bool(!settled));
@@ -202,5 +244,47 @@ fn wait_approval(
             return Ok(value);
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::import::job::ImportJob;
+
+    #[test]
+    fn import_receipt_reports_counts_and_hides_compression() {
+        let job = ImportJob::new("job-1", "1 个路径");
+        job.set_total(10);
+        job.inc_processed();
+        job.inc_imported(3);
+        job.inc_duplicates(2);
+        job.inc_merged(1);
+        job.inc_failed();
+        job.inc_optimized(4, 1024);
+        job.add_preview(7);
+        job.add_preview(8);
+        job.add_failure("a.png", "无法解码");
+
+        let value = import_receipt_value(&job.snapshot(), false);
+        assert_eq!(value["total"], 10);
+        assert_eq!(value["imported"], 3);
+        assert_eq!(value["duplicates"], 2);
+        assert_eq!(value["merged"], 1);
+        assert_eq!(value["failed"], 1);
+        assert_eq!(value["previewIds"], json!([7, 8]));
+        assert_eq!(value["failureCount"], 1);
+        assert_eq!(value["failures"], json!([]));
+        assert!(value.get("optimized").is_none());
+        assert!(value.get("optimizedBytes").is_none());
+    }
+
+    #[test]
+    fn import_receipt_can_include_failures() {
+        let job = ImportJob::new("job-2", "1 个路径");
+        job.add_failure("a.png", "无法解码");
+        let value = import_receipt_value(&job.snapshot(), true);
+        assert_eq!(value["failures"][0]["path"], "a.png");
+        assert_eq!(value["failures"][0]["reason"], "无法解码");
     }
 }

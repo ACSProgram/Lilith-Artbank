@@ -66,6 +66,8 @@ pub struct AppState {
     app: AppHandle,
     library: Mutex<Option<LibrarySession>>,
     import_job: Mutex<Option<Arc<ImportJob>>>,
+    /// 已结束的导入回执；MCP 任务列表在导入结束后仍要能读到统计与预览。
+    import_receipts: Mutex<VecDeque<ImportSnapshot>>,
     managed: AtomicBool,
     recovery: Mutex<RecoveryPlan>,
     optimize_estimates: Arc<Mutex<VecDeque<(String, OptimizeEstimate)>>>,
@@ -77,6 +79,8 @@ pub struct AppState {
 
 /// MCP 能取消的任务只保留最近这些条，足够覆盖一次确认后的等待窗口。
 const MAX_MCP_TASKS: usize = 100;
+/// 导入回执与任务列表保留同样量级，旧的滚动淘汰。
+const MAX_IMPORT_RECEIPTS: usize = 20;
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
@@ -92,6 +96,7 @@ impl AppState {
             app,
             library: Mutex::new(None),
             import_job: Mutex::new(None),
+            import_receipts: Mutex::new(VecDeque::new()),
             managed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryPlan::default()),
             optimize_estimates: Arc::new(Mutex::new(VecDeque::new())),
@@ -143,6 +148,26 @@ impl AppState {
         app: AppHandle,
         request: ImportRequest,
     ) -> AppResult<ImportSnapshot> {
+        self.start_import_inner(app, request, false)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// MCP 导入：与界面导入同一条管线，固定不压缩，并记录 AI 前缀与可取消任务。
+    pub fn start_mcp_import(
+        &self,
+        mut request: ImportRequest,
+    ) -> AppResult<(ImportSnapshot, Option<i64>)> {
+        request.optimize = None;
+        request.worker_threads = None;
+        self.start_import_inner(self.app.clone(), request, true)
+    }
+
+    fn start_import_inner(
+        &self,
+        app: AppHandle,
+        request: ImportRequest,
+        from_mcp: bool,
+    ) -> AppResult<(ImportSnapshot, Option<i64>)> {
         self.ensure_no_activity()?;
         let mut request = request.normalized()?;
         request.worker_threads = self.settings.snapshot().performance.worker_threads;
@@ -165,8 +190,14 @@ impl AppState {
                 request.folder
             )
         };
+        let label = if from_mcp {
+            format!("AI · {label}")
+        } else {
+            label
+        };
         let operation_id =
             history::begin_live(&database, NewOperation::new(HistoryKind::Import, label))?;
+        handle.set_operation_id(Some(operation_id));
         let source = ImportSource {
             database: database.clone(),
             thumbs,
@@ -190,7 +221,29 @@ impl AppState {
             return Err(conflict_error(&active));
         }
         *self.import_job.lock() = Some(job.clone());
-        Ok(job.snapshot())
+        if from_mcp {
+            self.remember_mcp_task(job.id());
+        }
+        Ok((job.snapshot(), Some(operation_id)))
+    }
+
+    /// 导入结束后由导入线程登记；任务列表按任务 id 取回统计与预览。
+    pub fn remember_import_receipt(&self, snapshot: ImportSnapshot) {
+        let mut receipts = self.import_receipts.lock();
+        receipts.retain(|receipt| receipt.progress.job_id != snapshot.progress.job_id);
+        receipts.push_front(snapshot);
+        receipts.truncate(MAX_IMPORT_RECEIPTS);
+    }
+
+    /// 进行中的导入取实时快照，已结束的取回执。
+    pub fn import_receipt(&self, job_id: &str) -> Option<ImportSnapshot> {
+        self.import_status(job_id).or_else(|| {
+            self.import_receipts
+                .lock()
+                .iter()
+                .find(|receipt| receipt.progress.job_id == job_id)
+                .cloned()
+        })
     }
 
     pub fn cancel_import(&self, job_id: &str) -> AppResult<()> {
@@ -344,8 +397,21 @@ impl AppState {
             self.mcp_approvals.fail(id, error.to_string());
             return Err(error);
         }
+        let tool = record.action.tool.clone();
         match crate::mcp::tools::execute_approval(self, &record.action) {
             Ok(outcome) => {
+                let operation = outcome
+                    .value
+                    .get("operationId")
+                    .and_then(Value::as_i64)
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string());
+                crate::mcp::audit::log_line(
+                    "approval",
+                    &format!(
+                        "approval={id} tool={tool} status=approved operation={operation} task={}",
+                        outcome.task_id.as_deref().unwrap_or("-")
+                    ),
+                );
                 if let Some(task_id) = &outcome.task_id {
                     self.remember_mcp_task(task_id);
                     self.mcp_approvals
@@ -363,6 +429,10 @@ impl AppState {
                 Ok(outcome.value)
             }
             Err(error) => {
+                crate::mcp::audit::log_line(
+                    "approval",
+                    &format!("approval={id} tool={tool} status=error error={error}"),
+                );
                 self.mcp_approvals.fail(id, error.to_string());
                 Err(error)
             }
@@ -481,6 +551,7 @@ impl AppState {
         *self.library.lock() = Some(session);
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.import_receipts.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
@@ -506,6 +577,7 @@ impl AppState {
         *self.library.lock() = Some(session);
         *self.recovery.lock() = plan;
         self.optimize_estimates.lock().clear();
+        self.import_receipts.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
@@ -547,6 +619,7 @@ impl AppState {
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.import_receipts.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();

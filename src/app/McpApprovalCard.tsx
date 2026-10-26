@@ -19,6 +19,13 @@ interface ApprovalPreview {
   operation?: string;
   target?: string | null;
   count?: number;
+  /** 导入按输入路径计数，其余写入按图片计数。 */
+  unit?: "path" | "image";
+  pathTotal?: number;
+  paths?: string[];
+  tags?: string[];
+  score?: number;
+  duplicatePolicy?: string;
   selected?: number;
   willChange?: number;
   steps?: number;
@@ -55,12 +62,37 @@ function amountLine(preview: ApprovalPreview): string {
   const count = preview.count ?? preview.selected;
   if (typeof count === "number") {
     const target = preview.target ? ` · ${preview.target}` : "";
-    return `${count.toLocaleString()} 张${target}`;
+    const unit = preview.unit === "path" ? "个路径" : "张";
+    return `${count.toLocaleString()} ${unit}${target}`;
   }
   if (typeof preview.steps === "number") {
     return `${preview.steps.toLocaleString()} 条记录 · 影响 ${(preview.affected ?? 0).toLocaleString()} 张`;
   }
   return "—";
+}
+
+/** 导入卡片的标签/评分/重复策略；三项都没有时不占一行。 */
+function importMeta(preview: ApprovalPreview): string[] {
+  return [
+    preview.tags?.length ? `标签 ${preview.tags.join("、")}` : null,
+    typeof preview.score === "number" && preview.score > 0 ? `评分 ${preview.score} 星` : null,
+    preview.duplicatePolicy
+      ? preview.duplicatePolicy === "merge"
+        ? "重复项合并"
+        : "跳过重复项"
+      : null,
+  ].filter((item): item is string => item !== null);
+}
+
+/** 列表只展开前几条，其余合并成一行。 */
+function Remaining({ total, shown, label }: { total: number; shown: number; label: string }) {
+  const rest = total - shown;
+  if (rest <= 0) return null;
+  return (
+    <li className="mcp-approval-more">
+      其余 {rest.toLocaleString()} {label}
+    </li>
+  );
 }
 
 export function ApprovalCard({
@@ -82,6 +114,8 @@ export function ApprovalCard({
   const preview = readPreview(result?.latest ?? approval.preview);
   const sample = (preview.sample ?? []).slice(0, 5);
   const entries = (preview.entries ?? []).slice(0, 5);
+  const paths = (preview.paths ?? []).slice(0, 5);
+  const meta = importMeta(preview);
   const consequences = preview.consequences ?? [];
   const open = approval.status === "pending";
 
@@ -99,6 +133,29 @@ export function ApprovalCard({
         <span>{formatTime(approval.createdAt)}</span>
       </div>
 
+      {paths.length > 0 ? (
+        <ul className="mcp-approval-sample mcp-approval-paths">
+          {paths.map((path, index) => (
+            <li key={`${path}-${index}`}>
+              <span title={path}>{path}</span>
+            </li>
+          ))}
+          <Remaining
+            total={preview.pathTotal ?? preview.paths?.length ?? 0}
+            shown={paths.length}
+            label="个路径未展开"
+          />
+        </ul>
+      ) : null}
+
+      {meta.length > 0 ? (
+        <div className="mcp-approval-meta">
+          {meta.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+
       {sample.length > 0 ? (
         <ul className="mcp-approval-sample">
           {sample.map((item) => (
@@ -108,11 +165,11 @@ export function ApprovalCard({
               {typeof item.score === "number" ? <em>{item.score} 星</em> : null}
             </li>
           ))}
-          {(preview.sample?.length ?? 0) > sample.length ? (
-            <li className="mcp-approval-more">
-              其余 {(preview.sample?.length ?? 0) - sample.length} 张未展开
-            </li>
-          ) : null}
+          <Remaining
+            total={preview.sample?.length ?? 0}
+            shown={sample.length}
+            label="张未展开"
+          />
         </ul>
       ) : null}
 
@@ -125,11 +182,11 @@ export function ApprovalCard({
               <em>{entry.affected.toLocaleString()} 张</em>
             </li>
           ))}
-          {(preview.entries?.length ?? 0) > entries.length ? (
-            <li className="mcp-approval-more">
-              另有 {(preview.entries?.length ?? 0) - entries.length} 条记录
-            </li>
-          ) : null}
+          <Remaining
+            total={preview.entries?.length ?? 0}
+            shown={entries.length}
+            label="条记录"
+          />
         </ul>
       ) : null}
 

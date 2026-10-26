@@ -158,7 +158,7 @@ fn mcp_mode(state: &AppState) -> McpMode {
     state.settings.snapshot().mcp.mode
 }
 
-fn ensure_writable(state: &AppState) -> AppResult<McpMode> {
+pub(super) fn ensure_writable(state: &AppState) -> AppResult<McpMode> {
     let mode = mcp_mode(state);
     if mode == McpMode::ReadOnly {
         return Err(AppError::message(
@@ -326,7 +326,7 @@ fn guide_preview(
     })
 }
 
-fn enqueue_approval<T: Serialize>(
+pub(super) fn enqueue_approval<T: Serialize>(
     state: &AppState,
     tool: &str,
     title: String,

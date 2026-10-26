@@ -14,7 +14,7 @@
 - 找相似、相似分组、pHash/主色/embedding/pose 相似度：读 `docs/modules/ai-service.md` 的“本地检索”，再进入 `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`。
 - 清理、缩略图重建、描述导入导出：读 `docs/modules/maintenance.md`。
 - 图片空间优化（估算与执行）：读 `docs/modules/maintenance.md` 的“图片空间优化”，再进入 `src-tauri/src/imageops/optimize.rs`、`src-tauri/src/library/optimize_estimate.rs`、`src-tauri/src/library/optimize.rs`、`src-tauri/src/app/state.rs`、`src/app/OptimizeDialog.tsx`。
-- MCP 服务、stdio 小桥、读写工具、三档权限、确认队列、selector 与拼图：读 `docs/modules/mcp.md`，再进入 `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx`。
+- MCP 服务、stdio 小桥、读写工具、导入与审计、三档权限、确认队列、selector 与拼图：读 `docs/modules/mcp.md`，再进入 `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx`。
 - 构建、测试、性能基准：读 `docs/guides/validation.md`、`docs/guides/performance.md`。
 - 当前阶段状态与未完成事项：读 `docs/planning/current-handoff.md`、`docs/planning/todo.md`；阶段划分看 `docs/planning/roadmap.md`。
 

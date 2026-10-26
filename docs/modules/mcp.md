@@ -1,6 +1,6 @@
 # MCP 图库控制
 
-支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库。批次 1（只读）与批次 2（写工具、撤销/重做、询问档、任务工具）已实现；导入与审计日志属于批次 3，当前没有 `import_start`。
+支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库。批次 1（只读）、批次 2（写工具、撤销/重做、询问档、任务工具）与批次 3（导入、导入回执、`logs/mcp.log` 审计）已实现。
 
 传输与进程：
 
@@ -36,13 +36,13 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 | 档位 | 行为 |
 | --- | --- |
-| `readOnly` | 写工具、`history_undo` / `history_redo` 返回“当前是只读模式”；只读工具与 `history_list`、`tasks_get` 可用。 |
-| `ask` | 回收站、撤销/重做、以及**影响超过 100 张**的批量写入进入待确认队列；其余写入直接执行。 |
+| `readOnly` | 写工具、`import_start`、`history_undo` / `history_redo` 返回“当前是只读模式”；只读工具与 `history_list`、`tasks_get` 可用。 |
+| `ask` | 导入、回收站、撤销/重做、以及**影响超过 100 张**的批量写入进入待确认队列；其余写入直接执行。 |
 | `full` | 不弹应用内确认，直接执行；`confirmedCount`、撤销/重做数量核对仍然保留。 |
 
 只读档不隐藏写工具，客户端缓存的 `tools/list` 不会因为切换档位失效。
 
-## 工具（20 个）
+## 工具（21 个）
 
 ### 只读（8）
 
@@ -61,6 +61,8 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `find_similar` 的 `total` 是截断前的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。
+- AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本，当前没有导出工具。
+- `find_similar` 当前没有范围参数、临时文件夹也还没有实现；两者分别排在批次 4、批次 5，见 [MCP 计划](../planning/2026-10-25-MCP图库控制计划.md)。
 
 ### 写入（7）
 
@@ -98,12 +100,24 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 | 工具 | 关键输入 | 返回 |
 | --- | --- | --- |
-| `tasks_get` | `taskId?`、`waitMs≤30000`、`includeFailures?` | 任务快照；不带 id 时返回活动任务、最近结束的任务与待确认列表 |
+| `tasks_get` | `taskId?`、`waitMs≤30000`、`includeFailures?` | 任务快照；导入任务附带回执；不带 id 时返回活动任务、最近结束的任务与待确认列表 |
 | `tasks_cancel` | `taskId` | — |
 
 - `tasks_get` 传 `approvalId` 时等待用户批准/拒绝，并附带关联任务的状态；批准后启动的任务要用同一 `approvalId` 或任务 id 继续轮询。
 - `tasks_cancel` 只允许取消 MCP 自己发起的任务；用户从界面启动的任务不能由 AI 取消。传 `approvalId` 等同于拒绝。
 - 任务快照的可选 `operationId` 在写入记录产生后出现；进行中通常为空。
+- 导入任务额外附带 `import` 回执：`imported`、`duplicates`、`merged`、`failed`、`similar`、`previewIds`、`startedAt`、`finishedAt` 与失败清单。回执不返回 `optimized` / `optimizedBytes`，MCP 不能控制压缩。`previewIds` 最多 25 张，可直接作为 `image_sheet` 的 `selector.ids`。
+
+### 导入（1）
+
+| 工具 | 关键输入 | 返回 |
+| --- | --- | --- |
+| `import_start` | 本机绝对路径、目标文件夹、`folderMode: flat/preserve`、标签、评分、`duplicatePolicy: skip/merge` | `taskId`、`pathCount`、`target`、`operationId`、`compressed: false` |
+
+- 导入固定 `optimize = None`，不接受 `workerThreads`；即使请求里带了这两个字段也不透传。
+- 单次最多 10000 个输入路径；扫描阶段最多处理 100000 个文件，超出时只处理前面的文件并记一条失败。
+- 询问档每次导入都要确认；确认卡展开前 5 条来源路径、其余只给数量，并列出目标文件夹、标签、评分与重复策略。只读档拒绝。
+- 导入完成后整次导入可以用 `history_undo` 撤销；新写入会清空重做分支的规则不变。
 
 ## 选择器
 
@@ -143,6 +157,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 询问档的拦截条件：
 
+- `import_start`（不论路径数）；
 - `images_trash`（不论张数）；
 - `history_undo`、`history_redo`（不论条数）；
 - 任何解析出超过 100 张图片的批量写入（更新、移动、恢复、集合创建/成员变更）。
@@ -156,12 +171,22 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 异步任务继续用 `task-progress` / `task-finished`；`TaskCenterProvider` 在 `task-finished` 时递增数据版本。
 - 设置 → MCP 面板监听 `mcp-approval-changed` 与 `library-changed`，刷新待确认与最近 AI 操作。
 
+## 审计日志
+
+`logs/mcp.log` 记录：
+
+- 每次工具调用的工具名、档位、结果状态、`selected` / `affected` / `operationId` / `taskId` 与耗时；阻塞线程异常终止也记一条 `status=error`。错误只写可读错误文本，不写返回值或整份参数。
+- 导入来源单独一行：档位、目标文件夹、任务号、操作记录号、路径总数与前 20 个来源路径。总数写在路径之前，单行截断只会切掉路径尾部。
+- 询问档的批准与执行结果；stdio 小桥的启动、连接错误与退出。
+- 单行最长 600 字符，换行会被压成空格。设置页的“最近 AI 操作”仍从操作记录里筛选 `AI ·` 标题，不解析日志文件。
+
 ## 安全与限制
 
 - 只绑定环回地址；缺少或错误的 Bearer 口令返回 HTTP 401。
 - 应用未运行、MCP 服务未开启、图库未打开时，工具返回可读错误。
-- 不提供永久删除、清空回收站、图片空间优化、像素编辑、批量 AI 生成、图库打开/关闭、设置修改、导入（批次 3）。
-- `readOnly` 档拒绝全部写入与撤销/重做；`full` 档不弹确认，但仍有数量核对与上述能力边界。
+- 不提供永久删除、清空回收站、图片空间优化、像素编辑、批量 AI 生成、图库打开/关闭与设置修改。
+- 导入接受任意本机绝对路径，不做目录白名单；询问档必须确认，`full` 档会在设置页提示这一能力。导入固定不压缩，来源路径写入 `logs/mcp.log`。
+- `readOnly` 档拒绝全部写入、导入与撤销/重做；`full` 档不弹确认，但仍有数量核对与上述能力边界。
 - 不新建 headless 产品模式；便携包仍然只有一个 exe。
 - 运行时文件是本地凭据，不要提交或分享；`.gitignore` 已排除 `mcp-runtime.json`。
 
@@ -173,15 +198,17 @@ Rust：
 - `src-tauri/src/mcp/bridge.rs`：`--mcp-stdio` 逐行代理，维护协商版本。
 - `src-tauri/src/mcp/server.rs`：rmcp 工具适配器、工具描述与工具注册。
 - `src-tauri/src/mcp/approval.rs`：待确认队列、状态与 10 分钟过期。
+- `src-tauri/src/mcp/audit.rs`：`logs/mcp.log` 工具调用与导入来源审计。
 - `src-tauri/src/mcp/selection.rs`：selector 解析（分页与全量 id）、排除与去重。
 - `src-tauri/src/mcp/sheet.rs`：拼图映射缓存与缩略图/原图读取。
 - `src-tauri/src/mcp/tools/read.rs`：只读工具。
 - `src-tauri/src/mcp/tools/write.rs`：写工具、数量核对、询问判定与写后事件。
 - `src-tauri/src/mcp/tools/history.rs`：记录列表、撤销/重做预览与批准执行。
-- `src-tauri/src/mcp/tools/task.rs`：任务与确认单查询、等待与取消。
+- `src-tauri/src/mcp/tools/task.rs`：任务与确认单查询、等待、取消与导入回执。
+- `src-tauri/src/mcp/tools/import.rs`：导入输入校验、固定不压缩、确认预览与任务启动。
 - `src-tauri/src/library/history.rs`：`write_with_id`、`prefix_label`、`preview_undo` / `preview_redo`。
 - `src-tauri/src/library/metadata.rs`、`collections.rs`：带 `operationId` 的写入口与 `create_with_images`。
-- `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、`library-changed`、批准执行入口。
+- `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀。
 - `src-tauri/src/app/commands.rs`：`list_mcp_approvals`、`approve_mcp_approval`、`reject_mcp_approval`。
 - `src-tauri/src/imageops/contact_sheet.rs`：拼图布局、编号与 JPEG 编码。
 - `src-tauri/src/library/similarity.rs`、`ai/embedding.rs`、`ai/pose.rs`：相似扫描返回截断前的命中总数（`*_with_total`）。
@@ -191,14 +218,14 @@ Rust：
 
 - `src/app/types.ts`、`src/app/api.ts`：MCP 确认单类型与三个命令；`AppInfo.exePath` 供客户端配置使用。
 - `src/app/McpPanel.tsx`：设置 → MCP 的三档、待确认与最近 AI 操作。
-- `src/app/McpApprovalCard.tsx`：确认卡片、全局非模态宿主、`useApprovalActions` 与 `mcp-approval-changed` 监听。
+- `src/app/McpApprovalCard.tsx`：确认卡片（导入额外显示来源路径、标签/评分与重复策略）、全局非模态宿主、`useApprovalActions` 与 `mcp-approval-changed` 监听。
 - `src/app/TaskCenterProvider.tsx`：挂载确认卡片宿主，并在 `library-changed` 时推进数据版本。
 - `src/app/LibraryWorkspace.tsx`：监听 `library-changed`，在 `closeViewer` 为真时关闭查看器。
 - `src/app/taskTypes.ts`：任务快照的 `operationId`。
 
 ## 验证
 
-自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量、临时图库只读工具。
+自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量（21）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、审计单行截断、导入缩略图预览上限 25。
 
 真实客户端验收需要用户执行：
 
@@ -210,3 +237,7 @@ Rust：
 6. 对一条记录 `history_list` → `history_undo` dryRun → 带 steps/affected 执行，确认任务中心进度与撤销结果；再重做。压缩记录应返回“压缩操作不可撤销”。
 7. 启动一次导入/优化后调用写工具，确认得到明确冲突错误；用 `tasks_get` 查看活动任务。
 8. 关闭 MCP 服务，确认客户端收到明确连接错误；重启应用后确认 `mcp-runtime.json` 已更新。
+9. 询问档调用 `import_start` 导入几张图片，确认右下角与设置页出现确认卡，卡片列出来源路径、目标文件夹、标签/评分与重复策略；批准后任务开始，拒绝或超时则不导入。
+10. `tasks_get(taskId)` 等到导入完成，确认附带回执的 `imported` / `duplicates` / `merged` / `previewIds` 与失败清单；用 `image_sheet(selector.ids=previewIds)` 看到刚入库的图。
+11. 对这次导入 `history_list` → `history_undo`，确认整次导入被撤销；确认 `logs/mcp.log` 有工具调用与导入来源行，且没有压缩字段或压缩行为。
+12. 从便携目录启动 exe（含 `server/`，不含安装器），重复第 2 步，确认 `--mcp-stdio` 指向当前 exe 且能正常调用 `library_info` 和 `import_start`。

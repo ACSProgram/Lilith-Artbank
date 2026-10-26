@@ -1,4 +1,5 @@
 pub mod history;
+pub mod import;
 pub mod read;
 pub mod task;
 pub mod write;
@@ -50,6 +51,7 @@ pub fn execute_approval(state: &AppState, action: &ApprovalAction) -> AppResult<
         }
         "history_undo" => history::execute_undo(state, &parse(&action.arguments)?),
         "history_redo" => history::execute_redo(state, &parse(&action.arguments)?),
+        "import_start" => import::execute_import(state, &parse(&action.arguments)?),
         other => Err(AppError::message(format!("未知的待确认工具：{other}"))),
     }
 }

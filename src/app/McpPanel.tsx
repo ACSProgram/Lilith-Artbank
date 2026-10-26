@@ -21,7 +21,7 @@ const MODE_CHOICES: { value: McpMode; label: string; hint: string }[] = [
   {
     value: "ask",
     label: "询问",
-    hint: "回收站、撤销/重做和超过 100 张的批量写入需要你确认。",
+    hint: "导入、回收站、撤销/重做和超过 100 张的批量写入需要你确认。",
   },
   {
     value: "full",
@@ -195,8 +195,8 @@ export function McpPanel({
         <div className="mcp-warning">
           <ShieldAlert size={15} />
           <span>
-            AI 可以修改、移动、移入回收站并撤销你自己的操作记录，且不会再逐条询问。
-            没有永久删除、清空回收站与压缩工具。
+            AI 可以读取任意本机路径并导入图片（不会压缩），可以修改、移动、移入回收站并撤销
+            你自己的操作记录，且不会再逐条询问。没有永久删除、清空回收站、压缩与像素编辑工具。
           </span>
         </div>
       ) : null}

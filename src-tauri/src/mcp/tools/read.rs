@@ -147,7 +147,10 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
                 "maxSearchPage": MAX_SEARCH_PAGE,
                 "maxSheetCells": u32::from(contact_sheet::MAX_GRID).pow(2),
                 "maxImageIdsPerGet": MAX_IMAGE_IDS,
+                "maxImportPaths": 10_000,
+                "maxImportFiles": 100_000,
                 "sheetTtlMinutes": SHEET_TTL_MINUTES,
+                "importCompresses": false,
             }
         }
     }))
@@ -984,11 +987,13 @@ mod tests {
     #[test]
     fn library_info_reports_mode_and_limits() {
         let fixture = fixture();
-        let value = library_info(&fixture.context, 20).unwrap();
+        let value = library_info(&fixture.context, 21).unwrap();
         assert_eq!(value["counts"]["images"], 3);
         assert_eq!(value["mcp"]["mode"], "ask");
         assert_eq!(value["mcp"]["writeTools"], true);
         assert_eq!(value["mcp"]["approvalThreshold"], 100);
         assert_eq!(value["mcp"]["limits"]["maxSheetCells"], 25);
+        assert_eq!(value["mcp"]["limits"]["maxImportPaths"], 10_000);
+        assert_eq!(value["mcp"]["limits"]["importCompresses"], false);
     }
 }

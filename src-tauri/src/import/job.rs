@@ -13,7 +13,8 @@ use crate::{
 
 const MAX_FAILURES: usize = 200;
 const MAX_HINTS: usize = 100;
-const MAX_PREVIEWS: usize = 24;
+/// 与拼图最大格数一致，导入完成后可以直接拼一张 5×5。
+const MAX_PREVIEWS: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -309,6 +310,18 @@ mod tests {
         assert!(value.get("finishedAt").is_some());
         assert!(value.get("previewIds").unwrap().is_array());
         assert!(value.get("progress").is_none());
+    }
+
+    #[test]
+    fn preview_ids_keep_the_latest_25() {
+        let job = ImportJob::new("job-1", "1 个路径");
+        for id in 1..=30 {
+            job.add_preview(id);
+        }
+        let previews = job.snapshot().preview_ids;
+        assert_eq!(previews.len(), MAX_PREVIEWS);
+        assert_eq!(previews.first(), Some(&6));
+        assert_eq!(previews.last(), Some(&30));
     }
 
     #[test]
