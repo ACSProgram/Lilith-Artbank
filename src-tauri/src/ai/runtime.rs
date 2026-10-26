@@ -148,7 +148,10 @@ pub struct SemanticSearchResult {
     pub token: String,
     pub model: String,
     pub dim: u32,
+    /// 缓存下来、可分页与全选的结果条数（受 limit 截断）。
     pub total: usize,
+    /// 截断前的命中总数。
+    pub total_hits: usize,
     pub elapsed_ms: i64,
     pub mean_count: u64,
 }
@@ -166,7 +169,10 @@ pub struct SimilarityPage {
 pub struct ImageSimilarityResult {
     pub token: String,
     pub kind: String,
+    /// 缓存下来、可分页与全选的结果条数（受 limit 截断）。
     pub total: usize,
+    /// 截断前的命中总数。
+    pub total_hits: usize,
     pub elapsed_ms: i64,
 }
 
@@ -210,7 +216,8 @@ struct ResultCache {
     token: String,
     generation: u64,
     library_id: String,
-    ids: Vec<i64>,
+    /// 已按相似度排好序的命中；phash/color 是距离（越小越近），其余是相似度（越大越近）。
+    hits: Vec<(i64, f32)>,
 }
 
 struct Inner {
@@ -539,9 +546,13 @@ impl AiRuntime {
         let handles = self.handles()?;
         let started = Instant::now();
         let client = AiClient::new(&settings.base_url);
-        let health = client
-            .health()
-            .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
+        let health = client.health().map_err(|error| {
+            if error.transport {
+                AppError::message("AI 服务未启动或无法连接，请先在应用设置里启动 AI 服务")
+            } else {
+                AppError::message(format!("AI 服务不可用：{error}"))
+            }
+        })?;
         // 语义搜索只需要文本塔；图片模型名与维度直接从 health 读取，
         // 避免为了拿维度而把图片塔加载进显存。
         let image_capability = health
@@ -583,7 +594,7 @@ impl AiRuntime {
         }
         let mean = self.ensure_mean(&handles, &image_model, dim)?;
         let limit = limit.unwrap_or(embedding::DEFAULT_SEARCH_LIMIT);
-        let results = embedding::search(
+        let (hits, total_hits) = embedding::search_with_total(
             &handles.database,
             &self.inner.store,
             &image_model,
@@ -593,18 +604,19 @@ impl AiRuntime {
             limit,
         )?;
         let token = uuid::Uuid::new_v4().to_string();
-        let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
+        let returned = hits.len();
         *self.inner.results.lock() = Some(ResultCache {
             token: token.clone(),
             generation: handles.generation,
             library_id: handles.library_id.clone(),
-            ids: ids.clone(),
+            hits,
         });
         Ok(SemanticSearchResult {
             token,
             model: image_model,
             dim,
-            total: ids.len(),
+            total: returned,
+            total_hits,
             elapsed_ms: started.elapsed().as_millis() as i64,
             mean_count: mean.count,
         })
@@ -625,7 +637,7 @@ impl AiRuntime {
         let limit = limit
             .unwrap_or(library_similarity::DEFAULT_LIMIT)
             .clamp(1, library_similarity::MAX_LIMIT);
-        let ids: Vec<i64> = match kind {
+        let (hits, total_hits): (Vec<(i64, f32)>, usize) = match kind {
             "phash" => {
                 let target = library_similarity::target_visuals(&handles.database, target_id)?;
                 let threshold = threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD);
@@ -633,16 +645,18 @@ impl AiRuntime {
                     return Err(AppError::message("pHash 阈值超出 0-256"));
                 }
                 let index = self.visual_index(&handles)?;
-                index
-                    .similar_phash(
-                        crate::imageops::phash::words(&target.phash),
-                        threshold,
-                        limit,
-                        target_id,
-                    )
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect()
+                let (hit, total) = index.similar_phash_with_total(
+                    crate::imageops::phash::words(&target.phash),
+                    threshold,
+                    limit,
+                    target_id,
+                );
+                (
+                    hit.into_iter()
+                        .map(|(id, distance)| (id, distance as f32))
+                        .collect(),
+                    total,
+                )
             }
             "color4" | "color8" => {
                 let target = library_similarity::target_visuals(&handles.database, target_id)?;
@@ -658,37 +672,31 @@ impl AiRuntime {
                         crate::imageops::colors::prepare_palette::<8>(&target.colors8).to_vec(),
                     )
                 };
-                index
-                    .similar_color(&prepared, palette, limit, target_id)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect()
+                index.similar_color_with_total(&prepared, palette, limit, target_id)
             }
             "embedding" => self.similar_ids_by_embedding(&handles, target_id, limit)?,
             "pose" => {
                 // pose 记录没有自己的可见性标记，只确认目标图未被移入回收站。
                 library_similarity::ensure_visible(&handles.database, target_id)?;
-                pose::similar(&handles.database, &self.inner.store, target_id, limit)?
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect()
+                pose::similar_with_total(&handles.database, &self.inner.store, target_id, limit)?
             }
             other => {
                 return Err(AppError::message(format!("未知的相似度类型：{other}")));
             }
         };
-        let total = ids.len();
+        let returned = hits.len();
         let token = uuid::Uuid::new_v4().to_string();
         *self.inner.results.lock() = Some(ResultCache {
             token: token.clone(),
             generation: handles.generation,
             library_id: handles.library_id.clone(),
-            ids,
+            hits,
         });
         Ok(ImageSimilarityResult {
             token,
             kind: kind.to_owned(),
-            total,
+            total: returned,
+            total_hits,
             elapsed_ms: started.elapsed().as_millis() as i64,
         })
     }
@@ -712,11 +720,11 @@ impl AiRuntime {
         handles: &LibraryHandles,
         target_id: i64,
         limit: usize,
-    ) -> AppResult<Vec<i64>> {
+    ) -> AppResult<(Vec<(i64, f32)>, usize)> {
         let target = embedding::target(&handles.database, &self.inner.store, target_id)?
             .ok_or_else(|| AppError::message("这张图片还没有 embedding，请先运行 AI 任务"))?;
         let mean = self.ensure_mean(handles, &target.model, target.dim)?;
-        Ok(embedding::similar_to(
+        embedding::similar_to_with_total(
             &handles.database,
             &self.inner.store,
             &target.model,
@@ -725,10 +733,7 @@ impl AiRuntime {
             &mean.vector,
             target_id,
             limit,
-        )?
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect())
+        )
     }
 
     /// 全库相似分组：两种指标可以单独启用，也可以同时启用（同时满足才归组）。
@@ -886,8 +891,23 @@ impl AiRuntime {
                     && cache.generation == handles.generation
                     && cache.library_id == handles.library_id
             })
-            .map(|cache| cache.ids.clone())
+            .map(|cache| cache.hits.iter().map(|(id, _)| *id).collect())
             .ok_or_else(|| AppError::message("相似结果已失效，请重新搜索"))
+    }
+
+    /// 当前相似结果的 id → 分数表；token 失效时返回空表，由调用方决定怎么提示。
+    pub fn similarity_scores(&self, token: &str) -> AppResult<std::collections::HashMap<i64, f32>> {
+        let handles = self.handles()?;
+        let cache = self.inner.results.lock();
+        Ok(cache
+            .as_ref()
+            .filter(|cache| {
+                cache.token == token
+                    && cache.generation == handles.generation
+                    && cache.library_id == handles.library_id
+            })
+            .map(|cache| cache.hits.iter().copied().collect())
+            .unwrap_or_default())
     }
 
     fn handles(&self) -> AppResult<LibraryHandles> {

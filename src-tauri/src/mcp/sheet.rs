@@ -111,6 +111,9 @@ pub struct SheetSlot {
 #[serde(rename_all = "camelCase")]
 pub struct SheetCellOutput {
     pub label: String,
+    /// 以拼图格子为来源时记录来源标签；输出标签始终按新拼图布局编号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
     pub image_id: Option<i64>,
     pub width: Option<i64>,
     pub height: Option<i64>,
@@ -175,6 +178,7 @@ pub fn build(
             pointers.push(None);
             cells.push(SheetCellOutput {
                 label: slot.label.clone(),
+                source_label: None,
                 image_id: None,
                 width: None,
                 height: None,
@@ -192,6 +196,7 @@ pub fn build(
         pointers.push(pointer);
         cells.push(SheetCellOutput {
             label: slot.label.clone(),
+            source_label: None,
             image_id: Some(row.id),
             width: Some(row.width),
             height: Some(row.height),

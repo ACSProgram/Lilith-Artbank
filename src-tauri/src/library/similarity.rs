@@ -109,6 +109,7 @@ impl VisualIndex {
         Ok(visual_stamp(database)? == self.stamp)
     }
 
+    #[cfg(test)]
     pub fn similar_phash(
         &self,
         target: [u64; 4],
@@ -116,6 +117,18 @@ impl VisualIndex {
         limit: usize,
         exclude: i64,
     ) -> Vec<(i64, u32)> {
+        self.similar_phash_with_total(target, threshold, limit, exclude)
+            .0
+    }
+
+    /// 与 [`Self::similar_phash`] 相同，同时返回截断前的命中总数。
+    pub fn similar_phash_with_total(
+        &self,
+        target: [u64; 4],
+        threshold: u32,
+        limit: usize,
+        exclude: i64,
+    ) -> (Vec<(i64, u32)>, usize) {
         let mut scored = Vec::new();
         for row in &self.rows {
             if row.id == exclude {
@@ -126,11 +139,13 @@ impl VisualIndex {
                 scored.push((row.id, distance));
             }
         }
+        let total = scored.len();
         scored.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
         scored.truncate(limit.clamp(1, MAX_LIMIT));
-        scored
+        (scored, total)
     }
 
+    #[cfg(test)]
     pub fn similar_color(
         &self,
         target: &[LabColor],
@@ -138,6 +153,18 @@ impl VisualIndex {
         limit: usize,
         exclude: i64,
     ) -> Vec<(i64, f32)> {
+        self.similar_color_with_total(target, palette, limit, exclude)
+            .0
+    }
+
+    /// 与 [`Self::similar_color`] 相同，同时返回截断前的命中总数。
+    pub fn similar_color_with_total(
+        &self,
+        target: &[LabColor],
+        palette: ColorPalette,
+        limit: usize,
+        exclude: i64,
+    ) -> (Vec<(i64, f32)>, usize) {
         let mut scored = Vec::new();
         for row in &self.rows {
             if row.id == exclude {
@@ -152,6 +179,7 @@ impl VisualIndex {
             }
             scored.push((row.id, colors::prepared_distance(target, candidate)));
         }
+        let total = scored.len();
         scored.sort_by(|left, right| {
             left.1
                 .partial_cmp(&right.1)
@@ -159,7 +187,7 @@ impl VisualIndex {
                 .then_with(|| left.0.cmp(&right.0))
         });
         scored.truncate(limit.clamp(1, MAX_LIMIT));
-        scored
+        (scored, total)
     }
 
     /// 全库 pHash 相似对分组；索引已常驻，不再读库。

@@ -11,7 +11,7 @@
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
 | description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/`、`server/` |
 | 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts` |
-| MCP 服务、stdio 小桥、只读工具、selector、拼图 | `docs/modules/mcp.md` | `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/SettingsDialog.tsx` |
+| MCP 服务、stdio 小桥、读写工具、三档权限、确认队列、selector、拼图 | `docs/modules/mcp.md` | `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx` |
 | 清理、缩略图重建、描述导入导出、图片空间优化（估算与执行） | `docs/modules/maintenance.md`（图片空间优化） | `src-tauri/src/` 对应领域模块；空间优化在 `imageops/optimize.rs`、`library/optimize_estimate.rs`、`library/optimize.rs`、`src/app/OptimizeDialog.tsx` |
 | 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
 | 当前阶段/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |

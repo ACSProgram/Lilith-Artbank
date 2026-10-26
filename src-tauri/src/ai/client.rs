@@ -16,6 +16,8 @@ const ENSURE_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct AiError {
     pub message: String,
     pub retryable: bool,
+    /// 连接层失败（进程未启动、端口未监听等）；面向外部的文案不应带出内部地址与 OS 错误。
+    pub transport: bool,
 }
 
 impl AiError {
@@ -23,6 +25,7 @@ impl AiError {
         Self {
             message: message.into(),
             retryable: true,
+            transport: true,
         }
     }
 
@@ -30,6 +33,7 @@ impl AiError {
         Self {
             message: message.into(),
             retryable: (500..=599).contains(&code),
+            transport: false,
         }
     }
 
@@ -37,6 +41,7 @@ impl AiError {
         Self {
             message: message.into(),
             retryable: false,
+            transport: false,
         }
     }
 }

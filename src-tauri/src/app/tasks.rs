@@ -151,6 +151,8 @@ pub struct TaskSnapshot {
     pub finished_at: Option<i64>,
     pub failures: Vec<TaskFailure>,
     pub cancellable: bool,
+    /// 这条任务最终写入的操作记录 id；任务进行中通常为空。
+    pub operation_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +185,7 @@ pub struct TaskHandle {
     failures: Mutex<Vec<TaskFailure>>,
     started_at: i64,
     finished_at: Mutex<Option<i64>>,
+    operation_id: Mutex<Option<i64>>,
 }
 
 impl TaskHandle {
@@ -204,7 +207,12 @@ impl TaskHandle {
             failures: Mutex::new(Vec::new()),
             started_at: now_ms(),
             finished_at: Mutex::new(None),
+            operation_id: Mutex::new(None),
         })
+    }
+
+    pub fn set_operation_id(&self, operation_id: Option<i64>) {
+        *self.operation_id.lock() = operation_id;
     }
 
     pub fn id(&self) -> &str {
@@ -348,6 +356,7 @@ impl TaskHandle {
             finished_at: *self.finished_at.lock(),
             failures: self.failures.lock().clone(),
             cancellable: self.is_cancellable(),
+            operation_id: *self.operation_id.lock(),
         }
     }
 

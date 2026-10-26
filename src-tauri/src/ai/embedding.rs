@@ -163,6 +163,7 @@ pub fn target(
 
 /// 目标图 embedding 相似：中心化余弦降序，排除目标图自身。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn similar_to(
     database: &LibraryDb,
     store: &FeatureStore,
@@ -173,10 +174,28 @@ pub fn similar_to(
     exclude: i64,
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
-    let mut results = search(database, store, model, dim, target, mean, limit + 1)?;
+    similar_to_with_total(database, store, model, dim, target, mean, exclude, limit)
+        .map(|(items, _)| items)
+}
+
+/// 与 [`similar_to`] 相同，同时返回排除目标图后的命中总数。
+#[allow(clippy::too_many_arguments)]
+pub fn similar_to_with_total(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    target: &[f32],
+    mean: &[f32],
+    exclude: i64,
+    limit: usize,
+) -> AppResult<(Vec<(i64, f32)>, usize)> {
+    let (mut results, total) =
+        search_with_total(database, store, model, dim, target, mean, limit + 1)?;
     results.retain(|(id, _)| *id != exclude);
     results.truncate(limit);
-    Ok(results)
+    // 目标图自己的向量一定参与扫描，总数减掉它。
+    Ok((results, total.saturating_sub(1)))
 }
 
 pub struct DuplicateGroups {
@@ -446,6 +465,7 @@ pub fn mean(
 }
 
 /// 中心化余弦：cosine(v - mean, q - mean)。计算全程 f32。
+#[cfg(test)]
 pub fn search(
     database: &LibraryDb,
     store: &FeatureStore,
@@ -455,11 +475,25 @@ pub fn search(
     mean: &[f32],
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
+    search_with_total(database, store, model, dim, query, mean, limit).map(|(items, _)| items)
+}
+
+/// 返回相似度降序结果，同时返回截断前的命中总数。
+pub fn search_with_total(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    query: &[f32],
+    mean: &[f32],
+    limit: usize,
+) -> AppResult<(Vec<(i64, f32)>, usize)> {
     let rows = rows(database, model, dim)?;
-    search_rows(store, rows, dim, query, mean, limit)
+    search_rows_with_total(store, rows, dim, query, mean, limit)
 }
 
 /// 向量扫描只依赖行指针与 pack，不访问数据库；便于基准与后续复用。
+#[cfg(test)]
 pub fn search_rows(
     store: &FeatureStore,
     rows: Vec<EmbeddingRow>,
@@ -468,12 +502,24 @@ pub fn search_rows(
     mean: &[f32],
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
+    search_rows_with_total(store, rows, dim, query, mean, limit).map(|(items, _)| items)
+}
+
+/// 与 [`search_rows`] 相同，同时返回截断前的命中总数。
+pub fn search_rows_with_total(
+    store: &FeatureStore,
+    rows: Vec<EmbeddingRow>,
+    dim: u32,
+    query: &[f32],
+    mean: &[f32],
+    limit: usize,
+) -> AppResult<(Vec<(i64, f32)>, usize)> {
     if query.len() != dim as usize || mean.len() != dim as usize {
         return Err(AppError::message("查询向量与模型维度不一致"));
     }
     let query = normalize_f32(query)?;
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let dim_usize = dim as usize;
     let mut dot_qq = 0.0_f32;
@@ -527,13 +573,14 @@ pub fn search_rows(
     }
 
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
+    let total = scored.len();
     if scored.len() > limit {
         // 只做部分选择再排序，避免为取 top-K 对全量结果排序。
         scored.select_nth_unstable_by(limit, by_score_desc);
         scored.truncate(limit);
     }
     scored.sort_by(by_score_desc);
-    Ok(scored)
+    Ok((scored, total))
 }
 
 fn by_score_desc(left: &(i64, f32), right: &(i64, f32)) -> std::cmp::Ordering {

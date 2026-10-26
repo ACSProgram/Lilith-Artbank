@@ -121,12 +121,23 @@ pub fn load(
 /// 扫描同一模型的 pose 记录并按相似度降序返回；结果排除目标图自身。
 ///
 /// 每个特征包只 mmap 一次再逐条切片，不为单条记录重复打开文件。
+#[cfg(test)]
 pub fn similar(
     database: &LibraryDb,
     store: &FeatureStore,
     target_id: i64,
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
+    similar_with_total(database, store, target_id, limit).map(|(items, _)| items)
+}
+
+/// 与 [`similar`] 相同，同时返回截断前的命中总数。
+pub fn similar_with_total(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    target_id: i64,
+    limit: usize,
+) -> AppResult<(Vec<(i64, f32)>, usize)> {
     let target = load(database, store, target_id)?
         .ok_or_else(|| AppError::message("这张图片还没有姿势数据，请先生成姿势"))?;
     let target_pose = SimilarityPose::from_landmarks(&target.landmarks);
@@ -189,8 +200,9 @@ pub fn similar(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.0.cmp(&right.0))
     });
+    let total = scored.len();
     scored.truncate(limit.clamp(1, MAX_LIMIT));
-    Ok(scored)
+    Ok((scored, total))
 }
 
 fn decode_landmarks(bytes: &[u8]) -> Vec<PoseLandmark> {

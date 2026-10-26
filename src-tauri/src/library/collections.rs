@@ -66,10 +66,29 @@ pub fn list(database: &LibraryDb) -> AppResult<Vec<CollectionInfo>> {
 }
 
 pub fn create(database: &LibraryDb, name: &str) -> AppResult<CollectionInfo> {
+    create_with_images(database, name, &[]).map(|(info, _, _)| info)
+}
+
+/// 建集合并在同一事务里加入图片；只产生一条操作记录。
+pub fn create_with_images(
+    database: &LibraryDb,
+    name: &str,
+    image_ids: &[i64],
+) -> AppResult<(CollectionInfo, u64, Option<i64>)> {
     let name = validate_name(name)?;
-    history::write(
+    let ids = if image_ids.is_empty() {
+        Vec::new()
+    } else {
+        validate_ids(image_ids, MAX_IMAGES)?
+    };
+    let label = if ids.is_empty() {
+        format!("创建集合「{name}」")
+    } else {
+        format!("创建集合「{name}」（{} 张）", ids.len())
+    };
+    history::write_with_id(
         database,
-        NewOperation::new(HistoryKind::CollectionCreate, format!("创建集合「{name}」")),
+        NewOperation::new(HistoryKind::CollectionCreate, label),
         |transaction, draft| {
             ensure_unique_name(transaction, &name, None)?;
             let sort_order = next_sort_order(transaction)?;
@@ -80,31 +99,59 @@ pub fn create(database: &LibraryDb, name: &str) -> AppResult<CollectionInfo> {
                 params![name, sort_order, now],
             )?;
             let id = transaction.last_insert_rowid();
+            let mut items = Vec::new();
+            if !ids.is_empty() {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO collection_items(collection_id, image_id, position)
+                     SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM images WHERE id = ?2)
+                     ON CONFLICT(collection_id, image_id) DO NOTHING",
+                )?;
+                let mut position = 0_i64;
+                for image_id in &ids {
+                    let changed = statement.execute(params![id, image_id, position])?;
+                    if changed > 0 {
+                        items.push((*image_id, position));
+                        position += 1;
+                    }
+                }
+            }
             draft.json(&CollectionSnapshot {
                 id,
                 name: name.clone(),
                 sort_order,
                 created_at: now,
                 updated_at: now,
-                items: Vec::new(),
+                items: items.clone(),
             })?;
-            draft.affected(1);
-            Ok(CollectionInfo {
-                id,
-                name: name.clone(),
-                sort_order,
-                image_count: 0,
-                created_at: now,
-                updated_at: now,
-            })
+            draft.affected(1 + items.len() as u64);
+            Ok((
+                CollectionInfo {
+                    id,
+                    name: name.clone(),
+                    sort_order,
+                    image_count: items.len() as u64,
+                    created_at: now,
+                    updated_at: now,
+                },
+                items.len() as u64,
+            ))
         },
     )
+    .map(|((info, added), operation_id)| (info, added, operation_id))
 }
 
 pub fn rename(database: &LibraryDb, collection_id: i64, name: &str) -> AppResult<()> {
+    rename_with_id(database, collection_id, name).map(|(_, _)| ())
+}
+
+pub fn rename_with_id(
+    database: &LibraryDb,
+    collection_id: i64,
+    name: &str,
+) -> AppResult<((), Option<i64>)> {
     validate_id(collection_id)?;
     let name = validate_name(name)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(
             HistoryKind::CollectionRename,
@@ -141,9 +188,13 @@ pub fn rename(database: &LibraryDb, collection_id: i64, name: &str) -> AppResult
 }
 
 pub fn delete(database: &LibraryDb, collection_id: i64) -> AppResult<u64> {
+    delete_with_id(database, collection_id).map(|(affected, _)| affected)
+}
+
+pub fn delete_with_id(database: &LibraryDb, collection_id: i64) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
     let name = collection_name(database, collection_id)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::CollectionDelete, format!("删除集合「{name}」")),
         |transaction, draft| {
@@ -197,10 +248,18 @@ pub fn reorder(database: &LibraryDb, collection_ids: &[i64]) -> AppResult<()> {
 }
 
 pub fn add_images(database: &LibraryDb, collection_id: i64, image_ids: &[i64]) -> AppResult<u64> {
+    add_images_with_id(database, collection_id, image_ids).map(|(added, _)| added)
+}
+
+pub fn add_images_with_id(
+    database: &LibraryDb,
+    collection_id: i64,
+    image_ids: &[i64],
+) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
     let ids = validate_ids(image_ids, MAX_IMAGES)?;
     let name = collection_name(database, collection_id)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::CollectionAdd, format!("加入集合「{name}」")),
         |transaction, draft| {
@@ -254,10 +313,18 @@ pub fn remove_images(
     collection_id: i64,
     image_ids: &[i64],
 ) -> AppResult<u64> {
+    remove_images_with_id(database, collection_id, image_ids).map(|(removed, _)| removed)
+}
+
+pub fn remove_images_with_id(
+    database: &LibraryDb,
+    collection_id: i64,
+    image_ids: &[i64],
+) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
     let ids = validate_ids(image_ids, MAX_IMAGES)?;
     let name = collection_name(database, collection_id)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::CollectionRemove, format!("移出集合「{name}」")),
         |transaction, draft| {

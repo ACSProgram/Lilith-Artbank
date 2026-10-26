@@ -10,7 +10,8 @@ use std::{
 
 use parking_lot::Mutex;
 use rusqlite::OptionalExtension;
-use tauri::AppHandle;
+use serde_json::Value;
+use tauri::{AppHandle, Emitter};
 
 use crate::{
     ai::{
@@ -46,8 +47,16 @@ use crate::{
         thumbs::{self, ThumbPack},
         viewer::PoseData,
     },
-    mcp::{context::ReadContext, runtime::McpRuntime, sheet::SheetCache},
+    mcp::{
+        approval::{ApprovalQueue, ApprovalView},
+        context::ReadContext,
+        runtime::McpRuntime,
+        sheet::SheetCache,
+    },
 };
+
+/// MCP 同步写入成功后通知前端刷新；载荷包含来源、操作记录 id 与是否需要关闭查看器。
+pub const LIBRARY_CHANGED_EVENT: &str = "library-changed";
 
 pub struct AppState {
     pub settings: SettingsStore,
@@ -61,13 +70,20 @@ pub struct AppState {
     recovery: Mutex<RecoveryPlan>,
     optimize_estimates: Arc<Mutex<VecDeque<(String, OptimizeEstimate)>>>,
     mcp_sheets: Arc<Mutex<SheetCache>>,
+    mcp_write: Arc<Mutex<()>>,
+    mcp_approvals: Arc<ApprovalQueue>,
+    mcp_tasks: Arc<Mutex<VecDeque<String>>>,
 }
+
+/// MCP 能取消的任务只保留最近这些条，足够覆盖一次确认后的等待窗口。
+const MAX_MCP_TASKS: usize = 100;
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 
 impl AppState {
     pub fn new(settings: SettingsStore, app: AppHandle) -> Self {
+        let mcp_approvals = Arc::new(ApprovalQueue::new(app.clone()));
         Self {
             settings,
             ai: AiRuntime::new(),
@@ -80,6 +96,9 @@ impl AppState {
             recovery: Mutex::new(RecoveryPlan::default()),
             optimize_estimates: Arc::new(Mutex::new(VecDeque::new())),
             mcp_sheets: Arc::new(Mutex::new(SheetCache::default())),
+            mcp_write: Arc::new(Mutex::new(())),
+            mcp_approvals,
+            mcp_tasks: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -220,6 +239,10 @@ impl AppState {
 
     /// 设置保存后按新的 MCP 配置重启服务；关闭时删除运行时文件。
     pub fn apply_mcp_settings(&self, settings: &crate::app::settings::McpSettings) {
+        // 关闭服务或切到只读后，旧确认单已经不能执行，直接丢弃，避免留下点不动的卡片。
+        if !settings.enabled || settings.mode == crate::app::settings::McpMode::ReadOnly {
+            self.mcp_approvals.clear();
+        }
         self.mcp.apply(self.app.clone(), settings);
     }
 
@@ -245,6 +268,204 @@ impl AppState {
         })
     }
 
+    /// MCP 写入在本进程内串行；与任务总线无关，只保护多个客户端同时调用。
+    pub(crate) fn lock_mcp_writes(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.mcp_write.lock()
+    }
+
+    /// 短写入立即占用 write lane；任何在跑的任务（导入、移动、编辑、优化、撤销/重做）都会拒绝。
+    pub(crate) fn acquire_write_lane(&self) -> AppResult<LaneGuard> {
+        self.tasks.acquire_immediate(TaskLane::Write)
+    }
+
+    /// MCP 同步写入后的统一收尾：失效页面缓存与相似结果，裁剪记录，再通知前端刷新。
+    pub(crate) fn after_mcp_write(&self, payload: Value, invalidate_similarity: bool) {
+        query::clear_page_cache();
+        if invalidate_similarity {
+            self.ai.invalidate_similarity();
+        }
+        self.after_history_write();
+        let _ = self.app.emit(LIBRARY_CHANGED_EVENT, payload);
+    }
+
+    pub(crate) fn mcp_approvals(&self) -> Arc<ApprovalQueue> {
+        self.mcp_approvals.clone()
+    }
+
+    /// 待确认与执行中的列表；绑定任务的状态按任务总线实时推导。
+    pub fn mcp_approval_views(&self) -> Vec<ApprovalView> {
+        use crate::mcp::approval::ApprovalStatus;
+        let snapshots = self.tasks.list();
+        self.mcp_approvals
+            .list()
+            .into_iter()
+            .map(|mut view| {
+                if view.status == ApprovalStatus::Running
+                    && let Some(task_id) = view.task_id.as_deref()
+                    && let Some(task) = snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.task_id == task_id)
+                {
+                    match task.phase {
+                        TaskPhase::Completed => view.status = ApprovalStatus::Completed,
+                        TaskPhase::Failed => {
+                            view.status = ApprovalStatus::Failed;
+                            if view.error.is_none() {
+                                view.error = Some(task.message.clone());
+                            }
+                        }
+                        TaskPhase::Cancelled => {
+                            view.status = ApprovalStatus::Failed;
+                            view.error = Some("任务已取消".to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+                view
+            })
+            .collect()
+    }
+
+    pub fn reject_mcp_approval(&self, id: &str) -> AppResult<()> {
+        self.mcp_approvals.reject(id)
+    }
+
+    /// 用户批准后执行；写操作重新解析 selector 并核对数量，变化时只返回错误，不落库。
+    pub fn approve_mcp_approval(&self, id: &str) -> AppResult<Value> {
+        let record = self.mcp_approvals.begin(id)?;
+        let settings = self.settings.snapshot().mcp;
+        if !settings.enabled {
+            let error = AppError::message("MCP 服务已关闭，不能执行待确认操作");
+            self.mcp_approvals.fail(id, error.to_string());
+            return Err(error);
+        }
+        if settings.mode == crate::app::settings::McpMode::ReadOnly {
+            let error = AppError::message("当前是只读模式，MCP 写入已关闭");
+            self.mcp_approvals.fail(id, error.to_string());
+            return Err(error);
+        }
+        match crate::mcp::tools::execute_approval(self, &record.action) {
+            Ok(outcome) => {
+                if let Some(task_id) = &outcome.task_id {
+                    self.remember_mcp_task(task_id);
+                    self.mcp_approvals
+                        .attach_task(id, task_id, outcome.value.clone());
+                } else if outcome.value["status"] == "rejected" {
+                    // 执行前复核失败（数量或状态变化）不是成功，也不能让确认单看起来已完成。
+                    let reason = outcome.value["reason"]
+                        .as_str()
+                        .unwrap_or("执行前核对未通过");
+                    self.mcp_approvals
+                        .fail_with(id, reason, Some(outcome.value.clone()));
+                } else {
+                    self.mcp_approvals.complete(id, outcome.value.clone());
+                }
+                Ok(outcome.value)
+            }
+            Err(error) => {
+                self.mcp_approvals.fail(id, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn remember_mcp_task(&self, task_id: &str) {
+        let mut tasks = self.mcp_tasks.lock();
+        if tasks.iter().any(|id| id == task_id) {
+            return;
+        }
+        tasks.push_back(task_id.to_owned());
+        while tasks.len() > MAX_MCP_TASKS {
+            tasks.pop_front();
+        }
+    }
+
+    pub(crate) fn is_mcp_task(&self, task_id: &str) -> bool {
+        self.mcp_tasks.lock().iter().any(|id| id == task_id)
+    }
+
+    /// MCP 发起的移动：后台任务，完成后任务快照带 `operationId`。
+    pub fn start_mcp_move_task(
+        &self,
+        image_ids: Vec<i64>,
+        folder_path: String,
+    ) -> AppResult<TaskStartResult> {
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let scope = format!("{} 张", image_ids.len());
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::FolderMove,
+            scope,
+        );
+        let task_id = handle.id().to_owned();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let ai = self.ai.clone();
+        let launched = self.tasks.launch(
+            self.app.clone(),
+            handle,
+            ConflictPolicy::Fail,
+            move |guard| {
+                let database = database.clone();
+                let root = root.clone();
+                let task = worker.clone();
+                let tasks = tasks.clone();
+                let ai = ai.clone();
+                let _ = tasks.spawn_worker("mcp-move".to_owned(), task.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    task.set_phase(TaskPhase::Running);
+                    let result = metadata::move_images_with_id(
+                        &database,
+                        &root,
+                        &image_ids,
+                        &folder_path,
+                        &*task,
+                    );
+                    match &result {
+                        Ok((report, operation_id)) => {
+                            if let Some(operation_id) = operation_id {
+                                let _ = history::prefix_label(&database, *operation_id, "AI · ");
+                            }
+                            task.set_operation_id(*operation_id);
+                            let mut summary =
+                                format!("移动 {} 张，跳过 {} 张", report.moved, report.skipped);
+                            if !report.failures.is_empty() {
+                                summary.push_str(&format!("，失败 {} 张", report.failures.len()));
+                            }
+                            task.set_message(summary);
+                        }
+                        Err(error) => task.set_message(error.to_string()),
+                    }
+                    query::clear_page_cache();
+                    ai.invalidate_similarity();
+                    task.finish_from(&result.map(|_| ()));
+                });
+            },
+        )?;
+        if matches!(launched, TaskStartResult::Started { .. }) {
+            self.remember_mcp_task(&task_id);
+        }
+        Ok(launched)
+    }
+
+    pub fn mcp_undo_to(&self, target_id: i64) -> AppResult<TaskStartResult> {
+        let result = self.undo_to(target_id)?;
+        if let TaskStartResult::Started { task } = &result {
+            self.remember_mcp_task(&task.task_id);
+        }
+        Ok(result)
+    }
+
+    pub fn mcp_redo_to(&self, target_id: i64) -> AppResult<TaskStartResult> {
+        let result = self.redo_to(target_id)?;
+        if let TaskStartResult::Started { task } = &result {
+            self.remember_mcp_task(&task.task_id);
+        }
+        Ok(result)
+    }
+
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
         self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
@@ -261,6 +482,7 @@ impl AppState {
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.mcp_approvals.clear();
         query::clear_page_cache();
         Ok(info)
     }
@@ -285,6 +507,7 @@ impl AppState {
         *self.recovery.lock() = plan;
         self.optimize_estimates.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.mcp_approvals.clear();
         query::clear_page_cache();
         if self.managed.load(Ordering::SeqCst) {
             self.after_library_open();
@@ -325,6 +548,7 @@ impl AppState {
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.mcp_approvals.clear();
         query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())

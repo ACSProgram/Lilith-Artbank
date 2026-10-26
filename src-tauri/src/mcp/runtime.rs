@@ -63,9 +63,25 @@ pub struct McpStatus {
 
 struct Running {
     port: u16,
+    token: String,
+    started_at: i64,
     cancel: CancellationToken,
     /// 服务任务退出时收到一次通知；`stop()` 用它等端口释放。
     stopped: Receiver<()>,
+}
+
+impl Running {
+    /// 复用当前监听与口令，只替换档位；档位只影响后续工具调用。
+    fn runtime_file(&self, mode: McpMode) -> RuntimeFile {
+        RuntimeFile {
+            version: RUNTIME_VERSION,
+            port: self.port,
+            token: self.token.clone(),
+            pid: std::process::id(),
+            started_at: self.started_at,
+            mode,
+        }
+    }
 }
 
 struct Inner {
@@ -94,10 +110,37 @@ impl McpRuntime {
         }
     }
 
-    /// 设置保存或启动时调用：先停旧服务，再按新设置决定是否启动。
+    /// 设置保存或启动时调用：端口或开关变化才重启服务。
     ///
+    /// 只改档位时保留监听与口令，避免已连接的客户端因口令轮换而全部 401。
     /// 端口被占用等启动失败只记录在状态里，不影响设置保存。
     pub fn apply(&self, app: AppHandle, settings: &McpSettings) {
+        let running = self.inner.running.lock();
+        if let Some(running) = running.as_ref()
+            && settings.enabled
+            && running.port == settings.port
+        {
+            match write_runtime(
+                &paths::mcp_runtime_path(),
+                &running.runtime_file(settings.mode),
+            ) {
+                Ok(()) => {
+                    *self.inner.last_error.lock() = None;
+                    log::info!(
+                        "MCP 设置已应用（档位 {}，端口 {}，口令不变）",
+                        settings.mode.as_str(),
+                        running.port
+                    );
+                }
+                Err(error) => {
+                    log::warn!("更新 MCP 运行时文件失败：{error}");
+                    *self.inner.last_error.lock() = Some(error.to_string());
+                }
+            }
+            return;
+        }
+        drop(running);
+
         self.stop();
         if !settings.enabled {
             *self.inner.last_error.lock() = None;
@@ -127,13 +170,14 @@ impl McpRuntime {
         })?;
 
         let token = new_token();
+        let started_at = chrono::Local::now().timestamp_millis();
         let runtime_path = paths::mcp_runtime_path();
         let runtime = RuntimeFile {
             version: RUNTIME_VERSION,
             port: settings.port,
             token: token.clone(),
             pid: std::process::id(),
-            started_at: chrono::Local::now().timestamp_millis(),
+            started_at,
             mode: settings.mode,
         };
         write_runtime(&runtime_path, &runtime)?;
@@ -151,6 +195,8 @@ impl McpRuntime {
         });
         *self.inner.running.lock() = Some(Running {
             port: settings.port,
+            token,
+            started_at,
             cancel,
             stopped,
         });
@@ -544,5 +590,23 @@ mod tests {
         let rebound =
             TcpListener::bind(("127.0.0.1", port)).expect("停止后应能立刻重新监听同一端口");
         drop(rebound);
+    }
+
+    #[test]
+    fn mode_change_keeps_port_and_token() {
+        let (stopped_tx, stopped) = channel();
+        drop(stopped_tx);
+        let running = Running {
+            port: 18767,
+            token: "token".to_owned(),
+            started_at: 42,
+            cancel: CancellationToken::new(),
+            stopped,
+        };
+        let file = running.runtime_file(McpMode::ReadOnly);
+        assert_eq!(file.port, 18767);
+        assert_eq!(file.token, "token");
+        assert_eq!(file.started_at, 42);
+        assert_eq!(file.mode, McpMode::ReadOnly);
     }
 }

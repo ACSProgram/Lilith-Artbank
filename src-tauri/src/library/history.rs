@@ -682,6 +682,16 @@ pub fn write<T>(
     op: NewOperation<'_>,
     work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
 ) -> AppResult<T> {
+    write_with_id(database, op, work).map(|(value, _)| value)
+}
+
+/// 与 [`write`] 相同，但返回新建记录的 id；没有产生记录（空操作）时为 `None`。
+/// MCP 写入用它在工具结果里给出 `operationId`。
+pub fn write_with_id<T>(
+    database: &LibraryDb,
+    op: NewOperation<'_>,
+    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
+) -> AppResult<(T, Option<i64>)> {
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // 新的写入开启新时间线：被撤销的灰记录与它们的暂存文件都不再可重做。
@@ -699,15 +709,16 @@ pub fn write<T>(
         let value = work(&transaction, &mut draft)?;
         if draft.affected == 0 && draft.chunks.is_empty() {
             // 事务随 drop 回滚。
-            return Ok(value);
+            return Ok((value, None));
         }
         transaction.execute(
             "UPDATE operations SET status = 'applied', affected = ?1 WHERE id = ?2",
             params![draft.affected as i64, draft.id],
         )?;
         insert_chunks(&transaction, draft.id, &draft.chunks)?;
+        let operation_id = draft.id;
         transaction.commit()?;
-        Ok(value)
+        Ok((value, Some(operation_id)))
     })
 }
 
@@ -805,6 +816,17 @@ pub fn update_label(database: &LibraryDb, operation_id: i64, label: &str) -> App
     })
 }
 
+/// 在记录标题前加来源前缀（MCP 写入用“AI · ”）；不改表结构。
+pub fn prefix_label(database: &LibraryDb, operation_id: i64, prefix: &str) -> AppResult<()> {
+    database.with_writer(|connection| {
+        connection.execute(
+            "UPDATE operations SET label = ?1 || label WHERE id = ?2",
+            params![prefix, operation_id],
+        )?;
+        Ok(())
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
@@ -880,6 +902,162 @@ pub fn list(database: &LibraryDb) -> AppResult<Vec<HistoryEntry>> {
             })
             .collect()
     })
+}
+
+/// 撤销/重做前的回退清单：会动几条、合计影响数、逐条记录与阻塞原因。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationPreview {
+    pub target_id: i64,
+    pub steps: u64,
+    pub affected: u64,
+    pub entries: Vec<HistoryEntry>,
+    pub blocked_reason: Option<String>,
+}
+
+type OperationRow = (i64, String, String, i64, i64, String, String);
+
+fn read_operation_rows(
+    database: &LibraryDb,
+    sql: &str,
+    target_id: i64,
+) -> AppResult<Vec<OperationRow>> {
+    database.with_reader(|connection| {
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement
+            .query_map([target_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+}
+
+fn operation_entry(row: &OperationRow) -> AppResult<HistoryEntry> {
+    Ok(HistoryEntry {
+        id: row.0,
+        kind: HistoryKind::parse(&row.1)?,
+        label: row.2.clone(),
+        created_at: row.3,
+        affected: row.4.max(0) as u64,
+        status: OperationStatus::parse(&row.5)?,
+        error: row.6.clone(),
+    })
+}
+
+/// 与 `run_undo` 相同的目标与线性链判定，但不写数据库。
+pub fn preview_undo(database: &LibraryDb, target_id: i64) -> AppResult<OperationPreview> {
+    let rows = read_operation_rows(
+        database,
+        "SELECT id, kind, label, created_at, affected, status, error
+         FROM operations WHERE id >= ?1 ORDER BY id DESC",
+        target_id,
+    )?;
+    let target = rows
+        .iter()
+        .find(|row| row.0 == target_id)
+        .ok_or_else(|| AppError::message("操作记录不存在"))?;
+    match OperationStatus::parse(&target.5)? {
+        OperationStatus::Applied => {}
+        OperationStatus::UndoFailed => {
+            return Err(AppError::message(
+                "这条记录上次撤销失败，需要先处理失败原因",
+            ));
+        }
+        OperationStatus::Undone | OperationStatus::Redoing => {
+            return Err(AppError::message("这条记录已经撤销，可以重做"));
+        }
+        OperationStatus::Pending | OperationStatus::Undoing => {
+            return Err(AppError::message("只能撤销已经完成的操作"));
+        }
+    }
+    if rows
+        .iter()
+        .any(|row| row.0 >= target_id && row.5 == OperationStatus::UndoFailed.as_str())
+    {
+        return Err(AppError::message(
+            "之后有一条记录上次撤销失败，不能继续回退；请先处理失败原因或清空记录",
+        ));
+    }
+    if rows.iter().any(|row| {
+        row.0 >= target_id && matches!(row.5.as_str(), "undone" | "redoing") && !row.6.is_empty()
+    }) {
+        return Err(AppError::message(
+            "之后有一条记录上次重做失败，不能继续回退；请先重试重做或清空记录",
+        ));
+    }
+
+    let selected = rows
+        .iter()
+        .filter(|row| matches!(row.5.as_str(), "applied" | "undoing"))
+        .map(operation_entry)
+        .collect::<AppResult<Vec<_>>>()?;
+    if selected.is_empty() {
+        return Err(AppError::message("没有可撤销的记录"));
+    }
+    Ok(build_preview(target_id, selected))
+}
+
+/// 与 `run_redo` 相同的连续 `undone` 链判定，但不写数据库。
+pub fn preview_redo(database: &LibraryDb, target_id: i64) -> AppResult<OperationPreview> {
+    let rows = read_operation_rows(
+        database,
+        "SELECT id, kind, label, created_at, affected, status, error
+         FROM operations WHERE id <= ?1 ORDER BY id DESC",
+        target_id,
+    )?;
+    let target = rows
+        .first()
+        .filter(|row| row.0 == target_id)
+        .ok_or_else(|| AppError::message("操作记录不存在"))?;
+    match OperationStatus::parse(&target.5)? {
+        OperationStatus::Undone | OperationStatus::Redoing => {}
+        OperationStatus::Applied => {
+            return Err(AppError::message("这条记录还没有撤销，不能重做"));
+        }
+        OperationStatus::UndoFailed => {
+            return Err(AppError::message(
+                "这条记录上次撤销失败，需要先处理失败原因",
+            ));
+        }
+        OperationStatus::Pending | OperationStatus::Undoing => {
+            return Err(AppError::message("只能重做已经撤销的操作"));
+        }
+    }
+    let selected = rows
+        .iter()
+        .take_while(|row| matches!(row.5.as_str(), "undone" | "redoing"))
+        .map(operation_entry)
+        .collect::<AppResult<Vec<_>>>()?;
+    if selected.is_empty() {
+        return Err(AppError::message("没有可重做的记录"));
+    }
+    // 重做按时间从早到晚执行；预览也按这个顺序给出。
+    let mut selected = selected;
+    selected.reverse();
+    Ok(build_preview(target_id, selected))
+}
+
+fn build_preview(target_id: i64, entries: Vec<HistoryEntry>) -> OperationPreview {
+    let blocked_reason = entries
+        .iter()
+        .any(|entry| entry.kind == HistoryKind::Optimize)
+        .then(|| "压缩操作不可撤销，原图已删除".to_owned());
+    OperationPreview {
+        target_id,
+        steps: entries.len() as u64,
+        affected: entries.iter().map(|entry| entry.affected).sum(),
+        entries,
+        blocked_reason,
+    }
 }
 
 pub fn pending_summary(database: &LibraryDb) -> AppResult<(u64, u64)> {
@@ -4006,7 +4184,7 @@ mod tests {
     use super::*;
     use crate::{
         app::tasks::TaskKind,
-        library::{NoopReporter, collections, import::ensure_folder, service},
+        library::{NoopReporter, collections, import::ensure_folder, metadata, service},
     };
 
     struct Fixture {
@@ -5426,5 +5604,111 @@ mod tests {
             .find(|collection| collection.name == "相似组 2")
             .unwrap();
         assert_eq!(collection_items(fixture.db(), group_two.id), vec![third]);
+    }
+
+    #[test]
+    fn preview_reports_steps_affected_and_blocks_optimize() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("preview");
+        let (_, first) = metadata::set_scores_with_id(fixture.db(), &[image], 3).unwrap();
+        let first = first.unwrap();
+        let (_, second) = metadata::set_scores_with_id(fixture.db(), &[image], 4).unwrap();
+        let second = second.unwrap();
+
+        let preview = preview_undo(fixture.db(), second).unwrap();
+        assert_eq!(preview.steps, 1);
+        assert_eq!(preview.affected, 1);
+        assert_eq!(preview.entries[0].id, second);
+        assert!(preview.blocked_reason.is_none());
+
+        let preview = preview_undo(fixture.db(), first).unwrap();
+        assert_eq!(preview.steps, 2);
+        assert_eq!(preview.affected, 2);
+        assert_eq!(preview.entries[0].id, second);
+
+        // 模拟两条都已撤销，重做目标取较新的一条，会连续重做两条。
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute("UPDATE operations SET status = 'undone', undone_at = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let preview = preview_redo(fixture.db(), second).unwrap();
+        assert_eq!(preview.steps, 2);
+        assert_eq!(preview.affected, 2);
+        assert_eq!(preview.entries[0].id, first);
+        assert_eq!(preview.entries[1].id, second);
+
+        let optimize_id = fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO operations(kind, label, created_at, status, affected, error)
+                     VALUES ('optimize', '优化图片空间', 2, 'applied', 5, '')",
+                    [],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE operations SET status = 'applied', undone_at = NULL WHERE id IN (?1, ?2)",
+                    params![first, second],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let preview = preview_undo(fixture.db(), first).unwrap();
+        assert_eq!(preview.steps, 3);
+        assert_eq!(preview.affected, 7);
+        assert_eq!(
+            preview.blocked_reason.as_deref(),
+            Some("压缩操作不可撤销，原图已删除")
+        );
+        assert!(preview.entries.iter().any(|entry| entry.id == optimize_id));
+    }
+
+    #[test]
+    fn write_with_id_returns_new_id_and_none_for_noop() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("write-id");
+        let (_, operation) = metadata::set_scores_with_id(fixture.db(), &[image], 2).unwrap();
+        let operation = operation.unwrap();
+        assert_eq!(
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT affected FROM operations WHERE id = ?1",
+                        [operation],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap(),
+            1
+        );
+
+        let collection = collections::create(fixture.db(), "无改动").unwrap();
+        let (_, none) = collections::rename_with_id(fixture.db(), collection.id, "无改动").unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn description_write_reports_changed_count_and_skips_identical_text() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("description");
+        let (changed, operation) =
+            metadata::update_description_with_id(fixture.db(), image, "  新描述  ").unwrap();
+        assert_eq!(changed, 1);
+        assert!(operation.is_some());
+
+        // 同样的手写描述不再产生记录，也不会报成一次改动。
+        let (changed, operation) =
+            metadata::update_description_with_id(fixture.db(), image, "新描述").unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(operation, None);
     }
 }

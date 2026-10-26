@@ -1,7 +1,7 @@
 # 当前阶段状态
 
-日期：2026-10-25
-阶段：**MCP 图库控制批次 1（只读）已完成（2026-10-26），待真实 MCP 客户端验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
+日期：2026-10-26
+阶段：**MCP 图库控制批次 1（只读）与批次 2（写工具、撤销/重做、询问档）已完成（2026-10-26），真实客户端主体已通过，剩余复测项见“真实客户端实测”；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。图片空间优化批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
 历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
 
@@ -54,7 +54,7 @@
 - `src-tauri/src/mcp/tools/read.rs`、`selection.rs`、`sheet.rs`：结构化查询与总数、浏览器同款筛选/排序/游标、query/ids/sheet/similarity selector、`excludeIds`/`excludeCells`、缺失 id、相似结果单槽失效；拼图映射缓存 128 份、TTL 2 小时，只存格子与图片 id。
 - `src-tauri/src/imageops/contact_sheet.rs`：1–5 格拼图，长边约 1600px、等比 contain、深灰背景、内置 5×7 位图字体编号 A1–E5、缺图占位、JPEG 88；`thumb` 读缩略图包，`detail` 直接解码原图且最多 3×3。两种清晰度都按格子逐张解码，画完即释放。
 - 设置 v6：新增 `mcp { enabled, port, mode }`，默认关闭、18767、ask；v5→v6 迁移补默认值。设置页新增 MCP 分类（开关、端口、运行状态、只读说明）。
-- 与计划的差异：批次 1 没有注册任何写工具，因此 `library_info` 的实际 `mode` 固定为 `readOnly`，`configuredMode` 单独返回；`library_info` 的 AI 部分只报配置与特征数量，不做会阻塞的 live health 检查；`find_similar` 的 `threshold` 只对 pHash 生效，其余相似度沿用现有实现；拼图同时实现了 `detail` 清晰度。
+- 与计划的差异：批次 1 没有注册任何写工具，因此 `library_info` 的实际 `mode` 固定为 `readOnly`，`configuredMode` 单独返回（批次 2 起 `mode` 直接返回当前档位，`configuredMode` 已删除）；`library_info` 的 AI 部分只报配置与特征数量，不做会阻塞的 live health 检查；`find_similar` 的 `threshold` 只对 pHash 生效，其余相似度沿用现有实现；拼图同时实现了 `detail` 清晰度。
 - 测试：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector、搜索总数与分页、临时图库只读工具、拼图布局/缺图/缓存、相似 token 失效、bridge SSE/版本解析。
 - 未做：真实 MCP 客户端与 `--mcp-stdio` 小桥实测；真实窗口设置页状态；批次 2 的写工具、询问档、撤销/重做；批次 3 的导入与审计日志。
 
@@ -70,6 +70,70 @@
 - 文档纠正：`mcp.md` 与计划里的运行时文件写入时机、bridge session id、随机端口、拼图编码格式；设置页分类数改为七个。
 
 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（244 通过、5 ignored）、`cargo clippy --all-targets`（7 条警告都位于本批次未修改的 `library/edit.rs` 与 `library/history.rs`）、`npm run typecheck`、`npm run test:web`（21 通过）、`npm run build`、`git diff --check`。
+
+## MCP 图库控制批次 2（2026-10-26）
+
+写工具、撤销/重做与三档行为；导入与 `logs/mcp.log` 审计仍属批次 3。
+
+- 工具总数 20：8 个只读 + `images_update` / `images_move` / `images_trash` / `images_restore` / `collections_create` / `collections_modify` / `collections_membership` + `history_list` / `history_undo` / `history_redo` + `tasks_get` / `tasks_cancel`。写工具仍然注册，只读档调用时返回可读错误。
+- 三档：`readOnly` 拒绝全部写入与撤销/重做；`ask` 只拦回收站、撤销/重做与超过 100 张的批量写入；`full` 直接执行但仍保留数量核对。询问阈值固定 100。
+- `mcp/approval.rs`：内存待确认队列，10 分钟过期；用户批准后重新解析 selector、核对 `confirmedCount`，数量或状态变化就拒绝；换库/关库时清空。右下角非模态确认卡片与设置页待确认列表共用同一份队列。
+- `mcp/tools/write.rs`：所有写入先 `dryRun` 看数量，正式写入必须带一致的 `confirmedCount`；部分 id 不存在/已在回收站/不在回收站时整批拒绝并返回失败清单；空 selector 返回 `noop`，不写记录。MCP 写入进程内串行，并立即占用 write lane；任务占用时直接拒绝。
+- `mcp/tools/history.rs`：`history_list` 返回每条记录的 `undoSteps` / `redoSteps`、`canUndo` / `canRedo` 与阻塞原因；撤销/重做先给回退清单，正式执行核对步数与影响数；询问档永远确认，完全档也核对；压缩记录阻断原因原样透传。
+- `mcp/tools/task.rs`：`tasks_get` 不带 id 返回活动/最近任务与待确认列表；`waitMs≤30000`；`approvalId` 会等待批准并附带关联任务。`tasks_cancel` 只允许取消 MCP 发起的任务，传 `approvalId` 等同拒绝。
+- `library/history.rs`：`write_with_id` 返回新记录 id（空操作 `None`）、`prefix_label`、`preview_undo` / `preview_redo`。`metadata` / `collections` 增加带 id 的写入口；`collections::create_with_images` 在一次事务里建集合并加入成员，撤销删除整个集合、重做按原 id 与顺序恢复。
+- `app/state.rs`：MCP 写入互斥、`after_mcp_write`（清页面缓存、失效相似结果、裁剪记录、发 `library-changed`）、`operationId` 随任务快照、MCP 任务登记、批准执行入口；MCP 移动任务完成后写入 `AI ·` 前缀与 `operationId`。
+- 前端：设置 → MCP 增加三档、完全档警告、待确认、最近 `AI ·` 操作与 stdio 客户端配置复制；`McpApprovalCard` 提供全局非模态确认卡片；`TaskCenterProvider` 监听 `library-changed` 推进数据版本，`LibraryWorkspace` 在 `closeViewer` 时关闭查看器；任务快照类型补 `operationId`。
+- 客户端配置修正（2026-10-26）：`AppInfo` 增加 `exePath`（`current_exe()`），复制配置不再按设置文件目录拼 exe 名。开发模式下设置文件在仓库根、exe 在 `src-tauri/target/debug/`，旧拼法会指向不存在的文件，客户端表现为 `-32000 Connection closed`。
+- 与计划的差异：没有为待确认请求建任务条目，确认状态由队列与关联任务推导；`collections_create` 增加了 `confirmedCount`（带 selector 时必填）；设置页“最近 AI 操作”从操作记录筛选，不读独立日志；写 selector 上限 100 万 id，相似结果仍 10,000。
+- 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（257 通过、5 ignored）、`cargo clippy --all-targets`（7 条警告都来自既有代码：`library/edit.rs` 与 `library/history.rs` 的导入/编辑清理路径）、`npm run typecheck`、`npm run test:web`（21 通过）、`npm run build`、`git diff --check`。
+- 未做：批次 3 的 `import_start`、`logs/mcp.log` 审计与便携包实测。
+
+### 真实客户端实测（2026-10-26）
+
+在独立测试库 `Lilith Artbank Test`（9 448 张、回收站 8 张）用真实 MCP 客户端逐个调用 20 个工具；写入类全部真实执行并撤销回滚。以下项目已通过，下次验收可跳过：
+
+- `library_info`：库信息、计数、特征数、AI 配置与档位正确。
+- `folders_list`：根目录 5 个、子树计数正确；不存在路径报错清楚。
+- `tags_list`：按图片数排序、名称模糊匹配正确。
+- `collections_list`：正常。
+- `search_images`：键集游标无重无漏；7 种排序（像素排序的 `sortValues` 可核对）；扩展名/评分/大小/文件夹/标签 any/description·embedding·pose 有无筛选生效；`view=all/trash/collection` 与 `search` 的 `view` / `library` scope 区分正确（`library` 能搜到回收站）；分面计数正确。
+- `images_get`：`missingIds` 正常；超过 50 张被拒。
+- `image_sheet`：thumb 4×4、detail 2×2、以格子为来源、`sheetId` 过期报错、detail 超 3×3 报错均正确。
+- `find_similar`：phash / color4 / color8 / embedding / pose 五种都出结果（pose 16 ms、embedding 24 ms）。
+- `tasks_get`：任务列表、单任务、按 `approvalId` 等待正常。
+- `images_update`：评分、加标签、删标签、单图描述生效；`dryRun`、`confirmedCount` 不一致、四选一互斥、描述恰好 1 张全部按设计拦住。
+- 集合：创建 / 加图 / 移出 / 改名 / 删除（含 `expectedItems` 校验）正常。
+- `images_move`：后台任务 + `operationId` + 文件真实落盘。
+- `images_trash` / `images_restore`：往返正常。
+- `history_list` / `history_undo` / `history_redo`：dryRun 12 步 / 影响 14 张，实际撤销与重做各 12/12 成功，逐张核对分数、描述、标签、文件夹与集合全部回到原值。
+- `tasks_cancel`：拒绝审批生效，图片未变动、未产生记录。
+
+同批修复：
+
+- **切档不再断线**：`McpRuntime::apply` 在开关与端口不变时只更新运行时文件的 `mode`，保留监听与口令。此前每次保存设置都 `stop()` + `start()`，切到只读会换口令，已连接客户端全部 401。
+- **AI 错误文案收窄**：`AiError` 增加 `transport` 标记；语义搜索连接失败只返回“AI 服务未启动或无法连接，请先在应用设置里启动 AI 服务”，不再带内部 URL 与 OS 错误。
+- **`tags_list` 过滤 0 张标签**：删光图片后标签记录仍在，但列表不再返回。
+- **`find_similar` 命中数**：`similar_phash` / `similar_color` / embedding / pose 扫描返回截断前总数；工具输出 `total` 为全部命中、`returned` 为可翻页条数、预览带 `score` 与 `scoreKind`（distance / similarity）。
+- **拼图来源标签**：以拼图格子为来源时，输出格子始终按新布局编号（A1、B1…），来源标签改放 `sourceLabel`。
+- **搜索描述**：`search_images` 描述写明 `search` 会匹配标签名、`view=library` 包含回收站、`pageSize` 超限报错。
+- **`pageSize` 不再静默截断**：超出 1–50 返回明确错误。
+
+待复测：切档后的连接与工具调用、`find_similar mode=text` 的错误文案（需要 AI 服务环境）、`tags_list` 0 张过滤、`find_similar` 的 `total` / `returned` / `score`、拼图 `sourceLabel`、`pageSize=51` 报错；询问档确认卡片的批准/10 分钟过期仍未实测。
+
+### 批次 2 收尾整理（2026-10-26）
+
+代码整理，除注明处不改行为契约：
+
+- `mcp/approval.rs`：去掉只包一个 `Mutex` 的 `Inner`，队列直接持 `Arc<Mutex<VecDeque<_>>>`。
+- `mcp/tools/write.rs`：`noop` 结果抽成 `noop_outcome()`；`collections_modify` 不再拆 `execute_` 入口（重命名/删除不在询问档拦截范围内），去掉没用到的 `approved` 参数。
+- `mcp/tools/history.rs`：dryRun、数量核对失败与确认单共用同一份回退清单 JSON，不再重复构造。
+- `mcp/tools/read.rs`：`library_info` 去掉与 `mode` 完全重复的 `configuredMode`。
+- `library/metadata.rs`：`update_description_with_id` 与其他 `*_with_id` 一致，返回实际改动数；`images_update` 的 `affected` 改由领域层给出，不再从 `willChange` 反推。
+- 行为修正：`collections_create` 带 selector 却一张都没解析到时返回 `noop`，不再静默创建空集合；不带 selector 仍按用户意图创建空集合。
+- 前端：`McpApprovalCard` 抽出 `useApprovalActions`，设置面板与悬浮卡片共用批准/拒绝；待确认列表读取失败时显示错误，而不是“没有等待处理的操作”；`busy` 判定简化。
+- 测试：新增 `description_write_reports_changed_count_and_skips_identical_text`。
+- 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（258 通过、5 ignored）、`cargo clippy --all-targets`（7 条警告都在既有 `library/edit.rs` 与 `library/history.rs`）、`npm run typecheck`、`npm run build`、`git diff --check`。
 
 ## AI 服务端与便携化（待验收）
 
@@ -198,6 +262,7 @@
 - **撤销后重做（真实窗口）**：撤销几条后记录变灰、“当前状态”位置正确；选中灰色记录重做到指定位置，更新记录仍保持灰色；编辑与导入重做后原图/缩略图/标签/文件夹恢复；重做到一半关闭应用，重开后只续做本次选中的记录；任意新操作后灰色记录消失、暂存文件释放；重做失败提示与再次重试。
 - **操作撤销批次 3（真实窗口）**：评分/描述/标签设置/批量加删标签/标签改名/删除逐项撤销与重做；集合创建/改名/删除/排序/加入/移出/并集交集差集撤销与重做，条目顺序与 `updated_at` 正确；相似分组“每组一个集合”和“合并保存”各只出现一条记录，撤销整批消失、重做整批恢复；批量 AI 描述（服务可用时）取消后已写描述可撤销；历史面板中集合结构记录显示“项”、图片记录显示“张”。
 - **MCP 批次 1（真实客户端）**：设置 → MCP 开启服务后状态为运行中；stdio 小桥能完成 initialize 并调用 8 个只读工具；`image_sheet` 编号与映射一致，`detail` 仅 3×3 及以下；`find_similar` 旧 token 失效提示可读；关闭服务后客户端收到明确连接错误；重启应用后 `mcp-runtime.json` 口令更新；设置页保存端口冲突时状态显示启动失败且设置不丢。
+- **MCP 批次 2（真实客户端与窗口）**：只读档写入被拒；询问档普通评分/标签直接执行、回收站与超过 100 张写入进入确认队列；确认卡片出现在右下角与设置页，批准后刷新网格、拒绝与 10 分钟过期可读；移动任务完成后快照带 `operationId`，`AI ·` 记录出现在设置页最近操作；`history_list` 的撤销/重做步数与实际一致，完全档仍需数量核对；压缩记录上的撤销返回“压缩操作不可撤销”；`tasks_cancel` 只能取消 MCP 任务；换库后旧确认单消失。
 - **图片空间优化（真实窗口）**：估算数字合理；改任一参数后估算清空、必须重估；确认执行后的进度、取消与失败清单；完成后记录标题显示「N 张 · 省 X」且选中它时撤销被禁用并提示不可撤销；抽查 PNG→JPEG 的平涂区域无明显色带；执行前后磁盘体积差与估算接近；网格缩略图不闪烁（默认沿用旧图）；主库首次打开会把 schema v5 升到 v6。
 - **图片空间优化第三阶段（真实窗口）**：连跑 20 次估算，中途切标签或启动别的任务，确认不再停在「正在读取估算结果…」；统计候选阶段只显示百分比（不再出现图库总张数），编码样本时分母是样本数；估算末尾能看到「正在汇总结果…」而不是停在 `k / n`；长边输入 63 / 64 / 65535 / 65536 与空值的行为；WebP + 超过 16383 的提示；抽样滑块拖动后 300ms 内按钮不可点、提示耗时随格式变化；全库执行时进度按张平滑推进、批间短暂停顿有「正在写入第 k 批」文案、取消后停在真实张数；任务胶囊与对话框的进度一致；导入时压缩开启与关闭各导入一批，确认真实窗口完成页「其中 N 张已压缩，省 X」；导入透明 PNG + JPG、宽色域图、超长图，确认保留原图；同一源图同参数重复导入与改档位后的条数符合预期。
 - **主库真实窗口**：应用打开 `G:\Lilith Image Library`（设置已指向该库），首次打开会把 schema v5 升到 v6（只新增一列）。检查树/计数/缩略图/查看器/pose/搜索/评分/标签/描述/编辑/AI/S7。
@@ -221,7 +286,7 @@
 
 1. 按上面的清单在 `npm run tauri dev` 下手工验收；真实库只读用于验收，测试、基准和演示仍用临时目录或复制样本。
 2. 在便携目录中实测 AI 服务：设置 Python/脚本/模型路径，分别加载图片塔与文本塔，跑批量 embedding、pose、语义搜索，并观察空闲卸载。
-3. 用真实 MCP 客户端验收批次 1 的 stdio 小桥、8 个只读工具与拼图；之后按计划进入批次 2（写工具、询问档、撤销/重做）。待决策项见 [待办与待决策](todo.md)。
+3. 用真实 MCP 客户端验收批次 1 的 stdio 小桥、8 个只读工具与拼图，以及批次 2 的写工具、询问档、撤销/重做与任务工具；之后按计划进入批次 3（导入、审计日志、便携包实测）。待决策项见 [待办与待决策](todo.md)。
 4. 需要标定相似度阈值时，用复制出来的小样本跑基准，不要对 `G:\Lilith Image Library` 直接调参或写入测试数据。
 
 ## 约束

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{
@@ -52,6 +53,28 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
 #[tauri::command]
 pub fn get_mcp_status(state: State<'_, AppState>) -> crate::mcp::runtime::McpStatus {
     state.mcp_status()
+}
+
+#[tauri::command]
+pub fn list_mcp_approvals(state: State<'_, AppState>) -> Vec<crate::mcp::approval::ApprovalView> {
+    state.mcp_approval_views()
+}
+
+#[tauri::command]
+pub async fn approve_mcp_approval(app: AppHandle, approval_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state
+            .approve_mcp_approval(&approval_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn reject_mcp_approval(state: State<'_, AppState>, approval_id: String) -> Result<(), String> {
+    AppError::command(state.reject_mcp_approval(&approval_id))
 }
 
 #[tauri::command]
@@ -134,6 +157,8 @@ pub struct AppInfo {
     pub version: String,
     pub settings_path: String,
     pub log_path: String,
+    /// 当前进程的可执行文件；开发模式与便携模式都能据此拼出 stdio 客户端配置。
+    pub exe_path: String,
 }
 
 /// 日志文件名与 `lib.rs` 里 `TargetKind::Folder` 的 `file_name` 一致。
@@ -161,6 +186,9 @@ pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         settings_path: state.settings.path().to_string_lossy().into_owned(),
         log_path: log_file_path(),
+        exe_path: std::env::current_exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     }
 }
 
@@ -870,6 +898,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         find_similar_images,
         get_similarity_page,
         get_similarity_ids,
-        get_mcp_status
+        get_mcp_status,
+        list_mcp_approvals,
+        approve_mcp_approval,
+        reject_mcp_approval
     ]
 }

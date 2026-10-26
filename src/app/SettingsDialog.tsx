@@ -19,6 +19,7 @@ import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
 import { appApi, browserPreview } from "./api";
+import { McpPanel } from "./McpPanel";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
@@ -778,60 +779,12 @@ export function SettingsDialog({
 
               {tab === "mcp" ? (
                 <Panel title="MCP 服务">
-                  <label className="toggle-row">
-                    <input
-                      type="checkbox"
-                      checked={draft.mcp.enabled}
-                      onChange={(event) =>
-                        patch((current) => ({
-                          ...current,
-                          mcp: { ...current.mcp, enabled: event.target.checked },
-                        }))
-                      }
-                    />
-                    <span>
-                      <strong>启用 MCP 服务</strong>
-                      <small>只从本机 127.0.0.1 接受连接，AI 客户端可以读取当前图库。</small>
-                    </span>
-                  </label>
-                  <Field label="端口">
-                    <input
-                      className="input"
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={draft.mcp.port}
-                      onChange={(event) =>
-                        patch((current) => ({
-                          ...current,
-                          mcp: { ...current.mcp, port: Number(event.target.value) },
-                        }))
-                      }
-                    />
-                  </Field>
-                  <div className="settings-note">保存后生效。</div>
-                  <div className="ai-settings-status">
-                    <div>
-                      <strong>
-                        {mcpStatus?.running
-                          ? "服务运行中"
-                          : mcpStatus?.enabled
-                            ? "服务未运行"
-                            : "服务已关闭"}
-                      </strong>
-                      <span>
-                        {mcpError ??
-                          mcpStatus?.error ??
-                          `127.0.0.1:${mcpStatus?.port ?? draft.mcp.port}`}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="settings-note">
-                    权限：只读。当前只开放浏览、搜索、详情与拼图；修改、撤销与导入尚未开放。
-                  </div>
-                  <div className="settings-note">
-                    支持 stdio 的客户端用本程序加 --mcp-stdio 启动。
-                  </div>
+                  <McpPanel
+                    draft={draft}
+                    patch={patch}
+                    status={mcpStatus}
+                    statusError={mcpError}
+                  />
                 </Panel>
               ) : null}
 

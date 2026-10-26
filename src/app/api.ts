@@ -4,6 +4,7 @@ import type {
   AppInfo,
   LibraryInfo,
   LibraryInspection,
+  McpApproval,
   McpStatus,
   Settings,
 } from "./types";
@@ -148,6 +149,7 @@ export const appApi = {
         version: "0.1.0",
         settingsPath: "(浏览器预览模式)",
         logPath: "(浏览器预览模式)",
+        exePath: "(浏览器预览模式)",
       };
     }
     return invoke<AppInfo>("get_app_info");
@@ -165,6 +167,21 @@ export const appApi = {
       };
     }
     return invoke<McpStatus>("get_mcp_status");
+  },
+
+  async listMcpApprovals(): Promise<McpApproval[]> {
+    if (!isTauri()) return [];
+    return invoke<McpApproval[]>("list_mcp_approvals");
+  },
+
+  async approveMcpApproval(approvalId: string): Promise<unknown> {
+    if (!isTauri()) throw new Error("MCP 确认需要桌面窗口");
+    return invoke<unknown>("approve_mcp_approval", { approvalId });
+  },
+
+  async rejectMcpApproval(approvalId: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("reject_mcp_approval", { approvalId });
   },
 
   /** 在系统文件管理器里定位文件或打开目录。 */

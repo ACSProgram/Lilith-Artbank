@@ -334,6 +334,7 @@ pub(crate) fn ensure_capability(
     Err(AiError {
         message: format!("服务没有可用的 {name} 能力"),
         retryable: false,
+        transport: false,
     })
 }
 

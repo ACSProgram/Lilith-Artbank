@@ -137,10 +137,12 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
             "launchConfigured": context.settings.ai.launch_configured(),
         },
         "mcp": {
-            "mode": "readOnly",
-            "configuredMode": context.settings.mcp.mode.as_str(),
+            // 工具按当前设置实时判定，这里返回的就是本次调用的实际档位。
+            "mode": context.settings.mcp.mode.as_str(),
             "toolCount": tool_count,
-            "writeTools": false,
+            "writeTools": true,
+            "approvalThreshold": super::write::APPROVAL_THRESHOLD,
+            "approvalTimeoutMinutes": crate::mcp::approval::APPROVAL_TTL.as_secs() / 60,
             "limits": {
                 "maxSearchPage": MAX_SEARCH_PAGE,
                 "maxSheetCells": u32::from(contact_sheet::MAX_GRID).pow(2),
@@ -197,12 +199,14 @@ pub fn folders_list(context: &ReadContext, input: &FoldersListInput) -> AppResul
 pub fn tags_list(context: &ReadContext, input: &TagsListInput) -> AppResult<Value> {
     let query_text = input.query.as_deref().unwrap_or("").trim();
     let limit = input.limit.unwrap_or(100).clamp(1, 500);
-    let tags = if query_text.is_empty() {
+    let mut tags = if query_text.is_empty() {
         query::list_tags(&context.database, Some(limit))?
     } else {
         // search_tags 自己把上限收到 200。
         query::search_tags(&context.database, query_text, Some(limit))?
     };
+    // 去掉图片后标签记录仍在，0 张的标签对“有哪些标签”没有意义。
+    tags.retain(|tag| tag.image_count > 0);
     Ok(json!({
         "query": query_text,
         "tags": tags.iter().map(|tag| json!({
@@ -239,10 +243,12 @@ pub fn search_images(context: &ReadContext, input: &SearchImagesInput) -> AppRes
     if input.page_token.is_some() {
         query.page_token = input.page_token.clone();
     }
-    let page_size = input
-        .page_size
-        .unwrap_or(MAX_SEARCH_PAGE)
-        .clamp(1, MAX_SEARCH_PAGE);
+    let page_size = input.page_size.unwrap_or(MAX_SEARCH_PAGE);
+    if page_size == 0 || page_size > MAX_SEARCH_PAGE {
+        return Err(AppError::message(format!(
+            "pageSize 必须在 1-{MAX_SEARCH_PAGE} 之间，收到 {page_size}"
+        )));
+    }
     query.limit = Some(page_size);
 
     // 分面计数里已经算过同一个命中集的总数，开了分面就不再单独 count 一次。
@@ -279,7 +285,7 @@ pub fn find_similar(
         .preview_limit
         .unwrap_or(12)
         .clamp(1, MAX_PREVIEW as u32) as usize;
-    let (token, kind, total, elapsed_ms, extra) = match input.mode {
+    let (token, kind, returned, total_hits, elapsed_ms, extra) = match input.mode {
         SimilarMode::Image => {
             let target_id = input
                 .target_id
@@ -295,6 +301,7 @@ pub fn find_similar(
                 result.token,
                 result.kind,
                 result.total,
+                result.total_hits,
                 result.elapsed_ms,
                 Value::Null,
             )
@@ -311,6 +318,7 @@ pub fn find_similar(
                 result.token,
                 "semantic".to_owned(),
                 result.total,
+                result.total_hits,
                 result.elapsed_ms,
                 json!({
                     "model": result.model,
@@ -321,6 +329,12 @@ pub fn find_similar(
         }
     };
     let preview = ai.similarity_page(&token, 0, Some(preview_limit))?;
+    let scores = ai.similarity_scores(&token)?;
+    let score_kind = if matches!(kind.as_str(), "phash" | "color4" | "color8") {
+        "distance"
+    } else {
+        "similarity"
+    };
     Ok(json!({
         "token": token,
         "mode": match input.mode {
@@ -328,12 +342,22 @@ pub fn find_similar(
             SimilarMode::Text => "text",
         },
         "kind": kind,
-        "total": total,
+        "scoreKind": score_kind,
+        "total": total_hits,
+        "returned": returned,
+        "limit": limit,
         "elapsedMs": elapsed_ms,
-        "preview": preview.items.iter().map(compact_row).collect::<Vec<_>>(),
+        "preview": preview.items.iter().map(|row| {
+            let mut value = compact_row(row);
+            value["score"] = match scores.get(&row.id) {
+                Some(score) => json!(((f64::from(*score)) * 1e6).round() / 1e6),
+                None => Value::Null,
+            };
+            value
+        }).collect::<Vec<_>>(),
         "nextOffset": preview.next_offset,
         "detail": extra,
-        "note": "相似结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。",
+        "note": "total 是全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）；phash/color 的 score 是距离，越小越近，embedding/pose/semantic 的 score 是相似度，越大越近。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。",
     }))
 }
 
@@ -403,18 +427,31 @@ pub fn image_sheet(
     let limit = (grid as usize) * (grid as usize);
     let selection = selection::resolve_page(&input.selector, context, ai, limit)?;
 
+    let source_labels: Vec<Option<String>> = selection
+        .slots
+        .iter()
+        .map(|slot| slot.label.clone())
+        .collect();
     let labels = sheet::labels(grid);
     let mut slots = Vec::with_capacity(limit);
     for (index, label) in labels.into_iter().enumerate() {
         slots.push(match selection.slots.get(index) {
+            // 输出标签必须对应新拼图的位置；来源格子只作为 sourceLabel 保留。
             Some(slot) => sheet::SheetSlot {
-                label: slot.label.clone().unwrap_or(label),
+                label,
                 row: slot.row.clone(),
             },
             None => sheet::SheetSlot { label, row: None },
         });
     }
-    let built = sheet::build(context, grid, resolution, slots)?;
+    let mut built = sheet::build(context, grid, resolution, slots)?;
+    for (index, cell) in built.cells.iter_mut().enumerate() {
+        if let Some(source) = source_labels.get(index).and_then(Option::as_ref)
+            && source != &cell.label
+        {
+            cell.source_label = Some(source.clone());
+        }
+    }
     let mapping = json!({
         "sheetId": built.record.id,
         "grid": grid,
@@ -510,6 +547,7 @@ mod tests {
                 let people = connection.last_insert_rowid();
                 connection.execute("INSERT INTO tags(name) VALUES ('风景')", [])?;
                 let scenery = connection.last_insert_rowid();
+                connection.execute("INSERT INTO tags(name) VALUES ('未使用')", [])?;
 
                 for (id, folder, score, description, imported_at) in [
                     (1_i64, works, 5_i64, "红衣人物", 100_i64),
@@ -620,6 +658,16 @@ mod tests {
         assert_eq!(value["total"], 3);
         assert_eq!(value["images"].as_array().unwrap().len(), 2);
         assert!(value["nextCursor"].is_object() || value["nextPageToken"].is_string());
+
+        let error = search_images(
+            &fixture.context,
+            &SearchImagesInput {
+                page_size: Some(MAX_SEARCH_PAGE + 1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pageSize"));
     }
 
     #[test]
@@ -657,6 +705,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tags["tags"][0]["name"], "人物");
+
+        let all_tags = tags_list(
+            &fixture.context,
+            &TagsListInput {
+                query: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = all_tags["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"未使用"));
+        assert!(names.contains(&"人物"));
 
         let collections = collections_list(&fixture.context).unwrap();
         assert_eq!(collections["collections"][0]["name"], "精选");
@@ -701,6 +766,34 @@ mod tests {
     }
 
     #[test]
+    fn write_selection_resolves_all_ids_and_missing() {
+        let fixture = fixture();
+        let selection = selection::resolve_ids(
+            &Selector::Ids {
+                ids: vec![3, 1, 1, 99],
+                exclude_ids: vec![1],
+            },
+            &fixture.context,
+            &fixture.ai,
+        )
+        .unwrap();
+        assert_eq!(selection.ids, vec![3]);
+        assert_eq!(selection.missing_ids, vec![99]);
+
+        let selection = selection::resolve_ids(
+            &Selector::Query {
+                query: Box::new(McpQuery::default()),
+                exclude_ids: Vec::new(),
+            },
+            &fixture.context,
+            &fixture.ai,
+        )
+        .unwrap();
+        assert_eq!(selection.ids.len(), 3);
+        assert!(selection.missing_ids.is_empty());
+    }
+
+    #[test]
     fn image_sheet_returns_mapping_and_cached_cells() {
         let fixture = fixture();
         let input = ImageSheetInput {
@@ -724,7 +817,7 @@ mod tests {
             &ImageSheetInput {
                 selector: Selector::Sheet {
                     sheet_id,
-                    cells: vec!["A1".into()],
+                    cells: vec!["B1".into()],
                     exclude_cells: Vec::new(),
                     exclude_ids: Vec::new(),
                 },
@@ -733,7 +826,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(cached.mapping["cells"][0]["imageId"], 1);
+        // 输出按新拼图编号，来源格子 B1 只出现在 sourceLabel。
+        assert_eq!(cached.mapping["cells"][0]["label"], "A1");
+        assert_eq!(cached.mapping["cells"][0]["sourceLabel"], "B1");
+        assert_eq!(cached.mapping["cells"][0]["imageId"], 2);
     }
 
     #[test]
@@ -779,6 +875,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first["preview"][0]["id"], 2);
+        // total 是截断前的全部命中；returned 才是可翻页条数。
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["returned"], 2);
+        assert_eq!(first["scoreKind"], "distance");
+        assert_eq!(first["preview"][0]["score"], 0.0);
         let first_token = first["token"].as_str().unwrap().to_owned();
 
         find_similar(
@@ -802,6 +903,24 @@ mod tests {
                 .is_err(),
             "新的相似搜索应让旧 token 失效"
         );
+
+        let limited = find_similar(
+            &fixture.context,
+            &fixture.ai,
+            &FindSimilarInput {
+                mode: SimilarMode::Image,
+                target_id: Some(1),
+                kind: Some("phash".into()),
+                threshold: Some(6),
+                limit: Some(1),
+                preview_limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(limited["total"], 2);
+        assert_eq!(limited["returned"], 1);
+        assert_eq!(limited["limit"], 1);
     }
 
     #[test]
@@ -863,12 +982,13 @@ mod tests {
     }
 
     #[test]
-    fn library_info_reports_read_only_limits() {
+    fn library_info_reports_mode_and_limits() {
         let fixture = fixture();
-        let value = library_info(&fixture.context, 8).unwrap();
+        let value = library_info(&fixture.context, 20).unwrap();
         assert_eq!(value["counts"]["images"], 3);
-        assert_eq!(value["mcp"]["mode"], "readOnly");
-        assert_eq!(value["mcp"]["writeTools"], false);
+        assert_eq!(value["mcp"]["mode"], "ask");
+        assert_eq!(value["mcp"]["writeTools"], true);
+        assert_eq!(value["mcp"]["approvalThreshold"], 100);
         assert_eq!(value["mcp"]["limits"]["maxSheetCells"], 25);
     }
 }

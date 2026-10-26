@@ -1058,6 +1058,7 @@ function mockHistoryTask(kind: TaskKind, label: string, scope: string): TaskSnap
     finishedAt: null,
     failures: [],
     cancellable: false,
+    operationId: null,
   };
 }
 

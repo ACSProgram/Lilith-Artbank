@@ -44,6 +44,28 @@ export interface McpStatus {
   error: string | null;
 }
 
+export type McpApprovalStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "rejected"
+  | "expired"
+  | "failed";
+
+/** AI 写入前的待确认请求；只在内存里，10 分钟不处理自动过期。 */
+export interface McpApproval {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  status: McpApprovalStatus;
+  title: string;
+  tool: string;
+  preview: unknown;
+  result: unknown;
+  error: string | null;
+  taskId: string | null;
+}
+
 /** 排序方案：全局共享，存设置，数量上限 50 是存储上限。 */
 export interface SortProfile {
   id: string;
@@ -99,4 +121,5 @@ export interface AppInfo {
   version: string;
   settingsPath: string;
   logPath: string;
+  exePath: string;
 }

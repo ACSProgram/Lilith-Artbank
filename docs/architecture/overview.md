@@ -157,6 +157,6 @@ S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）�
 
 2026-10-25 图片空间优化第三阶段已实现：长边改 64–65535 自由输入，抽样改 50–2000 离散滑块；估算取结果改为依赖任务原始值并带 5 秒超时重试，进度按阶段推进（统计候选只报百分比，编码样本按张显示，百分比加权不回退）；执行在并行编码内部按张上报，编码与提交前分别显示文案；导入管线新增可选的 `optimize` 参数，在解码后、发布前复用同一套压缩内核，去重语义改为压缩后内容哈希，`optimized_at` 标记导入即压缩的行。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化)、[导入与缩略图](../modules/import.md) 与 [当前阶段状态](../planning/current-handoff.md)。
 
-2026-10-26 MCP 图库控制批次 1（只读）已实现：设置 v6 的 `mcp` 配置、应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）、同 exe 的 `--mcp-stdio` 小桥、8 个只读工具（图库概况、文件夹、标签、集合、搜索、找相似、详情、拼图）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存。写入、撤销/重做、导入与询问档确认队列未实现。详见 [MCP 图库控制](../modules/mcp.md) 与 [当前阶段状态](../planning/current-handoff.md)。
+2026-10-26 MCP 图库控制批次 1（只读）与批次 2（写工具、撤销/重做、任务）已实现：设置 v6 的 `mcp` 配置、应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）、同 exe 的 `--mcp-stdio` 小桥、20 个工具（8 只读 + 7 写 + 3 历史 + 2 任务）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存、`dryRun` / `confirmedCount`、三档权限与 10 分钟确认队列、`library-changed` 刷新。真实 MCP 客户端实测主体通过（2026-10-26），切档保留口令、`find_similar` 命中数与分数、0 张标签过滤等语义已按实测修正。导入、永久删除、清空回收站与压缩仍不开放。详见 [MCP 图库控制](../modules/mcp.md) 与 [当前阶段状态](../planning/current-handoff.md)。
 
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图包压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

@@ -218,9 +218,17 @@ pub fn update_score(database: &LibraryDb, image_id: i64, score: i64) -> AppResul
 }
 
 pub fn set_scores(database: &LibraryDb, image_ids: &[i64], score: i64) -> AppResult<u64> {
+    set_scores_with_id(database, image_ids, score).map(|(changed, _)| changed)
+}
+
+pub fn set_scores_with_id(
+    database: &LibraryDb,
+    image_ids: &[i64],
+    score: i64,
+) -> AppResult<(u64, Option<i64>)> {
     validate_score(score)?;
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::Score, format!("批量评分 {score} 星")),
         |transaction, draft| {
@@ -263,12 +271,21 @@ pub fn set_scores(database: &LibraryDb, image_ids: &[i64], score: i64) -> AppRes
 }
 
 pub fn update_description(database: &LibraryDb, image_id: i64, description: &str) -> AppResult<()> {
+    update_description_with_id(database, image_id, description).map(|(_, _)| ())
+}
+
+/// 与其他 `*_with_id` 一致：返回实际改动的图片数（0 或 1）与新记录 id。
+pub fn update_description_with_id(
+    database: &LibraryDb,
+    image_id: i64,
+    description: &str,
+) -> AppResult<(u64, Option<i64>)> {
     if image_id <= 0 {
         return Err(AppError::message("图片 id 无效"));
     }
     let description = description.trim();
     validate_description(description)?;
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::Description, "修改描述"),
         |transaction, draft| {
@@ -284,7 +301,7 @@ pub fn update_description(database: &LibraryDb, image_id: i64, description: &str
                 return Err(AppError::message("图片不存在"));
             };
             if old_description == description && old_source == "user" && old_model.is_empty() {
-                return Ok(());
+                return Ok(0);
             }
             let modified_at = now_ms();
             transaction.execute(
@@ -302,7 +319,7 @@ pub fn update_description(database: &LibraryDb, image_id: i64, description: &str
                 modified_at: old_modified_at,
             })?;
             draft.affected(1);
-            Ok(())
+            Ok(1)
         },
     )
 }
@@ -483,12 +500,20 @@ pub fn set_image_tags(
 }
 
 pub fn add_tags(database: &LibraryDb, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
+    add_tags_with_id(database, image_ids, tag_names).map(|(changed, _)| changed)
+}
+
+pub fn add_tags_with_id(
+    database: &LibraryDb,
+    image_ids: &[i64],
+    tag_names: &[String],
+) -> AppResult<(u64, Option<i64>)> {
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
     let names = normalize_tag_names(tag_names)?;
     if names.is_empty() {
-        return Ok(0);
+        return Ok((0, None));
     }
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(
             HistoryKind::TagAdd,
@@ -570,12 +595,20 @@ pub fn remove_tags(
     image_ids: &[i64],
     tag_names: &[String],
 ) -> AppResult<u64> {
+    remove_tags_with_id(database, image_ids, tag_names).map(|(changed, _)| changed)
+}
+
+pub fn remove_tags_with_id(
+    database: &LibraryDb,
+    image_ids: &[i64],
+    tag_names: &[String],
+) -> AppResult<(u64, Option<i64>)> {
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
     let names = normalize_tag_names(tag_names)?;
     if names.is_empty() {
-        return Ok(0);
+        return Ok((0, None));
     }
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(
             HistoryKind::TagRemove,
@@ -730,13 +763,23 @@ pub fn move_images(
     folder_path: &str,
     reporter: &dyn BatchReporter,
 ) -> AppResult<MoveReport> {
+    move_images_with_id(database, root, image_ids, folder_path, reporter).map(|(report, _)| report)
+}
+
+pub fn move_images_with_id(
+    database: &LibraryDb,
+    root: &Path,
+    image_ids: &[i64],
+    folder_path: &str,
+    reporter: &dyn BatchReporter,
+) -> AppResult<(MoveReport, Option<i64>)> {
     let ids = validate_ids_for_files(image_ids)?;
     let folder_path = normalize_folder(folder_path)?;
     let paths = LibraryPaths::new(root);
     let total = ids.len();
     reporter.report(0, total);
 
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::Move, format!("移动图片到「{folder_path}」")),
         |transaction, draft| {
@@ -858,6 +901,14 @@ pub fn move_images(
 }
 
 pub fn set_trashed(database: &LibraryDb, image_ids: &[i64], trashed: bool) -> AppResult<u64> {
+    set_trashed_with_id(database, image_ids, trashed).map(|(changed, _)| changed)
+}
+
+pub fn set_trashed_with_id(
+    database: &LibraryDb,
+    image_ids: &[i64],
+    trashed: bool,
+) -> AppResult<(u64, Option<i64>)> {
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
     let (kind, label) = if trashed {
         (HistoryKind::Trash, "移入回收站")
@@ -871,7 +922,7 @@ pub fn set_trashed(database: &LibraryDb, image_ids: &[i64], trashed: bool) -> Ap
         "deleted_at IS NOT NULL"
     };
     let assigned = if trashed { "?1" } else { "NULL" };
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(kind, label),
         |transaction, draft| {

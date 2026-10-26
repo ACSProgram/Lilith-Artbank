@@ -131,6 +131,8 @@ export interface TaskSnapshot {
   finishedAt: number | null;
   failures: TaskFailure[];
   cancellable: boolean;
+  /** 任务最终写入的操作记录 id；进行中通常为空。 */
+  operationId: number | null;
 }
 
 export interface TaskSummary {

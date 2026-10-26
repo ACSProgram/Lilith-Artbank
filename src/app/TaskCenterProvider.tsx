@@ -5,11 +5,14 @@ import { TaskCapsule } from "./TaskCapsule";
 import { isTaskActive, type BatchTaskRequest, type TaskSnapshot } from "./taskTypes";
 import { errorMessage } from "../shared/errors";
 import { useNotices } from "./noticeContext";
+import { useAppRuntime } from "./runtimeContext";
+import { McpApprovalHost } from "./McpApprovalCard";
 
 const MAX_TASKS = 50;
 
 export function TaskCenterProvider({ children }: { children: ReactNode }) {
   const { notify } = useNotices();
+  const { settings } = useAppRuntime();
   const [tasks, setTasks] = useState<TaskSnapshot[]>([]);
   const [dataVersion, setDataVersion] = useState(0);
   const [lastFinished, setLastFinished] = useState<TaskSnapshot | null>(null);
@@ -55,7 +58,13 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
           setDataVersion((value) => value + 1);
         }
       });
-      unlisteners.push(progress, finished);
+      // MCP 同步写入不产生任务，后端单独发 library-changed；同样推进数据版本，
+      // 让网格、文件夹、计数与打开着的操作记录面板一起刷新。
+      const changed = await listen<{ closeViewer?: boolean }>("library-changed", () => {
+        if (disposed) return;
+        setDataVersion((value) => value + 1);
+      });
+      unlisteners.push(progress, finished, changed);
     })();
 
     return () => {
@@ -99,6 +108,7 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
   return (
     <TaskCenterContext.Provider value={value}>
       {children}
+      <McpApprovalHost enabled={Boolean(settings?.mcp.enabled)} />
       <TaskCapsule />
     </TaskCenterContext.Provider>
   );

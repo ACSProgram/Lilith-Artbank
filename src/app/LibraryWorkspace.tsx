@@ -144,6 +144,24 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     }
   }, [lastFinished]);
 
+  // MCP 同步写入的刷新由 TaskCenterProvider 推进数据版本；这里只处理查看器关闭。
+  useEffect(() => {
+    if (browserPreview) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      if (disposed) return;
+      unlisten = await listen<{ closeViewer?: boolean }>("library-changed", (event) => {
+        if (event.payload?.closeViewer) setViewerSession(null);
+      });
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const generateDescription = useCallback(async (imageId: number) => {
     const result = await aiApi.describeImage(imageId);
     return { text: result.text, model: result.model };

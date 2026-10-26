@@ -16,6 +16,8 @@ use super::{context::ReadContext, sheet::SheetCell};
 
 const MAX_SELECTION_LIMIT: usize = 10_000;
 const MAX_IDS: usize = MAX_SELECTION_LIMIT;
+/// 写入 selector 可以覆盖整库；与界面批量任务的上限一致。
+const MAX_WRITE_IDS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -262,6 +264,113 @@ pub struct SelectionPage {
     pub total: u64,
     pub next: Option<Selector>,
     pub missing_ids: Vec<i64>,
+}
+
+/// 写入用的全量解析结果：不分页，按 selector 顺序去重。
+pub struct IdSelection {
+    pub ids: Vec<i64>,
+    pub missing_ids: Vec<i64>,
+}
+
+pub fn resolve_ids(
+    selector: &Selector,
+    context: &ReadContext,
+    ai: &AiRuntime,
+) -> AppResult<IdSelection> {
+    match selector {
+        Selector::Query { query, exclude_ids } => {
+            let ids = query::query_ids(&context.database, query.to_library_query())?;
+            Ok(IdSelection {
+                ids: apply_excludes(dedupe_ids(&ids, MAX_WRITE_IDS)?, exclude_ids),
+                missing_ids: Vec::new(),
+            })
+        }
+        Selector::Ids { ids, exclude_ids } => {
+            let ids = apply_excludes(dedupe_ids(ids, MAX_WRITE_IDS)?, exclude_ids);
+            let existing: HashSet<i64> =
+                query::rows_by_ids(&context.database, &context.root, &ids)?
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect();
+            let mut resolved = Vec::with_capacity(ids.len());
+            let mut missing_ids = Vec::new();
+            for id in ids {
+                if existing.contains(&id) {
+                    resolved.push(id);
+                } else {
+                    missing_ids.push(id);
+                }
+            }
+            Ok(IdSelection {
+                ids: resolved,
+                missing_ids,
+            })
+        }
+        Selector::Sheet {
+            sheet_id,
+            cells,
+            exclude_cells,
+            exclude_ids,
+        } => {
+            let record = context.sheets.lock().get(sheet_id)?;
+            let selected = select_cells(&record.cells, cells, exclude_cells)?;
+            let excluded: HashSet<i64> = exclude_ids.iter().copied().collect();
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            for cell in selected {
+                if let Some(id) = cell.image_id
+                    && !excluded.contains(&id)
+                    && seen.insert(id)
+                {
+                    ids.push(id);
+                }
+            }
+            Ok(IdSelection {
+                ids,
+                missing_ids: Vec::new(),
+            })
+        }
+        // 写入按全部命中解析：`limit` 只影响读取分页，这里忽略。
+        Selector::Similarity {
+            token,
+            offset,
+            limit: _,
+            exclude_ids,
+        } => {
+            let excluded: HashSet<i64> = exclude_ids.iter().copied().collect();
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            let mut cursor = *offset;
+            let mut total = None;
+            loop {
+                let page = ai.similarity_page(token, cursor, Some(300))?;
+                let page_total = page.total;
+                let page_next = page.next_offset;
+                total.get_or_insert(page_total);
+                let page_len = page.items.len();
+                for row in page.items {
+                    if !excluded.contains(&row.id) && seen.insert(row.id) {
+                        ids.push(row.id);
+                    }
+                }
+                let next = page_next.unwrap_or(cursor + page_len);
+                if next <= cursor || page_len == 0 || ids.len() >= MAX_SELECTION_LIMIT {
+                    break;
+                }
+                cursor = next;
+                if let Some(total) = total
+                    && cursor >= total
+                {
+                    break;
+                }
+            }
+            ids.truncate(MAX_SELECTION_LIMIT);
+            Ok(IdSelection {
+                ids,
+                missing_ids: Vec::new(),
+            })
+        }
+    }
 }
 
 pub fn resolve_page(
