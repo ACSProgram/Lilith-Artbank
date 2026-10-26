@@ -50,6 +50,7 @@ import {
   RenameCollectionDialog,
 } from "./CollectionDialogs";
 import { FilterPanel } from "./FilterPanel";
+import { FindSimilarPanel, type SimilarReference } from "./FindSimilarPanel";
 import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
 import { OperationHistoryPanel } from "./OperationHistoryPanel";
@@ -81,7 +82,6 @@ import type {
   CollectionInfo,
   FeatureSummary,
   FolderInfo,
-  ImageCapabilities,
   ImageDetails,
   ImageRow,
   LibraryView as LibraryViewType,
@@ -98,8 +98,10 @@ import type {
   ViewerSessionUpdate,
 } from "../../shared/viewerSession";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
-import type { SimilarKind } from "../../shared/similarity";
-import { SIMILAR_LABELS } from "../../shared/similarity";
+import {
+  similarKindLabel,
+  type FindSimilarConfig,
+} from "../../shared/similarity";
 
 interface LibraryViewProps {
   browse: BrowseState;
@@ -116,7 +118,6 @@ interface LibraryViewProps {
   /** 开始把网格/列表中的图片拖到文件夹。 */
   onBeginImageDrag: (imageIds: number[], label: string, event: ReactPointerEvent<HTMLDivElement>) => void;
   similarity?: SimilarityBrowseState;
-  onFindSimilar?: (kind: SimilarKind, targetId: number) => void;
   onOpenSimilarityGroups?: () => void;
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
   onOpenOptimize?: (context: BatchTaskContextInfo) => void;
@@ -172,7 +173,6 @@ export function LibraryView({
   onOpenImport,
   onBeginImageDrag,
   similarity,
-  onFindSimilar,
   onOpenSimilarityGroups,
   onOpenBatchTasks,
   onOpenOptimize,
@@ -214,12 +214,20 @@ export function LibraryView({
   const [viewBusy, setViewBusy] = useState(false);
   const [semanticDraft, setSemanticDraft] = useState("");
   const [similarityTarget, setSimilarityTarget] = useState<ImageDetails | null>(null);
-  const [contextCaps, setContextCaps] = useState<ImageCapabilities | null>(null);
+  const [similarityReference, setSimilarityReference] =
+    useState<SimilarReference | null>(null);
+  const [findSimilarOpen, setFindSimilarOpen] = useState(false);
+  const [findSimilarContext, setFindSimilarContext] =
+    useState<BatchTaskContextInfo | null>(null);
+  const [findSimilarInitial, setFindSimilarInitial] =
+    useState<FindSimilarConfig | null>(null);
+  const [lastFindSimilar, setLastFindSimilar] =
+    useState<FindSimilarConfig | null>(null);
   const [featureSummary, setFeatureSummary] = useState<FeatureSummary | null>(null);
 
   const viewRef = useRef<VirtualViewHandle>(null);
-  const contextCapsTarget = useRef<number | null>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
+  const findSimilarAnchorRef = useRef<HTMLDivElement>(null);
   const taskAnchorRef = useRef<HTMLButtonElement>(null);
   const historyAnchorRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -297,15 +305,16 @@ export function LibraryView({
   }, [items]);
 
   // 相似结果的目标图不在结果里，单独取一次详情用于标题与“打开比较图”。
+  // 平均参考只取第一张用于打开查看器，标题仍然显示参考图数量。
+  const similarityTargetId = similarMode ? (similarity?.targetIds[0] ?? null) : null;
   useEffect(() => {
-    const targetId = similarMode ? (similarity?.targetId ?? null) : null;
-    if (targetId == null) {
+    if (similarityTargetId == null) {
       setSimilarityTarget(null);
       return;
     }
     let disposed = false;
     void libraryApi
-      .getImageDetail(targetId)
+      .getImageDetail(similarityTargetId)
       .then((details) => {
         if (!disposed) setSimilarityTarget(details);
       })
@@ -315,7 +324,7 @@ export function LibraryView({
     return () => {
       disposed = true;
     };
-  }, [similarMode, similarity?.targetId]);
+  }, [similarityTargetId]);
 
   /** 界面偏好（填充方式、详情面板）改了就存，不弹“设置已保存”。 */
   const persistUi = useCallback(
@@ -499,6 +508,20 @@ export function LibraryView({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [filterOpen]);
 
+  useEffect(() => {
+    if (!findSimilarOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        findSimilarAnchorRef.current &&
+        !findSimilarAnchorRef.current.contains(event.target as Node)
+      ) {
+        setFindSimilarOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [findSimilarOpen]);
+
   // 新建集合对话框里要显示“当前视图 N 张”，打开时取一次总数（不拉全量 id）。
   useEffect(() => {
     if (!createCollectionOpen) return;
@@ -673,19 +696,6 @@ export function LibraryView({
         items: targetItems.length > 0 ? targetItems : [item],
         ids: ids.length > 0 ? ids : [item.id],
       });
-      // 菜单先出现，能力随后补齐；只在目标仍是同一张图时写回。
-      setContextCaps(null);
-      contextCapsTarget.current = item.id;
-      void libraryApi
-        .getImageCapabilities([item.id])
-        .then((caps) => {
-          if (contextCapsTarget.current === item.id) {
-            setContextCaps(caps[0] ?? null);
-          }
-        })
-        .catch(() => {
-          // 查询失败时按“未知”处理，菜单项保持可用。
-        });
     },
     [items, selected],
   );
@@ -695,8 +705,16 @@ export function LibraryView({
     clearSelection();
   }, [clearSelection]);
 
-  /** 打开任务前先算好各范围的数量；id 集合仍由 Rust 侧解析。 */
-  const buildTaskContext = useCallback(async (): Promise<BatchTaskContextInfo | null> => {
+  /**
+   * 打开任务前先算好各范围的数量；id 集合仍由 Rust 侧解析。
+   *
+   * 相似结果视图里底层图库视图默认不能当范围（批量任务会改错图片），
+   * 找相似例外：它要能把结果再收窄到进入相似结果前的那个视图。
+   */
+  const buildTaskContext = useCallback(async (options?: {
+    includeView?: boolean;
+  }): Promise<BatchTaskContextInfo | null> => {
+    const includeView = !similarityActive || options?.includeView === true;
     const folderId =
       browse.filters.folderIds.length === 1 ? browse.filters.folderIds[0] : null;
     const folder = folderId != null ? folders.find((item) => item.id === folderId) : undefined;
@@ -705,7 +723,7 @@ export function LibraryView({
         ? collections.find((item) => item.id === effectiveCollectionId)
         : undefined;
     let viewTotal: number | null = null;
-    if (!similarityActive) {
+    if (includeView) {
       try {
         viewTotal = (await libraryApi.getFilterCounts(query)).total;
       } catch {
@@ -714,10 +732,11 @@ export function LibraryView({
     }
     return {
       selectedIds: [...selected],
-      query: similarityActive ? null : query,
+      query: includeView ? query : null,
       viewTotal,
       folderId,
       folderName: folder?.path ?? null,
+      folderDirectTotal: folder?.directImageCount ?? null,
       folderTotal: folder?.totalImageCount ?? null,
       collectionId: effectiveView === "collection" ? effectiveCollectionId : null,
       collectionName: collection?.name ?? null,
@@ -749,6 +768,56 @@ export function LibraryView({
     const context = await buildTaskContext();
     if (context) onOpenOptimize(context);
   }, [buildTaskContext, onOpenOptimize]);
+
+  const openFindSimilarPanel = useCallback(
+    async (reference: SimilarReference, initial: FindSimilarConfig | null) => {
+      const context = await buildTaskContext({ includeView: true });
+      if (!context) {
+        notify("无法读取当前范围", "error");
+        return;
+      }
+      setFindSimilarContext(context);
+      setFindSimilarInitial(initial);
+      setFindSimilarOpen(true);
+    },
+    [buildTaskContext, notify],
+  );
+
+  const handleSetSimilarReference = useCallback(
+    (ids: number[], items: ImageRow[]) => {
+      setContextMenu(null);
+      setSimilarityReference({ ids, items });
+      setLastFindSimilar(null);
+      notify(
+        ids.length > 1 ? `已设为 ${ids.length} 张相似参考（平均）` : "已设为相似参考",
+        "success",
+        "在工具栏点「相似」开始查找。",
+      );
+    },
+    [notify],
+  );
+
+  const openFindSimilarFromToolbar = useCallback(() => {
+    if (!similarityReference) return;
+    void openFindSimilarPanel(similarityReference, lastFindSimilar);
+  }, [lastFindSimilar, openFindSimilarPanel, similarityReference]);
+
+  const toggleFindSimilarPanel = useCallback(() => {
+    if (findSimilarOpen) {
+      setFindSimilarOpen(false);
+      return;
+    }
+    openFindSimilarFromToolbar();
+  }, [findSimilarOpen, openFindSimilarFromToolbar]);
+
+  const startFindSimilar = useCallback(
+    (config: FindSimilarConfig) => {
+      setLastFindSimilar(config);
+      setFindSimilarOpen(false);
+      similarity?.findSimilar(config);
+    },
+    [similarity],
+  );
 
   const resolveResultIds = useCallback(async () => {
     if (similarityActive && similarity) return similarity.ids();
@@ -1071,7 +1140,7 @@ export function LibraryView({
 
   /** 打开“找相似”的比较图：目标图不在结果里，单独用它的详情组装查看器。 */
   const openSimilarityTarget = useCallback(async () => {
-    const targetId = similarity?.targetId;
+    const targetId = similarity?.targetIds[0];
     if (targetId == null) return;
     let details = similarityTarget?.id === targetId ? similarityTarget : null;
     if (!details) {
@@ -1142,7 +1211,7 @@ export function LibraryView({
     refreshData,
     removeFromCurrentCollection,
     restoreSelected,
-    similarity?.targetId,
+    similarity?.targetIds,
     similarityTarget,
     trashSelected,
   ]);
@@ -1278,6 +1347,7 @@ export function LibraryView({
     if (key === "Escape") {
       event.preventDefault();
       if (taskMenuOpen) setTaskMenuOpen(false);
+      else if (findSimilarOpen) setFindSimilarOpen(false);
       else if (filterOpen) setFilterOpen(false);
       else if (contextMenu) setContextMenu(null);
       else clearSelection();
@@ -1380,11 +1450,16 @@ export function LibraryView({
   }, [browse]);
 
   const filterCount = activeFilterCount(browse.filters);
-  const similarityTargetLabel = similarityTarget
-    ? fileNameOf(similarityTarget.filePath)
-    : similarity?.targetId != null
-      ? `#${similarity.targetId}`
-      : "比较图";
+  const similarityReferenceCount = similarityReference?.ids.length ?? 0;
+  const referenceCount = similarity?.targetIds.length ?? 0;
+  const averageReference = referenceCount > 1;
+  const similarityTargetLabel = averageReference
+    ? `${referenceCount} 张参考图`
+    : similarityTarget
+      ? fileNameOf(similarityTarget.filePath)
+      : similarityTargetId != null
+        ? `#${similarityTargetId}`
+        : "比较图";
   const noResults = status === "ready" && items.length === 0;
   const selectedIds = useMemo(() => [...selected], [selected]);
   const contextHasDeleted = contextMenu?.items.some((item) => item.deletedAt != null) ?? false;
@@ -1658,6 +1733,35 @@ export function LibraryView({
             ) : null}
           </div>
 
+          <div className="filter-anchor" ref={findSimilarAnchorRef}>
+            <Button
+              size="sm"
+              variant={similarityReference ? "primary" : "secondary"}
+              icon={<ScanSearch size={14} />}
+              disabled={!similarityReference}
+              aria-expanded={findSimilarOpen}
+              title={
+                similarityReference
+                  ? similarityReferenceCount > 1
+                    ? `已设 ${similarityReferenceCount} 张相似参考（平均），点击调整条件`
+                    : "已设 1 张相似参考，点击调整条件"
+                  : "右键图片设为相似参考"
+              }
+              onClick={toggleFindSimilarPanel}
+            >
+              相似
+              {similarityReferenceCount > 1 ? ` · ${similarityReferenceCount}` : ""}
+            </Button>
+            <FindSimilarPanel
+              open={findSimilarOpen}
+              reference={similarityReference}
+              context={findSimilarContext}
+              initial={findSimilarInitial}
+              onClose={() => setFindSimilarOpen(false)}
+              onStart={startFindSimilar}
+            />
+          </div>
+
           <div className="filter-anchor" ref={filterAnchorRef}>
             <Button
               size="sm"
@@ -1758,18 +1862,31 @@ export function LibraryView({
                 <button
                   type="button"
                   className="similarity-target"
-                  title="打开这张比较图"
+                  title={averageReference ? "打开第一张参考图" : "打开这张比较图"}
                   onClick={() => void openSimilarityTarget()}
                 >
                   {similarityTargetLabel}
                 </button>
-                {similarity.kind ? ` · ${SIMILAR_LABELS[similarity.kind]}` : ""}
+                {similarity.kind
+                  ? ` · ${similarKindLabel(similarity.kind, averageReference)}`
+                  : ""}
+                {similarity.scopeLabel ? ` · 范围：${similarity.scopeLabel}` : ""}
               </>
             ) : (
               `语义搜索「${similarity.text}」`
             )}{" "}
             · {similarity.total.toLocaleString()} 张结果
           </span>
+          {similarMode && similarityReference ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<SlidersHorizontal size={12} />}
+              onClick={openFindSimilarFromToolbar}
+            >
+              调整
+            </Button>
+          ) : null}
           <Button
             size="sm"
             variant="success"
@@ -1941,7 +2058,6 @@ export function LibraryView({
       {contextMenu ? (
         <LibraryContextMenu
           menu={contextMenu}
-          capabilities={contextCaps}
           inCollection={effectiveView === "collection"}
           hasActive={contextHasActive}
           hasDeleted={contextHasDeleted}
@@ -1958,11 +2074,9 @@ export function LibraryView({
             setContextMenu(null);
             if (item) onCopyImage(item.id);
           }}
-          onFindSimilar={(kind) => {
-            const item = contextMenu.items[0];
-            setContextMenu(null);
-            if (item) onFindSimilar?.(kind, item.id);
-          }}
+          onSetSimilarReference={() =>
+            handleSetSimilarReference(contextMenu.ids, contextMenu.items)
+          }
           onAddToCollection={() => {
             setContextMenu(null);
             setCollectionPickerOpen(true);

@@ -3,6 +3,8 @@ use image::{DynamicImage, imageops::FilterType};
 const SAMPLE_EDGE: u32 = 64;
 const ITERATIONS: usize = 12;
 const KMAX: usize = 8;
+/// 合并参考主色时的迭代上限；与单张主色用同一套固定迭代次数。
+const AGGREGATE_ITERATIONS: usize = ITERATIONS;
 
 pub const COLORS4_BYTES: usize = 16;
 pub const COLORS8_BYTES: usize = 32;
@@ -191,6 +193,157 @@ pub fn prepare_palette<const N: usize>(palette: &[u8]) -> [LabColor; N] {
         };
     }
     out
+}
+
+/// 把多张图的 4/8 色合并成一组参考主色。
+///
+/// 每张图等权；在 OKLab 里做加权 k-means，初始化取“权重最高 → 最远点”，
+/// 保留 `N` 个代表色。同样的输入始终得到同样的结果。
+pub fn aggregate_palettes<const N: usize>(palettes: &[[LabColor; N]]) -> [LabColor; N] {
+    if palettes.is_empty() {
+        return [LabColor::default(); N];
+    }
+    let mut samples = Vec::with_capacity(palettes.len() * N);
+    let image_weight = 1.0 / palettes.len() as f32;
+    for palette in palettes {
+        for entry in palette {
+            samples.push(LabColor {
+                l: entry.l,
+                a: entry.a,
+                b: entry.b,
+                weight: entry.weight * image_weight,
+            });
+        }
+    }
+    let total_weight: f32 = samples.iter().map(|entry| entry.weight).sum();
+    if total_weight <= f32::EPSILON {
+        return palettes[0];
+    }
+
+    let mut centroids: Vec<[f32; 3]> = Vec::with_capacity(N.min(samples.len()));
+    let first = samples
+        .iter()
+        .enumerate()
+        .max_by(|left, right| {
+            left.1
+                .weight
+                .total_cmp(&right.1.weight)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    centroids.push([samples[first].l, samples[first].a, samples[first].b]);
+    while centroids.len() < N.min(samples.len()) {
+        let mut best_index = 0;
+        let mut best_distance = -1.0_f32;
+        for (index, sample) in samples.iter().enumerate() {
+            let point = [sample.l, sample.a, sample.b];
+            let nearest = centroids
+                .iter()
+                .map(|centroid| lab_distance_squared(&point, centroid))
+                .fold(f32::INFINITY, f32::min);
+            let score = nearest * sample.weight.max(f32::EPSILON);
+            if score > best_distance {
+                best_distance = score;
+                best_index = index;
+            }
+        }
+        let chosen = &samples[best_index];
+        centroids.push([chosen.l, chosen.a, chosen.b]);
+    }
+
+    let nearest_cluster = |point: [f32; 3], centroids: &[[f32; 3]]| -> usize {
+        let mut best = 0;
+        let mut best_distance = f32::INFINITY;
+        for (cluster, centroid) in centroids.iter().enumerate() {
+            let distance = lab_distance_squared(&point, centroid);
+            if distance < best_distance {
+                best_distance = distance;
+                best = cluster;
+            }
+        }
+        best
+    };
+
+    let mut assignments = vec![usize::MAX; samples.len()];
+    let mut cluster_weights = vec![0.0_f32; centroids.len()];
+    for _ in 0..AGGREGATE_ITERATIONS {
+        let mut sums = vec![[0.0_f64; 3]; centroids.len()];
+        cluster_weights.fill(0.0);
+        let mut changed = false;
+        for (index, sample) in samples.iter().enumerate() {
+            let point = [sample.l, sample.a, sample.b];
+            let best = nearest_cluster(point, &centroids);
+            if assignments[index] != best {
+                assignments[index] = best;
+                changed = true;
+            }
+            let weight = f64::from(sample.weight);
+            cluster_weights[best] += sample.weight;
+            for axis in 0..3 {
+                sums[best][axis] += weight * f64::from(point[axis]);
+            }
+        }
+        for (cluster, centroid) in centroids.iter_mut().enumerate() {
+            let weight = cluster_weights[cluster];
+            if weight > f32::EPSILON {
+                let weight = f64::from(weight);
+                *centroid = [
+                    (sums[cluster][0] / weight) as f32,
+                    (sums[cluster][1] / weight) as f32,
+                    (sums[cluster][2] / weight) as f32,
+                ];
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // 质心是上一轮末尾更新的，权重按最终质心重算一次，避免用到上一轮归属。
+    cluster_weights.fill(0.0);
+    for sample in &samples {
+        let cluster = nearest_cluster([sample.l, sample.a, sample.b], &centroids);
+        cluster_weights[cluster] += sample.weight;
+    }
+
+    let mut entries: Vec<LabColor> = centroids
+        .into_iter()
+        .zip(cluster_weights)
+        .map(|(centroid, weight)| LabColor {
+            l: centroid[0],
+            a: centroid[1],
+            b: centroid[2],
+            weight,
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        right
+            .weight
+            .total_cmp(&left.weight)
+            .then_with(|| left.l.total_cmp(&right.l))
+            .then_with(|| left.a.total_cmp(&right.a))
+            .then_with(|| left.b.total_cmp(&right.b))
+    });
+    let assigned: f32 = entries.iter().map(|entry| entry.weight).sum();
+    if assigned > f32::EPSILON {
+        for entry in &mut entries {
+            entry.weight /= assigned;
+        }
+    } else {
+        return palettes[0];
+    }
+    let mut output = [LabColor::default(); N];
+    for (slot, entry) in output.iter_mut().zip(entries) {
+        *slot = entry;
+    }
+    output
+}
+
+fn lab_distance_squared(left: &[f32; 3], right: &[f32; 3]) -> f32 {
+    let dl = left[0] - right[0];
+    let da = left[1] - right[1];
+    let db = left[2] - right[2];
+    dl * dl + da * da + db * db
 }
 
 /// 两套已预转换主色的对称加权距离，0 表示一致。
@@ -400,6 +553,41 @@ mod tests {
         assert_eq!(distance4(&colors4, &colors4), 0.0);
         let prepared = prepare_palette::<8>(&colors8);
         assert_eq!(prepared_distance(&prepared, &prepared), 0.0);
+    }
+
+    fn nearest_distance(entry: &LabColor, palette: &[LabColor]) -> f32 {
+        palette
+            .iter()
+            .map(|other| {
+                let dl = entry.l - other.l;
+                let da = entry.a - other.a;
+                let db = entry.b - other.b;
+                (dl * dl + da * da + db * db).sqrt()
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn aggregate_keeps_colors_of_identical_palettes() {
+        let (colors4, _) = dominant(&two_color());
+        let prepared = prepare_palette::<4>(&colors4);
+        let merged = aggregate_palettes(&[prepared, prepared, prepared]);
+        assert!((merged.iter().map(|entry| entry.weight).sum::<f32>() - 1.0).abs() < 1e-5);
+        for entry in prepared {
+            if entry.weight > 0.0 {
+                assert!(nearest_distance(&entry, &merged) < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_keeps_colors_from_different_references() {
+        let red = prepare_palette::<4>(&dominant(&solid([200, 30, 30])).0);
+        let blue = prepare_palette::<4>(&dominant(&solid([30, 40, 200])).0);
+        let merged = aggregate_palettes(&[red, blue]);
+        assert!(nearest_distance(&red[0], &merged) < 1e-4);
+        assert!(nearest_distance(&blue[0], &merged) < 1e-4);
+        assert!((merged.iter().map(|entry| entry.weight).sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
     #[test]

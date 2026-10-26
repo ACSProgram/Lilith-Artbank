@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::{OptionalExtension, params};
 
@@ -128,14 +128,18 @@ pub fn similar(
     target_id: i64,
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
-    similar_with_total(database, store, target_id, limit).map(|(items, _)| items)
+    similar_with_total(database, store, target_id, None, None, limit).map(|(items, _)| items)
 }
 
 /// 与 [`similar`] 相同，同时返回截断前的命中总数。
+///
+/// `min_score` 是相似度下限；`allowed` 非空时只扫描范围内的图片。
 pub fn similar_with_total(
     database: &LibraryDb,
     store: &FeatureStore,
     target_id: i64,
+    min_score: Option<f32>,
+    allowed: Option<&HashSet<i64>>,
     limit: usize,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
     let target = load(database, store, target_id)?
@@ -167,6 +171,11 @@ pub fn similar_with_total(
             if image_id == target_id || length as usize != POSE_BYTES {
                 continue;
             }
+            if let Some(allowed) = allowed
+                && !allowed.contains(&image_id)
+            {
+                continue;
+            }
             by_pack
                 .entry(pack_name)
                 .or_default()
@@ -190,7 +199,11 @@ pub fn similar_with_total(
                 continue;
             };
             let pose = SimilarityPose::from_landmarks(&decode_landmarks(bytes));
-            scored.push((image_id, target_pose.similarity(&pose, &weights) as f32));
+            let score = target_pose.similarity(&pose, &weights) as f32;
+            if min_score.is_some_and(|min| score < min) {
+                continue;
+            }
+            scored.push((image_id, score));
         }
     }
     scored.sort_by(|left, right| {

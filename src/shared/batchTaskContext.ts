@@ -7,6 +7,9 @@ export interface BatchTaskContextInfo {
   viewTotal: number | null;
   folderId: number | null;
   folderName: string | null;
+  /** 只含该文件夹自身。 */
+  folderDirectTotal: number | null;
+  /** 含全部后代。 */
   folderTotal: number | null;
   collectionId: number | null;
   collectionName: string | null;

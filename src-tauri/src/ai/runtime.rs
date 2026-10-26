@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -22,6 +22,7 @@ use crate::{
             TaskStartResult,
         },
     },
+    imageops,
     library::{
         db::LibraryDb,
         paths::LibraryPaths,
@@ -174,6 +175,84 @@ pub struct ImageSimilarityResult {
     /// 截断前的命中总数。
     pub total_hits: usize,
     pub elapsed_ms: i64,
+}
+
+fn reference_ids(ids: &[i64]) -> AppResult<Vec<i64>> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for id in ids {
+        if *id <= 0 {
+            return Err(AppError::message("参考图 id 无效"));
+        }
+        if seen.insert(*id) {
+            result.push(*id);
+        }
+    }
+    if result.is_empty() {
+        return Err(AppError::message("至少需要一张参考图"));
+    }
+    if result.len() > library_similarity::MAX_REFERENCE_IDS {
+        return Err(AppError::message(format!(
+            "参考图最多 {} 张",
+            library_similarity::MAX_REFERENCE_IDS
+        )));
+    }
+    Ok(result)
+}
+
+fn single_reference(ids: &[i64], label: &str) -> AppResult<i64> {
+    if ids.len() != 1 {
+        return Err(AppError::message(format!("{label}：只支持单张参考图")));
+    }
+    Ok(ids[0])
+}
+
+/// pHash 距离上限；省略时用默认 6，最大 256（等于不限制）。
+fn parse_phash_threshold(value: Option<f64>) -> AppResult<u32> {
+    let raw = value.unwrap_or(f64::from(library_similarity::DEFAULT_PHASH_THRESHOLD));
+    let max = f64::from(library_similarity::MAX_PHASH_THRESHOLD);
+    if !raw.is_finite() || !(0.0..=max).contains(&raw) {
+        return Err(AppError::message("pHash 阈值必须是 0-256"));
+    }
+    Ok(raw.round() as u32)
+}
+
+fn parse_distance_threshold(value: Option<f64>, label: &str) -> AppResult<Option<f32>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => Ok(Some(value as f32)),
+        Some(_) => Err(AppError::message(format!("{label}必须在 0 到 1 之间"))),
+    }
+}
+
+fn parse_score_threshold(value: Option<f64>, label: &str) -> AppResult<Option<f32>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(Some(value as f32)),
+        Some(_) => Err(AppError::message(format!("{label}必须在 -1 到 1 之间"))),
+    }
+}
+
+/// 单张参考直接用自身主色；多张时等权合并成一组代表色。
+fn reference_colors<const N: usize>(
+    database: &LibraryDb,
+    targets: &[i64],
+    colors_of: impl for<'a> Fn(&'a library_similarity::TargetPalette) -> &'a [u8],
+) -> AppResult<Vec<imageops::colors::LabColor>> {
+    if let [target_id] = targets {
+        let visuals = library_similarity::target_visuals(database, *target_id)?;
+        let palette = library_similarity::TargetPalette {
+            colors4: visuals.colors4,
+            colors8: visuals.colors8,
+        };
+        return Ok(imageops::colors::prepare_palette::<N>(colors_of(&palette)).to_vec());
+    }
+    let palettes = library_similarity::target_palettes(database, targets)?;
+    let prepared: Vec<_> = palettes
+        .iter()
+        .map(|palette| imageops::colors::prepare_palette::<N>(colors_of(palette)))
+        .collect();
+    Ok(imageops::colors::aggregate_palettes(&prepared).to_vec())
 }
 
 /// 相似分组的两种指标；可以单独启用，也可以同时启用（同时满足才归组）。
@@ -533,11 +612,15 @@ impl AiRuntime {
 
     /// 语义搜索：text embedding → 与同 model/dim 的图片向量做中心化余弦扫描。
     /// 结果 id 缓存在内存里，按图库代次与 library_id 绑定；关库、换库或数据变化后失效。
+    ///
+    /// `scope` 把扫描收窄到当前视图/选择/文件夹/集合；`min_score` 是相似度下限。
     pub fn semantic_search(
         &self,
         settings: &AiSettings,
         text: &str,
         limit: Option<usize>,
+        scope: Option<&TaskScope>,
+        min_score: Option<f64>,
     ) -> AppResult<SemanticSearchResult> {
         let text = text.trim();
         if text.is_empty() {
@@ -594,6 +677,8 @@ impl AiRuntime {
         }
         let mean = self.ensure_mean(&handles, &image_model, dim)?;
         let limit = limit.unwrap_or(embedding::DEFAULT_SEARCH_LIMIT);
+        let allowed = self.resolve_similarity_scope(&handles.database, scope)?;
+        let min_score = parse_score_threshold(min_score, "语义相似度下限")?;
         let (hits, total_hits) = embedding::search_with_total(
             &handles.database,
             &self.inner.store,
@@ -602,6 +687,11 @@ impl AiRuntime {
             &query_embedding.vector,
             &mean.vector,
             limit,
+            embedding::SearchFilter {
+                allowed: allowed.as_ref(),
+                excluded: None,
+                min_score,
+            },
         )?;
         let token = uuid::Uuid::new_v4().to_string();
         let returned = hits.len();
@@ -624,32 +714,37 @@ impl AiRuntime {
 
     /// 目标图相似：`phash`、`color4`、`color8`、`embedding`、`pose`。
     ///
+    /// 单张参考图支持全部指标；多张参考图只支持主色与 embedding 的平均。
+    /// `scope` 把扫描收窄到当前视图/选择/文件夹/集合；`None` 与全库等价。
     /// 结果写入统一的 token 缓存，后续分页与全选复用 `get_similarity_page` / `get_similarity_ids`。
     pub fn find_similar_images(
         &self,
         kind: &str,
-        target_id: i64,
-        threshold: Option<u32>,
+        target_ids: &[i64],
+        threshold: Option<f64>,
         limit: Option<usize>,
+        scope: Option<&TaskScope>,
     ) -> AppResult<ImageSimilarityResult> {
         let handles = self.handles()?;
         let started = Instant::now();
         let limit = limit
             .unwrap_or(library_similarity::DEFAULT_LIMIT)
             .clamp(1, library_similarity::MAX_LIMIT);
+        let targets = reference_ids(target_ids)?;
+        let exclude: HashSet<i64> = targets.iter().copied().collect();
+        let allowed = self.resolve_similarity_scope(&handles.database, scope)?;
         let (hits, total_hits): (Vec<(i64, f32)>, usize) = match kind {
             "phash" => {
+                let target_id = single_reference(&targets, "pHash")?;
                 let target = library_similarity::target_visuals(&handles.database, target_id)?;
-                let threshold = threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD);
-                if threshold > library_similarity::MAX_PHASH_THRESHOLD {
-                    return Err(AppError::message("pHash 阈值超出 0-256"));
-                }
+                let threshold = parse_phash_threshold(threshold)?;
                 let index = self.visual_index(&handles)?;
                 let (hit, total) = index.similar_phash_with_total(
                     crate::imageops::phash::words(&target.phash),
                     threshold,
                     limit,
-                    target_id,
+                    &exclude,
+                    allowed.as_ref(),
                 );
                 (
                     hit.into_iter()
@@ -659,26 +754,56 @@ impl AiRuntime {
                 )
             }
             "color4" | "color8" => {
-                let target = library_similarity::target_visuals(&handles.database, target_id)?;
+                let threshold = parse_distance_threshold(threshold, "主色距离上限")?;
                 let index = self.visual_index(&handles)?;
-                let (palette, prepared) = if kind == "color4" {
+                let (palette, colors) = if kind == "color4" {
                     (
                         library_similarity::ColorPalette::Colors4,
-                        crate::imageops::colors::prepare_palette::<4>(&target.colors4).to_vec(),
+                        reference_colors::<4>(&handles.database, &targets, |palette| {
+                            &palette.colors4
+                        })?,
                     )
                 } else {
                     (
                         library_similarity::ColorPalette::Colors8,
-                        crate::imageops::colors::prepare_palette::<8>(&target.colors8).to_vec(),
+                        reference_colors::<8>(&handles.database, &targets, |palette| {
+                            &palette.colors8
+                        })?,
                     )
                 };
-                index.similar_color_with_total(&prepared, palette, limit, target_id)
+                index.similar_color_with_total(
+                    &colors,
+                    palette,
+                    threshold,
+                    limit,
+                    &exclude,
+                    allowed.as_ref(),
+                )
             }
-            "embedding" => self.similar_ids_by_embedding(&handles, target_id, limit)?,
+            "embedding" => {
+                let threshold = parse_score_threshold(threshold, "语义相似度下限")?;
+                self.similar_ids_by_embedding(
+                    &handles,
+                    &targets,
+                    &exclude,
+                    threshold,
+                    limit,
+                    allowed.as_ref(),
+                )?
+            }
             "pose" => {
+                let target_id = single_reference(&targets, "姿势")?;
                 // pose 记录没有自己的可见性标记，只确认目标图未被移入回收站。
                 library_similarity::ensure_visible(&handles.database, target_id)?;
-                pose::similar_with_total(&handles.database, &self.inner.store, target_id, limit)?
+                let threshold = parse_score_threshold(threshold, "姿势相似度下限")?;
+                pose::similar_with_total(
+                    &handles.database,
+                    &self.inner.store,
+                    target_id,
+                    threshold,
+                    allowed.as_ref(),
+                    limit,
+                )?
             }
             other => {
                 return Err(AppError::message(format!("未知的相似度类型：{other}")));
@@ -701,6 +826,17 @@ impl AiRuntime {
         })
     }
 
+    fn resolve_similarity_scope(
+        &self,
+        database: &LibraryDb,
+        scope: Option<&TaskScope>,
+    ) -> AppResult<Option<HashSet<i64>>> {
+        match scope {
+            None | Some(TaskScope::Library) => Ok(None),
+            Some(scope) => Ok(Some(scope.resolve(database)?.into_iter().collect())),
+        }
+    }
+
     fn visual_index(
         &self,
         handles: &LibraryHandles,
@@ -718,11 +854,18 @@ impl AiRuntime {
     fn similar_ids_by_embedding(
         &self,
         handles: &LibraryHandles,
-        target_id: i64,
+        target_ids: &[i64],
+        exclude: &HashSet<i64>,
+        threshold: Option<f32>,
         limit: usize,
+        allowed: Option<&HashSet<i64>>,
     ) -> AppResult<(Vec<(i64, f32)>, usize)> {
-        let target = embedding::target(&handles.database, &self.inner.store, target_id)?
-            .ok_or_else(|| AppError::message("这张图片还没有 embedding，请先运行 AI 任务"))?;
+        let target = if target_ids.len() == 1 {
+            embedding::target(&handles.database, &self.inner.store, target_ids[0])?
+                .ok_or_else(|| AppError::message("这张图片还没有 embedding，请先运行 AI 任务"))?
+        } else {
+            embedding::target_average(&handles.database, &self.inner.store, target_ids)?
+        };
         let mean = self.ensure_mean(handles, &target.model, target.dim)?;
         embedding::similar_to_with_total(
             &handles.database,
@@ -731,8 +874,13 @@ impl AiRuntime {
             target.dim,
             &target.vector,
             &mean.vector,
-            target_id,
+            exclude,
             limit,
+            embedding::SearchFilter {
+                allowed,
+                excluded: None,
+                min_score: threshold,
+            },
         )
     }
 

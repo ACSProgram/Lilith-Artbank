@@ -21,13 +21,13 @@ import {
   type ConflictPolicy,
   type TaskSummary,
 } from "./taskTypes";
+import { ScopePicker } from "../shared/components/ScopePicker";
 import {
   buildScope,
   defaultScopeChoice,
   scopeAvailability,
-  scopeCountLabel,
   type ScopeChoice,
-} from "./taskScope";
+} from "../shared/scope";
 
 interface BatchTaskDialogProps {
   open: boolean;
@@ -227,42 +227,13 @@ export function BatchTaskDialog({
         </div>
 
         <Field label="处理范围">
-          <div className="batch-task-scopes">
-            {(Object.keys(scopeOptions) as ScopeChoice[]).map((value) => {
-              const availability = scopeOptions[value];
-              return (
-                <label
-                  key={value}
-                  className={`batch-task-scope${
-                    !availability.enabled ? " is-disabled" : ""
-                  }`}
-                  title={availability.reason}
-                >
-                  <input
-                    type="radio"
-                    name="batch-scope"
-                    checked={scope === value}
-                    disabled={!availability.enabled}
-                    onChange={() => setScope(value)}
-                  />
-                  <span>
-                    {value === "selected"
-                      ? "当前选择"
-                      : value === "folder"
-                        ? context?.folderName || "当前文件夹"
-                        : value === "collection"
-                          ? context?.collectionName || "当前集合"
-                          : value === "view"
-                            ? "当前视图"
-                            : "整个图库"}
-                  </span>
-                  <em>
-                    {availability.enabled ? scopeCountLabel(value, context) : availability.reason}
-                  </em>
-                </label>
-              );
-            })}
-          </div>
+          <ScopePicker
+            name="batch-scope"
+            value={scope}
+            onChange={setScope}
+            context={context}
+            availability={scopeOptions}
+          />
         </Field>
 
         {kind !== "thumbnail" ? (

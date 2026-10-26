@@ -6,12 +6,16 @@ use serde_json::{Value, json};
 
 use crate::{
     ai::runtime::AiRuntime,
-    app::error::{AppError, AppResult},
+    app::{
+        error::{AppError, AppResult},
+        tasks::TaskScope,
+    },
     imageops::contact_sheet,
     library::{
         capability, collections, metadata,
         paths::{normalize_folder, parent_path},
         query::{self, ImageRow},
+        similarity::MAX_REFERENCE_IDS,
     },
 };
 
@@ -73,23 +77,83 @@ pub enum SimilarMode {
     Text,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum FindSimilarScope {
+    Library,
+    #[serde(rename_all = "camelCase")]
+    Folder {
+        folder_id: i64,
+        #[serde(default = "default_include_subfolders")]
+        include_subfolders: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    Collection {
+        collection_id: i64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Selection {
+        image_ids: Vec<i64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    View {
+        query: Box<McpQuery>,
+    },
+}
+
+fn default_include_subfolders() -> bool {
+    true
+}
+
+impl FindSimilarScope {
+    fn to_task_scope(&self) -> TaskScope {
+        match self {
+            Self::Library => TaskScope::Library,
+            Self::Folder {
+                folder_id,
+                include_subfolders,
+            } => TaskScope::Folder {
+                folder_id: *folder_id,
+                include_subfolders: *include_subfolders,
+            },
+            Self::Collection { collection_id } => TaskScope::Collection {
+                collection_id: *collection_id,
+            },
+            Self::Selection { image_ids } => TaskScope::Selected {
+                image_ids: image_ids.clone(),
+            },
+            Self::View { query } => TaskScope::View {
+                query: Box::new(query.to_library_query()),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FindSimilarInput {
     #[schemars(description = "image 用目标图找相似；text 用语义搜索")]
     pub mode: SimilarMode,
-    #[schemars(description = "mode=image 时必填")]
+    #[schemars(description = "mode=image 时的单张参考图；与 targetIds 二选一")]
     pub target_id: Option<i64>,
+    #[schemars(
+        description = "mode=image 时的多张参考图；多张只支持 color4/color8/embedding，最多 100 张"
+    )]
+    pub target_ids: Option<Vec<i64>>,
     #[schemars(description = "mode=text 时必填")]
     pub text: Option<String>,
     #[schemars(description = "phash / color4 / color8 / embedding / pose；默认 phash")]
     pub kind: Option<String>,
-    #[schemars(description = "pHash 阈值 0-256；默认 6")]
-    pub threshold: Option<u32>,
+    #[schemars(
+        description = "pHash 用 0-256 距离上限，省略时 6；其它指标用 -1 到 1 的分数下限，省略不限制"
+    )]
+    pub threshold: Option<f64>,
     #[schemars(description = "最多返回结果数，1-10000")]
     pub limit: Option<u32>,
     #[schemars(description = "返回多少条预览，1-25；默认 12")]
     pub preview_limit: Option<u32>,
+    #[schemars(description = "扫描范围；默认整个图库")]
+    pub scope: Option<FindSimilarScope>,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -147,6 +211,7 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
                 "maxSearchPage": MAX_SEARCH_PAGE,
                 "maxSheetCells": u32::from(contact_sheet::MAX_GRID).pow(2),
                 "maxImageIdsPerGet": MAX_IMAGE_IDS,
+                "maxReferenceImages": MAX_REFERENCE_IDS,
                 "maxImportPaths": 10_000,
                 "maxImportFiles": 100_000,
                 "sheetTtlMinutes": SHEET_TTL_MINUTES,
@@ -288,25 +353,59 @@ pub fn find_similar(
         .preview_limit
         .unwrap_or(12)
         .clamp(1, MAX_PREVIEW as u32) as usize;
+    let task_scope = input
+        .scope
+        .as_ref()
+        .map(FindSimilarScope::to_task_scope)
+        .unwrap_or(TaskScope::Library);
+    let scope_label = task_scope.label();
     let (token, kind, returned, total_hits, elapsed_ms, extra) = match input.mode {
         SimilarMode::Image => {
-            let target_id = input
-                .target_id
-                .ok_or_else(|| AppError::message("mode=image 时必须提供 targetId"))?;
+            let target_ids = match (&input.target_ids, input.target_id) {
+                (Some(ids), None) => ids.clone(),
+                (Some(_), Some(_)) => {
+                    return Err(AppError::message("targetId 与 targetIds 只能传一个"));
+                }
+                (None, Some(id)) => vec![id],
+                (None, None) => {
+                    return Err(AppError::message(
+                        "mode=image 时必须提供 targetId 或 targetIds",
+                    ));
+                }
+            };
             let kind = input.kind.as_deref().unwrap_or("phash").trim();
             if !matches!(kind, "phash" | "color4" | "color8" | "embedding" | "pose") {
                 return Err(AppError::message(format!(
                     "相似度类型只能是 phash、color4、color8、embedding 或 pose，收到 {kind}"
                 )));
             }
-            let result = ai.find_similar_images(kind, target_id, input.threshold, Some(limit))?;
+            if target_ids.len() > MAX_REFERENCE_IDS {
+                return Err(AppError::message(format!(
+                    "参考图最多 {MAX_REFERENCE_IDS} 张"
+                )));
+            }
+            if target_ids.len() > 1 && !matches!(kind, "color4" | "color8" | "embedding") {
+                return Err(AppError::message(
+                    "多张参考图只支持 color4、color8 或 embedding",
+                ));
+            }
+            let result = ai.find_similar_images(
+                kind,
+                &target_ids,
+                input.threshold,
+                Some(limit),
+                Some(&task_scope),
+            )?;
             (
                 result.token,
                 result.kind,
                 result.total,
                 result.total_hits,
                 result.elapsed_ms,
-                Value::Null,
+                json!({
+                    "targetIds": target_ids,
+                    "referenceCount": target_ids.len(),
+                }),
             )
         }
         SimilarMode::Text => {
@@ -316,7 +415,13 @@ pub fn find_similar(
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .ok_or_else(|| AppError::message("mode=text 时必须提供 text"))?;
-            let result = ai.semantic_search(&context.settings.ai, text, Some(limit))?;
+            let result = ai.semantic_search(
+                &context.settings.ai,
+                text,
+                Some(limit),
+                Some(&task_scope),
+                input.threshold,
+            )?;
             (
                 result.token,
                 "semantic".to_owned(),
@@ -346,6 +451,7 @@ pub fn find_similar(
         },
         "kind": kind,
         "scoreKind": score_kind,
+        "scope": scope_label,
         "total": total_hits,
         "returned": returned,
         "limit": limit,
@@ -360,7 +466,7 @@ pub fn find_similar(
         }).collect::<Vec<_>>(),
         "nextOffset": preview.next_offset,
         "detail": extra,
-        "note": "total 是全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）；phash/color 的 score 是距离，越小越近，embedding/pose/semantic 的 score 是相似度，越大越近。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。",
+        "note": "total 是范围与阈值过滤后的全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）；phash/color 的 score 是距离，越小越近，embedding/pose/semantic 的 score 是相似度，越大越近。多张参考图只用于 color4/color8/embedding 的平均。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。",
     }))
 }
 
@@ -870,7 +976,7 @@ mod tests {
                 mode: SimilarMode::Image,
                 target_id: Some(1),
                 kind: Some("phash".into()),
-                threshold: Some(6),
+                threshold: Some(6.0),
                 limit: Some(10),
                 preview_limit: Some(5),
                 ..Default::default()
@@ -892,7 +998,7 @@ mod tests {
                 mode: SimilarMode::Image,
                 target_id: Some(2),
                 kind: Some("phash".into()),
-                threshold: Some(6),
+                threshold: Some(6.0),
                 limit: Some(10),
                 preview_limit: Some(5),
                 ..Default::default()
@@ -914,7 +1020,7 @@ mod tests {
                 mode: SimilarMode::Image,
                 target_id: Some(1),
                 kind: Some("phash".into()),
-                threshold: Some(6),
+                threshold: Some(6.0),
                 limit: Some(1),
                 preview_limit: Some(5),
                 ..Default::default()
@@ -924,6 +1030,63 @@ mod tests {
         assert_eq!(limited["total"], 2);
         assert_eq!(limited["returned"], 1);
         assert_eq!(limited["limit"], 1);
+    }
+
+    #[test]
+    fn find_similar_narrows_scope_and_rejects_average_for_phash() {
+        let fixture = fixture();
+        let scoped = find_similar(
+            &fixture.context,
+            &fixture.ai,
+            &FindSimilarInput {
+                mode: SimilarMode::Image,
+                target_id: Some(1),
+                kind: Some("phash".into()),
+                threshold: Some(6.0),
+                limit: Some(10),
+                preview_limit: Some(5),
+                scope: Some(FindSimilarScope::Selection { image_ids: vec![3] }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped["scope"], "选中 1 张");
+        assert_eq!(scoped["total"], 1);
+        assert_eq!(scoped["preview"][0]["id"], 3);
+
+        assert!(
+            find_similar(
+                &fixture.context,
+                &fixture.ai,
+                &FindSimilarInput {
+                    mode: SimilarMode::Image,
+                    target_ids: Some(vec![1, 2]),
+                    kind: Some("phash".into()),
+                    threshold: Some(6.0),
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+
+        let averaged = find_similar(
+            &fixture.context,
+            &fixture.ai,
+            &FindSimilarInput {
+                mode: SimilarMode::Image,
+                target_ids: Some(vec![1, 2]),
+                kind: Some("color8".into()),
+                threshold: Some(1.0),
+                limit: Some(10),
+                preview_limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(averaged["detail"]["referenceCount"], 2);
+        assert_eq!(averaged["total"], 1);
+        assert_eq!(averaged["preview"][0]["id"], 3);
     }
 
     #[test]
@@ -956,7 +1119,7 @@ mod tests {
                 mode: SimilarMode::Image,
                 target_id: Some(1),
                 kind: Some("phash".into()),
-                threshold: Some(6),
+                threshold: Some(6.0),
                 limit: Some(10),
                 preview_limit: Some(5),
                 ..Default::default()
@@ -993,6 +1156,7 @@ mod tests {
         assert_eq!(value["mcp"]["writeTools"], true);
         assert_eq!(value["mcp"]["approvalThreshold"], 100);
         assert_eq!(value["mcp"]["limits"]["maxSheetCells"], 25);
+        assert_eq!(value["mcp"]["limits"]["maxReferenceImages"], 100);
         assert_eq!(value["mcp"]["limits"]["maxImportPaths"], 10_000);
         assert_eq!(value["mcp"]["limits"]["importCompresses"], false);
     }

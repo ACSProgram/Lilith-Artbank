@@ -139,7 +139,7 @@ S6 已实现：AI 服务进程托管（启动/探活/启动失败退避重试/�
 
 2026-10-24 单库与多级文件夹已实现：设置 v2（单一 `libraryPath`）与 v1 迁移、schema v2（`folders.path` NOCASE 唯一索引）、单库生命周期与命令清理、文件夹创建/重命名/移动/删除空文件夹、子树筛选与树计数、导入“平铺/保留源目录”、前端单库外壳与文件夹树/面包屑/选择器/拖放。自动测试覆盖迁移、路径校验、文件夹 CRUD、子树查询与导入层级；真实窗口交互待手工验收。
 
-S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。
+S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。2026-10-26 起入口改为右键“设为相似参考”（多选为平均参考）+ 工具栏“相似”面板，并支持范围收窄，见 [浏览与查询](../modules/browse-and-query.md)。
 
 2026-10-24 体验整改 P0（基础层）已实现：`tokens.css` 语义变量与 `html[data-theme]` 主题切换（`settings.ui.theme` 支持 `light`/`dark`/`system` 并真正生效）、查看器与主界面统一配色、设置 v3（删掉 `thumbnailCacheMb`，新增缩略图填充/缓存张数/排序/排序方案/胶片带字段）、schema v3（`folders.sort_index`）、`ConfirmDialog` 的 `detail`/`checkbox`、`Modal` 焦点陷阱与滚动锁、`Popover`/`MenuSection`、移入回收站统一确认。
 

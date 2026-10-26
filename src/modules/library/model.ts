@@ -7,7 +7,7 @@ import type {
   SortKey,
   SortSpec,
 } from "./types";
-import type { SimilarKind } from "../../shared/similarity";
+import type { FindSimilarConfig, SimilarKind } from "../../shared/similarity";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 
 /** 与 Rust `query::DEFAULT_LIMIT` 保持一致。 */
@@ -371,7 +371,8 @@ export interface SimilarityBrowseState {
   mode: "semantic" | "similar";
   text: string;
   kind: SimilarKind | null;
-  targetId: number | null;
+  targetIds: number[];
+  scopeLabel: string;
   token: string | null;
   model: string;
   total: number;
@@ -384,11 +385,7 @@ export interface SimilarityBrowseState {
   moreError: string | null;
   hasMore: boolean;
   search: (text: string) => void;
-  findSimilar: (
-    kind: SimilarKind,
-    targetId: number,
-    threshold?: number,
-  ) => void;
+  findSimilar: (config: FindSimilarConfig) => void;
   clear: () => void;
   loadMore: () => void;
   retry: () => void;

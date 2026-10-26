@@ -1,6 +1,6 @@
 # MCP 图库控制
 
-支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库。批次 1（只读）、批次 2（写工具、撤销/重做、询问档、任务工具）与批次 3（导入、导入回执、`logs/mcp.log` 审计）已实现。
+支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库。批次 1（只读）、批次 2（写工具、撤销/重做、询问档、任务工具）、批次 3（导入、导入回执、`logs/mcp.log` 审计）与批次 4（找相似范围与平均参考）已实现。
 
 传输与进程：
 
@@ -53,16 +53,18 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `tags_list` | `query?`、`limit?` | 有图片的标签 id、名称、图片数；0 张标签不返回 |
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
 | `search_images` | 结构化查询、`pageSize` 1–50、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述与标签名 |
-| `find_similar` | `mode: image/text`、目标图或文本、`kind`、阈值、`limit` | token、全部命中数、可翻页数、带分数的预览 |
+| `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览 |
 | `images_get` | `ids≤50` | 详情、标签、描述、能力标记 |
 | `image_sheet` | selector、`grid 1–5`、`resolution: thumb/detail` | 拼图图片、格子映射、`sheetId`、下一页 |
 
 - `search_images` 始终返回 `total`；`pageSize` 超出 1–50 直接报错，不静默截断。分面计数按需开启，2 字搜索与超大集合较慢。
-- `find_similar` 的 `total` 是截断前的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
+- `find_similar` 的 `total` 是范围与阈值过滤后的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
+- `find_similar` 的 `threshold`：pHash 是 0–256 距离上限，省略时用默认 6；其它指标是 -1–1 的分数下限，省略不限制。多张参考图只支持 `color4`/`color8`/`embedding` 的平均，最多 100 张；`phash` 与 `pose` 只接受单张。
+- `find_similar` 的 `scope` 与界面一致：`library`（默认）、`folder`（`folderId`、`includeSubfolders`，默认包含）、`collection`（`collectionId`）、`selection`（`imageIds`）、`view`（结构化 `query`）。全库不解析 id；其它范围在 Rust 侧解析成 id 集合后与扫描取交集。
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。
 - AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本，当前没有导出工具。
-- `find_similar` 当前没有范围参数、临时文件夹也还没有实现；两者分别排在批次 4、批次 5，见 [MCP 计划](../planning/2026-10-25-MCP图库控制计划.md)。
+- 临时文件夹还没有实现，排在批次 5，见 [MCP 计划](../planning/2026-10-25-MCP图库控制计划.md)。
 
 ### 写入（7）
 
@@ -201,7 +203,7 @@ Rust：
 - `src-tauri/src/mcp/audit.rs`：`logs/mcp.log` 工具调用与导入来源审计。
 - `src-tauri/src/mcp/selection.rs`：selector 解析（分页与全量 id）、排除与去重。
 - `src-tauri/src/mcp/sheet.rs`：拼图映射缓存与缩略图/原图读取。
-- `src-tauri/src/mcp/tools/read.rs`：只读工具。
+- `src-tauri/src/mcp/tools/read.rs`：只读工具、`find_similar` 的 `FindSimilarScope` 与多参考图参数。
 - `src-tauri/src/mcp/tools/write.rs`：写工具、数量核对、询问判定与写后事件。
 - `src-tauri/src/mcp/tools/history.rs`：记录列表、撤销/重做预览与批准执行。
 - `src-tauri/src/mcp/tools/task.rs`：任务与确认单查询、等待、取消与导入回执。
@@ -211,7 +213,7 @@ Rust：
 - `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀。
 - `src-tauri/src/app/commands.rs`：`list_mcp_approvals`、`approve_mcp_approval`、`reject_mcp_approval`。
 - `src-tauri/src/imageops/contact_sheet.rs`：拼图布局、编号与 JPEG 编码。
-- `src-tauri/src/library/similarity.rs`、`ai/embedding.rs`、`ai/pose.rs`：相似扫描返回截断前的命中总数（`*_with_total`）。
+- `src-tauri/src/library/similarity.rs`、`ai/embedding.rs`、`ai/pose.rs`：相似扫描返回截断前的命中总数（`*_with_total`），接受范围 id 集合、排除集合与阈值；主色平均在 `imageops/colors.rs::aggregate_palettes`，embedding 平均在 `ai/embedding.rs::target_average`。
 - `src-tauri/src/ai/runtime.rs`：相似结果槽改存 `(id, 分数)`，`similarity_scores` 供预览带 `score`；`AiError.transport` 让语义搜索连接失败只报可读文案。
 
 前端：
@@ -225,7 +227,7 @@ Rust：
 
 ## 验证
 
-自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量（21）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、审计单行截断、导入缩略图预览上限 25。
+自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、`find_similar` 的 scope 收窄与多参考图平均/拒绝、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量（21）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、审计单行截断、导入缩略图预览上限 25。
 
 真实客户端验收需要用户执行：
 
@@ -241,3 +243,4 @@ Rust：
 10. `tasks_get(taskId)` 等到导入完成，确认附带回执的 `imported` / `duplicates` / `merged` / `previewIds` 与失败清单；用 `image_sheet(selector.ids=previewIds)` 看到刚入库的图。
 11. 对这次导入 `history_list` → `history_undo`，确认整次导入被撤销；确认 `logs/mcp.log` 有工具调用与导入来源行，且没有压缩字段或压缩行为。
 12. 从便携目录启动 exe（含 `server/`，不含安装器），重复第 2 步，确认 `--mcp-stdio` 指向当前 exe 且能正常调用 `library_info` 和 `import_start`。
+13. `find_similar` 分别传 `scope: {"type":"folder","folderId":…,"includeSubfolders":false}` 与 `targetIds`（两张图，`kind: color8`），确认结果只来自范围、参考图全部被排除，`detail.referenceCount=2`、`scope` 文案与界面一致。

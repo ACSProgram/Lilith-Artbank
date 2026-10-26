@@ -342,7 +342,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 beginDrag({ kind: "images", imageIds, label }, event)
               }
               similarity={similarity}
-              onFindSimilar={(kind, imageId) => similarity.findSimilar(kind, imageId)}
               onOpenSimilarityGroups={() => {
                 setSimilarityGroupsOpen(true);
               }}

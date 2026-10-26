@@ -1,4 +1,6 @@
-import type { LibraryQuery } from "../modules/library/types";
+import type { TaskScope } from "../shared/scope";
+
+export type { TaskScope };
 
 export type TaskKind =
   | "import"
@@ -143,14 +145,6 @@ export interface TaskSummary {
   lane: TaskLane;
   phase: TaskPhase;
 }
-
-/** 前端只传语义范围；id 集合由 Rust 侧解析。 */
-export type TaskScope =
-  | { type: "selected"; imageIds: number[] }
-  | { type: "folder"; folderId: number; includeSubfolders: boolean }
-  | { type: "collection"; collectionId: number }
-  | { type: "view"; query: LibraryQuery }
-  | { type: "library" };
 
 export interface BatchTaskRequest {
   kind: TaskRequestKind;

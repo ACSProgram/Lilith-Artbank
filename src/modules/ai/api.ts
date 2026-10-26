@@ -8,6 +8,7 @@ import type {
   SimilarityPage,
 } from "./types";
 import type { SimilarKind } from "../../shared/similarity";
+import type { TaskScope } from "../../shared/scope";
 
 export const aiBrowserPreview =
   typeof window === "undefined" || !("__TAURI_INTERNALS__" in window);
@@ -82,18 +83,20 @@ export const aiApi = {
     });
   },
 
-  async findSimilarImages(
-    kind: SimilarKind,
-    targetId: number,
-    threshold?: number,
-    limit?: number,
-  ): Promise<ImageSimilarityResult> {
-    requireTauri("找相似");
+  async findSimilarImages(request: {
+    kind: SimilarKind;
+    targetIds: number[];
+    threshold?: number | null;
+    limit?: number | null;
+    scope?: TaskScope | null;
+  }): Promise<ImageSimilarityResult> {
+    requireTauri("相似检索");
     return invoke<ImageSimilarityResult>("find_similar_images", {
-      kind,
-      targetId,
-      threshold: threshold ?? null,
-      limit: limit ?? null,
+      kind: request.kind,
+      targetIds: request.targetIds,
+      threshold: request.threshold ?? null,
+      limit: request.limit ?? null,
+      scope: request.scope ?? null,
     });
   },
 

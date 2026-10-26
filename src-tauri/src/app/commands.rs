@@ -13,7 +13,10 @@ use crate::{
         error::{AppError, AppResult},
         settings::Settings,
         state::AppState,
-        tasks::{BatchTaskRequest, LaneGuard, TaskKind, TaskPhase, TaskSnapshot, TaskStartResult},
+        tasks::{
+            BatchTaskRequest, LaneGuard, TaskKind, TaskPhase, TaskScope, TaskSnapshot,
+            TaskStartResult,
+        },
     },
     import::{ImportRequest, job::ImportSnapshot},
     library::{
@@ -764,23 +767,26 @@ pub async fn semantic_search(
 ) -> Result<SemanticSearchResult, String> {
     let settings = state.settings.snapshot().ai;
     let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.semantic_search(&settings, &text, limit))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.semantic_search(&settings, &text, limit, None, None)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn find_similar_images(
     state: State<'_, AppState>,
     kind: String,
-    target_id: i64,
-    threshold: Option<u32>,
+    target_ids: Vec<i64>,
+    threshold: Option<f64>,
     limit: Option<usize>,
+    scope: Option<TaskScope>,
 ) -> Result<ImageSimilarityResult, String> {
     let runtime = state.ai.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        runtime.find_similar_images(&kind, target_id, threshold, limit)
+        runtime.find_similar_images(&kind, &target_ids, threshold, limit, scope.as_ref())
     })
     .await
     .map_err(|error| error.to_string())?

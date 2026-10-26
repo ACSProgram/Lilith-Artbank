@@ -24,13 +24,15 @@ import {
   type TaskSnapshot,
   type TaskSummary,
 } from "./taskTypes";
+import { ScopePicker } from "../shared/components/ScopePicker";
 import {
   buildScope,
   defaultScopeChoice,
   scopeAvailability,
   scopeCountLabel,
+  scopeName,
   type ScopeChoice,
-} from "./taskScope";
+} from "../shared/scope";
 
 interface OptimizeDialogProps {
   open: boolean;
@@ -78,22 +80,6 @@ function parseEdge(text: string): { value: number | null; invalid: boolean } {
 function sampleSeconds(size: number, format: OptimizeOptions["outputFormat"]): number {
   const rate = format === "webp" ? SAMPLE_RATE_WEBP : SAMPLE_RATE_JPEG;
   return size / rate;
-}
-
-/** 范围的名字；数量另用 `scopeCountLabel`，两处展示要保持一致。 */
-function scopeName(scope: ScopeChoice, context: BatchTaskContextInfo | null): string {
-  switch (scope) {
-    case "selected":
-      return "当前选择";
-    case "folder":
-      return context?.folderName || "当前文件夹";
-    case "collection":
-      return context?.collectionName || "当前集合";
-    case "view":
-      return "当前视图";
-    case "library":
-      return "整个图库";
-  }
 }
 
 /** 估算与执行共用同一块进度展示，只有数据来源不同。 */
@@ -483,30 +469,13 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
         {!estimate && !execution ? (
           <>
             <Field label="处理范围">
-              <div className="batch-task-scopes">
-                {(Object.keys(scopeOptions) as ScopeChoice[]).map((value) => {
-                  const availability = scopeOptions[value];
-                  return (
-                    <label
-                      key={value}
-                      className={`batch-task-scope${availability.enabled ? "" : " is-disabled"}`}
-                      title={availability.reason}
-                    >
-                      <input
-                        type="radio"
-                        name="optimize-scope"
-                        checked={scope === value}
-                        disabled={!availability.enabled}
-                        onChange={() => setScope(value)}
-                      />
-                      <span>{scopeName(value, context)}</span>
-                      <em>
-                        {availability.enabled ? scopeCountLabel(value, context) : availability.reason}
-                      </em>
-                    </label>
-                  );
-                })}
-              </div>
+              <ScopePicker
+                name="optimize-scope"
+                value={scope}
+                onChange={setScope}
+                context={context}
+                availability={scopeOptions}
+              />
             </Field>
 
             <div className="optimize-section">

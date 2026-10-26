@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use half::{f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
@@ -116,6 +116,29 @@ pub struct TargetEmbedding {
     pub vector: Vec<f32>,
 }
 
+/// 相似扫描的范围、排除项与最低分。
+///
+/// `allowed` 为 `None` 表示全库；`excluded` 是参考图，`min_score` 是相似度下限。
+#[derive(Clone, Copy, Default)]
+pub struct SearchFilter<'a> {
+    pub allowed: Option<&'a HashSet<i64>>,
+    pub excluded: Option<&'a HashSet<i64>>,
+    pub min_score: Option<f32>,
+}
+
+impl SearchFilter<'_> {
+    fn allows(&self, image_id: i64) -> bool {
+        if self
+            .excluded
+            .is_some_and(|excluded| excluded.contains(&image_id))
+        {
+            return false;
+        }
+        self.allowed
+            .is_none_or(|allowed| allowed.contains(&image_id))
+    }
+}
+
 /// 读取某张图片的 embedding；没有记录或记录损坏时返回 `None`。
 pub fn target(
     database: &LibraryDb,
@@ -161,6 +184,65 @@ pub fn target(
     )
 }
 
+/// 多张参考图的 embedding 平均向量；任一张缺失或模型/维度不一致都拒绝。
+pub fn target_average(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    ids: &[i64],
+) -> AppResult<TargetEmbedding> {
+    if ids.is_empty() {
+        return Err(AppError::message("至少需要一张参考图"));
+    }
+    let mut model: Option<String> = None;
+    let mut dim = 0_u32;
+    let mut sum: Vec<f32> = Vec::new();
+    let mut missing = 0_usize;
+    for id in ids {
+        let Some(target) = target(database, store, *id)? else {
+            missing += 1;
+            continue;
+        };
+        match &model {
+            None => {
+                model = Some(target.model.clone());
+                dim = target.dim;
+                sum = vec![0.0; dim as usize];
+            }
+            Some(current) if *current != target.model || target.dim != dim => {
+                return Err(AppError::message(
+                    "参考图的 embedding 模型或维度不一致，请先统一重算",
+                ));
+            }
+            _ => {}
+        }
+        if target.vector.len() != dim as usize {
+            return Err(AppError::message("参考图的 embedding 维度无效"));
+        }
+        for (slot, value) in sum.iter_mut().zip(target.vector) {
+            *slot += value;
+        }
+    }
+    if missing > 0 {
+        return Err(AppError::message(format!(
+            "{missing} 张参考图还没有 embedding，请先运行 AI 任务"
+        )));
+    }
+    let Some(model) = model else {
+        return Err(AppError::message(
+            "参考图还没有 embedding，请先运行 AI 任务",
+        ));
+    };
+    let count = ids.len() as f32;
+    for value in &mut sum {
+        *value /= count;
+    }
+    Ok(TargetEmbedding {
+        model,
+        dim,
+        vector: normalize_f32(&sum)?,
+    })
+}
+
 /// 目标图 embedding 相似：中心化余弦降序，排除目标图自身。
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -174,8 +256,18 @@ pub fn similar_to(
     exclude: i64,
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
-    similar_to_with_total(database, store, model, dim, target, mean, exclude, limit)
-        .map(|(items, _)| items)
+    similar_to_with_total(
+        database,
+        store,
+        model,
+        dim,
+        target,
+        mean,
+        &HashSet::from([exclude]),
+        limit,
+        SearchFilter::default(),
+    )
+    .map(|(items, _)| items)
 }
 
 /// 与 [`similar_to`] 相同，同时返回排除目标图后的命中总数。
@@ -187,15 +279,23 @@ pub fn similar_to_with_total(
     dim: u32,
     target: &[f32],
     mean: &[f32],
-    exclude: i64,
+    exclude: &HashSet<i64>,
     limit: usize,
+    filter: SearchFilter,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
-    let (mut results, total) =
-        search_with_total(database, store, model, dim, target, mean, limit + 1)?;
-    results.retain(|(id, _)| *id != exclude);
-    results.truncate(limit);
-    // 目标图自己的向量一定参与扫描，总数减掉它。
-    Ok((results, total.saturating_sub(1)))
+    search_with_total(
+        database,
+        store,
+        model,
+        dim,
+        target,
+        mean,
+        limit,
+        SearchFilter {
+            excluded: Some(exclude),
+            ..filter
+        },
+    )
 }
 
 pub struct DuplicateGroups {
@@ -475,10 +575,21 @@ pub fn search(
     mean: &[f32],
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
-    search_with_total(database, store, model, dim, query, mean, limit).map(|(items, _)| items)
+    search_with_total(
+        database,
+        store,
+        model,
+        dim,
+        query,
+        mean,
+        limit,
+        SearchFilter::default(),
+    )
+    .map(|(items, _)| items)
 }
 
 /// 返回相似度降序结果，同时返回截断前的命中总数。
+#[allow(clippy::too_many_arguments)]
 pub fn search_with_total(
     database: &LibraryDb,
     store: &FeatureStore,
@@ -487,9 +598,10 @@ pub fn search_with_total(
     query: &[f32],
     mean: &[f32],
     limit: usize,
+    filter: SearchFilter,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
     let rows = rows(database, model, dim)?;
-    search_rows_with_total(store, rows, dim, query, mean, limit)
+    search_rows_with_total(store, rows, dim, query, mean, limit, filter)
 }
 
 /// 向量扫描只依赖行指针与 pack，不访问数据库；便于基准与后续复用。
@@ -502,10 +614,20 @@ pub fn search_rows(
     mean: &[f32],
     limit: usize,
 ) -> AppResult<Vec<(i64, f32)>> {
-    search_rows_with_total(store, rows, dim, query, mean, limit).map(|(items, _)| items)
+    search_rows_with_total(
+        store,
+        rows,
+        dim,
+        query,
+        mean,
+        limit,
+        SearchFilter::default(),
+    )
+    .map(|(items, _)| items)
 }
 
 /// 与 [`search_rows`] 相同，同时返回截断前的命中总数。
+#[allow(clippy::too_many_arguments)]
 pub fn search_rows_with_total(
     store: &FeatureStore,
     rows: Vec<EmbeddingRow>,
@@ -513,11 +635,16 @@ pub fn search_rows_with_total(
     query: &[f32],
     mean: &[f32],
     limit: usize,
+    filter: SearchFilter,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
     if query.len() != dim as usize || mean.len() != dim as usize {
         return Err(AppError::message("查询向量与模型维度不一致"));
     }
     let query = normalize_f32(query)?;
+    let rows: Vec<EmbeddingRow> = rows
+        .into_iter()
+        .filter(|row| filter.allows(row.image_id))
+        .collect();
     if rows.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -537,6 +664,7 @@ pub fn search_rows_with_total(
         return Err(AppError::message("查询向量与均值重合，无法排序"));
     }
 
+    let min_score = filter.min_score;
     let mut scored = Vec::with_capacity(rows.len());
     for (pack_name, pack_rows) in group_by_pack(rows) {
         let map = store.mmap(&pack_name)?;
@@ -562,9 +690,14 @@ pub fn search_rows_with_total(
                     }
                     let centered_dot = dot_vq - dot_vm - dot_mq + dot_mm;
                     let score = centered_dot / (vector_norm_sq * query_norm_sq).sqrt();
-                    score
-                        .is_finite()
-                        .then_some((row.image_id, score.clamp(-1.0, 1.0)))
+                    if !score.is_finite() {
+                        return None;
+                    }
+                    let score = score.clamp(-1.0, 1.0);
+                    if min_score.is_some_and(|min| score < min) {
+                        return None;
+                    }
+                    Some((row.image_id, score))
                 },
             )
             .flatten()
@@ -692,6 +825,76 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 1);
         assert!(results[0].1 >= results[1].1);
+    }
+
+    #[test]
+    fn average_target_is_normalized_and_rejects_missing() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=3 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let average = target_average(&session.db, &packs, &[1, 2]).unwrap();
+        assert_eq!(average.model, "model");
+        assert_eq!(average.dim, 4);
+        assert!((average.vector[0] - 0.707_106_77).abs() < 1e-5);
+        assert!((average.vector[1] - 0.707_106_77).abs() < 1e-5);
+        assert!(target_average(&session.db, &packs, &[1, 3]).is_err());
+    }
+
+    #[test]
+    fn search_filter_narrows_scope_excludes_and_threshold() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=3 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        let allowed = HashSet::from([1_i64, 2]);
+        let excluded = HashSet::from([2_i64]);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let filter = SearchFilter {
+            allowed: Some(&allowed),
+            excluded: Some(&excluded),
+            min_score: None,
+        };
+        let (hits, total) = search_with_total(
+            &session.db,
+            &packs,
+            "model",
+            4,
+            &query,
+            &mean.vector,
+            10,
+            filter,
+        )
+        .unwrap();
+        assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(total, 1);
+
+        let filter = SearchFilter {
+            min_score: Some(0.5),
+            ..SearchFilter::default()
+        };
+        let (hits, _) = search_with_total(
+            &session.db,
+            &packs,
+            "model",
+            4,
+            &query,
+            &mean.vector,
+            10,
+            filter,
+        )
+        .unwrap();
+        assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]

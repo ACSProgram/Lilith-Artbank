@@ -208,7 +208,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "找相似：mode=image 用目标图与 kind（phash/color4/color8/embedding/pose）；mode=text 用语义搜索。total 是全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
+        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 用语义搜索。scope 可选 library/folder/collection/selection/view，默认 Entire library。threshold：pHash 是 0-256 距离上限，其它指标是 -1 到 1 的分数下限。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
     )]
     async fn find_similar(
         &self,

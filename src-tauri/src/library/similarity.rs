@@ -1,6 +1,9 @@
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, params_from_iter};
 
 use crate::{
     app::error::{AppError, AppResult},
@@ -8,7 +11,7 @@ use crate::{
         colors::{self, LabColor},
         phash,
     },
-    library::db::LibraryDb,
+    library::{db::LibraryDb, placeholders},
 };
 
 pub const DEFAULT_PHASH_THRESHOLD: u32 = 6;
@@ -17,6 +20,8 @@ pub const MAX_PHASH_THRESHOLD: u32 = 256;
 pub const MAX_INDEXED_PHASH_THRESHOLD: u32 = 7;
 pub const DEFAULT_LIMIT: usize = 2_000;
 pub const MAX_LIMIT: usize = 10_000;
+/// 平均参考最多合并的图片数；再多的平均没有稳定含义，也避免一次读入过多向量。
+pub const MAX_REFERENCE_IDS: usize = 100;
 
 const PHASH_BANDS: usize = 8;
 /// 单次全库分组的候选检查上限；超过即标记截断，避免退化数据把扫描拖成 O(n²)。
@@ -34,6 +39,12 @@ pub enum ColorPalette {
 
 pub struct TargetVisuals {
     pub phash: [u8; 32],
+    pub colors4: [u8; colors::COLORS4_BYTES],
+    pub colors8: [u8; colors::COLORS8_BYTES],
+}
+
+#[derive(Clone, Copy)]
+pub struct TargetPalette {
     pub colors4: [u8; colors::COLORS4_BYTES],
     pub colors8: [u8; colors::COLORS8_BYTES],
 }
@@ -117,21 +128,30 @@ impl VisualIndex {
         limit: usize,
         exclude: i64,
     ) -> Vec<(i64, u32)> {
-        self.similar_phash_with_total(target, threshold, limit, exclude)
+        let exclude = HashSet::from([exclude]);
+        self.similar_phash_with_total(target, threshold, limit, &exclude, None)
             .0
     }
 
     /// 与 [`Self::similar_phash`] 相同，同时返回截断前的命中总数。
+    ///
+    /// `exclude` 是所有参考图；`allowed` 非空时只统计范围内的行。
     pub fn similar_phash_with_total(
         &self,
         target: [u64; 4],
         threshold: u32,
         limit: usize,
-        exclude: i64,
+        exclude: &HashSet<i64>,
+        allowed: Option<&HashSet<i64>>,
     ) -> (Vec<(i64, u32)>, usize) {
         let mut scored = Vec::new();
         for row in &self.rows {
-            if row.id == exclude {
+            if exclude.contains(&row.id) {
+                continue;
+            }
+            if let Some(allowed) = allowed
+                && !allowed.contains(&row.id)
+            {
                 continue;
             }
             let distance = phash::distance_words(&target, &row.phash);
@@ -153,21 +173,31 @@ impl VisualIndex {
         limit: usize,
         exclude: i64,
     ) -> Vec<(i64, f32)> {
-        self.similar_color_with_total(target, palette, limit, exclude)
+        let exclude = HashSet::from([exclude]);
+        self.similar_color_with_total(target, palette, None, limit, &exclude, None)
             .0
     }
 
     /// 与 [`Self::similar_color`] 相同，同时返回截断前的命中总数。
+    ///
+    /// `threshold` 是 OKLab 距离上限；`allowed` 非空时只统计范围内的行。
     pub fn similar_color_with_total(
         &self,
         target: &[LabColor],
         palette: ColorPalette,
+        threshold: Option<f32>,
         limit: usize,
-        exclude: i64,
+        exclude: &HashSet<i64>,
+        allowed: Option<&HashSet<i64>>,
     ) -> (Vec<(i64, f32)>, usize) {
         let mut scored = Vec::new();
         for row in &self.rows {
-            if row.id == exclude {
+            if exclude.contains(&row.id) {
+                continue;
+            }
+            if let Some(allowed) = allowed
+                && !allowed.contains(&row.id)
+            {
                 continue;
             }
             let candidate = match palette {
@@ -177,7 +207,11 @@ impl VisualIndex {
             if candidate.len() != target.len() {
                 continue;
             }
-            scored.push((row.id, colors::prepared_distance(target, candidate)));
+            let distance = colors::prepared_distance(target, candidate);
+            if threshold.is_some_and(|max_distance| distance > max_distance) {
+                continue;
+            }
+            scored.push((row.id, distance));
         }
         let total = scored.len();
         scored.sort_by(|left, right| {
@@ -387,6 +421,57 @@ pub fn target_visuals(database: &LibraryDb, image_id: i64) -> AppResult<TargetVi
     Ok(target)
 }
 
+/// 批量读取参考图的两套主色；任何一张不存在、在回收站或数据不完整都整批拒绝。
+pub fn target_palettes(database: &LibraryDb, ids: &[i64]) -> AppResult<Vec<TargetPalette>> {
+    let mut found: HashMap<i64, TargetPalette> = HashMap::new();
+    for chunk in ids.chunks(400) {
+        let marks = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT id, colors4, colors8 FROM images
+             WHERE deleted_at IS NULL AND id IN ({marks})"
+        );
+        let rows = database.with_reader(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        for (id, colors4, colors8) in rows {
+            if colors4.len() != colors::COLORS4_BYTES || colors8.len() != colors::COLORS8_BYTES {
+                continue;
+            }
+            let mut palette = TargetPalette {
+                colors4: [0; colors::COLORS4_BYTES],
+                colors8: [0; colors::COLORS8_BYTES],
+            };
+            palette.colors4.copy_from_slice(&colors4);
+            palette.colors8.copy_from_slice(&colors8);
+            found.insert(id, palette);
+        }
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    let mut missing = 0_usize;
+    for id in ids {
+        match found.get(id) {
+            Some(palette) => out.push(*palette),
+            None => missing += 1,
+        }
+    }
+    if missing > 0 {
+        return Err(AppError::message(format!(
+            "{missing} 张参考图不存在、已在回收站或缺少主色数据"
+        )));
+    }
+    Ok(out)
+}
+
 /// 目标图 pHash 相似：Hamming 距离升序，距离相同按 id 升序；结果排除目标图本身。
 #[cfg(test)]
 pub fn similar_by_phash(
@@ -577,6 +662,49 @@ mod tests {
         assert_eq!(results[0].0, 2);
         assert_eq!(results[1].0, 3);
         assert!(results[0].1 < results[1].1);
+    }
+
+    #[test]
+    fn scope_and_threshold_narrow_visual_scans() {
+        let (_temp, session) = fixture();
+        let red = solid_palette(4, [210, 30, 30]);
+        let near_red = solid_palette(4, [200, 40, 40]);
+        let blue = solid_palette(4, [30, 40, 210]);
+        insert(
+            &session,
+            1,
+            [0; 32],
+            red.clone().try_into().unwrap(),
+            [0; 32],
+        );
+        insert(&session, 2, [0; 32], near_red.try_into().unwrap(), [0; 32]);
+        insert(&session, 3, [0; 32], blue.try_into().unwrap(), [0; 32]);
+
+        let index = VisualIndex::load(&session.db).unwrap();
+        let exclude = HashSet::from([1_i64]);
+        let allowed = HashSet::from([2_i64, 3]);
+        let (hits, total) =
+            index.similar_phash_with_total([0; 4], 256, 10, &exclude, Some(&allowed));
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(total, 2);
+
+        let prepared = colors::prepare_palette::<4>(&red);
+        let (hits, total) = index.similar_color_with_total(
+            &prepared,
+            ColorPalette::Colors4,
+            Some(0.05),
+            10,
+            &exclude,
+            None,
+        );
+        assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(total, 1);
+
+        assert_eq!(target_palettes(&session.db, &[1, 2]).unwrap().len(), 2);
+        assert!(target_palettes(&session.db, &[1, 99]).is_err());
     }
 
     #[test]

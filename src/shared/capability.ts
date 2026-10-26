@@ -1,5 +1,4 @@
-import type { FeatureSummary, ImageCapabilities } from "../modules/library/types";
-import type { SimilarKind } from "./similarity";
+import type { FeatureSummary } from "../modules/library/types";
 
 export interface ActionAvailability {
   enabled: boolean;
@@ -7,35 +6,6 @@ export interface ActionAvailability {
 }
 
 const ALLOW: ActionAvailability = { enabled: true };
-
-/** 右键“找相似”各项：按目标图实际具备的特征判断，不靠点击后报错。 */
-export function similarKindAvailability(
-  kind: SimilarKind,
-  caps: ImageCapabilities | null,
-): ActionAvailability {
-  if (!caps) return ALLOW;
-  switch (kind) {
-    case "phash":
-      return caps.phash
-        ? ALLOW
-        : { enabled: false, reason: "这张图片缺少 pHash 特征" };
-    case "color4":
-    case "color8":
-      return caps.colors
-        ? ALLOW
-        : { enabled: false, reason: "这张图片缺少主色数据" };
-    case "embedding":
-      return caps.embedding
-        ? ALLOW
-        : { enabled: false, reason: "这张图片还没有 embedding，可在批量任务里生成" };
-    case "pose":
-      return caps.pose
-        ? ALLOW
-        : { enabled: false, reason: "这张图片还没有姿势数据，可在批量任务里生成" };
-    default:
-      return ALLOW;
-  }
-}
 
 /** AI 批量任务需要本机服务在线；具体模型由后端在开始前确保加载。 */
 export function aiTaskAvailability(online: boolean): ActionAvailability {

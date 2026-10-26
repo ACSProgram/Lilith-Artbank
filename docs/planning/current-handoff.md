@@ -1,7 +1,7 @@
 # 当前阶段状态
 
 日期：2026-10-26
-阶段：**MCP 图库控制批次 1（只读）、批次 2（写工具、撤销/重做、询问档）与批次 3（导入、回执、审计）已完成（2026-10-26），批次 2 真实客户端主体已通过，批次 3 待真实客户端与便携目录验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。图片空间优化批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
+阶段：**MCP 图库控制批次 1（只读）、批次 2（写工具、撤销/重做、询问档）、批次 3（导入、回执、审计）与批次 4（找相似交互重构）已完成（2026-10-26），批次 2 真实客户端主体已通过，批次 3/4 待真实客户端与真实窗口验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。图片空间优化批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
 历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
 
@@ -137,7 +137,7 @@
 
 ## MCP 图库控制批次 3（2026-10-26）
 
-导入、导入回执、审计与收尾。找相似交互重构放入批次 4、临时文件夹放入批次 5，均已确认方向但未实现。
+导入、导入回执、审计与收尾。找相似交互重构已在批次 4 实现；临时文件夹仍排在批次 5。
 
 - 工具总数 21：新增 `import_start`，接受本机绝对路径、目标文件夹、`folderMode`、标签、评分与 `duplicatePolicy`；固定 `optimize = None`，不接受 `workerThreads`，最多 10000 个输入路径。
 - `mcp/tools/import.rs`：输入校验、目标与重复策略、询问档确认预览（前 20 个来源路径、目标、标签/评分/重复策略）、任务启动与结果；只读档拒绝，询问档每次确认。
@@ -147,6 +147,35 @@
 - 收尾修正：`server.rs` 工具数与说明补上导入；完全档警告说明可读取任意路径并导入但不会压缩；AI 结果优先建集合（服务端指令与 `collections_create` 描述）；导入预览 id 上限 24 → 25，可直接拼 5×5；确认卡展开前 5 条来源路径、其余只给数量，并显示标签/评分与重复策略。
 - 测试：导入输入、未知 `optimize`/`workerThreads` 不透传、相对路径与模式校验、预览路径截断、导入回执隐藏压缩字段、预览 25 张、审计单行截断与导入来源行总数在前、工具注册数量 21；`cargo test --lib` 267 通过（5 ignored）。
 - 未做：真实 MCP 客户端导入与确认卡、便携目录 stdio 实测、`logs/mcp.log` 真实落盘检查；验收步骤见 `docs/modules/mcp.md`。
+
+## MCP 图库控制批次 4（2026-10-26）
+
+找相似交互重构、范围收窄与平均参考；临时文件夹仍属批次 5。
+
+- 右键菜单由五个即时指标改为一个“设为相似参考”；多选为“设为相似参考（平均）”，只允许主色 4/8 色与语义平均，pHash/姿势平均没有意义。参考图在同一图库会话内保留，最多 100 张；回收站图片不能作为参考图。
+- 新增 `src/modules/library/FindSimilarPanel.tsx`：与筛选面板一致的工具栏下拉面板，含参考图缩略图与数量、单张五指标/平均三指标、“最低相似度”滑杆（0–100%，可勾“不限”）、结果数量（1–10000，默认 2000）与范围；缺 embedding/pose 时按用户决定只置灰并提示到批量任务生成，不自动计算。右键设置参考图后不自动打开面板，工具栏“相似”与结果条“调整”可打开。
+- 范围抽成 `src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`，批量任务与图片空间优化同步复用；找相似默认当前视图，支持当前选择、当前文件夹（含/不含子文件夹）、当前集合与全库。`BatchTaskContextInfo` 增加 `folderDirectTotal`。
+- 后端 `find_similar_images` 改为 `targetIds`（≤100）、浮点阈值、`TaskScope` 范围；`find_similar` 的 pHash 是距离上限，主色是 OKLab 距离上限，embedding/pose 是相似度下限。全库不解析 id；其它范围先解析成 id 集合再与扫描取交集，embedding/pose 只读取范围内向量。
+- 平均参考：主色把每张图的 4/8 色等权合并后在 OKLab 做加权 k-means；embedding 求平均后归一化；所有参考图都会从结果中排除。`imageops/colors.rs::aggregate_palettes`、`ai/embedding.rs::target_average`。
+- MCP `find_similar` 增加 `scope`、`targetIds` 与浮点阈值，`FindSimilarScope` 与界面参数一致；`library_info` 增加 `maxReferenceImages=100`；结果仍只保留一个槽。
+- 测试：主色平均、embedding 平均、范围/排除/阈值过滤、MCP scope 收窄、多参考 phash 拒绝、平均主色预览；`cargo test --lib` 273 通过（5 ignored）、`npx tsc --noEmit`、`npm run build`、`git diff --check` 通过。
+- 未做：用户真实窗口验收（右键/工具栏/调整、平均参考、阈值与范围、缺特征置灰）；MCP 真实客户端复测 scope 与 targetIds；查看器没有加参考图入口。
+
+### 批次 4 收尾整理（2026-10-26）
+
+代码整理，不改行为契约：
+
+- `ai/runtime.rs`：`similar_ids_by_embedding` 直接用调用方算好的参考图排除集合，不再自己重建；主色 4 色与 8 色两条几乎相同的分支收进 `reference_colors`（单张直接用自身主色，多张才合并），去掉两段各 20 多行的重复；`score_threshold` 与 `parse_score_threshold` 合并（`semantic_search` 改收 `Option<f64>`，阈值校验只写一处）；pHash 阈值两次相同报错合并成一次范围判断。
+- `imageops/colors.rs`：`aggregate_palettes` 抽出 `nearest_cluster`；收敛后按最终质心重算各簇权重（此前用的是上一轮质心的归属）；`AGGREGATE_ITERATIONS` 与单张主色共用同一迭代常量；注释改成实际用的初始化方式（最高权重 → 最远点），不再写成“固定种子”。
+- `ai/embedding.rs`：删掉属性与函数之间的空行；`SearchFilter` 注释写明 `allowed = None` 表示全库。
+- `FindSimilarPanel`：`EMPTY_THRESHOLDS` 更名 `defaultThresholds`（给的是默认值，不是空值）；`canStart` 去掉非空断言；参考图区块不再重复头部已显示的数量与文件名。
+- `src/shared/scope.ts`：`defaultScopeChoice` 去掉永远走不到的 `library` 分支。
+- `useSimilarityBrowse`：请求开始与成功两处重复的 mode/text/kind/targetIds/scopeLabel 收成一份。
+- `LibraryView`：`buildTaskContext` 的 `similarityView` 参数更名 `includeView` 并补注释——它管的是“相似结果视图里是否把底层图库视图算作范围”。
+- 测试：新增 `src/shared/scope.test.ts`（4 条，已加进 `npm run test:web`，21 → 25），覆盖范围构造、默认范围、文件夹数量文案与可用性。
+- 文档纠正：`mcp.md` 的阈值说明（pHash 省略时是默认 6，不是“不限制”）；`ai-service.md` 的范围说明（界面只给找相似提供范围，语义搜索目前只有 MCP 传 `scope`）与 pHash/主色/embedding 条目改成“参考图/平均参考”；`browse-and-query.md` 补 `FindSimilarPanel.tsx`、`shared/scope.ts` 与 `ScopePicker` 的文件表，右键菜单写“回收站图片置灰”而不是“不提供”，选择范围置灰条件改成“当前选择全都在参考图里”；`overview.md` 的 S7 条目补上入口变更。
+
+自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（7 条警告都在既有 `library/edit.rs` 与 `library/history.rs`）、`cargo test --lib`（273 通过、5 ignored）、`npm run typecheck`、`npm run test:web`（25 通过）、`npm run build`、`git diff --check`。
 
 ## AI 服务端与便携化（待验收）
 
