@@ -742,7 +742,8 @@ pub enum ConflictPolicy {
 }
 
 /// 前端只传语义范围，id 集合在 Rust 侧解析，避免几十万 id 过 IPC。
-#[derive(Debug, Clone, Deserialize, Default)]
+/// 估算结果要能重建执行请求，所以这里同时支持序列化。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TaskScope {
     Selected {

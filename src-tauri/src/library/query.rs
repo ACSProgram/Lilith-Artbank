@@ -44,7 +44,7 @@ pub fn clear_page_cache() {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LibraryView {
     #[default]
@@ -55,7 +55,7 @@ pub enum LibraryView {
     Temp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SortKey {
     #[default]
@@ -68,7 +68,7 @@ pub enum SortKey {
     CollectionPosition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SearchScope {
     #[default]
@@ -76,7 +76,7 @@ pub enum SearchScope {
     Library,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum PresenceFilter {
     #[default]
@@ -85,7 +85,7 @@ pub enum PresenceFilter {
     Missing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SortSpec {
     pub key: SortKey,
@@ -101,7 +101,7 @@ impl Default for SortSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TagMode {
     #[default]
@@ -109,7 +109,7 @@ pub enum TagMode {
     All,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LibraryFilters {
     pub folder_ids: Vec<i64>,
@@ -126,7 +126,7 @@ pub struct LibraryFilters {
     pub pose: PresenceFilter,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LibraryQuery {
     pub view: LibraryView,

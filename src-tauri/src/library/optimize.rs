@@ -377,6 +377,9 @@ fn encode_one(
     let source_path =
         metadata::content_path(paths, &row.folder_path, &row.content_hash, &row.file_ext)?;
     let bytes = std::fs::read(&source_path)?;
+    if optimize::multiframe_guard(&bytes, &row.format).is_err() {
+        return Ok(None);
+    }
     if optimize::color_profile_guard(&bytes, &row.format, options).is_err() {
         return Ok(None);
     }

@@ -754,6 +754,12 @@ impl AppState {
         query::filter_counts(&database, query)
     }
 
+    /// 只算命中总数，不取分面；对话框要一个“当前视图 N 张”时用它，别跑完整统计。
+    pub fn query_total(&self, query: LibraryQuery) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        query::query_total(&database, query)
+    }
+
     pub fn folders(&self) -> AppResult<Vec<FolderInfo>> {
         let (database, _) = self.query_source()?;
         query::list_folders(&database)
@@ -1527,10 +1533,18 @@ impl AppState {
             return Err(AppError::message("当前范围没有图片"));
         }
         let fingerprint = optimize_fingerprint(&request.scope, &options);
+        let scope = request.scope.clone();
+        let scope_label = scope.label();
+        let library_id = self
+            .status()
+            .ok()
+            .flatten()
+            .map(|info| info.id)
+            .unwrap_or_default();
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             TaskKind::OptimizeEstimate,
-            request.scope.label(),
+            scope_label.clone(),
         );
         let task_id = handle.id().to_owned();
         let worker = handle.clone();
@@ -1553,7 +1567,11 @@ impl AppState {
                             &*worker,
                         );
                         match result {
-                            Ok(Some(estimate)) => {
+                            Ok(Some(mut estimate)) => {
+                                // 结果要能独立重建执行请求：范围、参数与图库标识都在结果里。
+                                estimate.scope = Some(scope);
+                                estimate.scope_label = scope_label;
+                                estimate.library_id = library_id;
                                 store_estimate(&estimates, estimate);
                                 worker.set_message("估算完成");
                                 worker.finish_from(&Ok(()));

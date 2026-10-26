@@ -79,9 +79,18 @@ export interface OptimizeEstimate {
   taskId: string;
   createdAt: number;
   optionsFingerprint: string;
+  /** 估算参数；接管任务时据此重建执行请求。 */
+  options?: OptimizeOptions | null;
+  /** 估算范围；接管任务时直接复用，不按当前浏览状态重拼。 */
+  scope?: TaskScope | null;
+  scopeLabel: string;
+  sampleSize: number;
+  libraryId: string;
   sampleCount: number;
   sampleBytes: number;
   coverage: number;
+  /** 样本编码阶段的墙钟耗时（毫秒）。 */
+  sampleElapsedMs: number;
   sampleBadPixelRatio: number;
   totalCount: number;
   totalBytes: number;
@@ -93,16 +102,25 @@ export interface OptimizeEstimate {
   skipOptimized: OptimizeSkipBucket;
   skipTransparent: OptimizeSkipBucket;
   skipTooLarge: OptimizeSkipBucket;
+  /** 前置跳过：GIF。 */
+  skipAnimated: OptimizeSkipBucket;
   skipColorProfile: OptimizeSkipBucket;
   skipDepth: OptimizeSkipBucket;
   skipQuality: OptimizeSkipBucket;
   skipNotSmaller: OptimizeSkipBucket;
+  /** 候选内跳过：APNG、动画 WebP、多页 TIFF。 */
+  skipMultiframe: OptimizeSkipBucket;
+  /** 候选内跳过：数据库列与实际文件不符、解码后才发现的前置原因。 */
+  skipLate: OptimizeSkipBucket;
   failedCount: number;
   failedBytes: number;
   savingsBytes: number;
   savingsMarginBytes: number;
   predictedBytes: number;
   estimatedSeconds: number;
+  estimatedWorkSeconds: number;
+  estimatedWriteSeconds: number;
+  estimatedFinishSeconds: number;
   qualityCounts: OptimizeQualityCount[];
   curve: OptimizeCurvePoint[];
   folders: OptimizeFolderEstimate[];

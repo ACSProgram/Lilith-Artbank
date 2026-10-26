@@ -17,7 +17,7 @@ import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { BatchTaskDialog } from "./BatchTaskDialog";
 import { OptimizeDialog } from "./OptimizeDialog";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
-import { useTaskCenter } from "./taskContext";
+import { useTaskData } from "./taskContext";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { Sidebar } from "./Sidebar";
@@ -57,8 +57,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return folders.find((folder) => folder.id === selected[0])?.path ?? "";
   }, [browse.browse.filters.folderIds, folders, importTarget]);
   const similarity = useSimilarityBrowse();
-  const { dataVersion: taskDataVersion, lastFinished } = useTaskCenter();
+  const { dataVersion: taskDataVersion, lastFinished } = useTaskData();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
+  const optimizeQueryRef = useRef(0);
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
 
@@ -261,6 +262,29 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     },
   });
 
+  // 优化对话框先打开、后补范围计数：只查总数，不跑分面统计。
+  // 放在 `if (!current)` 之前，避免关闭图库时少注册一个 effect。
+  useEffect(() => {
+    if (!optimizeContext?.query || optimizeContext.viewTotal != null) return;
+    const generation = optimizeQueryRef.current + 1;
+    optimizeQueryRef.current = generation;
+    let disposed = false;
+    void libraryApi
+      .getQueryTotal(optimizeContext.query)
+      .then((total) => {
+        if (disposed || generation !== optimizeQueryRef.current) return;
+        setOptimizeContext((previous) =>
+          previous && previous.query ? { ...previous, viewTotal: total } : previous,
+        );
+      })
+      .catch(() => {
+        // 取不到就保持“—”，不阻塞对话框。
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [optimizeContext]);
+
   if (!current) return null;
 
   const hasImages =
@@ -430,6 +454,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             open={optimizeContext !== null}
             onClose={() => setOptimizeContext(null)}
             context={optimizeContext}
+            libraryId={current.id}
           />
           <ImportDialog
             open={importOpen}

@@ -172,6 +172,8 @@ pub enum SkipReason {
     QualityNotMet,
     /// 达到画质底线，但省不到 5%。
     NotSmallEnough,
+    /// 动画、多帧或多页源：编码成单帧会丢掉其余帧与页。
+    AnimatedOrMultipage,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +187,10 @@ pub struct OptimizePlan {
 /// 执行与估算共用这一段，保证“估算里被跳过的图，执行时也跳过”。
 /// 16 位源要解码后才知道，不在这里判断。
 pub fn prefilter(source: &SourceInfo, options: &OptimizeOptions) -> Result<(), SkipReason> {
+    // GIF 一律保守跳过：静态 GIF 也当多帧处理，编码成单帧会丢动画。
+    if source.format.eq_ignore_ascii_case("gif") {
+        return Err(SkipReason::AnimatedOrMultipage);
+    }
     if source.bpp() < BPP_THRESHOLD {
         return Err(SkipReason::BppLow);
     }
@@ -240,6 +246,116 @@ pub fn color_profile_guard(
         Some(false) => Err(SkipReason::ColorProfile),
         _ => Ok(()),
     }
+}
+
+/// 动画、多帧与多页源判据：只读文件头，不解码全部帧。
+///
+/// GIF 由 `prefilter` 按数据库里的格式直接拦掉；这里处理 APNG、动画 WebP
+/// 与多页 TIFF——它们的格式列与单帧版本相同，只能读文件才分得出来。
+pub fn multiframe_guard(bytes: &[u8], format: &str) -> Result<(), SkipReason> {
+    let multipage = match format.to_ascii_lowercase().as_str() {
+        "gif" => true,
+        "png" => png_is_apng(bytes),
+        "webp" => webp_is_animated(bytes),
+        "tiff" | "tif" => tiff_page_count(bytes) > 1,
+        _ => false,
+    };
+    if multipage {
+        Err(SkipReason::AnimatedOrMultipage)
+    } else {
+        Ok(())
+    }
+}
+
+/// PNG 的 `acTL` 块表示这是 APNG。
+fn png_is_apng(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
+    let mut offset = 8;
+    while offset + 8 <= bytes.len() {
+        let length = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        if kind == b"acTL" {
+            return true;
+        }
+        if kind == b"IDAT" || kind == b"IEND" {
+            return false;
+        }
+        match offset.checked_add(12 + length) {
+            Some(next) if next > offset => offset = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// 动画 WebP 带 `ANIM` 块；静态 WebP 只有 `VP8`/`VP8L`/`VP8X` 与可选的 `ALPH`/`ICCP`。
+fn webp_is_animated(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let kind = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        if kind == b"ANIM" {
+            return true;
+        }
+        match offset.checked_add(8 + length + (length & 1)) {
+            Some(next) if next > offset => offset = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// TIFF 的 IFD 链长度；读到第二个 IFD 就说明是多页。解析失败按单页处理。
+fn tiff_page_count(bytes: &[u8]) -> u32 {
+    if bytes.len() < 8 {
+        return 1;
+    }
+    let little = match &bytes[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return 1,
+    };
+    if read_u16(bytes, 2, little) != Some(42) {
+        return 1;
+    }
+    let mut offset = match read_u32(bytes, 4, little) {
+        Some(offset) => usize::try_from(offset).unwrap_or(0),
+        None => return 1,
+    };
+    let mut pages = 0_u32;
+    while offset > 0 && offset + 2 <= bytes.len() {
+        pages += 1;
+        if pages > 1 {
+            return pages;
+        }
+        let Some(count) = read_u16(bytes, offset, little) else {
+            break;
+        };
+        let entries_end = match offset.checked_add(2 + usize::from(count) * 12) {
+            Some(end) => end,
+            None => break,
+        };
+        let Some(next) = read_u32(bytes, entries_end, little) else {
+            break;
+        };
+        offset = usize::try_from(next).unwrap_or(0);
+    }
+    pages.max(1)
 }
 
 /// 源文件嵌入的 ICC 配置是否为 sRGB；`None` 表示没有嵌入配置。
@@ -484,8 +600,11 @@ pub fn encode_ladder(
     Ok(LadderOutcome::Skipped(SkipReason::QualityNotMet))
 }
 
+/// 替换阈值：新文件必须小于原图的 `MAX_SIZE_RATIO`。`round` 避免
+/// `0.95 * 100.0` 这类乘法截断成 94 把阈值收紧一个百分点。
 pub fn is_smaller_enough(original: u64, encoded: u64) -> bool {
-    encoded.saturating_mul(100) < original.saturating_mul(95)
+    let threshold_percent = (MAX_SIZE_RATIO * 100.0).round() as u64;
+    encoded.saturating_mul(100) < original.saturating_mul(threshold_percent)
 }
 
 /// 编码一次；输出 JPEG 时搬运源 JPEG 的 EXIF（去掉 Orientation）与 ICC。
@@ -1196,5 +1315,87 @@ mod tests {
         deep.bit_depth = 16;
         assert!(prefilter(&deep, &options).is_ok());
         assert_eq!(plan(&deep, &options).unwrap_err(), SkipReason::SixteenBit);
+    }
+
+    fn png_with_chunk(kind: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    fn webp_with_chunk(kind: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    /// 两页 TIFF：IFD0 在 8，指向 16 处的第二个 IFD。
+    fn two_page_tiff() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.resize(16, 0);
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn multiframe_guard_rejects_animated_and_multipage_sources() {
+        assert_eq!(
+            multiframe_guard(&[], "gif"),
+            Err(SkipReason::AnimatedOrMultipage)
+        );
+        assert_eq!(
+            multiframe_guard(&png_with_chunk(b"acTL"), "png"),
+            Err(SkipReason::AnimatedOrMultipage)
+        );
+        assert_eq!(
+            multiframe_guard(&webp_with_chunk(b"ANIM"), "webp"),
+            Err(SkipReason::AnimatedOrMultipage)
+        );
+        assert_eq!(
+            multiframe_guard(&two_page_tiff(), "tiff"),
+            Err(SkipReason::AnimatedOrMultipage)
+        );
+
+        // 单帧版本不受影响。
+        assert!(multiframe_guard(&png_with_chunk(b"IHDR"), "png").is_ok());
+        assert!(multiframe_guard(&webp_with_chunk(b"VP8 "), "webp").is_ok());
+        let single_page = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"II");
+            bytes.extend_from_slice(&42_u16.to_le_bytes());
+            bytes.extend_from_slice(&8_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes
+        };
+        assert!(multiframe_guard(&single_page, "tiff").is_ok());
+        // 普通 JPEG 不解析，直接放行。
+        assert!(multiframe_guard(&[0xFF, 0xD8, 0xFF, 0xE0], "jpeg").is_ok());
+    }
+
+    #[test]
+    fn prefilter_skips_gif_before_other_reasons() {
+        let options = OptimizeOptions::default();
+        let gif = source("gif", 8_000_000, 800, 600);
+        assert_eq!(
+            prefilter(&gif, &options).unwrap_err(),
+            SkipReason::AnimatedOrMultipage
+        );
+        assert_eq!(
+            plan(&gif, &options).unwrap_err(),
+            SkipReason::AnimatedOrMultipage
+        );
     }
 }

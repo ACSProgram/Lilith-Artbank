@@ -5573,11 +5573,91 @@ body.is-drag-sorting * {
   font-size: 10.5px;
 }
 
+/* 五个档位等距停靠：标签绝对定位到各自的百分比位置，与滑块 thumb 对齐。 */
 .optimize-slider-marks {
-  display: flex;
-  justify-content: space-between;
+  position: relative;
+  height: 14px;
+  margin-top: 2px;
   color: var(--text-faint);
   font-size: 9.5px;
+}
+
+.optimize-slider-marks span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.optimize-slider-marks span:first-child {
+  transform: none;
+}
+
+.optimize-slider-marks span:last-child {
+  transform: translateX(-100%);
+}
+
+/* 漏斗的两行短信息：范围与候选，避免环图分母看起来是“整个范围”。 */
+.optimize-funnel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.optimize-funnel span {
+  white-space: nowrap;
+}
+
+/* 未纳入候选：前置排除单独成组，不与候选内跳过混在一张图例里。 */
+.optimize-prefilter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.optimize-prefilter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.optimize-prefilter-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 11px;
+}
+
+.optimize-prefilter-row span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optimize-prefilter-row em {
+  color: var(--text-faint);
+  font-style: normal;
+}
+
+.optimize-prefilter-row strong {
+  font-weight: 550;
+  text-align: right;
+}
+
+/* 预计耗时下面的三项拆分；为 0 的项不渲染。 */
+.optimize-timing-detail {
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .optimize-error-row {

@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { taskApi } from "./taskApi";
-import { TaskCenterContext, type TaskCenter } from "./taskContext";
+import {
+  TaskActiveContext,
+  TaskCenterContext,
+  TaskDataContext,
+  type TaskActiveInfo,
+  type TaskCenter,
+  type TaskDataInfo,
+} from "./taskContext";
 import { TaskCapsule } from "./TaskCapsule";
 import { isTaskActive, type BatchTaskRequest, type TaskSnapshot } from "./taskTypes";
 import { errorMessage } from "../shared/errors";
@@ -105,9 +112,24 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
     [tasks, active, dataVersion, start, cancel, find, lastFinished],
   );
 
+  // 任务进度每 150ms 变一次；这两个窄上下文只在真正相关的值变化时才换新对象，
+  // 让网格与浏览界面不必跟着整包 `tasks` 重渲染。
+  const activeInfo = useMemo<TaskActiveInfo>(
+    () => ({ count: active.length, label: active[0]?.label ?? null }),
+    [active],
+  );
+  const dataInfo = useMemo<TaskDataInfo>(
+    () => ({ dataVersion, lastFinished }),
+    [dataVersion, lastFinished],
+  );
+
   return (
     <TaskCenterContext.Provider value={value}>
-      {children}
+      <TaskActiveContext.Provider value={activeInfo}>
+        <TaskDataContext.Provider value={dataInfo}>
+          {children}
+        </TaskDataContext.Provider>
+      </TaskActiveContext.Provider>
       <McpApprovalHost enabled={Boolean(settings?.mcp.enabled)} />
       <TaskCapsule />
     </TaskCenterContext.Provider>

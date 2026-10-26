@@ -32,7 +32,7 @@ import {
 } from "lucide-react";
 import { useAppRuntime } from "../../app/runtimeContext";
 import { useNotices } from "../../app/noticeContext";
-import { useTaskCenter } from "../../app/taskContext";
+import { useTaskActive } from "../../app/taskContext";
 import { Button, IconButton } from "../../shared/components/Button";
 import { MenuSection } from "../../shared/components/MenuSection";
 import { Popover } from "../../shared/components/Popover";
@@ -181,7 +181,7 @@ export function LibraryView({
 }: LibraryViewProps) {
   const { settings, current, refreshStatus, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
-  const { active: activeTasks } = useTaskCenter();
+  const { count: activeTaskCount, label: activeTaskLabel } = useTaskActive();
 
   const [searchDraft, setSearchDraft] = useState(browse.search);
   const [searchMode, setSearchMode] = useState<SearchMode>(initialSearchMode);
@@ -722,52 +722,64 @@ export function LibraryView({
    *
    * 相似结果视图里底层图库视图默认不能当范围（批量任务会改错图片），
    * 找相似例外：它要能把结果再收窄到进入相似结果前的那个视图。
+   *
+   * `viewTotal` 需要一次计数查询，所以单独拆出来：空间优化对话框先用
+   * `buildTaskContextBase` 立刻打开，再由工作区异步补这个数。
    */
-  const buildTaskContext = useCallback(async (options?: {
-    includeView?: boolean;
-  }): Promise<BatchTaskContextInfo | null> => {
-    const includeView = !similarityActive || options?.includeView === true;
-    const folderId =
-      browse.filters.folderIds.length === 1 ? browse.filters.folderIds[0] : null;
-    const folder = folderId != null ? folders.find((item) => item.id === folderId) : undefined;
-    const collection =
-      effectiveView === "collection"
-        ? collections.find((item) => item.id === effectiveCollectionId)
-        : undefined;
-    let viewTotal: number | null = null;
-    if (includeView) {
+  const buildTaskContextBase = useCallback(
+    (options?: { includeView?: boolean }): BatchTaskContextInfo | null => {
+      const includeView = !similarityActive || options?.includeView === true;
+      const folderId =
+        browse.filters.folderIds.length === 1 ? browse.filters.folderIds[0] : null;
+      const folder =
+        folderId != null ? folders.find((item) => item.id === folderId) : undefined;
+      const collection =
+        effectiveView === "collection"
+          ? collections.find((item) => item.id === effectiveCollectionId)
+          : undefined;
+      return {
+        selectedIds: [...selected],
+        query: includeView ? query : null,
+        viewTotal: null,
+        folderId,
+        folderName: folder?.path ?? null,
+        folderDirectTotal: folder?.directImageCount ?? null,
+        folderTotal: folder?.totalImageCount ?? null,
+        collectionId: effectiveView === "collection" ? effectiveCollectionId : null,
+        collectionName: collection?.name ?? null,
+        collectionTotal: collection?.imageCount ?? null,
+        libraryTotal: current?.imageCount ?? 0,
+        tempTotal: current?.tempCount ?? 0,
+      };
+    },
+    [
+      browse.filters.folderIds,
+      collections,
+      current?.imageCount,
+      current?.tempCount,
+      effectiveCollectionId,
+      effectiveView,
+      folders,
+      query,
+      selected,
+      similarityActive,
+    ],
+  );
+
+  const buildTaskContext = useCallback(
+    async (options?: { includeView?: boolean }): Promise<BatchTaskContextInfo | null> => {
+      const context = buildTaskContextBase(options);
+      if (!context?.query) return context;
+      let viewTotal: number | null = null;
       try {
-        viewTotal = (await libraryApi.getFilterCounts(query)).total;
+        viewTotal = await libraryApi.getQueryTotal(context.query);
       } catch {
         viewTotal = null;
       }
-    }
-    return {
-      selectedIds: [...selected],
-      query: includeView ? query : null,
-      viewTotal,
-      folderId,
-      folderName: folder?.path ?? null,
-      folderDirectTotal: folder?.directImageCount ?? null,
-      folderTotal: folder?.totalImageCount ?? null,
-      collectionId: effectiveView === "collection" ? effectiveCollectionId : null,
-      collectionName: collection?.name ?? null,
-      collectionTotal: collection?.imageCount ?? null,
-      libraryTotal: current?.imageCount ?? 0,
-      tempTotal: current?.tempCount ?? 0,
-    };
-  }, [
-    browse.filters.folderIds,
-    collections,
-    current?.imageCount,
-    current?.tempCount,
-    effectiveCollectionId,
-    effectiveView,
-    folders,
-    query,
-    selected,
-    similarityActive,
-  ]);
+      return { ...context, viewTotal };
+    },
+    [buildTaskContextBase],
+  );
 
   const openBatchTasks = useCallback(async () => {
     setTaskMenuOpen(false);
@@ -776,12 +788,13 @@ export function LibraryView({
     if (context) onOpenBatchTasks(context);
   }, [buildTaskContext, onOpenBatchTasks]);
 
-  const openOptimize = useCallback(async () => {
+  const openOptimize = useCallback(() => {
     setTaskMenuOpen(false);
     if (!onOpenOptimize) return;
-    const context = await buildTaskContext();
+    // 先开窗，范围计数由工作区补；不要为了一个数字跑完整分面统计。
+    const context = buildTaskContextBase();
     if (context) onOpenOptimize(context);
-  }, [buildTaskContext, onOpenOptimize]);
+  }, [buildTaskContextBase, onOpenOptimize]);
 
   const openFindSimilarPanel = useCallback(
     async (reference: SimilarReference, initial: FindSimilarConfig | null) => {
@@ -1555,10 +1568,10 @@ export function LibraryView({
             type="button"
             className="button button-secondary button-sm"
             aria-expanded={historyOpen}
-            disabled={activeTasks.length > 0}
+            disabled={activeTaskCount > 0}
             title={
-              activeTasks.length > 0
-                ? `「${activeTasks[0].label}」正在进行，完成后才能撤销`
+              activeTaskCount > 0
+                ? `「${activeTaskLabel ?? "其他任务"}」正在进行，完成后才能撤销`
                 : "最近的操作记录"
             }
             onClick={() => setHistoryOpen((open) => !open)}

@@ -76,6 +76,12 @@ export const libraryApi = {
     return invoke<FilterCounts>("get_filter_counts", { query });
   },
 
+  /** 只算命中总数，不取分面；对话框显示“当前视图 N 张”时用它。 */
+  async getQueryTotal(query: LibraryQuery): Promise<number> {
+    if (!isTauri()) return mockFilterCounts(query).total;
+    return invoke<number>("get_query_total", { query });
+  },
+
   async getFolders(): Promise<FolderInfo[]> {
     if (!isTauri()) return mockFolders();
     return invoke<FolderInfo[]>("get_folders");

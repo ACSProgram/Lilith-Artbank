@@ -296,6 +296,11 @@ pub fn get_filter_counts(
 }
 
 #[tauri::command]
+pub fn get_query_total(state: State<'_, AppState>, query: LibraryQuery) -> Result<u64, String> {
+    AppError::command(state.query_total(query))
+}
+
+#[tauri::command]
 pub fn get_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
     AppError::command(state.folders())
 }
@@ -848,6 +853,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         query_images,
         query_image_ids,
         get_filter_counts,
+        get_query_total,
         get_folders,
         create_folder,
         rename_folder,

@@ -9,7 +9,7 @@
 - **MCP 图库控制**：应用内 stateless Streamable HTTP 服务（只绑 `127.0.0.1` + 随机 Bearer 口令 + 程序目录的 `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；23 个工具覆盖浏览、搜索、拼图、写入、撤销/重做、任务、导入、临时区特征与文件夹管理；三档权限（只读 / 询问 / 完全）与 10 分钟确认队列；`logs/mcp.log` 审计。永久删除、清空回收站、图片空间优化、像素编辑与普通图库的批量 AI 生成仍不开放。契约见 [MCP 图库控制](../modules/mcp.md)。
 - **临时文件夹**：schema v7 的 `folders.kind = 'temp'`，与回收站同级的会话级暂存区；只能经导入进入，打开、关闭、换库与退出时清空，元数据改动不写操作记录。见[图库与元数据](../modules/library.md#临时文件夹)与[导入与缩略图](../modules/import.md)。
 - **图库操作撤销**：schema v5 的操作记录、线性撤销与重做、延迟释放、`.artbank/undo/` 暂存；评分/描述/标签/集合/相似分组、导入、编辑、移动、文件夹全部接入。见[图库与元数据](../modules/library.md#操作记录与撤销)。
-- **图片空间优化**：分层估算 + 两阶段界面、不可撤销的压缩记录、导入即压缩。见[维护与批量工作流](../modules/maintenance.md#图片空间优化)。
+- **图片空间优化**：分层估算 + 两阶段界面、不可撤销的压缩记录、导入即压缩。整改批次 1 已落地（动画/多页源保护、五档抽样与实测等待提示、关闭后可接管任务、漏斗统计闭合、耗时三段拆分、打开延迟）；批次 2（执行写路径、断电协议、线程与耗时标定）未开始。见[维护与批量工作流](../modules/maintenance.md#图片空间优化)与[整改计划](2026-10-26-图片空间优化整改计划.md)。
 - **AI 服务**：本机 HTTP `/v1` 服务的托管与便携分发；描述本轮不实现。见 [AI 服务](../modules/ai-service.md)。
 - 其余已完成阶段（S0–S3、S4、S6、S7、单库与多级文件夹、旧库迁移、体验整改 P0–P4）的结论仍在各模块文档里，历史记录详见文末归档表。
 
@@ -17,7 +17,7 @@
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
 - 存储版本：schema v7（v1→…→v7 链式迁移，v7 新增 `folders.kind` 与唯一的临时文件夹）、设置 v6（v1→…→v6，v6 新增 `mcp`）。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（299 通过、5 ignored）、`npx tsc --noEmit`、`npm run test:web`、`npm run build`、`git diff --check`。
+- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（305 通过、5 ignored）、`npx tsc --noEmit`、`npm run test:web`、`npm run build`、`git diff --check`。
 - 20 万行元数据基准（`perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Play, Square } from "lucide-react";
+import { AlertTriangle, Play, RotateCcw, Square } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
@@ -21,6 +21,7 @@ import {
   type OptimizeEstimate,
   type OptimizeOptions,
   type OptimizeTier,
+  type TaskScope,
   type TaskSnapshot,
   type TaskSummary,
 } from "./taskTypes";
@@ -38,6 +39,8 @@ interface OptimizeDialogProps {
   open: boolean;
   onClose: () => void;
   context: BatchTaskContextInfo | null;
+  /** 当前图库标识；换库后不接管上一个图库的任务。 */
+  libraryId: string;
 }
 
 const TIERS: Array<{ value: OptimizeTier; label: string; detail: string }> = [
@@ -57,13 +60,30 @@ const MAX_LONG_EDGE = 65_535;
 const WEBP_MAX_EDGE = 16_383;
 const EDGE_PRESETS = [4000, 3000, 2400];
 
-const SAMPLE_MIN = 50;
-const SAMPLE_MAX = 2000;
-const SAMPLE_STEP = 50;
-const SAMPLE_SETTLE_MS = 300;
-/** 实测编码吞吐（张/秒，见归档的《图片空间优化计划》第 13 节），只用来给抽样等一个大概。 */
-const SAMPLE_RATE_JPEG = 61;
-const SAMPLE_RATE_WEBP = 12.7;
+/** 抽样只有五档，滑块按索引走，标签与停靠点一一对应。 */
+const SAMPLE_CHOICES: ReadonlyArray<{ size: number; label: string }> = [
+  { size: 50, label: "50（快）" },
+  { size: 200, label: "200（默认）" },
+  { size: 500, label: "500" },
+  { size: 1_000, label: "1000" },
+  { size: 2_000, label: "2000（准）" },
+];
+const DEFAULT_SAMPLE_INDEX = 1;
+
+/** 一次已完成的估算，用来给同一组设置提示抽样等待时间。 */
+interface SampleMeasurement {
+  elapsedMs: number;
+  count: number;
+}
+
+interface RunConfig {
+  scopeLabel: string;
+  scope: TaskScope;
+  options: OptimizeOptions;
+  sampleSize: number;
+  /** 发起时的设置签名；结果回来时用它判断设置是否已改。 */
+  signature: string;
+}
 
 /** 空值表示不限；非整数或越界都算非法。 */
 function parseEdge(text: string): { value: number | null; invalid: boolean } {
@@ -76,10 +96,20 @@ function parseEdge(text: string): { value: number | null; invalid: boolean } {
   return { value, invalid: false };
 }
 
-/** 抽样编码的粗略等待时间；只按输出格式与样本数折算。 */
-function sampleSeconds(size: number, format: OptimizeOptions["outputFormat"]): number {
-  const rate = format === "webp" ? SAMPLE_RATE_WEBP : SAMPLE_RATE_JPEG;
-  return size / rate;
+function sampleKey(format: OptimizeOptions["outputFormat"], edge: number | null, size: number) {
+  return `${format}|${edge ?? "none"}|${size}`;
+}
+
+/** 抽样提示只描述“抽样编码要等多久”，与结果页的总预计耗时是两件事。 */
+function sampleWaitLabel(
+  measurement: SampleMeasurement | undefined,
+  size: number,
+): string | null {
+  if (!measurement || measurement.count <= 0 || measurement.elapsedMs <= 0) return null;
+  // 候选不足时实测样本少于档位，按实测单张耗时折算到当前档位。
+  const seconds = (measurement.elapsedMs / 1000) * (size / measurement.count);
+  if (seconds < 1) return "不到 1 秒";
+  return formatDuration(seconds);
 }
 
 /** 估算与执行共用同一块进度展示，只有数据来源不同。 */
@@ -111,25 +141,56 @@ function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number 
   );
 }
 
-/** 跳过原因按体积从大到小展示；计数为 0 的不占版面。 */
-function skipSegments(estimate: OptimizeEstimate): OptimizeShareSegment[] {
+/** 前置排除：只靠数据库列就能判定，不进候选池。 */
+function prefilterSegments(estimate: OptimizeEstimate): OptimizeShareSegment[] {
   return [
     { key: "compact", label: "已足够紧凑", ...estimate.skipCompact },
     { key: "optimized", label: "已处理过", ...estimate.skipOptimized },
     { key: "transparent", label: "有透明通道", ...estimate.skipTransparent },
     { key: "tooLarge", label: "超出 WebP 尺寸", ...estimate.skipTooLarge },
+    { key: "animated", label: "GIF", ...estimate.skipAnimated },
+  ]
+    .filter((segment) => segment.count > 0)
+    .sort((left, right) => right.bytes - left.bytes);
+}
+
+/** 候选内跳过：解码后才发现不处理。 */
+function candidateSkipSegments(estimate: OptimizeEstimate): OptimizeShareSegment[] {
+  return [
     { key: "color", label: "非 sRGB 色彩", ...estimate.skipColorProfile },
+    { key: "depth", label: "16 位源", ...estimate.skipDepth },
     { key: "quality", label: "画质不达标", ...estimate.skipQuality },
     { key: "notSmaller", label: "省得太少", ...estimate.skipNotSmaller },
-    { key: "depth", label: "16 位源", ...estimate.skipDepth },
+    { key: "multiframe", label: "动画/多页", ...estimate.skipMultiframe },
+    { key: "late", label: "解码后判定", ...estimate.skipLate },
     { key: "failed", label: "读取失败", count: estimate.failedCount, bytes: estimate.failedBytes },
   ]
     .filter((segment) => segment.count > 0)
     .sort((left, right) => right.bytes - left.bytes);
 }
 
-export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) {
-  const { start, cancel, find } = useTaskCenter();
+function scopeChoiceOf(scope: TaskScope | null | undefined): ScopeChoice | null {
+  if (!scope) return null;
+  switch (scope.type) {
+    case "selected":
+      return "selected";
+    case "folder":
+      return "folder";
+    case "collection":
+      return "collection";
+    case "view":
+      return "view";
+    case "temp":
+      return "temp";
+    case "library":
+      return "library";
+    default:
+      return null;
+  }
+}
+
+export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDialogProps) {
+  const { tasks, start, cancel, find } = useTaskCenter();
   const { confirm } = useNotices();
   const [scope, setScope] = useState<ScopeChoice>("library");
   const [tier, setTier] = useState<OptimizeTier>("high");
@@ -141,8 +202,9 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
   const [regenerateThumbnails, setRegenerateThumbnails] = useState(false);
   const [recomputePhash, setRecomputePhash] = useState(false);
   const [recomputeColors, setRecomputeColors] = useState(false);
-  const [sampleSize, setSampleSize] = useState(200);
-  const [samplePending, setSamplePending] = useState(false);
+  const [sampleSize, setSampleSize] = useState<number>(
+    SAMPLE_CHOICES[DEFAULT_SAMPLE_INDEX].size,
+  );
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<TaskSummary[] | null>(null);
@@ -153,36 +215,22 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
   const [canRetryEstimate, setCanRetryEstimate] = useState(false);
   const [executeTaskId, setExecuteTaskId] = useState<string | null>(null);
   const [pendingKind, setPendingKind] = useState<"estimate" | "execute">("estimate");
+  const [runConfig, setRunConfig] = useState<RunConfig | null>(null);
+  /** 当前展示的结果对应的设置签名；与表单签名不一致时结果作废。 */
+  const [resultSignature, setResultSignature] = useState<string | null>(null);
+  const [measurements, setMeasurements] = useState<Record<string, SampleMeasurement>>({});
   // 结果在表单下方，估算完成时可能落在可视区外，需要主动滚进来。
   const resultRef = useRef<HTMLDivElement>(null);
   const fetchedEstimate = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    setScope(defaultScopeChoice(context));
-    setTier("high");
-    setOutputFormat("jpeg");
-    setMaxLongEdgeText("");
-    setEdgeTouched(false);
-    setSkipOptimized(true);
-    setRegenerateThumbnails(false);
-    setRecomputePhash(false);
-    setRecomputeColors(false);
-    setSampleSize(200);
-    setSamplePending(false);
-    setStarting(false);
-    setError(null);
-    setConflict(null);
-    setTaskId(null);
-    setEstimate(null);
-    setLoadingEstimate(false);
-    setEstimateRetry(0);
-    setCanRetryEstimate(false);
-    setExecuteTaskId(null);
-    setPendingKind("estimate");
-    fetchedEstimate.current = null;
-    // 只在打开时重置；任务进度不应打断用户正在改的选项。
-  }, [open]);
+  /** 已放弃的结果不再自动弹回。 */
+  const abandoned = useRef<Set<string>>(new Set());
+  /** 本会话发起过的估算任务；只有它们才做“设置已改”的校验。 */
+  const launched = useRef<Set<string>>(new Set());
+  const signatureRef = useRef("");
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
+  const runConfigRef = useRef<RunConfig | null>(null);
+  runConfigRef.current = runConfig;
 
   const edge = useMemo(() => parseEdge(maxLongEdgeText), [maxLongEdgeText]);
 
@@ -211,19 +259,93 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     () => JSON.stringify({ scope, sampleSize, options }),
     [scope, sampleSize, options],
   );
+  signatureRef.current = signature;
 
+  // 换库时丢掉上一个图库的会话状态，避免接管到别的库的任务。
   useEffect(() => {
+    setRunConfig(null);
+    setTaskId(null);
+    setExecuteTaskId(null);
     setEstimate(null);
+    abandoned.current.clear();
+    launched.current.clear();
+  }, [libraryId]);
+
+  /** 打开窗口时按“执行 → 估算中 → 已有结果 → 已完成估算 → 默认配置”的顺序接管。 */
+  useEffect(() => {
+    if (!open) return;
+    setStarting(false);
+    setError(null);
+    setConflict(null);
+    setCanRetryEstimate(false);
+    setEstimateRetry(0);
+    setPendingKind("estimate");
+
+    const list = tasksRef.current;
+    const newest = (predicate: (task: TaskSnapshot) => boolean) =>
+      list
+        .filter(predicate)
+        .sort((left, right) => right.startedAt - left.startedAt)
+        .at(0) ?? null;
+
+    const runningExecution = newest((task) => task.kind === "optimize" && isTaskActive(task));
+    if (runningExecution) {
+      setExecuteTaskId(runningExecution.taskId);
+      return;
+    }
+    const runningEstimate = newest(
+      (task) =>
+        task.kind === "optimizeEstimate" &&
+        isTaskActive(task) &&
+        !abandoned.current.has(task.taskId),
+    );
+    if (runningEstimate) {
+      setTaskId(runningEstimate.taskId);
+      return;
+    }
+    if (estimate) return;
+
+    // 本会话里已完成、且没被放弃的估算或执行：保留现场。
+    if (taskId) {
+      const previous = list.find((item) => item.taskId === taskId);
+      if (previous && previous.phase === "completed" && !abandoned.current.has(taskId)) {
+        return;
+      }
+    }
+    if (executeTaskId) {
+      const previous = list.find((item) => item.taskId === executeTaskId);
+      if (previous && previous.phase === "completed") return;
+    }
+
+    // 默认配置。
+    setScope(defaultScopeChoice(context));
+    setTier("high");
+    setOutputFormat("jpeg");
+    setMaxLongEdgeText("");
+    setEdgeTouched(false);
+    setSkipOptimized(true);
+    setRegenerateThumbnails(false);
+    setRecomputePhash(false);
+    setRecomputeColors(false);
+    setSampleSize(SAMPLE_CHOICES[DEFAULT_SAMPLE_INDEX].size);
+    setTaskId(null);
+    setExecuteTaskId(null);
+    setEstimate(null);
+    setRunConfig(null);
+    fetchedEstimate.current = null;
+    // 只在打开时决策；任务进度不应打断用户正在改的选项。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // 设置一改，展示中的结果就作废；正在跑的旧任务完成时也会被签名校验挡住。
+  useEffect(() => {
+    if (!estimate || resultSignature === signature) return;
+    abandoned.current.add(estimate.taskId);
+    setEstimate(null);
+    setResultSignature(null);
     setError(null);
     setCanRetryEstimate(false);
-  }, [signature]);
-
-  // 拖动滑块时先禁用估算，松手 300ms 后才允许发起；避免每拖一格就重算一次。
-  useEffect(() => {
-    if (!samplePending) return;
-    const timer = window.setTimeout(() => setSamplePending(false), SAMPLE_SETTLE_MS);
-    return () => window.clearTimeout(timer);
-  }, [samplePending, sampleSize]);
+  }, [signature, estimate, resultSignature]);
 
   const task = taskId ? find(taskId) : null;
   const execution = executeTaskId ? find(executeTaskId) : null;
@@ -269,13 +391,23 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
         if (disposed) return;
         settled = true;
         window.clearTimeout(timer);
-        if (result) {
-          setEstimate(result);
-          setError(null);
-          setCanRetryEstimate(false);
-        } else {
+        if (!result) {
           setError("估算结果已被新的估算覆盖，请重新估算");
+          return;
         }
+        if (result.libraryId && libraryId && result.libraryId !== libraryId) {
+          setError("这条估算属于另一个图库，请重新估算");
+          return;
+        }
+        // 设置在本会话里改过：旧任务的结果与当前参数不符，直接丢弃。
+        if (
+          launched.current.has(estimateTaskId) &&
+          runConfigRef.current?.signature !== signatureRef.current
+        ) {
+          setError("估算运行期间设置已改变，请重新估算");
+          return;
+        }
+        applyEstimate(result);
       })
       .catch((cause: unknown) => {
         if (disposed) return;
@@ -291,7 +423,64 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [estimateTaskId, estimateTaskKind, estimateTaskPhase, estimateRetry]);
+  }, [estimateTaskId, estimateTaskKind, estimateTaskPhase, estimateRetry, libraryId]);
+
+  /** 用结果自身的参数回填表单与执行配置，接管时不依赖前端内存。 */
+  function applyEstimate(result: OptimizeEstimate) {
+    const restored = result.options ?? null;
+    // 统一成表单里的键序与默认值，签名比对才不会因序列化差异误判。
+    const normalized: OptimizeOptions = restored
+      ? {
+          tier: restored.tier,
+          outputFormat: restored.outputFormat,
+          maxLongEdge: restored.maxLongEdge ?? null,
+          skipOptimized: restored.skipOptimized,
+          regenerateThumbnails: restored.regenerateThumbnails,
+          recomputePhash: restored.recomputePhash,
+          recomputeColors: restored.recomputeColors,
+        }
+      : options;
+    const choice = scopeChoiceOf(result.scope);
+    if (choice) setScope(choice);
+    if (restored) {
+      setTier(normalized.tier);
+      setOutputFormat(normalized.outputFormat);
+      setMaxLongEdgeText(
+        normalized.maxLongEdge != null ? String(normalized.maxLongEdge) : "",
+      );
+      setSkipOptimized(normalized.skipOptimized);
+      setRegenerateThumbnails(normalized.regenerateThumbnails);
+      setRecomputePhash(normalized.recomputePhash);
+      setRecomputeColors(normalized.recomputeColors);
+    }
+    if (result.sampleSize > 0) setSampleSize(result.sampleSize);
+    if (result.scope) {
+      setRunConfig({
+        scopeLabel: result.scopeLabel || "当前范围",
+        scope: result.scope,
+        options: normalized,
+        sampleSize: result.sampleSize,
+        signature: signatureRef.current,
+      });
+    }
+    if (result.sampleElapsedMs > 0 && result.sampleCount > 0) {
+      const key = sampleKey(normalized.outputFormat, normalized.maxLongEdge, result.sampleSize);
+      setMeasurements((previous) => ({
+        ...previous,
+        [key]: { elapsedMs: result.sampleElapsedMs, count: result.sampleCount },
+      }));
+    }
+    // 结果对应的签名按回填后的设置算，避免回填本身触发“设置已改”。
+    const restoredSignature = JSON.stringify({
+      scope: choice ?? scope,
+      sampleSize: result.sampleSize > 0 ? result.sampleSize : sampleSize,
+      options: normalized,
+    });
+    setResultSignature(restoredSignature);
+    setEstimate(result);
+    setError(null);
+    setCanRetryEstimate(false);
+  }
 
   const scopeOptions = useMemo(() => scopeAvailability(context), [context]);
 
@@ -299,18 +488,34 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     if (estimate) resultRef.current?.scrollIntoView({ block: "start" });
   }, [estimate]);
 
+  /** 按当前表单拼一份执行配置；范围不可用时返回 null。 */
+  function buildFormConfig(target: BatchTaskContextInfo): RunConfig | null {
+    const builtScope = buildScope(scope, target);
+    if (!builtScope) return null;
+    const countLabel = scopeCountLabel(scope, target);
+    return {
+      scopeLabel: `${scopeName(scope, target)}${countLabel ? ` · ${countLabel}` : ""}`,
+      scope: builtScope,
+      options,
+      sampleSize,
+      signature,
+    };
+  }
+
   const launchTask = async (
     kind: "optimizeEstimate" | "optimize",
     policy: ConflictPolicy,
   ) => {
     if (!context) return;
     if (kind === "optimize" && !estimate) return;
-    if (edge.invalid) {
+    if (kind === "optimizeEstimate" && edge.invalid) {
       setEdgeTouched(true);
       return;
     }
-    const builtScope = buildScope(scope, context);
-    if (!builtScope) return;
+    // 执行优先用估算时记下的范围与参数，不用当前浏览状态重拼。
+    const config = (kind === "optimize" ? runConfig : null) ?? buildFormConfig(context);
+    if (!config) return;
+
     setStarting(true);
     setError(null);
     setConflict(null);
@@ -318,14 +523,14 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     try {
       const request: BatchTaskRequest = {
         kind,
-        scope: builtScope,
+        scope: config.scope,
         overwrite: false,
         recalcVisuals: false,
         prompt: null,
         maxTokens: null,
-        optimize: options,
+        optimize: config.options,
         estimateId: kind === "optimize" ? (estimate?.taskId ?? null) : null,
-        estimateSampleSize: kind === "optimizeEstimate" ? sampleSize : null,
+        estimateSampleSize: kind === "optimizeEstimate" ? config.sampleSize : null,
         conflict: policy,
       };
       const result = await start(request);
@@ -336,6 +541,9 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
       if (kind === "optimize") {
         setExecuteTaskId(result.task.taskId);
       } else {
+        setRunConfig(config);
+        setResultSignature(config.signature);
+        launched.current.add(result.task.taskId);
         setTaskId(result.task.taskId);
         setEstimate(null);
         setEstimateRetry(0);
@@ -359,6 +567,16 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
   };
 
   const retryKind = pendingKind === "execute" ? "optimize" : "optimizeEstimate";
+
+  const resetToConfig = () => {
+    setTaskId(null);
+    setExecuteTaskId(null);
+    setEstimate(null);
+    setRunConfig(null);
+    setError(null);
+    setConflict(null);
+    fetchedEstimate.current = null;
+  };
 
   const footer = activeExecution ? (
     <>
@@ -407,14 +625,21 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
       </Button>
     </>
   ) : execution ? (
-    <Button variant="primary" onClick={onClose}>
-      关闭
-    </Button>
+    <>
+      <Button variant="ghost" icon={<RotateCcw size={13} />} onClick={resetToConfig}>
+        重新估算
+      </Button>
+      <Button variant="primary" onClick={onClose}>
+        关闭
+      </Button>
+    </>
   ) : estimate ? (
     <>
       <Button
         variant="ghost"
         onClick={() => {
+          // 记住这次结果已被放弃，下次打开不要自动弹回。
+          abandoned.current.add(estimate.taskId);
           setEstimate(null);
           setError(null);
         }}
@@ -440,7 +665,7 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
         variant="primary"
         icon={<Play size={13} />}
         loading={starting || loadingEstimate}
-        disabled={!scopeOptions[scope].enabled || edge.invalid || samplePending}
+        disabled={!scopeOptions[scope].enabled || edge.invalid}
         onClick={() => void launchTask("optimizeEstimate", "fail")}
       >
         开始估算
@@ -448,13 +673,28 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
     </>
   );
 
-  const skippedCount = estimate
-    ? Math.max(0, estimate.totalCount - estimate.processCount)
+  const candidateSkipCount = estimate
+    ? Math.max(0, estimate.candidateCount - estimate.processCount)
     : 0;
-  const breakdown = estimate ? skipSegments(estimate) : [];
+  const candidateSkipBytes = estimate
+    ? Math.max(0, estimate.candidateBytes - estimate.processBytes)
+    : 0;
+  const candidateBreakdown = estimate ? candidateSkipSegments(estimate) : [];
+  const prefilterBreakdown = estimate ? prefilterSegments(estimate) : [];
   const qualityTotal = estimate
     ? estimate.qualityCounts.reduce((sum, entry) => sum + entry.count, 0)
     : 0;
+  const sampleIndex = SAMPLE_CHOICES.findIndex((choice) => choice.size === sampleSize);
+  const measurement = measurements[sampleKey(outputFormat, edge.value, sampleSize)];
+  const waitLabel = sampleWaitLabel(measurement, sampleSize);
+  const sampleShort = estimate ? estimate.sampleCount < estimate.sampleSize : false;
+  const timingParts = estimate
+    ? [
+        { label: "读取/编码", value: estimate.estimatedWorkSeconds },
+        { label: "写盘", value: estimate.estimatedWriteSeconds },
+        { label: "提交/删除", value: estimate.estimatedFinishSeconds },
+      ].filter((part) => part.value > 0)
+    : [];
 
   return (
     <Modal
@@ -594,27 +834,31 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
               </div>
               <Field label="估算抽样" hint="样本越多越准，也越慢。">
                 <div className="optimize-slider-head">
-                  <strong>{sampleSize} 张</strong>
-                  <span>约 {formatDuration(sampleSeconds(sampleSize, outputFormat))}</span>
+                  <strong>{sampleSize.toLocaleString()} 张</strong>
+                  {waitLabel ? <span>约 {waitLabel}</span> : null}
                 </div>
                 <input
                   className="range"
                   type="range"
-                  min={SAMPLE_MIN}
-                  max={SAMPLE_MAX}
-                  step={SAMPLE_STEP}
-                  value={sampleSize}
-                  onChange={(event) => {
-                    setSampleSize(Number(event.target.value));
-                    setSamplePending(true);
-                  }}
+                  min={0}
+                  max={SAMPLE_CHOICES.length - 1}
+                  step={1}
+                  value={sampleIndex < 0 ? DEFAULT_SAMPLE_INDEX : sampleIndex}
+                  onChange={(event) =>
+                    setSampleSize(SAMPLE_CHOICES[Number(event.target.value)].size)
+                  }
                 />
                 <div className="optimize-slider-marks">
-                  <span>50（快）</span>
-                  <span>200（默认）</span>
-                  <span>500</span>
-                  <span>1000</span>
-                  <span>2000（准）</span>
+                  {SAMPLE_CHOICES.map((choice, index) => (
+                    <span
+                      key={choice.size}
+                      style={{
+                        left: `${(index / (SAMPLE_CHOICES.length - 1)) * 100}%`,
+                      }}
+                    >
+                      {choice.label}
+                    </span>
+                  ))}
                 </div>
               </Field>
             </div>
@@ -633,35 +877,36 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
           </>
         ) : null}
 
-        {estimate ? (
+        {estimate && runConfig ? (
           <div className="optimize-run-summary">
             <span className="field-label">本次设置</span>
             <div className="optimize-outcome-rows">
               <div className="optimize-outcome-row">
                 <span>范围</span>
-                <strong>
-                  {scopeName(scope, context)}
-                  {scopeCountLabel(scope, context)
-                    ? ` · ${scopeCountLabel(scope, context)}`
-                    : ""}
-                </strong>
+                <strong>{runConfig.scopeLabel}</strong>
               </div>
               <div className="optimize-outcome-row">
                 <span>档位</span>
                 <strong>
-                  {tier === "extreme" ? "极高" : tier === "medium" ? "中" : "高"}
+                  {runConfig.options.tier === "extreme"
+                    ? "极高"
+                    : runConfig.options.tier === "medium"
+                      ? "中"
+                      : "高"}
                 </strong>
               </div>
               <div className="optimize-outcome-row">
                 <span>输出</span>
                 <strong>
-                  {outputFormat === "jpeg" ? "JPEG" : "WebP"} · 长边{" "}
-                  {edge.value ? `${edge.value} px` : "不限"}
+                  {runConfig.options.outputFormat === "jpeg" ? "JPEG" : "WebP"} · 长边{" "}
+                  {runConfig.options.maxLongEdge
+                    ? `${runConfig.options.maxLongEdge} px`
+                    : "不限"}
                 </strong>
               </div>
               <div className="optimize-outcome-row">
                 <span>已处理图片</span>
-                <strong>{skipOptimized ? "跳过" : "再压一次"}</strong>
+                <strong>{runConfig.options.skipOptimized ? "跳过" : "再压一次"}</strong>
               </div>
             </div>
           </div>
@@ -708,8 +953,20 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
             <div className="optimize-result-head">
               <strong>估算完成</strong>
               <span>
-                样本 {estimate.sampleCount.toLocaleString()} 张 · 覆盖{" "}
+                样本 {estimate.sampleCount.toLocaleString()} 张
+                {sampleShort ? "（候选不足）" : ""} · 覆盖{" "}
                 {(estimate.coverage * 100).toFixed(1)}% 的候选体积
+              </span>
+            </div>
+
+            <div className="optimize-funnel">
+              <span>
+                范围 {estimate.totalCount.toLocaleString()} 张 ·{" "}
+                {formatBytes(estimate.totalBytes)}
+              </span>
+              <span>
+                候选 {estimate.candidateCount.toLocaleString()} 张 ·{" "}
+                {formatBytes(estimate.candidateBytes)}
               </span>
             </div>
 
@@ -723,11 +980,11 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
                 }}
                 skipped={{
                   key: "skip",
-                  label: "跳过",
-                  count: skippedCount,
-                  bytes: Math.max(0, estimate.totalBytes - estimate.processBytes),
+                  label: "候选内跳过",
+                  count: candidateSkipCount,
+                  bytes: candidateSkipBytes,
                 }}
-                breakdown={breakdown}
+                breakdown={candidateBreakdown}
               />
 
               <div className="optimize-outcome">
@@ -755,13 +1012,32 @@ export function OptimizeDialog({ open, onClose, context }: OptimizeDialogProps) 
                     <span>预计耗时</span>
                     <strong>{formatDuration(estimate.estimatedSeconds)}</strong>
                   </div>
-                  <div className="optimize-outcome-row">
-                    <span>候选</span>
-                    <strong>{estimate.candidateCount.toLocaleString()} 张</strong>
-                  </div>
+                  {timingParts.length > 0 ? (
+                    <div className="optimize-timing-detail">
+                      其中：
+                      {timingParts
+                        .map((part) => `${part.label} ${formatDuration(part.value)}`)
+                        .join(" · ")}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
+
+            {prefilterBreakdown.length > 0 ? (
+              <div className="optimize-prefilter">
+                <span className="field-label">未纳入候选</span>
+                <div className="optimize-prefilter-list">
+                  {prefilterBreakdown.map((segment) => (
+                    <div key={segment.key} className="optimize-prefilter-row">
+                      <span>{segment.label}</span>
+                      <em>{segment.count.toLocaleString()} 张</em>
+                      <strong>{formatBytes(segment.bytes)}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
 
             {estimate.curve.length > 1 && estimate.savingsBytes > 0 ? (
               <div className="optimize-curve">

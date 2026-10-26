@@ -99,6 +99,7 @@ tags: string[]
 | `query_images` | `{ query }` | `{ items, nextCursor, nextPageToken }`（两者至多一个非空） |
 | `query_image_ids` | `{ query }` | `number[]`（当前查询的全部 id，最多 100 万） |
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
+| `get_query_total` | `{ query }` | `number`（只算命中总数，不取分面） |
 | `get_folders` | — | `FolderInfo[]`（`directImageCount` / `totalImageCount`，按路径排序，含 `sortIndex`） |
 | `get_tags` | `{ limit? }` | `TagInfo[]`（默认/最多 500，按活跃图片数降序） |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]`（按名称子串，最多 200） |
