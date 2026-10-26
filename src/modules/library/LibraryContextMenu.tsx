@@ -27,6 +27,7 @@ export interface ContextMenuState {
 interface LibraryContextMenuProps {
   menu: ContextMenuState;
   inCollection: boolean;
+  inTemp: boolean;
   hasActive: boolean;
   hasDeleted: boolean;
   onClose: () => void;
@@ -50,6 +51,7 @@ const CONTEXT_MENU_MAX_HEIGHT = 600;
 export function LibraryContextMenu({
   menu,
   inCollection,
+  inTemp,
   hasActive,
   hasDeleted,
   onClose,
@@ -172,18 +174,20 @@ export function LibraryContextMenu({
         </button>
       </MenuSection>
 
-      <MenuSection title="整理">
-        <button type="button" className="context-menu-item" onClick={onAddToCollection}>
-          <Layers size={14} />
-          <span>加入集合…</span>
-        </button>
-        {inCollection ? (
-          <button type="button" className="context-menu-item" onClick={onRemoveFromCollection}>
+      {!inTemp ? (
+        <MenuSection title="整理">
+          <button type="button" className="context-menu-item" onClick={onAddToCollection}>
             <Layers size={14} />
-            <span>移出当前集合</span>
+            <span>加入集合…</span>
           </button>
-        ) : null}
-      </MenuSection>
+          {inCollection ? (
+            <button type="button" className="context-menu-item" onClick={onRemoveFromCollection}>
+              <Layers size={14} />
+              <span>移出当前集合</span>
+            </button>
+          ) : null}
+        </MenuSection>
+      ) : null}
 
       {referenceCount > 0 ? (
         <MenuSection title="相似">
@@ -203,7 +207,7 @@ export function LibraryContextMenu({
         </MenuSection>
       ) : null}
 
-      {hasActive || hasDeleted ? (
+      {!inTemp && (hasActive || hasDeleted) ? (
         <MenuSection title="危险操作">
           {hasActive ? (
             <button type="button" className="context-menu-item" onClick={onTrash}>

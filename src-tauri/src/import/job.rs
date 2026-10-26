@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::tasks::{TaskHandle, TaskKind, TaskPhase},
+    import::ImportTarget,
     library::service::now_ms,
 };
 
@@ -55,6 +56,8 @@ pub struct ImportHint {
 pub struct ImportProgress {
     pub job_id: String,
     pub phase: ImportPhase,
+    /// 普通导入或临时导入；临时导入不入操作记录。
+    pub target: ImportTarget,
     pub total: usize,
     pub processed: usize,
     pub imported: usize,
@@ -86,6 +89,7 @@ pub struct ImportSnapshot {
 /// 这里保留导入独有的计数（新增/重复/合并/疑似重复）与预览 id。
 pub struct ImportJob {
     handle: Arc<TaskHandle>,
+    target: ImportTarget,
     phase: Mutex<ImportPhase>,
     total: AtomicUsize,
     processed: AtomicUsize,
@@ -116,11 +120,12 @@ fn task_phase(phase: ImportPhase) -> TaskPhase {
 }
 
 impl ImportJob {
-    pub fn new(id: impl Into<String>, scope: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>, scope: impl Into<String>, target: ImportTarget) -> Self {
         let id = id.into();
         let handle = TaskHandle::new(id.clone(), TaskKind::Import, scope);
         Self {
             handle,
+            target,
             phase: Mutex::new(ImportPhase::Scanning),
             total: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
@@ -263,6 +268,7 @@ impl ImportJob {
         ImportProgress {
             job_id: self.handle.id().to_owned(),
             phase: self.phase(),
+            target: self.target,
             total: self.total.load(Ordering::Relaxed),
             processed: self.processed.load(Ordering::Relaxed),
             imported: self.imported.load(Ordering::Relaxed),
@@ -295,7 +301,7 @@ mod tests {
 
     #[test]
     fn snapshot_serializes_flat_camel_case_fields() {
-        let job = ImportJob::new("job-1", "1 个路径");
+        let job = ImportJob::new("job-1", "1 个路径", ImportTarget::Library);
         job.set_total(10);
         job.inc_imported(3);
         job.add_failure("a.png", "无法解码");
@@ -314,7 +320,7 @@ mod tests {
 
     #[test]
     fn preview_ids_keep_the_latest_25() {
-        let job = ImportJob::new("job-1", "1 个路径");
+        let job = ImportJob::new("job-1", "1 个路径", ImportTarget::Library);
         for id in 1..=30 {
             job.add_preview(id);
         }

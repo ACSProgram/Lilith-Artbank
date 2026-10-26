@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     import::job::ImportFailure,
-    library::paths::{DATA_DIR, LEGACY_DATA_DIR, OUTPUT_DIR, RECYCLE_DIR},
+    library::paths::{DATA_DIR, LEGACY_DATA_DIR, OUTPUT_DIR, RECYCLE_DIR, TEMP_FOLDER_DIR},
 };
 
 pub const SUPPORTED_EXTENSIONS: [&str; 9] = [
@@ -172,7 +172,7 @@ fn should_skip_directory(path: &Path, library_root: &Path) -> bool {
     if name == DATA_DIR || name == LEGACY_DATA_DIR {
         return true;
     }
-    if name == RECYCLE_DIR || name == OUTPUT_DIR {
+    if name == RECYCLE_DIR || name == OUTPUT_DIR || name.starts_with(TEMP_FOLDER_DIR) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         return canonical.starts_with(library_root);
     }

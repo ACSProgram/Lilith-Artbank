@@ -26,6 +26,7 @@ pub enum QueryView {
     All,
     Trash,
     Collection,
+    Temp,
 }
 
 impl From<QueryView> for LibraryView {
@@ -34,6 +35,7 @@ impl From<QueryView> for LibraryView {
             QueryView::All => LibraryView::All,
             QueryView::Trash => LibraryView::Trash,
             QueryView::Collection => LibraryView::Collection,
+            QueryView::Temp => LibraryView::Temp,
         }
     }
 }
@@ -156,7 +158,9 @@ pub struct McpCursor {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpQuery {
-    #[schemars(description = "all=正常图片；trash=回收站；collection=集合（需要 collectionId）")]
+    #[schemars(
+        description = "all=正常图片；trash=回收站；collection=集合（需要 collectionId）；temp=临时文件夹"
+    )]
     pub view: QueryView,
     #[schemars(description = "view=collection 时必填")]
     pub collection_id: Option<i64>,

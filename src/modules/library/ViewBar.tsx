@@ -8,6 +8,7 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
+  Timer,
   Trash2,
 } from "lucide-react";
 import { Button } from "../../shared/components/Button";
@@ -20,9 +21,11 @@ interface ViewBarProps {
   collections: CollectionInfo[];
   imageCount: number;
   trashCount: number;
+  tempCount: number;
   emptyingTrash: boolean;
   onShowAll: () => void;
   onShowTrash: () => void;
+  onShowTemp: () => void;
   onShowCollection: (collectionId: number) => void;
   onNewCollection: () => void;
   onManageCollections: () => void;
@@ -48,9 +51,11 @@ export function ViewBar({
   collections,
   imageCount,
   trashCount,
+  tempCount,
   emptyingTrash,
   onShowAll,
   onShowTrash,
+  onShowTemp,
   onShowCollection,
   onNewCollection,
   onManageCollections,
@@ -99,6 +104,18 @@ export function ViewBar({
         <span>回收站</span>
         <em>{trashCount.toLocaleString()}</em>
       </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={view === "temp"}
+        className={`view-tab view-tab-temp${view === "temp" ? " is-active" : ""}`}
+        title="临时区：关闭、切换图库或退出应用时自动清空"
+        onClick={onShowTemp}
+      >
+        <Timer size={14} />
+        <span>临时</span>
+        <em>{tempCount.toLocaleString()}</em>
+      </button>
 
       <span className="view-bar-separator" aria-hidden="true" />
 
@@ -126,7 +143,13 @@ export function ViewBar({
         ))}
       </div>
 
-      <button type="button" className="view-tab view-tab-add" onClick={onNewCollection}>
+      <button
+        type="button"
+        className="view-tab view-tab-add"
+        disabled={view === "temp"}
+        title={view === "temp" ? "临时图片不能加入集合" : undefined}
+        onClick={onNewCollection}
+      >
         <Plus size={13} />
         <span>新建集合</span>
       </button>

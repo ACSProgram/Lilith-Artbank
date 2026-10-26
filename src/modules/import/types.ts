@@ -1,5 +1,6 @@
 export type DuplicatePolicy = "skip" | "merge";
 export type FolderMode = "flat" | "preserve";
+export type ImportTarget = "library" | "temp";
 export type ImportOptimizeTier = "extreme" | "high" | "medium";
 export type ImportOptimizeFormat = "jpeg" | "webp";
 
@@ -23,6 +24,8 @@ export type ImportPhase =
 
 export interface ImportRequest {
   paths: string[];
+  /** library 为普通图库；temp 为临时文件夹（不写操作记录，关闭时清空）。 */
+  target: ImportTarget;
   folder: string;
   folderMode: FolderMode;
   tags: string[];
@@ -36,6 +39,7 @@ export interface ImportRequest {
 export interface ImportProgress {
   jobId: string;
   phase: ImportPhase;
+  target: ImportTarget;
   total: number;
   processed: number;
   imported: number;

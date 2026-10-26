@@ -20,7 +20,7 @@ use crate::{
         phash, thumbnail,
     },
     import::{
-        FolderMode, ImportRequest, ImportSource, decode,
+        FolderMode, ImportRequest, ImportSource, ImportTarget, decode,
         job::{DuplicatePolicy, ImportHint, ImportJob, ImportPhase},
         scan,
     },
@@ -56,6 +56,8 @@ struct WriterOptions {
     score: u8,
     policy: DuplicatePolicy,
     operation_id: Option<i64>,
+    /// 临时导入固定使用该文件夹 id，不再按路径解析。
+    folder_id: Option<i64>,
 }
 
 struct Staged {
@@ -175,6 +177,14 @@ fn run_inner(
             .collect::<Vec<_>>(),
     ));
 
+    let (folder, folder_id) = match request.target {
+        ImportTarget::Library => (request.folder.clone(), None),
+        ImportTarget::Temp => {
+            let temp = source.database.with_reader(crate::library::temp::require)?;
+            (temp.path, Some(temp.id))
+        }
+    };
+
     let inflight = Arc::new(Mutex::new(HashSet::new()));
     let (sender, receiver) = mpsc::sync_channel::<Outcome>(CHANNEL_DEPTH);
     let writer_options = WriterOptions {
@@ -182,6 +192,7 @@ fn run_inner(
         score: request.score,
         policy: request.duplicate_policy,
         operation_id: source.operation_id,
+        folder_id,
     };
 
     let writer = {
@@ -215,7 +226,7 @@ fn run_inner(
             database: source.database.clone(),
             paths: paths.clone(),
             temp_dir: temp_dir.to_path_buf(),
-            folder: request.folder.clone(),
+            folder,
             folder_mode: request.folder_mode,
             threshold: request.perceptual_threshold,
             optimize: request.optimize.map(|value| value.options()),
@@ -688,12 +699,16 @@ fn flush(
             let folder_id = match buffer.folder_ids.get(&item.folder) {
                 Some(id) => *id,
                 None => {
-                    let id = repository::ensure_folder_tracked(
-                        &transaction,
-                        &item.folder,
-                        now,
-                        &mut created_folders,
-                    )?;
+                    let id = if let Some(id) = options.folder_id {
+                        id
+                    } else {
+                        repository::ensure_folder_tracked(
+                            &transaction,
+                            &item.folder,
+                            now,
+                            &mut created_folders,
+                        )?
+                    };
                     buffer.folder_ids.insert(item.folder.clone(), id);
                     id
                 }
@@ -960,6 +975,7 @@ mod tests {
     fn request(directory: &Path) -> ImportRequest {
         ImportRequest {
             paths: vec![directory.to_string_lossy().into_owned()],
+            target: ImportTarget::Library,
             folder: "导入".into(),
             folder_mode: FolderMode::Flat,
             tags: vec!["测试".into()],
@@ -978,7 +994,11 @@ mod tests {
         root: &Path,
         dir: &Path,
     ) -> ImportJob {
-        let job = Arc::new(ImportJob::new("test-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "test-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(source(session, root), job.clone(), request(dir)).unwrap();
         job.finish(ImportPhase::Completed);
         Arc::try_unwrap(job).ok().unwrap()
@@ -1017,7 +1037,11 @@ mod tests {
         root: &Path,
         request: ImportRequest,
     ) -> ImportSnapshot {
-        let job = Arc::new(ImportJob::new("optimized-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "optimized-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(source(session, root), job.clone(), request).unwrap();
         job.finish(ImportPhase::Completed);
         job.snapshot()
@@ -1276,7 +1300,11 @@ mod tests {
             assert!(content.is_file(), "缺少原图 {}", content.display());
         }
 
-        let second = Arc::new(ImportJob::new("duplicate-job", "测试样本"));
+        let second = Arc::new(ImportJob::new(
+            "duplicate-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(
             source(&session, &library_root),
             second.clone(),
@@ -1312,7 +1340,11 @@ mod tests {
             second.to_string_lossy().into_owned(),
         ];
         preserve.folder_mode = FolderMode::Preserve;
-        let job = Arc::new(ImportJob::new("preserve-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "preserve-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(source(&session, &library_root), job.clone(), preserve).unwrap();
         job.finish(ImportPhase::Completed);
         assert_eq!(job.snapshot().progress.imported, 2);
@@ -1347,7 +1379,11 @@ mod tests {
         merge_request.duplicate_policy = DuplicatePolicy::Merge;
         merge_request.tags = vec!["第二次".into()];
         merge_request.score = 5;
-        let job = Arc::new(ImportJob::new("merge-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "merge-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(source(&session, &library_root), job.clone(), merge_request).unwrap();
         job.finish(ImportPhase::Completed);
         let snapshot = job.snapshot();
@@ -1382,7 +1418,11 @@ mod tests {
         let mut cancel_request = request(&source_dir);
         cancel_request.worker_threads = Some(4);
         cancel_request.cancel_after = Some(20);
-        let job = Arc::new(ImportJob::new("cancel-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "cancel-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         run(source(&session, &library_root), job.clone(), cancel_request).unwrap();
         assert!(job.should_cancel());
         job.finish(ImportPhase::Cancelled);
@@ -1436,7 +1476,11 @@ mod tests {
         let library_root = temp.path().join("library");
         let session = open_library(&library_root);
 
-        let job = Arc::new(ImportJob::new("perf-job", "测试样本"));
+        let job = Arc::new(ImportJob::new(
+            "perf-job",
+            "测试样本",
+            ImportTarget::Library,
+        ));
         let start = Instant::now();
         run(
             source(&session, &library_root),

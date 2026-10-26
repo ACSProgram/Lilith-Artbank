@@ -5,7 +5,7 @@ pub mod scan;
 
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
@@ -19,6 +19,15 @@ use crate::{
 };
 
 use job::{DuplicatePolicy, ImportJob, ImportPhase};
+
+/// 导入目的地：普通图库或临时文件夹。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportTarget {
+    #[default]
+    Library,
+    Temp,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +62,9 @@ impl ImportOptimize {
 #[serde(rename_all = "camelCase")]
 pub struct ImportRequest {
     pub paths: Vec<String>,
+    /// 省略或 `library` 为普通导入；`temp` 进入临时文件夹。
+    #[serde(default)]
+    pub target: ImportTarget,
     #[serde(default)]
     pub folder: String,
     #[serde(default)]
@@ -102,7 +114,22 @@ impl ImportRequest {
             return Err(AppError::message(format!("导入路径必须是绝对路径：{path}")));
         }
 
-        self.folder = normalize_folder(&self.folder)?;
+        if self.target == ImportTarget::Temp {
+            if self.duplicate_policy == DuplicatePolicy::Merge {
+                return Err(AppError::message(
+                    "临时导入只能跳过重复内容，不能合并到已有图片",
+                ));
+            }
+            if self.folder_mode == FolderMode::Preserve {
+                return Err(AppError::message("临时导入只能平铺，不能保留源目录"));
+            }
+            self.folder.clear();
+            self.folder_mode = FolderMode::Flat;
+            // 临时区是会话级暂存，压缩会丢掉原图且不可撤销，这里直接忽略请求里的压缩参数。
+            self.optimize = None;
+        } else {
+            self.folder = normalize_folder(&self.folder)?;
+        }
         if self.score > 5 {
             return Err(AppError::message("评分必须在 0-5 之间"));
         }
@@ -236,6 +263,7 @@ mod tests {
     fn request() -> ImportRequest {
         ImportRequest {
             paths: vec![std::env::temp_dir().to_string_lossy().into_owned()],
+            target: ImportTarget::Library,
             folder: String::new(),
             folder_mode: FolderMode::Flat,
             tags: Vec::new(),
@@ -258,6 +286,32 @@ mod tests {
         assert_eq!(normalized.folder, "人物/速写");
         assert_eq!(normalized.tags, vec!["速写".to_owned(), "人物".to_owned()]);
         assert_eq!(normalized.perceptual_threshold, 64);
+    }
+
+    #[test]
+    fn temp_import_forces_flat_skip_only() {
+        let mut value = request();
+        value.target = ImportTarget::Temp;
+        value.folder = "人物".into();
+        value.folder_mode = FolderMode::Flat;
+        value.optimize = Some(ImportOptimize {
+            tier: crate::imageops::optimize::QualityTier::Medium,
+            output_format: OptimizeFormat::Jpeg,
+        });
+        let normalized = value.normalized().unwrap();
+        assert_eq!(normalized.folder, "");
+        assert_eq!(normalized.folder_mode, FolderMode::Flat);
+        assert!(normalized.optimize.is_none(), "临时导入不压缩");
+
+        let mut merge = request();
+        merge.target = ImportTarget::Temp;
+        merge.duplicate_policy = DuplicatePolicy::Merge;
+        assert!(merge.normalized().is_err());
+
+        let mut preserve = request();
+        preserve.target = ImportTarget::Temp;
+        preserve.folder_mode = FolderMode::Preserve;
+        assert!(preserve.normalized().is_err());
     }
 
     #[test]

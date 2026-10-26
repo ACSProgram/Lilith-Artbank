@@ -19,6 +19,7 @@ use crate::{
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
         placeholders,
         service::now_ms,
+        temp,
     },
 };
 
@@ -192,9 +193,11 @@ pub fn update_score(database: &LibraryDb, image_id: i64, score: i64) -> AppResul
         return Err(AppError::message("图片 id 无效"));
     }
     validate_score(score)?;
-    history::write(
+    let tracked = !temp::is_image(database, image_id)?;
+    history::write_with_id_mode(
         database,
         NewOperation::new(HistoryKind::Score, format!("评分 {score} 星")),
+        tracked,
         |transaction, draft| {
             let old: Option<(i64, i64)> = transaction
                 .query_row(
@@ -210,11 +213,14 @@ pub fn update_score(database: &LibraryDb, image_id: i64, score: i64) -> AppResul
                 "UPDATE images SET score = ?1, modified_at = ?2 WHERE id = ?3",
                 params![score, now_ms(), image_id],
             )?;
-            draft.triples(&[(image_id, old_score, old_modified_at)]);
-            draft.affected(1);
+            if tracked {
+                draft.triples(&[(image_id, old_score, old_modified_at)]);
+                draft.affected(1);
+            }
             Ok(())
         },
-    )
+    )?;
+    Ok(())
 }
 
 pub fn set_scores(database: &LibraryDb, image_ids: &[i64], score: i64) -> AppResult<u64> {
@@ -228,12 +234,16 @@ pub fn set_scores_with_id(
 ) -> AppResult<(u64, Option<i64>)> {
     validate_score(score)?;
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
-    history::write_with_id(
+    let temp_ids = temp::ids_in(database, &ids)?;
+    let tracked = ids.iter().any(|id| !temp_ids.contains(id));
+    history::write_with_id_mode(
         database,
         NewOperation::new(HistoryKind::Score, format!("批量评分 {score} 星")),
+        tracked,
         |transaction, draft| {
             let now = now_ms();
             let mut changed = 0_u64;
+            let mut recorded = 0_u64;
             let mut triples = Vec::new();
             for chunk in ids.chunks(SQL_CHUNK) {
                 let marks = placeholders(chunk.len());
@@ -251,7 +261,13 @@ pub fn set_scores_with_id(
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                triples.extend(old_rows);
+                for row in old_rows {
+                    if temp_ids.contains(&row.0) {
+                        continue;
+                    }
+                    triples.push(row);
+                    recorded += 1;
+                }
                 changed += transaction.execute(
                     &format!(
                         "UPDATE images SET score = ?1, modified_at = ?2 WHERE id IN ({marks})"
@@ -263,8 +279,10 @@ pub fn set_scores_with_id(
                     ),
                 )? as u64;
             }
-            draft.triples(&triples);
-            draft.affected(changed);
+            if tracked {
+                draft.triples(&triples);
+                draft.affected(recorded);
+            }
             Ok(changed)
         },
     )
@@ -285,9 +303,11 @@ pub fn update_description_with_id(
     }
     let description = description.trim();
     validate_description(description)?;
-    history::write_with_id(
+    let tracked = !temp::is_image(database, image_id)?;
+    history::write_with_id_mode(
         database,
         NewOperation::new(HistoryKind::Description, "修改描述"),
+        tracked,
         |transaction, draft| {
             let old: Option<(String, String, String, i64)> = transaction
                 .query_row(
@@ -311,14 +331,16 @@ pub fn update_description_with_id(
                  WHERE id = ?3",
                 params![description, modified_at, image_id],
             )?;
-            draft.json(&DescriptionRecord {
-                image_id,
-                description: old_description,
-                description_source: old_source,
-                description_model: old_model,
-                modified_at: old_modified_at,
-            })?;
-            draft.affected(1);
+            if tracked {
+                draft.json(&DescriptionRecord {
+                    image_id,
+                    description: old_description,
+                    description_source: old_source,
+                    description_model: old_model,
+                    modified_at: old_modified_at,
+                })?;
+                draft.affected(1);
+            }
             Ok(1)
         },
     )
@@ -339,18 +361,23 @@ pub fn set_ai_description(
         return Err(AppError::message("AI 描述为空"));
     }
     validate_description(description)?;
-    history::write(
+    let tracked = !temp::is_image(database, image_id)?;
+    let (changed, _) = history::write_with_id_mode(
         database,
         NewOperation::new(HistoryKind::AiDescription, "AI 生成描述"),
+        tracked,
         |transaction, draft| {
             let Some(old) = write_ai_description(transaction, image_id, description, model)? else {
                 return Ok(false);
             };
-            draft.json(&old)?;
-            draft.affected(1);
+            if tracked {
+                draft.json(&old)?;
+                draft.affected(1);
+            }
             Ok(true)
         },
-    )
+    )?;
+    Ok(changed)
 }
 
 /// 批量 AI 描述：在任务开始前用 `begin_live` 建记录，每张图的事务里追加旧描述与影响数。
@@ -375,14 +402,16 @@ pub fn set_ai_description_live(
         let Some(old) = write_ai_description(&transaction, image_id, description, model)? else {
             return Ok(false);
         };
-        history::discard_redo_in_tx(&transaction)?;
-        history::append_live_in_tx(
-            &transaction,
-            operation_id,
-            ChunkFormat::Json,
-            &serde_json::to_vec(&old)?,
-        )?;
-        history::add_live_affected_in_tx(&transaction, operation_id, 1)?;
+        if !temp::is_image_in(&transaction, image_id)? {
+            history::discard_redo_in_tx(&transaction)?;
+            history::append_live_in_tx(
+                &transaction,
+                operation_id,
+                ChunkFormat::Json,
+                &serde_json::to_vec(&old)?,
+            )?;
+            history::add_live_affected_in_tx(&transaction, operation_id, 1)?;
+        }
         transaction.commit()?;
         Ok(true)
     })
@@ -451,9 +480,11 @@ pub fn set_image_tags(
     } else {
         format!("设置标签「{}」", tag_summary(&names))
     };
-    history::write(
+    let tracked = !temp::is_image(database, image_id)?;
+    history::write_with_id_mode(
         database,
         NewOperation::new(HistoryKind::TagSet, label),
+        tracked,
         |transaction, draft| {
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS (SELECT 1 FROM images WHERE id = ?1)",
@@ -484,15 +515,17 @@ pub fn set_image_tags(
                     params![image_id, tag_id],
                 )?;
             }
-            draft.json(&TagRecord::Set {
-                image_id,
-                old_tag_ids,
-                created: created
-                    .into_iter()
-                    .map(|(id, name)| TagRefRecord { id, name })
-                    .collect(),
-            })?;
-            draft.affected(1);
+            if tracked {
+                draft.json(&TagRecord::Set {
+                    image_id,
+                    old_tag_ids,
+                    created: created
+                        .into_iter()
+                        .map(|(id, name)| TagRefRecord { id, name })
+                        .collect(),
+                })?;
+                draft.affected(1);
+            }
             Ok(())
         },
     )?;
@@ -513,12 +546,15 @@ pub fn add_tags_with_id(
     if names.is_empty() {
         return Ok((0, None));
     }
-    history::write_with_id(
+    let temp_ids = temp::ids_in(database, &ids)?;
+    let tracked = ids.iter().any(|id| !temp_ids.contains(id));
+    history::write_with_id_mode(
         database,
         NewOperation::new(
             HistoryKind::TagAdd,
             format!("添加标签「{}」", tag_summary(&names)),
         ),
+        tracked,
         |transaction, draft| {
             let mut created = Vec::new();
             let tag_ids = ensure_tags_tracked(transaction, &names, &mut created)?;
@@ -527,6 +563,7 @@ pub fn add_tags_with_id(
                 .map(|(id, name)| TagRefRecord { id, name })
                 .collect();
             let mut added = 0_u64;
+            let mut recorded = 0_u64;
             for tag_id in &tag_ids {
                 for chunk in ids.chunks(SQL_CHUNK) {
                     let marks = placeholders(chunk.len());
@@ -571,20 +608,28 @@ pub fn add_tags_with_id(
                     if pairs.is_empty() {
                         continue;
                     }
-                    draft.json(&TagRecord::Add {
-                        pairs: pairs.clone(),
-                        created: std::mem::take(&mut pending_created),
-                    })?;
                     added += pairs.len() as u64;
+                    if tracked {
+                        pairs.retain(|(image_id, _)| !temp_ids.contains(image_id));
+                        recorded += pairs.len() as u64;
+                        if !pairs.is_empty() || !pending_created.is_empty() {
+                            draft.json(&TagRecord::Add {
+                                pairs,
+                                created: std::mem::take(&mut pending_created),
+                            })?;
+                        }
+                    }
                 }
             }
-            if !pending_created.is_empty() {
+            if tracked && !pending_created.is_empty() {
                 draft.json(&TagRecord::Add {
                     pairs: Vec::new(),
                     created: pending_created,
                 })?;
             }
-            draft.affected(added);
+            if tracked {
+                draft.affected(recorded);
+            }
             Ok(added)
         },
     )
@@ -608,15 +653,19 @@ pub fn remove_tags_with_id(
     if names.is_empty() {
         return Ok((0, None));
     }
-    history::write_with_id(
+    let temp_ids = temp::ids_in(database, &ids)?;
+    let tracked = ids.iter().any(|id| !temp_ids.contains(id));
+    history::write_with_id_mode(
         database,
         NewOperation::new(
             HistoryKind::TagRemove,
             format!("移除标签「{}」", tag_summary(&names)),
         ),
+        tracked,
         |transaction, draft| {
             let tag_ids = tag_ids_for_names(transaction, &names)?;
             let mut removed = 0_u64;
+            let mut recorded = 0_u64;
             for tag_id in tag_ids {
                 for chunk in ids.chunks(SQL_CHUNK) {
                     let marks = placeholders(chunk.len());
@@ -647,10 +696,21 @@ pub fn remove_tags_with_id(
                         values(),
                     )?;
                     removed += present.len() as u64;
-                    draft.json(&TagRecord::Remove { pairs: present })?;
+                    if tracked {
+                        let pairs: Vec<(i64, i64)> = present
+                            .into_iter()
+                            .filter(|(image_id, _)| !temp_ids.contains(image_id))
+                            .collect();
+                        recorded += pairs.len() as u64;
+                        if !pairs.is_empty() {
+                            draft.json(&TagRecord::Remove { pairs })?;
+                        }
+                    }
                 }
             }
-            draft.affected(removed);
+            if tracked {
+                draft.affected(recorded);
+            }
             Ok(removed)
         },
     )
@@ -774,7 +834,15 @@ pub fn move_images_with_id(
     reporter: &dyn BatchReporter,
 ) -> AppResult<(MoveReport, Option<i64>)> {
     let ids = validate_ids_for_files(image_ids)?;
+    // 临时路径在 normalize_folder 里就会被拒（保留目录名），不需要再查一次。
     let folder_path = normalize_folder(folder_path)?;
+    database.with_reader(|connection| {
+        temp::reject_images_in(
+            connection,
+            &ids,
+            "临时图片不能移出临时文件夹；关闭或切换图库时会自动清空",
+        )
+    })?;
     let paths = LibraryPaths::new(root);
     let total = ids.len();
     reporter.report(0, total);
@@ -910,6 +978,11 @@ pub fn set_trashed_with_id(
     trashed: bool,
 ) -> AppResult<(u64, Option<i64>)> {
     let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
+    temp::reject_images(
+        database,
+        &ids,
+        "临时图片不能移入回收站或恢复；关闭或切换图库时会自动清空",
+    )?;
     let (kind, label) = if trashed {
         (HistoryKind::Trash, "移入回收站")
     } else {
@@ -1170,7 +1243,7 @@ pub(crate) fn content_path(
     if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppError::message("内容哈希无效，拒绝操作文件"));
     }
-    let normalized_folder = normalize_folder(folder_path)?;
+    let normalized_folder = crate::library::paths::normalize_stored_folder(folder_path)?;
     if normalized_folder != folder_path {
         return Err(AppError::message("文件夹路径未规范化，拒绝操作文件"));
     }
@@ -1446,6 +1519,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn temp_metadata_changes_do_not_write_history() {
+        let fixture = fixture();
+        let temp_folder = fixture
+            .session
+            .db
+            .with_reader(temp::folder)
+            .unwrap()
+            .unwrap()
+            .id;
+        let temp_image = insert_image(&fixture, "t", "jpg", 0, temp_folder);
+        let normal_image = insert_image(&fixture, "n", "jpg", 0, fixture.folder);
+
+        update_score(&fixture.session.db, temp_image, 5).unwrap();
+        update_description(&fixture.session.db, temp_image, "临时描述").unwrap();
+        set_image_tags(&fixture.session.db, temp_image, &["临时".into()]).unwrap();
+        assert!(history::list(&fixture.session.db).unwrap().is_empty());
+
+        set_scores(&fixture.session.db, &[temp_image, normal_image], 4).unwrap();
+        let entries = history::list(&fixture.session.db).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let details = image_details(&fixture.session.db, &fixture.root, temp_image).unwrap();
+        assert_eq!(details.score, 4);
+        assert_eq!(details.description, "临时描述");
     }
 
     #[test]

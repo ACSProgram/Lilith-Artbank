@@ -19,6 +19,7 @@ import type {
   ImportPhase,
   ImportProgress,
   ImportSnapshot,
+  ImportTarget,
 } from "./types";
 import { errorMessage } from "../../shared/errors";
 
@@ -37,6 +38,8 @@ interface ImportDialogProps {
   initialPaths: string[];
   /** 打开时预填的目标文件夹（当前浏览的文件夹）。 */
   initialFolder?: string;
+  /** 导入到临时文件夹时不写操作记录、不建目录层级，关闭图库时清空。 */
+  target?: ImportTarget;
   folders: ImportFolder[];
   onClose: () => void;
   onFinished: () => void;
@@ -87,11 +90,13 @@ export function ImportDialog({
   open,
   initialPaths,
   initialFolder = "",
+  target = "library",
   folders,
   onClose,
   onFinished,
 }: ImportDialogProps) {
   const { confirm } = useNotices();
+  const temp = target === "temp";
   const [paths, setPaths] = useState<string[]>([]);
   const [folder, setFolder] = useState("");
   const [folderMode, setFolderMode] = useState<FolderMode>("flat");
@@ -146,7 +151,7 @@ export function ImportDialog({
   useEffect(() => {
     if (!open) return;
     setPaths(initialRef.current);
-    setFolder(initialFolderRef.current);
+    setFolder(temp ? "" : initialFolderRef.current);
     setFolderMode("flat");
     setFolderPickerOpen(false);
     setTagsText("");
@@ -163,7 +168,7 @@ export function ImportDialog({
     setStarting(false);
     jobIdRef.current = null;
     finishedRef.current = false;
-  }, [open]);
+  }, [open, temp]);
 
   useEffect(() => {
     if (!open) return;
@@ -268,7 +273,7 @@ export function ImportDialog({
       setError("请先选择图片或目录");
       return;
     }
-    if (optimizeEnabled) {
+    if (!temp && optimizeEnabled) {
       const accepted = await confirmImportOptimize(confirm, paths.length);
       if (!accepted) return;
     }
@@ -277,15 +282,17 @@ export function ImportDialog({
     try {
       const snapshot = await importApi.start({
         paths,
-        folder: folder.trim(),
-        folderMode,
+        target,
+        folder: temp ? "" : folder.trim(),
+        folderMode: temp ? "flat" : folderMode,
         tags: parseTags(tagsText),
         score,
-        duplicatePolicy: policy,
+        duplicatePolicy: temp ? "skip" : policy,
         perceptualThreshold: 6,
-        optimize: optimizeEnabled
-          ? { tier: optimizeTier, outputFormat: optimizeFormat }
-          : null,
+        optimize:
+          !temp && optimizeEnabled
+            ? { tier: optimizeTier, outputFormat: optimizeFormat }
+            : null,
       });
       jobIdRef.current = snapshot.jobId;
       setJobId(snapshot.jobId);
@@ -349,7 +356,9 @@ export function ImportDialog({
       title={view === "options" ? "导入图片" : phaseLabel(progress?.phase ?? "processing")}
       subtitle={
         view === "options"
-          ? "原图会复制到图库，源文件不动。"
+          ? temp
+            ? "原图会复制到临时文件夹，关闭、切换图库或退出应用时清空。"
+            : "原图会复制到图库，源文件不动。"
           : view === "running"
             ? "任务在后台执行，可以继续使用其他功能。"
             : undefined
@@ -397,23 +406,25 @@ export function ImportDialog({
           </div>
 
           <div className="import-options-grid">
-            <Field label="目标文件夹" hint="图库内相对路径，留空表示根目录">
-              <div className="input-row">
-                <input
-                  className="input"
-                  value={folder}
-                  placeholder="例如 人物/速写"
-                  onChange={(event) => setFolder(event.target.value)}
-                />
-                <Button
-                  size="sm"
-                  icon={<FolderOpen size={14} />}
-                  onClick={() => setFolderPickerOpen(true)}
-                >
-                  选择
-                </Button>
-              </div>
-            </Field>
+            {!temp ? (
+              <Field label="目标文件夹" hint="图库内相对路径，留空表示根目录">
+                <div className="input-row">
+                  <input
+                    className="input"
+                    value={folder}
+                    placeholder="例如 人物/速写"
+                    onChange={(event) => setFolder(event.target.value)}
+                  />
+                  <Button
+                    size="sm"
+                    icon={<FolderOpen size={14} />}
+                    onClick={() => setFolderPickerOpen(true)}
+                  >
+                    选择
+                  </Button>
+                </div>
+              </Field>
+            ) : null}
             <Field label="初始评分">
               <select
                 className="input"
@@ -438,110 +449,116 @@ export function ImportDialog({
             />
           </Field>
 
-          <div className="field">
-            <span className="field-label">目录层级</span>
-            <div className="import-policy">
-              <button
-                type="button"
-                className={`import-policy-option${folderMode === "flat" ? " is-active" : ""}`}
-                onClick={() => setFolderMode("flat")}
-              >
-                <strong>平铺</strong>
-                <span>所有图片进入目标文件夹</span>
-              </button>
-              <button
-                type="button"
-                className={`import-policy-option${folderMode === "preserve" ? " is-active" : ""}`}
-                onClick={() => setFolderMode("preserve")}
-              >
-                <strong>保留源目录</strong>
-                <span>按每个输入目录下的相对层级建文件夹</span>
-              </button>
+          {!temp ? (
+            <div className="field">
+              <span className="field-label">目录层级</span>
+              <div className="import-policy">
+                <button
+                  type="button"
+                  className={`import-policy-option${folderMode === "flat" ? " is-active" : ""}`}
+                  onClick={() => setFolderMode("flat")}
+                >
+                  <strong>平铺</strong>
+                  <span>所有图片进入目标文件夹</span>
+                </button>
+                <button
+                  type="button"
+                  className={`import-policy-option${folderMode === "preserve" ? " is-active" : ""}`}
+                  onClick={() => setFolderMode("preserve")}
+                >
+                  <strong>保留源目录</strong>
+                  <span>按每个输入目录下的相对层级建文件夹</span>
+                </button>
+              </div>
             </div>
-          </div>
+          ) : null}
 
           <div className="field">
             <span className="field-label">重复内容</span>
             <div className="import-policy">
               <button
                 type="button"
-                className={`import-policy-option${policy === "skip" ? " is-active" : ""}`}
+                className={`import-policy-option${temp || policy === "skip" ? " is-active" : ""}`}
                 onClick={() => setPolicy("skip")}
               >
                 <strong>跳过</strong>
                 <span>内容相同的只保留一张</span>
               </button>
-              <button
-                type="button"
-                className={`import-policy-option${policy === "merge" ? " is-active" : ""}`}
-                onClick={() => setPolicy("merge")}
-              >
-                <strong>合并标签与评分</strong>
-                <span>标签取并集，评分取较高值</span>
-              </button>
+              {!temp ? (
+                <button
+                  type="button"
+                  className={`import-policy-option${policy === "merge" ? " is-active" : ""}`}
+                  onClick={() => setPolicy("merge")}
+                >
+                  <strong>合并标签与评分</strong>
+                  <span>标签取并集，评分取较高值</span>
+                </button>
+              ) : null}
             </div>
           </div>
 
-          <div className="field">
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={optimizeEnabled}
-                onChange={(event) => setOptimizeEnabled(event.target.checked)}
-              />
-              <span>
-                <strong>导入时压缩</strong>
-                <small>原图不会保留，无法还原。</small>
-              </span>
-            </label>
-            {optimizeEnabled ? (
-              <div className="import-optimize">
-                <Field
-                  label="输出格式"
-                  hint={
-                    optimizeFormat === "webp"
-                      ? "WebP 不保留 EXIF 与色彩配置；超过 16383 px 的图会保留原图。"
-                      : "透明图会保留原图。"
-                  }
-                >
-                  <div className="optimize-choice-row">
-                    <button
-                      type="button"
-                      className={`optimize-choice${optimizeFormat === "jpeg" ? " is-active" : ""}`}
-                      onClick={() => setOptimizeFormat("jpeg")}
-                    >
-                      JPG
-                    </button>
-                    <button
-                      type="button"
-                      className={`optimize-choice${optimizeFormat === "webp" ? " is-active" : ""}`}
-                      onClick={() => setOptimizeFormat("webp")}
-                    >
-                      WebP
-                    </button>
-                  </div>
-                </Field>
-                <div className="field">
-                  <span className="field-label">质量档位</span>
-                  <div className="optimize-choice-row">
-                    {OPTIMIZE_TIERS.map((item) => (
-                      <button
-                        key={item.value}
-                        type="button"
-                        className={`optimize-choice${optimizeTier === item.value ? " is-active" : ""}`}
-                        onClick={() => setOptimizeTier(item.value)}
-                      >
-                        {item.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <span className="field-hint">
-                  压不动的图保留原图；同一源图用同样参数重复导入仍然去重，改档位或格式会变成两条记录。
+          {!temp ? (
+            <div className="field">
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={optimizeEnabled}
+                  onChange={(event) => setOptimizeEnabled(event.target.checked)}
+                />
+                <span>
+                  <strong>导入时压缩</strong>
+                  <small>原图不会保留，无法还原。</small>
                 </span>
-              </div>
-            ) : null}
-          </div>
+              </label>
+              {optimizeEnabled ? (
+                <div className="import-optimize">
+                  <Field
+                    label="输出格式"
+                    hint={
+                      optimizeFormat === "webp"
+                        ? "WebP 不保留 EXIF 与色彩配置；超过 16383 px 的图会保留原图。"
+                        : "透明图会保留原图。"
+                    }
+                  >
+                    <div className="optimize-choice-row">
+                      <button
+                        type="button"
+                        className={`optimize-choice${optimizeFormat === "jpeg" ? " is-active" : ""}`}
+                        onClick={() => setOptimizeFormat("jpeg")}
+                      >
+                        JPG
+                      </button>
+                      <button
+                        type="button"
+                        className={`optimize-choice${optimizeFormat === "webp" ? " is-active" : ""}`}
+                        onClick={() => setOptimizeFormat("webp")}
+                      >
+                        WebP
+                      </button>
+                    </div>
+                  </Field>
+                  <div className="field">
+                    <span className="field-label">质量档位</span>
+                    <div className="optimize-choice-row">
+                      {OPTIMIZE_TIERS.map((item) => (
+                        <button
+                          key={item.value}
+                          type="button"
+                          className={`optimize-choice${optimizeTier === item.value ? " is-active" : ""}`}
+                          onClick={() => setOptimizeTier(item.value)}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <span className="field-hint">
+                    压不动的图保留原图；同一源图用同样参数重复导入仍然去重，改档位或格式会变成两条记录。
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {error ? (
             <div className="import-error">
@@ -605,11 +622,17 @@ export function ImportDialog({
             </div>
           </div>
 
-          {summary && (summary.optimized > 0 || optimizeEnabled) ? (
+          {!temp && summary && (summary.optimized > 0 || optimizeEnabled) ? (
             <div className="import-note">
               {summary.optimized > 0
                 ? `其中 ${summary.optimized} 张已压缩，省 ${formatBytes(summary.optimizedBytes)}。`
                 : "没有图片被压缩：都已足够紧凑，或不满足压缩条件。"}
+            </div>
+          ) : null}
+
+          {temp && view !== "running" ? (
+            <div className="import-note">
+              临时图片会在关闭、切换图库或退出应用时清空。
             </div>
           ) : null}
 

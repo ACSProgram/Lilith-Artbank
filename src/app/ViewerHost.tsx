@@ -69,6 +69,7 @@ export function ViewerHost({
           version={version}
           folders={session.folders}
           currentCollectionId={session.currentCollectionId}
+          inTemp={session.inTemp}
           onClose={() => setSidebarOpen(false)}
           onChanged={refresh}
           onAddToCollection={() => session.addToCollection([activeId])}

@@ -1,7 +1,7 @@
 # 当前阶段状态
 
 日期：2026-10-26
-阶段：**MCP 图库控制批次 1（只读）、批次 2（写工具、撤销/重做、询问档）、批次 3（导入、回执、审计）与批次 4（找相似交互重构）已完成（2026-10-26），批次 2 真实客户端主体已通过，批次 3/4 待真实客户端与真实窗口验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。图片空间优化批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
+阶段：**MCP 图库控制批次 1（只读）、批次 2（写工具、撤销/重做、询问档）、批次 3（导入、回执、审计）、批次 4（找相似交互重构）与批次 5（临时文件夹）已完成（2026-10-26），批次 2 真实客户端主体已通过，批次 3/4/5 待真实客户端与真实窗口验收；图片空间优化第三阶段（体验整改 + 导入即压缩）已完成（2026-10-25），待真实窗口验收**。图片空间优化批次 1–2 与操作撤销批次 1–3（含重做增补）已完成并归档，操作撤销部分待用户真实窗口验收。此前 P0–P4 体验整改、S4 查看器、S6 AI 客户端、S7 相似度检索、单库与多级文件夹（A–C）、旧库全量迁移（D）均已落地，主库 390 542 张、独立测试库 9 455 张已迁移并自动验证。P0、P2、P4 已通过用户真实窗口手工验收；P1 的界面观感与 P3 的整体界面仍待验收。下一阶段按 [路线图](roadmap.md) 继续。
 
 历史批次记录已归档，本文件只保留当前状态、基线、待验收与约束。AI 服务端与便携化已实现，待用户实测。
 
@@ -177,6 +177,24 @@
 
 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（7 条警告都在既有 `library/edit.rs` 与 `library/history.rs`）、`cargo test --lib`（273 通过、5 ignored）、`npm run typecheck`、`npm run test:web`（25 通过）、`npm run build`、`git diff --check`。
 
+## MCP 图库控制批次 5（2026-10-26）
+
+临时文件夹：与回收站同级的会话级暂存区。批次 6（导入归因与临时区判定）仍未实现。
+
+- schema v7：`folders.kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','temp'))` 与唯一部分索引 `idx_folders_single_temp`；v6→v7 插入唯一的临时文件夹行（内部路径 `.artbank-temp`，与已有普通文件夹同名时追加 `-1`、`-2`），v1–v6 链式迁移。
+- `library/temp.rs`：`folder` / `require` / `path` / `is_image(_in)` / `image_ids_in` / `reject_images(_in)` / `ensure(database, root)` / `clear` / `free_path`；清空在一个事务里删行并重建目录，`image_tags`、`collection_items`、`feature_blobs` 与 FTS 由外键级联与触发器带走。
+- 查询：新增 `LibraryView::Temp`；视图排除与只取两种条件收敛成 `temp::EXCLUDE_SQL` / `temp::ONLY_SQL`，被列表、标签、集合计数与 `PreparedQuery` 共用；`list_folders`、`next_sort_index`、`reorder_folders` 只处理 `kind='normal'`；`folders.rs` 的重命名/移动/删除/排序都拒绝临时文件夹。
+- 写入拦截：移入回收站与恢复、移动（源）、几何编辑、加入集合、保存相似分组都拒绝临时图片；`move_images` 的目标路径由 `normalize_folder` 拒绝 `.artbank-temp*`。
+- 无记录事务：`history::write_with_id_mode(record = false)`；评分、描述、AI 描述与标签的临时图片部分不写 `operations`、也不清空重做分支，同一批里混有普通图片时只记录普通图片。
+- 导入：`ImportRequest.target`（`library` / `temp`）、`ImportJob` 与 `ImportProgress` 带 `target`；临时导入固定平铺、只允许 `skip`、不压缩、不建 `operations`，`pipeline` 直接用临时文件夹 id 落库。
+- 生命周期：`open_library` 先清上次残留再重算计数、`close_library` 清空、换库时清旧库、`RunEvent::Exit` 走新增的 `AppState::shutdown`（有写任务或任务停不下来时留给下次打开）；`LibraryInfo.tempCount` 与 `counts()` 三元组。
+- MCP：`search_images` 与 selector 的 `view: temp`、`find_similar` 的 `scope.temp`、`import_start(target)`、`tasks_get` 回执的 `target`、`library_info` 的 `tempFolder`；询问档对临时导入免确认，只读档仍然全拒。
+- 前端：视图栏“临时”标签（警示色激活态、显示张数）、`ImportDialog` 的临时模式（隐藏目标文件夹/目录层级/压缩，完成后提示会清空）、`LibraryView` 的临时视图（禁拖出、禁新建集合、面包屑固定“临时”、右键与详情侧栏隐藏被拒操作）、查看器编辑只读、`ScopePicker` 新增“临时文件夹”。
+- 与计划的差异：计划写“询问档临时导入默认仍确认”，实现改为免确认——临时区清空即失效，确认没有意义；计划说“需要保留的结果建集合”，实现里临时图片不能加入集合（关闭后集合项会悬空），只能重新导入图库，而同一内容的临时行仍在时会被当重复跳过，必须先清空临时区。
+- 收尾整理：`temp::free_path` 与 v6→v7 迁移共用一份，删掉 `schema::temp_folder_path`；`NOT IN (子查询)` 改成非相关标量子查询（20 万行文件夹排序 53.6 → 44.8 ms，无过滤基线 40.7 ms）；删掉 `temp::is_path` 与两处不可达的“目标不能是临时文件夹”检查（`normalize_folder` 已拒绝保留目录名）；`clear` 直接按 `folder_id` 删行（临时导入固定平铺，不会有子目录）；补齐“临时视图 + 全库搜索”仍排除临时图片的规则（此前会混进结果），并加回归断言。
+- 自动检查：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --lib`（282 通过、5 ignored）、`cargo clippy --all-targets`、`npx tsc --noEmit`、`npm run test:web`（25 通过）、`npm run build`、`git diff --check`、`perf_metadata_200k` 复跑（数字见[性能基准](../guides/performance.md)）。
+- 未做：真实窗口验收；主库 39 万行首次升到 v7 的耗时；全库相似扫描仍会扫到临时图片（批次 6 修正）。
+
 ## AI 服务端与便携化（待验收）
 
 - `server/` 实现 `/v1`：health、models/ensure、embed/image、embed/text、pose、shutdown；描述本轮不实现。
@@ -191,7 +209,7 @@
 ## 基线
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
-- 存储版本：schema v6（v1→v2→v3→v4→v5→v6 链式迁移）、设置 v6（v1→v2→v3→v4→v5→v6）；设置与日志位于程序目录，不读旧 AppData 设置。MCP 运行时文件为程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
+- 存储版本：schema v7（v1→v2→v3→v4→v5→v6→v7 链式迁移，v7 新增 `folders.kind` 与唯一的临时文件夹）、设置 v6（v1→v2→v3→v4→v5→v6）；设置与日志位于程序目录，不读旧 AppData 设置。MCP 运行时文件为程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
 - 20 万行元数据基准（`cargo test --lib -- --ignored --nocapture perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms、schema v3→v4 建两个索引 459 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 

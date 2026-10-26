@@ -22,6 +22,7 @@ use crate::{
         metadata,
         paths::LibraryPaths,
         service::now_ms,
+        temp,
         thumbs::ThumbPack,
         viewer,
     },
@@ -124,6 +125,11 @@ fn resolve(
     let row = content::load(database, request.image_id)?;
     if row.deleted_at.is_some() {
         return Err(AppError::message("回收站中的图片不能编辑"));
+    }
+    if temp::is_image(database, request.image_id)? {
+        return Err(AppError::message(
+            "临时图片不能编辑；关闭或切换图库时会自动清空",
+        ));
     }
     if row.pixel_count() > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(

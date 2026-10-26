@@ -166,6 +166,7 @@ fn import_receipt_value(receipt: &ImportSnapshot, include_failures: bool) -> Val
     };
     json!({
         "phase": progress.phase,
+        "target": progress.target,
         "total": progress.total,
         "processed": progress.processed,
         "imported": progress.imported,
@@ -250,11 +251,11 @@ fn wait_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import::job::ImportJob;
+    use crate::import::{ImportTarget, job::ImportJob};
 
     #[test]
     fn import_receipt_reports_counts_and_hides_compression() {
-        let job = ImportJob::new("job-1", "1 个路径");
+        let job = ImportJob::new("job-1", "1 个路径", ImportTarget::Library);
         job.set_total(10);
         job.inc_processed();
         job.inc_imported(3);
@@ -281,7 +282,7 @@ mod tests {
 
     #[test]
     fn import_receipt_can_include_failures() {
-        let job = ImportJob::new("job-2", "1 个路径");
+        let job = ImportJob::new("job-2", "1 个路径", ImportTarget::Library);
         job.add_failure("a.png", "无法解码");
         let value = import_receipt_value(&job.snapshot(), true);
         assert_eq!(value["failures"][0]["path"], "a.png");

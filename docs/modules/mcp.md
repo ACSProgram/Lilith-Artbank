@@ -48,11 +48,11 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 | 工具 | 输入 | 返回 |
 | --- | --- | --- |
-| `library_info` | — | 图库、计数、schema、特征数量、AI 配置、当前 MCP 档位与限制 |
+| `library_info` | — | 图库、普通/回收站/临时计数、schema、特征数量、AI 配置、当前 MCP 档位与限制 |
 | `folders_list` | `parentPath?`、`limit?` | 直接子文件夹、路径、直接/子树计数 |
 | `tags_list` | `query?`、`limit?` | 有图片的标签 id、名称、图片数；0 张标签不返回 |
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
-| `search_images` | 结构化查询、`pageSize` 1–50、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述与标签名 |
+| `search_images` | 结构化查询（`view` 可含 `temp`）、`pageSize` 1–50、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述与标签名 |
 | `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览 |
 | `images_get` | `ids≤50` | 详情、标签、描述、能力标记 |
 | `image_sheet` | selector、`grid 1–5`、`resolution: thumb/detail` | 拼图图片、格子映射、`sheetId`、下一页 |
@@ -60,11 +60,11 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `search_images` 始终返回 `total`；`pageSize` 超出 1–50 直接报错，不静默截断。分面计数按需开启，2 字搜索与超大集合较慢。
 - `find_similar` 的 `total` 是范围与阈值过滤后的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
 - `find_similar` 的 `threshold`：pHash 是 0–256 距离上限，省略时用默认 6；其它指标是 -1–1 的分数下限，省略不限制。多张参考图只支持 `color4`/`color8`/`embedding` 的平均，最多 100 张；`phash` 与 `pose` 只接受单张。
-- `find_similar` 的 `scope` 与界面一致：`library`（默认）、`folder`（`folderId`、`includeSubfolders`，默认包含）、`collection`（`collectionId`）、`selection`（`imageIds`）、`view`（结构化 `query`）。全库不解析 id；其它范围在 Rust 侧解析成 id 集合后与扫描取交集。
+- `find_similar` 的 `scope` 与界面一致：`library`（默认）、`folder`（`folderId`、`includeSubfolders`，默认包含）、`collection`（`collectionId`）、`selection`（`imageIds`）、`view`（结构化 `query`）、`temp`（临时文件夹）。全库不解析 id；其它范围在 Rust 侧解析成 id 集合后与扫描取交集。
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。
 - AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本，当前没有导出工具。
-- 临时文件夹还没有实现，排在批次 5，见 [MCP 计划](../planning/2026-10-25-MCP图库控制计划.md)。
+- `library_info` 的 `tempFolder` 给出临时文件夹是否可用、内部路径、图片数与生命周期说明；普通查询默认不含临时图片，必须显式 `view: "temp"` 或使用显式 id。
 
 ### 写入（7）
 
@@ -79,6 +79,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `collections_membership` | add / remove、集合、selector、`confirmedCount`、`dryRun?` | `affected`、`operationId` |
 
 - `images_update` 一次只做一类修改（评分、加标签、删标签、单图描述之一），一次调用只产生一条历史记录。描述要求 selector 解析为 1 张图。
+- 临时图片允许 `images_update`（评分、标签、描述），但不产生历史记录，结果里的 `operationId` 为 null；`images_move`、`images_trash`、`images_restore` 与集合成员变更会拒绝临时图片。
 - `collections_create` 带 selector 时在同一事务里建集合并加入图片，只产生一条记录；撤销会删除整个集合，重做按原 id 与条目顺序恢复。
 - selector 可以解析到不存在、已在回收站或不在回收站的图片；出现这类 id 时整批拒绝并返回失败清单，不会静默少做。
 - 产生操作记录时在标题前加 `AI · `。一次 MCP 写入最多 100 万张（query / ids）；相似结果最多 10,000 张；拼图最多 25 格。
@@ -108,18 +109,19 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `tasks_get` 传 `approvalId` 时等待用户批准/拒绝，并附带关联任务的状态；批准后启动的任务要用同一 `approvalId` 或任务 id 继续轮询。
 - `tasks_cancel` 只允许取消 MCP 自己发起的任务；用户从界面启动的任务不能由 AI 取消。传 `approvalId` 等同于拒绝。
 - 任务快照的可选 `operationId` 在写入记录产生后出现；进行中通常为空。
-- 导入任务额外附带 `import` 回执：`imported`、`duplicates`、`merged`、`failed`、`similar`、`previewIds`、`startedAt`、`finishedAt` 与失败清单。回执不返回 `optimized` / `optimizedBytes`，MCP 不能控制压缩。`previewIds` 最多 25 张，可直接作为 `image_sheet` 的 `selector.ids`。
+- 导入任务额外附带 `import` 回执：`target`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`previewIds`、`startedAt`、`finishedAt` 与失败清单。回执不返回 `optimized` / `optimizedBytes`，MCP 不能控制压缩。`previewIds` 最多 25 张，可直接作为 `image_sheet` 的 `selector.ids`。
 
 ### 导入（1）
 
 | 工具 | 关键输入 | 返回 |
 | --- | --- | --- |
-| `import_start` | 本机绝对路径、目标文件夹、`folderMode: flat/preserve`、标签、评分、`duplicatePolicy: skip/merge` | `taskId`、`pathCount`、`target`、`operationId`、`compressed: false` |
+| `import_start` | 本机绝对路径、`target: library/temp`、目标文件夹、`folderMode: flat/preserve`、标签、评分、`duplicatePolicy: skip/merge` | `taskId`、`pathCount`、`target`、`operationId`、`compressed: false` |
 
 - 导入固定 `optimize = None`，不接受 `workerThreads`；即使请求里带了这两个字段也不透传。
 - 单次最多 10000 个输入路径；扫描阶段最多处理 100000 个文件，超出时只处理前面的文件并记一条失败。
-- 询问档每次导入都要确认；确认卡展开前 5 条来源路径、其余只给数量，并列出目标文件夹、标签、评分与重复策略。只读档拒绝。
-- 导入完成后整次导入可以用 `history_undo` 撤销；新写入会清空重做分支的规则不变。
+- `target=library`（默认）导入普通图库，完成后整次导入可以用 `history_undo` 撤销。`target=temp` 导入临时文件夹：固定平铺、只允许 `skip`、不写操作记录，`operationId` 为 null，关闭/切换图库或退出应用时清空；显式传 `merge` 或 `preserve` 会报错。
+- 询问档只对 `target=library` 的导入要求确认；导入临时文件夹不需要确认，但仍写 `logs/mcp.log` 审计。只读档全部拒绝。
+- 确认卡展开前 5 条来源路径、其余只给数量，并列出目标（图库文件夹或临时文件夹）、标签、评分与重复策略。
 
 ## 选择器
 
@@ -132,7 +134,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 { "kind": "similarity", "token": "...", "offset": 0, "limit": 16 }
 ```
 
-- `query`：结构化查询，字段与 `search_images` 相同；写入时解析全部命中，不分页。
+- `query`：结构化查询，字段与 `search_images` 相同（`view` 可用 `temp`）；写入时解析全部命中，不分页。查询临时图片后仍受写入限制：只能改评分/标签/描述。
 - `ids`：明确 id，去重并保留输入顺序；不存在的 id 进入失败清单。
 - `sheet`：引用 `image_sheet` 返回的格子；`cells` 省略表示整盘。
 - `similarity`：引用 `find_similar` 返回的 token，按 `offset` 翻页。
@@ -159,7 +161,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 询问档的拦截条件：
 
-- `import_start`（不论路径数）；
+- `import_start` 且 `target=library`（不论路径数；`target=temp` 不确认）；
 - `images_trash`（不论张数）；
 - `history_undo`、`history_redo`（不论条数）；
 - 任何解析出超过 100 张图片的批量写入（更新、移动、恢复、集合创建/成员变更）。
@@ -227,7 +229,7 @@ Rust：
 
 ## 验证
 
-自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、`find_similar` 的 scope 收窄与多参考图平均/拒绝、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量（21）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、审计单行截断、导入缩略图预览上限 25。
+自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、`find_similar` 的 scope 收窄与多参考图平均/拒绝、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、工具注册数量（21）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、审计单行截断、导入缩略图预览上限 25、临时导入 target 校验（清空文件夹、拒绝 merge/preserve）、临时视图查询与元数据不写历史、`library_info` 临时计数与路径。
 
 真实客户端验收需要用户执行：
 
@@ -244,3 +246,5 @@ Rust：
 11. 对这次导入 `history_list` → `history_undo`，确认整次导入被撤销；确认 `logs/mcp.log` 有工具调用与导入来源行，且没有压缩字段或压缩行为。
 12. 从便携目录启动 exe（含 `server/`，不含安装器），重复第 2 步，确认 `--mcp-stdio` 指向当前 exe 且能正常调用 `library_info` 和 `import_start`。
 13. `find_similar` 分别传 `scope: {"type":"folder","folderId":…,"includeSubfolders":false}` 与 `targetIds`（两张图，`kind: color8`），确认结果只来自范围、参考图全部被排除，`detail.referenceCount=2`、`scope` 文案与界面一致。
+14. `import_start` 传 `target: "temp"` 导入几张图：询问档应直接开始、不出现确认卡；`tasks_get` 回执 `target=temp`、`operationId=null`；`search_images` 用 `view: "temp"` 能看到图片，普通 `view: "all"` 看不到。
+15. 对 `view: "temp"` 的图片调用 `images_update` 改评分，`history_list` 不应新增记录；调用 `images_trash` 或被移出临时视图范围应得到明确拒绝。

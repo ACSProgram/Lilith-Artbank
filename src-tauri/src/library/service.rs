@@ -9,6 +9,7 @@ use crate::{
         manifest::{LibraryInspection, LibraryManifest, inspect},
         paths::LibraryPaths,
         schema::{self, SCHEMA_VERSION},
+        temp,
         thumbs::ThumbPack,
     },
 };
@@ -21,6 +22,7 @@ pub struct LibraryInfo {
     pub path: String,
     pub image_count: u64,
     pub trash_count: u64,
+    pub temp_count: u64,
     pub schema_version: u32,
     pub opened_at: i64,
 }
@@ -72,6 +74,7 @@ pub fn create(
         let _ = std::fs::remove_dir_all(&paths.data);
         return Err(error);
     }
+    temp::ensure(&database, path)?;
 
     let info = LibraryInfo {
         id: manifest.library_id.clone(),
@@ -79,6 +82,7 @@ pub fn create(
         path: path.to_string_lossy().into_owned(),
         image_count: 0,
         trash_count: 0,
+        temp_count: 0,
         schema_version: SCHEMA_VERSION,
         opened_at: now_ms(),
     };
@@ -111,7 +115,8 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
     let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
     let database = LibraryDb::open(&paths.database, read_connections)?;
     database.with_writer(|connection| schema::ensure(connection, &manifest))?;
-    let (image_count, trash_count) = database.counts()?;
+    temp::ensure(&database, path)?;
+    let (image_count, trash_count, temp_count) = database.counts()?;
 
     Ok(LibrarySession {
         info: LibraryInfo {
@@ -120,6 +125,7 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
             path: path.to_string_lossy().into_owned(),
             image_count,
             trash_count,
+            temp_count,
             schema_version: SCHEMA_VERSION,
             opened_at: now_ms(),
         },

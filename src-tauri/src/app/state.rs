@@ -28,7 +28,7 @@ use crate::{
     },
     imageops::optimize::OptimizeOptions,
     import::{
-        ImportRequest, ImportSource,
+        ImportRequest, ImportSource, ImportTarget,
         job::{ImportJob, ImportSnapshot},
     },
     library::{
@@ -44,6 +44,7 @@ use crate::{
         optimize_estimate::{self, OptimizeEstimate},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
+        temp,
         thumbs::{self, ThumbPack},
         viewer::PoseData,
     },
@@ -137,9 +138,10 @@ impl AppState {
         let Some((mut info, database)) = snapshot else {
             return Ok(None);
         };
-        let (image_count, trash_count) = database.counts()?;
+        let (image_count, trash_count, temp_count) = database.counts()?;
         info.image_count = image_count;
         info.trash_count = trash_count;
+        info.temp_count = temp_count;
         Ok(Some(info))
     }
 
@@ -176,12 +178,23 @@ impl AppState {
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
 
-        let scope = format!("{} 个路径", request.paths.len());
-        let job = Arc::new(ImportJob::new(uuid::Uuid::new_v4().to_string(), scope));
+        let temp_target = request.target == ImportTarget::Temp;
+        let scope = if temp_target {
+            format!("{} 个路径 · 临时", request.paths.len())
+        } else {
+            format!("{} 个路径", request.paths.len())
+        };
+        let job = Arc::new(ImportJob::new(
+            uuid::Uuid::new_v4().to_string(),
+            scope,
+            request.target,
+        ));
         let handle = job.handle();
         let runner_job = job.clone();
         let runner_app = app.clone();
-        let label = if request.folder.is_empty() {
+        let label = if temp_target {
+            format!("导入 {} 个路径到临时区", request.paths.len())
+        } else if request.folder.is_empty() {
             format!("导入 {} 个路径", request.paths.len())
         } else {
             format!(
@@ -195,14 +208,21 @@ impl AppState {
         } else {
             label
         };
-        let operation_id =
-            history::begin_live(&database, NewOperation::new(HistoryKind::Import, label))?;
-        handle.set_operation_id(Some(operation_id));
+        // 临时导入是生命周期数据：不写操作记录，也不影响撤销/重做时间线。
+        let operation_id = if temp_target {
+            None
+        } else {
+            Some(history::begin_live(
+                &database,
+                NewOperation::new(HistoryKind::Import, label),
+            )?)
+        };
+        handle.set_operation_id(operation_id);
         let source = ImportSource {
             database: database.clone(),
             thumbs,
             root,
-            operation_id: Some(operation_id),
+            operation_id,
         };
         let started = match self
             .tasks
@@ -211,20 +231,24 @@ impl AppState {
             }) {
             Ok(result) => result,
             Err(error) => {
-                let _ = history::finish_live(&database, operation_id, &error.to_string());
+                if let Some(operation_id) = operation_id {
+                    let _ = history::finish_live(&database, operation_id, &error.to_string());
+                }
                 return Err(error);
             }
         };
         if let TaskStartResult::Conflict { active } = started {
             // 冲突时导入线程没有启动；空记录在这里收掉。
-            let _ = history::finish_live(&database, operation_id, "");
+            if let Some(operation_id) = operation_id {
+                let _ = history::finish_live(&database, operation_id, "");
+            }
             return Err(conflict_error(&active));
         }
         *self.import_job.lock() = Some(job.clone());
         if from_mcp {
             self.remember_mcp_task(job.id());
         }
-        Ok((job.snapshot(), Some(operation_id)))
+        Ok((job.snapshot(), operation_id))
     }
 
     /// 导入结束后由导入线程登记；任务列表按任务 id 取回统计与预览。
@@ -542,6 +566,7 @@ impl AppState {
         let (session, _manifest) = service::create(path, name, read_connections)?;
         let info = session.info.clone();
         self.settings.set_library_path(Some(info.path.clone()))?;
+        self.clear_previous_temp();
         self.ai.library_opened(
             info.id.clone(),
             session.db.clone(),
@@ -561,13 +586,22 @@ impl AppState {
     pub fn open_library(&self, path: &Path) -> AppResult<LibraryInfo> {
         self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
-        let session = service::open(path, read_connections)?;
-        let info = session.info.clone();
+        let mut session = service::open(path, read_connections)?;
         let plan = history::recover_on_open(&session.db)?;
-        if let Err(error) = history::cleanup_undo_dirs(&session.db, Path::new(&info.path)) {
+        if let Err(error) = history::cleanup_undo_dirs(&session.db, Path::new(&session.info.path)) {
             log::warn!("清理撤销暂存目录失败：{error}");
         }
+        // 上次退出没能清掉的临时图片在这里补清；计数要按清理后的状态重算。
+        if let Err(error) = temp::clear(&session.db, Path::new(&session.info.path)) {
+            log::warn!("清空临时文件夹失败：{error}");
+        }
+        let (image_count, trash_count, temp_count) = session.db.counts()?;
+        session.info.image_count = image_count;
+        session.info.trash_count = trash_count;
+        session.info.temp_count = temp_count;
+        let info = session.info.clone();
         self.settings.set_library_path(Some(info.path.clone()))?;
+        self.clear_previous_temp();
         self.ai.library_opened(
             info.id.clone(),
             session.db.clone(),
@@ -585,6 +619,18 @@ impl AppState {
             self.after_library_open();
         }
         Ok(info)
+    }
+
+    /// 切换图库时清空旧库的临时区；失败只记日志，不能挡住换库。
+    fn clear_previous_temp(&self) {
+        let Some((database, _, root)) = self.library_handles() else {
+            return;
+        };
+        if let Err(error) = temp::clear(&database, &root) {
+            log::warn!("切换图库前清空临时文件夹失败：{error}");
+        }
+        self.ai.invalidate_similarity();
+        self.mcp_sheets.lock().clear();
     }
 
     /// 启动时按设置自动打开上次的图库；失败只记录，不阻塞应用启动。
@@ -615,6 +661,11 @@ impl AppState {
         if !self.tasks.wait_idle(Duration::from_secs(10)) {
             return Err(AppError::message("任务正在停止，请稍后再关闭图库"));
         }
+        if let Some((database, _, root)) = self.library_handles()
+            && let Err(error) = temp::clear(&database, &root)
+        {
+            log::warn!("关闭图库前清空临时文件夹失败：{error}");
+        }
         self.ai.library_closed();
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
@@ -625,6 +676,24 @@ impl AppState {
         query::clear_page_cache();
         self.settings.set_library_path(None)?;
         Ok(())
+    }
+
+    /// 应用退出：没有写任务时尽量清空临时区；来不及清的下次打开图库会补清。
+    pub fn shutdown(&self) {
+        if self.tasks.lane_busy(TaskLane::Write) {
+            log::warn!("退出时仍有写任务，临时文件夹留到下次打开图库时清空");
+            return;
+        }
+        self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
+        if !self.tasks.wait_idle(Duration::from_secs(2)) {
+            log::warn!("退出时任务未停止，临时文件夹留到下次打开图库时清空");
+            return;
+        }
+        if let Some((database, _, root)) = self.library_handles()
+            && let Err(error) = temp::clear(&database, &root)
+        {
+            log::warn!("退出时清空临时文件夹失败：{error}");
+        }
     }
 
     pub fn rename_current_library(&self, name: &str) -> AppResult<LibraryInfo> {

@@ -35,6 +35,7 @@ import type {
 
 interface ViewerToolsProps {
   source: ViewerSource;
+  inTemp: boolean;
   geometry: GeometryState;
   cropMode: boolean;
   cropDraft: CropRect | null;
@@ -71,6 +72,7 @@ const FORMAT_LABELS: Record<OutputFormat, string> = {
 
 export function ViewerTools({
   source,
+  inTemp,
   geometry,
   cropMode,
   cropDraft,
@@ -94,7 +96,7 @@ export function ViewerTools({
   onReset,
   onSave,
 }: ViewerToolsProps) {
-  const editable = source.editable && !source.deleted && !saving;
+  const editable = source.editable && !source.deleted && !saving && !inTemp;
   const base = baseOutputSize(source, geometry);
   const output = outputSize(source, geometry);
   const [widthInput, setWidthInput] = useState(String(output.width));
@@ -192,7 +194,9 @@ export function ViewerTools({
   return (
     <aside className="viewer-tools" aria-label="编辑工具">
       <div className="viewer-tools-scroll">
-        {source.deleted ? (
+        {inTemp ? (
+          <p className="viewer-tool-note is-warning">临时文件夹中的图片只读。</p>
+        ) : source.deleted ? (
           <p className="viewer-tool-note is-warning">回收站中的图片只读，恢复后才能编辑。</p>
         ) : null}
         {!source.editable && !source.deleted ? (

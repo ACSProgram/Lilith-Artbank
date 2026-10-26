@@ -768,6 +768,7 @@ export function ImageViewer({
         {!fullscreen && source && geometry ? (
           <ViewerTools
             source={source}
+            inTemp={session.inTemp}
             geometry={geometry}
             cropMode={cropMode}
             cropDraft={cropDraft}

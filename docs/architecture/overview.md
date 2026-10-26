@@ -36,8 +36,8 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 单实例：再次启动只聚焦已有窗口，避免两个进程同时写同一图库。
 - 窗口使用无边框 + 40px 自绘标题栏；最小化/最大化/关闭由 Rust 命令控制。
 - 设置 v6 只保存一个 `libraryPath`（`mcp` 字段控制应用内 MCP 服务）；文件在程序根目录（release 为 exe 旁），不读旧 AppData 设置；启动时尝试打开它，失败则退回欢迎页并提示，不阻塞启动。操作记录不写设置，保留在每个图库自己的 SQLite 里。
-- 同一时间只有一个图库会话。打开或创建新库成功后才替换旧会话；关闭只释放连接并清空 `libraryPath`，不改文件。
-- 导入期间禁止关闭、创建或切换图库；任务完成后恢复。应用退出时已提交批次保留，未完成临时文件在下次打开时清理。
+- 同一时间只有一个图库会话。打开或创建新库成功后才替换旧会话；关闭只释放连接并清空 `libraryPath`，不改文件（临时文件夹除外：打开、关闭、换库与退出都会清空它）。
+- 导入期间禁止关闭、创建或切换图库；任务完成后恢复。应用退出时已提交批次保留，未完成的导入临时文件在下次打开时清理。
 - 文件夹的创建/重命名/移动/删除与物理目录同步，和导入、图像保存、回收站操作共用 `maintenance` 守卫。
 - 应用内没有“移除图库”条目；更换图库即打开另一个目录并替换当前会话。原图文件只在永久删除/清空回收站的记录过期、或用户清空操作记录之后才真正删除。
 - AI 服务默认随应用启动（可配置），启动失败不阻塞图库本体；退出时先请求服务优雅关闭。
@@ -54,12 +54,13 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
     temp/                  原子写入与编辑中间文件；打开图库时清理
     temp/viewer/           大图降采样预览缓存（`<id>-<hash>.webp`，按内容哈希失效）
     undo/<operation-id>/   编辑撤销用的旧原图暂存；记录消失后由打开图库时的清理删除
+  .artbank-temp/           临时文件夹（`folders.kind='temp'`，同名冲突时为 .artbank-temp-1）
   <folder>/<content-hash>.<ext>   文件夹就是真实目录，空文件夹也保留
   recycle/
   output/                  描述导出/回填流水线
 ```
 
-`.artbank`、`recycle`、`output` 是保留目录，不能作为图片文件夹（任何层级）；`.artbank/undo` 由操作记录使用。
+`.artbank`、`recycle`、`output` 与 `.artbank-temp*` 是保留目录，不能作为普通图片文件夹（任何层级）；`.artbank/undo` 由操作记录使用，`.artbank-temp*` 只作为临时文件夹的落地区，关闭、切换图库或退出时清空。
 
 不变量：
 
@@ -157,6 +158,8 @@ S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）�
 
 2026-10-25 图片空间优化第三阶段已实现：长边改 64–65535 自由输入，抽样改 50–2000 离散滑块；估算取结果改为依赖任务原始值并带 5 秒超时重试，进度按阶段推进（统计候选只报百分比，编码样本按张显示，百分比加权不回退）；执行在并行编码内部按张上报，编码与提交前分别显示文案；导入管线新增可选的 `optimize` 参数，在解码后、发布前复用同一套压缩内核，去重语义改为压缩后内容哈希，`optimized_at` 标记导入即压缩的行。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化)、[导入与缩略图](../modules/import.md) 与 [当前阶段状态](../planning/current-handoff.md)。
 
-2026-10-26 MCP 图库控制批次 1（只读）与批次 2（写工具、撤销/重做、任务）已实现：设置 v6 的 `mcp` 配置、应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）、同 exe 的 `--mcp-stdio` 小桥、20 个工具（8 只读 + 7 写 + 3 历史 + 2 任务）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存、`dryRun` / `confirmedCount`、三档权限与 10 分钟确认队列、`library-changed` 刷新。真实 MCP 客户端实测主体通过（2026-10-26），切档保留口令、`find_similar` 命中数与分数、0 张标签过滤等语义已按实测修正。导入、永久删除、清空回收站与压缩仍不开放。详见 [MCP 图库控制](../modules/mcp.md) 与 [当前阶段状态](../planning/current-handoff.md)。
+2026-10-26 MCP 图库控制批次 1–4 已实现：设置 v6 的 `mcp` 配置、应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）、同 exe 的 `--mcp-stdio` 小桥、21 个工具（8 只读 + 7 写 + 3 历史 + 2 任务 + `import_start`）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存、`dryRun` / `confirmedCount`、三档权限与 10 分钟确认队列、`library-changed` 刷新、`logs/mcp.log` 审计、`import_start` 与导入回执，以及界面侧的“设为相似参考” + 相似面板与共享范围选择器。真实 MCP 客户端实测主体通过（2026-10-26），切档保留口令、`find_similar` 命中数与分数、0 张标签过滤等语义已按实测修正。永久删除、清空回收站与压缩仍不开放。详见 [MCP 图库控制](../modules/mcp.md) 与 [当前阶段状态](../planning/current-handoff.md)。
+
+2026-10-26 MCP 图库控制批次 5（临时文件夹）已实现：schema v7 给 `folders` 加 `kind`（`normal` / `temp`）与唯一部分索引，每个图库固定一个 `.artbank-temp` 行；`library/temp.rs` 负责行与目录的确保、清空、临时图片判定与拒绝；`ImportRequest.target = temp` 固定平铺、只跳过重复、不压缩、不写操作记录；普通视图、全库搜索、标签与集合计数、文件夹树都排除临时图片，只有 `view=temp` 与显式 id 能拿到；评分/描述/标签改走无记录事务；打开、关闭、换库与退出时清空。详见 [图库与元数据](../modules/library.md#临时文件夹)、[导入与缩略图](../modules/import.md) 与 [当前阶段状态](../planning/current-handoff.md)。
 
 尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图包压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。

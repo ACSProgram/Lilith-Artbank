@@ -4,7 +4,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::{
     app::error::{AppError, AppResult},
@@ -71,20 +71,32 @@ impl LibraryDb {
         operation(&connection)
     }
 
-    pub fn counts(&self) -> AppResult<(u64, u64)> {
+    /// `(正常图片, 回收站, 临时文件夹)`；临时图片只计入第三个值。
+    pub fn counts(&self) -> AppResult<(u64, u64, u64)> {
         self.with_reader(|connection| {
+            let temp_id: Option<i64> = connection
+                .query_row("SELECT id FROM folders WHERE kind = 'temp'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let temp_id = temp_id.unwrap_or(-1);
             let active: u64 = connection.query_row(
-                "SELECT count(*) FROM images WHERE deleted_at IS NULL",
-                [],
+                "SELECT count(*) FROM images WHERE deleted_at IS NULL AND folder_id <> ?1",
+                [temp_id],
                 |row| row.get(0),
             )?;
             let trash: u64 = connection.query_row(
                 "SELECT count(*) FROM images
-                 WHERE deleted_at IS NOT NULL AND purge_operation_id IS NULL",
-                [],
+                 WHERE deleted_at IS NOT NULL AND purge_operation_id IS NULL AND folder_id <> ?1",
+                [temp_id],
                 |row| row.get(0),
             )?;
-            Ok((active, trash))
+            let temp: u64 = connection.query_row(
+                "SELECT count(*) FROM images WHERE deleted_at IS NULL AND folder_id = ?1",
+                [temp_id],
+                |row| row.get(0),
+            )?;
+            Ok((active, trash, temp))
         })
     }
 }

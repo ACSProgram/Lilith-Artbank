@@ -9,13 +9,21 @@
 - 文件选择器：多选图片；目录选择器：递归扫描。
 - 拖放：Tauri 原生 `drag-drop` 事件；窗口任意位置可放下图片或目录。
 - 支持格式：JPEG、PNG、BMP、WebP、TIFF、TGA、GIF（首帧）。HEIC/AVIF 暂不支持。
-- 扫描跳过 `.artbank` 与旧程序的 `.data`；若扫描范围在图库内，同时跳过 `recycle` 与 `output`；不跟随符号链接。
+- 扫描跳过 `.artbank`、旧程序的 `.data` 与临时文件夹目录（`.artbank-temp*`）；若扫描范围在图库内，同时跳过 `recycle` 与 `output`；不跟随符号链接。
 - 单次最多 10000 个输入路径、最多收集 100000 个文件；超出时停止扫描并在失败清单记录。
-- 导入选项：目标文件夹（图库内相对路径）、目录层级模式（平铺 / 保留源目录）、初始标签（最多 32 个，单个 ≤64 字符）、初始评分 0-5、重复策略（跳过 / 合并元数据）。
+- 导入选项：目标（图库 / 临时文件夹）、目标文件夹（图库内相对路径）、目录层级模式（平铺 / 保留源目录）、初始标签（最多 32 个，单个 ≤64 字符）、初始评分 0-5、重复策略（跳过 / 合并元数据）。
 - 路径必须是绝对路径；目标文件夹经 `normalize_folder` 校验，拒绝 `..`、盘符与绝对路径。
 - 目录扫描为每个文件记录相对于“每个输入目录根”的 `relative_folder`；直接选中的文件该值为空。
 - `folderMode=flat`：所有图片进入目标文件夹；`folderMode=preserve`：目标文件夹 + 源相对目录拼接后作为最终文件夹，空相对目录仍进入目标文件夹。所有不存在的祖先由导入写线程自动补齐。
 - 浏览器预览不执行导入；界面会提示需要 Tauri 桌面窗口。
+
+### 导入到临时文件夹
+
+- `ImportRequest.target=temp` 时不写操作记录，也不生成 `origin_operation_id`；导入不进入撤销/重做。
+- 临时导入固定平铺、只允许跳过重复、不压缩；显式传 `preserve` 或 `merge` 会被拒绝，目标文件夹字段被忽略。界面隐藏目标文件夹、目录层级与压缩选项，只保留评分、标签与“跳过重复”。
+- 图片直接写入图库根目录下的临时文件夹（`folders.kind='temp'`，通常是 `.artbank-temp`），不会进入普通视图、文件夹树或全库搜索。
+- 关闭、切换图库或退出应用时清空临时文件夹；导入完成页与图库视图的提示都会说明这一点。
+- MCP 的 `import_start(target=temp)` 在询问档不需要用户确认；图库导入仍然需要。
 
 ### 单张图片管线
 
@@ -133,7 +141,8 @@
 
 ```text
 paths: string[]            绝对路径，文件或目录
-folder: string             目标文件夹，图库内相对路径，根目录为 ""
+target: "library" | "temp" 导入图库或临时文件夹；默认 library
+folder: string             目标文件夹，图库内相对路径，根目录为 ""；target=temp 时忽略
 folderMode: "flat" | "preserve"  目录层级；默认 flat
 tags: string[]             初始标签
 score: number              0-5
@@ -145,7 +154,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 `workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
 
 事件名：`import-progress`、`import-finished`。
 
@@ -160,6 +169,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 - 合并策略：标签并集、评分取较高值；
 - 目录模式：`flat` 全部进入目标文件夹；`preserve` 按源相对目录建立多级文件夹，多个输入目录的同名子目录合并，祖先自动补齐；
 - 取消：已提交行数与数据库一致，临时目录为空；
+- 临时导入：`target=temp` 平铺、跳过重复、不压缩、不写操作记录，拒绝 merge/preserve；关闭图库时行、原图与集合引用被清空；
 - 删除 pack：指针仍可读取，读取返回错误而不是 panic；
 - 1000 张 768×512 混合格式（4 线程）：`imported=1000, failed=0, elapsed=19.99s, 50.0 张/秒`（复跑 20.97s / 47.7 张/秒），高于 20 张/秒门槛。
 

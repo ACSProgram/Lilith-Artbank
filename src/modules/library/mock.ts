@@ -183,10 +183,16 @@ export function mockSearchTags(query: string, limit = 50): TagInfo[] {
     .slice(0, limit);
 }
 
-export function mockLibraryCounts(): { imageCount: number; trashCount: number } {
+export function mockLibraryCounts(): {
+  imageCount: number;
+  trashCount: number;
+  tempCount: number;
+} {
   return {
     imageCount: mockImages.filter((image) => image.deletedAt == null).length,
     trashCount: mockImages.filter((image) => image.deletedAt != null).length,
+    // 浏览器预览不模拟临时文件夹的生命周期。
+    tempCount: 0,
   };
 }
 
@@ -198,6 +204,8 @@ function isLibraryScope(query: LibraryQuery): boolean {
 
 function inView(image: ImageRow, query: LibraryQuery): boolean {
   if (isLibraryScope(query)) return true;
+  // 浏览器预览不模拟临时文件夹。
+  if (query.view === "temp") return false;
   if (query.view === "trash") return image.deletedAt != null;
   if (query.view === "collection") {
     if (image.deletedAt != null) return false;

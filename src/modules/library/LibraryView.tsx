@@ -566,6 +566,17 @@ export function LibraryView({
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
 
+  const showTemp = useCallback(() => {
+    applyBrowse({
+      ...browseRef.current,
+      ...sortForViewChange(browseRef.current, "temp"),
+      view: "temp",
+      collectionId: null,
+      filters: { ...browseRef.current.filters, folderIds: [] },
+    });
+    similarityClear?.();
+  }, [applyBrowse, similarityClear]);
+
   const showCollection = useCallback(
     (collectionId: number) => {
       const currentState = browseRef.current;
@@ -644,11 +655,12 @@ export function LibraryView({
 
   const handleItemPointerDown = useCallback(
     (item: ImageRow, event: ReactPointerEvent<HTMLDivElement>) => {
+      if (effectiveView === "temp") return;
       const ids = selected.has(item.id) ? [...selected] : [item.id];
       if (ids.length === 0) return;
       onBeginImageDrag(ids, `${ids.length} 张图片`, event);
     },
-    [onBeginImageDrag, selected],
+    [effectiveView, onBeginImageDrag, selected],
   );
 
   // 单击只选中；双击 / Enter 打开查看器；详情面板由按钮或右键控制，避免每次点图都挤动网格。
@@ -742,11 +754,13 @@ export function LibraryView({
       collectionName: collection?.name ?? null,
       collectionTotal: collection?.imageCount ?? null,
       libraryTotal: current?.imageCount ?? 0,
+      tempTotal: current?.tempCount ?? 0,
     };
   }, [
     browse.filters.folderIds,
     collections,
     current?.imageCount,
+    current?.tempCount,
     effectiveCollectionId,
     effectiveView,
     folders,
@@ -1088,6 +1102,7 @@ export function LibraryView({
         initialId: item.id,
         folders,
         currentCollectionId: effectiveCollectionId,
+        inTemp: effectiveView === "temp",
         getItems: () => itemsRef.current,
         hasMore: () => hasMoreRef.current,
         subscribe: (listener) => {
@@ -1178,6 +1193,7 @@ export function LibraryView({
       initialId: row.id,
       folders,
       currentCollectionId: null,
+      inTemp: false,
       getItems: () => targetViewerItems.current,
       hasMore: () => false,
       subscribe: () => () => {},
@@ -1324,8 +1340,12 @@ export function LibraryView({
   const showFolder = useCallback(
     (folderId: number | null) => {
       const currentState = browseRef.current;
+      const leavingTemp = currentState.view === "temp";
       applyBrowse({
         ...currentState,
+        ...(leavingTemp ? sortForViewChange(currentState, "all") : {}),
+        view: leavingTemp ? "all" : currentState.view,
+        collectionId: leavingTemp ? null : currentState.collectionId,
         filters: {
           ...currentState.filters,
           folderIds: folderId == null ? [] : [folderId],
@@ -1379,7 +1399,9 @@ export function LibraryView({
       event.preventDefault();
       const ids = selected.size > 0 ? [...selected] : activeId != null ? [activeId] : [];
       if (ids.length === 0) return;
-      if (effectiveView === "trash") void deleteSelected(ids);
+      if (effectiveView === "temp") {
+        notify("临时图片不能移入回收站", "info", "关闭、切换图库或退出应用时会自动清空。");
+      } else if (effectiveView === "trash") void deleteSelected(ids);
       else void trashSelected(ids);
       return;
     }
@@ -1477,9 +1499,11 @@ export function LibraryView({
           collections={collections}
           imageCount={current?.imageCount ?? 0}
           trashCount={current?.trashCount ?? 0}
+          tempCount={current?.tempCount ?? 0}
           emptyingTrash={emptyingTrash}
           onShowAll={showAll}
           onShowTrash={showTrash}
+          onShowTemp={showTemp}
           onShowCollection={showCollection}
           onNewCollection={() => {
             setCreatePreset(null);
@@ -1599,9 +1623,9 @@ export function LibraryView({
             onClick={() => showFolder(null)}
           >
             <FolderOpen size={13} />
-            全部图片
+            {effectiveView === "temp" ? "临时" : "全部图片"}
           </button>
-          {browse.filters.folderIds.length > 1 ? (
+          {effectiveView !== "temp" && browse.filters.folderIds.length > 1 ? (
             <>
               <ChevronRight size={12} className="folder-crumb-separator" />
               <span className="folder-crumb is-current">
@@ -2039,6 +2063,7 @@ export function LibraryView({
             version={dataVersion}
             folders={folders}
             currentCollectionId={effectiveCollectionId}
+            inTemp={effectiveView === "temp"}
             onClose={() => setInspectorOpen(false)}
             onChanged={refreshData}
             onAddToCollection={() => setCollectionPickerOpen(true)}
@@ -2059,6 +2084,7 @@ export function LibraryView({
         <LibraryContextMenu
           menu={contextMenu}
           inCollection={effectiveView === "collection"}
+          inTemp={effectiveView === "temp"}
           hasActive={contextHasActive}
           hasDeleted={contextHasDeleted}
           onClose={() => setContextMenu(null)}

@@ -62,6 +62,7 @@ function mockLibrary(name: string, path: string): LibraryInfo {
     path,
     imageCount: counts.imageCount,
     trashCount: counts.trashCount,
+    tempCount: counts.tempCount,
     schemaVersion: 2,
     openedAt: Date.now(),
   };
@@ -127,6 +128,7 @@ export const appApi = {
           ...mockCurrent,
           imageCount: counts.imageCount,
           trashCount: counts.trashCount,
+          tempCount: counts.tempCount,
         };
       }
       return mockCurrent;

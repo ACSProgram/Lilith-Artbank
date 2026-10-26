@@ -38,6 +38,8 @@ export interface ViewerSession {
   initialId: number;
   folders: ViewerSessionFolder[];
   currentCollectionId: number | null;
+  /** 浏览的是临时文件夹：详情侧栏隐藏移动、集合与回收站操作。 */
+  inTemp: boolean;
   /** 必须返回稳定引用，供 useSyncExternalStore 使用。 */
   getItems(): readonly ViewerSessionItem[];
   hasMore(): boolean;

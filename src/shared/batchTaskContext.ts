@@ -15,4 +15,6 @@ export interface BatchTaskContextInfo {
   collectionName: string | null;
   collectionTotal: number | null;
   libraryTotal: number;
+  /** 临时文件夹当前图片数。 */
+  tempTotal: number;
 }

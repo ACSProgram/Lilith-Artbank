@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -17,11 +17,14 @@ CREATE TABLE folders (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL,
-    sort_index INTEGER NOT NULL DEFAULT 0
+    sort_index INTEGER NOT NULL DEFAULT 0,
+    -- normal=普通文件夹；temp=每个图库唯一的临时文件夹，只通过导入进入。
+    kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal', 'temp'))
 ) STRICT;
 
 -- Windows 下文件夹路径大小写不敏感；NOCASE 只覆盖 ASCII，中文不受影响。
 CREATE UNIQUE INDEX idx_folders_path_nocase ON folders(path COLLATE NOCASE);
+CREATE UNIQUE INDEX idx_folders_single_temp ON folders(kind) WHERE kind = 'temp';
 
 CREATE TABLE images (
     id INTEGER PRIMARY KEY,
@@ -228,6 +231,11 @@ pub fn initialize(connection: &mut Connection, manifest: &LibraryManifest) -> Ap
         params![now],
     )?;
     transaction.execute(
+        "INSERT INTO folders(path, created_at, sort_index, kind)
+         VALUES (?1, ?2, -1, 'temp')",
+        params![crate::library::paths::TEMP_FOLDER_DIR, now],
+    )?;
+    transaction.execute(
         "INSERT INTO thumb_segments(id, file_name, size, created_at) VALUES (0, '', 0, ?1)",
         params![now],
     )?;
@@ -247,29 +255,38 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         4 => {
             verify_meta(connection, manifest)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         5 => {
             verify_meta(connection, manifest)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
+        }
+        6 => {
+            verify_meta(connection, manifest)?;
+            migrate_v6_to_v7(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -402,6 +419,34 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v6 → v7：文件夹增加 kind，并为每个图库补一个唯一的临时文件夹。
+///
+/// 默认内部目录是 `.artbank-temp`；如果旧库里恰好已经有同名普通文件夹，
+/// 就依次尝试后缀，避免占用用户已有目录。
+fn migrate_v6_to_v7(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "ALTER TABLE folders ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'
+         CHECK (kind IN ('normal', 'temp'))",
+        [],
+    )?;
+    transaction.execute(
+        "CREATE UNIQUE INDEX idx_folders_single_temp
+         ON folders(kind) WHERE kind = 'temp'",
+        [],
+    )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    transaction.execute(
+        "INSERT INTO folders(path, created_at, sort_index, kind)
+         VALUES (?1, ?2, -1, 'temp')",
+        params![crate::library::temp::free_path(&transaction)?, now],
+    )?;
+    mark_version(&transaction, 7)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v6 升级到 v7");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,7 +552,27 @@ mod tests {
             .unwrap();
     }
 
+    fn downgrade_to_v6(connection: &Connection) {
+        connection
+            .execute("DELETE FROM folders WHERE kind = 'temp'", [])
+            .unwrap();
+        connection
+            .execute("DROP INDEX idx_folders_single_temp", [])
+            .unwrap();
+        connection
+            .execute("ALTER TABLE folders DROP COLUMN kind", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '6' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
     fn downgrade_to_v5(connection: &Connection) {
+        downgrade_to_v6(connection);
         connection
             .execute("ALTER TABLE images DROP COLUMN optimized_at", [])
             .unwrap();
@@ -607,7 +672,10 @@ mod tests {
         assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
 
         let mut statement = connection
-            .prepare("SELECT path, sort_index FROM folders ORDER BY sort_index")
+            .prepare(
+                "SELECT path, sort_index FROM folders
+                 WHERE kind = 'normal' ORDER BY sort_index",
+            )
             .unwrap();
         let rows = statement
             .query_map([], |row| {
@@ -763,6 +831,74 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn migrates_v6_to_v7_and_adds_a_single_temp_folder() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v6(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 6);
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES ('作品', 1)",
+                [],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let (path, kind, sort_index): (String, String, i64) = connection
+            .query_row(
+                "SELECT path, kind, sort_index FROM folders WHERE kind = 'temp'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(path, crate::library::paths::TEMP_FOLDER_DIR);
+        assert_eq!(kind, "temp");
+        assert_eq!(sort_index, -1);
+        let normal: String = connection
+            .query_row("SELECT kind FROM folders WHERE path = '作品'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(normal, "normal");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO folders(path, created_at, kind) VALUES ('另一个临时', 2, 'temp')",
+                    []
+                )
+                .is_err(),
+            "每个图库只能有一个临时文件夹"
+        );
+    }
+
+    #[test]
+    fn migration_avoids_an_existing_folder_with_the_temp_name() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v6(&connection);
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at) VALUES (?1, 1)",
+                [crate::library::paths::TEMP_FOLDER_DIR],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        let path: String = connection
+            .query_row("SELECT path FROM folders WHERE kind = 'temp'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            path,
+            format!("{}-1", crate::library::paths::TEMP_FOLDER_DIR)
+        );
     }
 
     #[test]

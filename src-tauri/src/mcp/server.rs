@@ -141,7 +141,7 @@ fn outcome_result(result: AppResult<ToolOutcome>) -> CallToolResult {
 #[tool_router]
 impl McpServer {
     #[tool(
-        description = "图库概况：名称、路径、图片/回收站计数、schema 版本、特征数量、AI 配置与 MCP 限制。只读。"
+        description = "图库概况：名称、路径、图片/回收站/临时文件夹计数、schema 版本、特征数量、AI 配置与 MCP 限制。只读。"
     )]
     async fn library_info(&self) -> Result<CallToolResult, ErrorData> {
         let result = self
@@ -193,7 +193,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "结构化搜索图片，返回总数、紧凑行与下一页游标；pageSize 范围 1-50，超出直接报错。search 会匹配描述与标签名，view=library 时包含回收站。includeFacets 会额外计算分面计数，较慢，按需开启。"
+        description = "结构化搜索图片，返回总数、紧凑行与下一页游标；pageSize 范围 1-50，超出直接报错。search 会匹配描述与标签名，view=library 时包含回收站，view=temp 只看临时文件夹。includeFacets 会额外计算分面计数，较慢，按需开启。"
     )]
     async fn search_images(
         &self,
@@ -208,7 +208,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 用语义搜索。scope 可选 library/folder/collection/selection/view，默认 Entire library。threshold：pHash 是 0-256 距离上限，其它指标是 -1 到 1 的分数下限。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
+        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 用语义搜索。scope 可选 library/folder/collection/selection/view/temp，默认 Entire library。threshold：pHash 是 0-256 距离上限，其它指标是 -1 到 1 的分数下限。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
     )]
     async fn find_similar(
         &self,
@@ -394,7 +394,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执。"
+        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执与 target。"
     )]
     async fn tasks_get(
         &self,
@@ -418,7 +418,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "从本机绝对路径导入图片或目录，固定不压缩，也不接受 workerThreads。返回 taskId；tasks_get 完成后附带导入回执与 previewIds，整次导入可用 history_undo 撤销。询问档每次都要用户确认，只读档拒绝。"
+        description = "从本机绝对路径导入图片或目录，固定不压缩，也不接受 workerThreads。target=library 导入图库并可用 history_undo 撤销；target=temp 导入临时文件夹，平铺、只跳过重复、不写操作记录，关闭/切换图库或退出应用时清空。返回 taskId；tasks_get 完成后附带导入回执与 previewIds。询问档对图库导入每次都要用户确认，导入临时文件夹不需要确认；只读档拒绝。"
     )]
     async fn import_start(
         &self,

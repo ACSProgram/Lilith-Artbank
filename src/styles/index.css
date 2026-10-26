@@ -2432,6 +2432,17 @@ textarea:focus-visible {
   color: var(--danger);
 }
 
+/* 临时区是会话级内容：用警示色与“全部/回收站”区分，提示关闭后会清空。 */
+.view-tab-temp.is-active {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.view-tab-temp.is-active em {
+  color: var(--warning);
+}
+
 .view-tab-collection {
   max-width: 180px;
 }

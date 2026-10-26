@@ -12,7 +12,7 @@ use crate::{
     library::{
         db::LibraryDb,
         paths::{escape_like, normalize_content_extension, parent_path, subtree_like_pattern},
-        placeholders,
+        placeholders, temp,
     },
 };
 
@@ -51,6 +51,8 @@ pub enum LibraryView {
     All,
     Trash,
     Collection,
+    /// 临时文件夹；只出现在视图栏的固定入口，不参与默认视图与搜索。
+    Temp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
@@ -652,15 +654,18 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
 pub fn list_tags(database: &LibraryDb, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
     let limit = limit.unwrap_or(MAX_TAGS).clamp(1, MAX_TAGS);
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(
+        // 临时图片不计入标签；标签本身仍保留，标签清空临时区后自然消失。
+        let mut statement = connection.prepare(&format!(
             "SELECT tags.id, tags.name, count(images.id)
              FROM tags
              JOIN image_tags ON image_tags.tag_id = tags.id
              JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
+             WHERE {}
              GROUP BY tags.id
              ORDER BY count(images.id) DESC, tags.name
              LIMIT ?1",
-        )?;
+            temp::EXCLUDE_SQL
+        ))?;
         let rows = statement.query_map([limit], |row| {
             Ok(TagInfo {
                 id: row.get(0)?,
@@ -685,16 +690,18 @@ pub fn search_tags(
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let pattern = format!("%{}%", escape_like(needle));
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&format!(
             "SELECT tags.id, tags.name, count(images.id)
              FROM tags
              LEFT JOIN image_tags ON image_tags.tag_id = tags.id
              LEFT JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
+                 AND {exclude}
              WHERE tags.name LIKE ?1 ESCAPE '\\'
              GROUP BY tags.id
              ORDER BY count(images.id) DESC, tags.name
              LIMIT ?2",
-        )?;
+            exclude = temp::EXCLUDE_SQL
+        ))?;
         let rows = statement.query_map(params![pattern, limit], |row| {
             Ok(TagInfo {
                 id: row.get(0)?,
@@ -950,6 +957,8 @@ impl PreparedQuery {
             filters: FilterSet::new(),
         };
         let library_scope = !query.search.is_empty() && query.search_scope == SearchScope::Library;
+        // 全库搜索忽略当前视图，所以“临时视图 + 全库搜索”要按全库规则排除临时图片。
+        let temp_view = !library_scope && query.view == LibraryView::Temp;
         if !library_scope {
             match query.view {
                 LibraryView::All => prepared
@@ -973,7 +982,17 @@ impl PreparedQuery {
                         .clauses
                         .push("images.deleted_at IS NULL".to_owned());
                 }
+                LibraryView::Temp => {
+                    prepared
+                        .filters
+                        .clauses
+                        .push("images.deleted_at IS NULL".to_owned());
+                    prepared.filters.clauses.push(temp::ONLY_SQL.to_owned());
+                }
             }
+        }
+        if !temp_view {
+            prepared.filters.clauses.push(temp::EXCLUDE_SQL.to_owned());
         }
         // 待释放行已经从回收站移除：回收站视图与全库搜索没有 `deleted_at IS NULL` 兜底，
         // 必须显式排除；其余视图由 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）。
@@ -1496,7 +1515,8 @@ fn folder_scope_paths(connection: &Connection, ids: &[i64]) -> AppResult<Vec<Str
 
 fn all_folders(connection: &Connection) -> AppResult<Vec<(i64, String)>> {
     // 按路径排序命中 `folders(path)` 唯一索引；前端树与计数都不依赖顺序，但返回值保持稳定。
-    let mut statement = connection.prepare("SELECT id, path FROM folders ORDER BY path")?;
+    let mut statement =
+        connection.prepare("SELECT id, path FROM folders WHERE kind = 'normal' ORDER BY path")?;
     let folders = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1615,7 +1635,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::{import::ensure_folder, service};
+    use crate::library::{import::ensure_folder, service, temp};
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -2895,7 +2915,116 @@ mod tests {
         let rows = rows_by_ids(&fixture.session.db, &fixture.root, &[5, 1]).unwrap();
         assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1]);
 
-        let (_, trash_count) = fixture.session.db.counts().unwrap();
+        let (_, trash_count, _) = fixture.session.db.counts().unwrap();
         assert_eq!(trash_count, 0);
+    }
+
+    #[test]
+    fn temp_images_are_hidden_from_normal_views_and_searches() {
+        let fixture = fixture();
+        let (temp_folder, temp_image) = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                let folder = temp::folder(connection)?.unwrap().id;
+                connection.execute("INSERT INTO tags(name) VALUES ('临时标签')", [])?;
+                let tag = connection.last_insert_rowid();
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    0,
+                    folder,
+                    600,
+                    6_000,
+                    700,
+                    700,
+                    None,
+                    &[tag],
+                );
+                let image: i64 =
+                    connection.query_row("SELECT max(id) FROM images", [], |row| row.get(0))?;
+                Ok((folder, image))
+            })
+            .unwrap();
+        let registered = fixture
+            .session
+            .db
+            .with_reader(temp::folder)
+            .unwrap()
+            .unwrap();
+        assert_eq!(temp_folder, registered.id);
+
+        let all = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::All,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&all).len(), 4);
+        assert!(all.items.iter().all(|row| row.id != temp_image));
+
+        let temp_page = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::Temp,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&temp_page), vec![temp_image]);
+
+        let search = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                search: "临时标签".into(),
+                search_scope: SearchScope::Library,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(search.items.is_empty());
+
+        // 临时视图里的“视图内搜索”能看到临时图片，但同一视图切到全库搜索时不算临时图片。
+        let in_temp = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::Temp,
+                search: "临时标签".into(),
+                search_scope: SearchScope::View,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&in_temp), vec![temp_image]);
+        let library_wide = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                view: LibraryView::Temp,
+                search: "临时标签".into(),
+                search_scope: SearchScope::Library,
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(library_wide.items.is_empty());
+
+        let tags = list_tags(&fixture.session.db, None).unwrap();
+        assert!(!tags.iter().any(|tag| tag.name == "临时标签"));
+
+        let (_, _, temp_count) = fixture.session.db.counts().unwrap();
+        assert_eq!(temp_count, 1);
     }
 }

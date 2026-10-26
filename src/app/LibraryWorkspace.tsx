@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderOpen, Images, Trash2, Upload } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
+import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
 import type { FolderInfo } from "../modules/library/types";
+import { sortForViewChange } from "../modules/library/model";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
 import { aiApi } from "../modules/ai/api";
 import { useAiStatus } from "../modules/ai/useAiStatus";
@@ -46,11 +48,14 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
   const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
   const browse = useLibraryBrowse(settings?.ui.sort);
+  const importTarget: ImportTarget =
+    browse.browse.view === "temp" ? "temp" : "library";
   const importFolder = useMemo(() => {
+    if (importTarget === "temp") return "";
     const selected = browse.browse.filters.folderIds;
     if (selected.length !== 1) return "";
     return folders.find((folder) => folder.id === selected[0])?.path ?? "";
-  }, [browse.browse.filters.folderIds, folders]);
+  }, [browse.browse.filters.folderIds, folders, importTarget]);
   const similarity = useSimilarityBrowse();
   const { dataVersion: taskDataVersion, lastFinished } = useTaskCenter();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
@@ -258,7 +263,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
 
   if (!current) return null;
 
-  const hasImages = current.imageCount > 0 || current.trashCount > 0;
+  const hasImages =
+    current.imageCount > 0 || current.trashCount > 0 || current.tempCount > 0;
   const semanticBlockedReason = !aiStatus?.online
     ? "AI 服务离线，语义搜索需要文本模型"
     : aiStatus.mean.count === 0
@@ -278,8 +284,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   };
 
   const selectFolders = (folderIds: number[]) => {
+    const leavingTemp = browse.browse.view === "temp";
     browse.applyBrowse({
       ...browse.browse,
+      ...(leavingTemp ? sortForViewChange(browse.browse, "all") : {}),
+      view: leavingTemp ? "all" : browse.browse.view,
+      collectionId: leavingTemp ? null : browse.browse.collectionId,
       filters: { ...browse.browse.filters, folderIds },
     });
   };
@@ -425,6 +435,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             open={importOpen}
             initialPaths={pendingPaths}
             initialFolder={importFolder}
+            target={importTarget}
             folders={folders}
             onClose={closeImport}
             onFinished={handleImportFinished}
@@ -444,7 +455,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               <div className="drop-overlay-card">
                 <Upload size={30} />
                 <strong>松开即可导入</strong>
-                <span>图片会被复制到当前图库</span>
+                <span>
+                  {importTarget === "temp"
+                    ? "图片会被复制到临时文件夹，关闭图库时清空。"
+                    : "图片会被复制到当前图库"}
+                </span>
               </div>
             </div>
           ) : null}

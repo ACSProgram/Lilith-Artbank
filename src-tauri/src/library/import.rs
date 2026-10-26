@@ -97,7 +97,7 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
         connection
             .query_row(
                 "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
-                 WHERE path <> '' AND instr(path, '/') = 0",
+                 WHERE kind = 'normal' AND path <> '' AND instr(path, '/') = 0",
                 [],
                 |row| row.get(0),
             )
@@ -106,7 +106,8 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
         connection
             .query_row(
                 "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
-                 WHERE path LIKE ?1 ESCAPE '\\'
+                 WHERE kind = 'normal'
+                   AND path LIKE ?1 ESCAPE '\\'
                    AND path <> ?2
                    AND instr(substr(path, length(?2) + 2), '/') = 0",
                 params![format!("{}/%", escape_like(parent)), parent],

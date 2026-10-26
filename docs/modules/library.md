@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v6、schema v6、多级文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v6、schema v7、多级文件夹、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,19 +36,20 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 6；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 7；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
 - v4 → v5 新增 `operations` / `operation_chunks` / `undo_runs` 三张表、`images.purge_operation_id` / `origin_operation_id` 两列与 `idx_images_purge` 索引，不改现有行；v1–v3 库按链式迁移到 v5。
-- v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行；v1–v5 库按链式迁移到 v6。
+- v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行。
+- v6 → v7 给 `folders` 增加 `kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','temp'))` 与唯一部分索引 `idx_folders_single_temp`，并插入唯一的临时文件夹行；内部路径固定为 `.artbank-temp`，已有同名文件夹时追加 `-1`、`-2` 后缀。v1–v6 库按链式迁移到 v7。
 
 ### 表
 
 | 表 | 作用 |
 | --- | --- |
 | `meta` | `appFormat`、`schemaVersion`、`libraryId`、`createdAt` |
-| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''`；每个祖先都有行，路径 NOCASE 唯一；`sort_index` 为手动排序位 |
+| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''`；每个祖先都有行，路径 NOCASE 唯一；`sort_index` 为手动排序位；`kind` 为 `normal` / `temp`，临时文件夹每个图库恰好一个 |
 | `images` | 图片元数据与缩略图指针 |
 | `tags` / `image_tags` | 规范化标签与多对多关系 |
 | `collections` / `collection_items` | 手工集合与顺序 |
@@ -221,7 +222,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 { kind: "invalid", reason }
 ```
 
-`LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`schemaVersion`、`openedAt`。
+`LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`tempCount`、`schemaVersion`、`openedAt`。计数分别对应普通图片、回收站与临时文件夹；临时图片不计入 `imageCount`。
 
 `FolderInfo`：`{ id, path, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。`sortIndex` 只在同级内比较，决定“手动”排序模式下的顺序。
 
@@ -245,6 +246,17 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 四个命令都返回完整 `FolderInfo[]`，前端用返回值整体刷新树，不做本地路径推算。
 - 文件夹计数由 `get_folders` 用一条直接计数查询在内存中沿路径前缀累加到祖先，结果随命令返回。
 - `folders.sort_index` 在新建、移动与手动排序时维护：新建与移动追加到同级末尾；`reorder_folders` 只接受同一父级的子文件夹，在事务里插入到指定位置并重新编号同级。前端“手动”排序模式按 `sortIndex` 显示，名称/图片数排序只是显示顺序，不会改写 `sortIndex`。
+- 临时文件夹（`kind='temp'`）不参与文件夹树、计数与同级排序；普通文件夹的创建、重命名、移动、删除与排序都拒绝临时文件夹与 `.artbank-temp*` 路径。
+
+## 临时文件夹
+
+每个图库恰好有一个 `folders.kind='temp'` 行，内部路径为 `.artbank-temp`（同名冲突时追加 `-1`、`-2`）。它是导入的临时落地区，不是普通文件夹：
+
+- 创建或打开图库时确保行与物理目录存在，并清空上一次会话留下的临时图片；关闭图库与应用退出时再次清空。清空会删掉临时图片行、原图与集合引用，保留临时文件夹本身。
+- 临时图片只通过导入 `target=temp` 进入；普通导入不能指定临时路径，图片也不能移入或移出临时文件夹。
+- 普通视图、全库搜索、文件夹树、标签列表、集合计数与图库计数都不包含临时图片；只有 `view=temp`、显式 id、`find_similar` 的 `scope=temp` 与全库相似扫描能拿到它们。全库相似扫描（`find_similar` 的 `scope=library` 与相似分组）目前仍会扫到临时图片，见 [待办](../planning/todo.md) 的批次 6。
+- 临时图片可以查看、评分、改描述、加标签、作为相似参考；不能移入回收站/恢复/永久删除、做几何编辑或加入集合。上述写路径在 Rust 侧统一拒绝。
+- 临时图片的评分、描述、标签与 AI 描述不写操作记录，也不会清空重做分支；导入临时文件夹同样不建 `operations` 行。清空临时文件夹不属于撤销范围。
 
 ## 操作记录与撤销
 
@@ -280,18 +292,18 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 生命周期
 
-- `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 打开 → 把路径写入设置。
-- `open_library_path`：校验清单/库 → 建连接池 → 校验或迁移 schema → 读计数 → 打开 → 把路径写入设置。空目录或无效目录直接拒绝，需先创建。
+- `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 打开 → 确保临时文件夹 → 把路径写入设置。
+- `open_library_path`：校验清单/库 → 建连接池 → 校验或迁移 schema → 清空上一个会话的临时图片（新建库则为 0）→ 确保临时文件夹 → 读计数 → 打开 → 把路径写入设置。空目录或无效目录直接拒绝，需先创建。
 - 打开或创建新库成功后才替换旧会话；失败保留旧会话与设置中的旧路径。
 - 启动：`open_configured_library` 按 `libraryPath` 自动打开；失败只记日志，前端随后再尝试一次并提示，最终退回欢迎页。
-- `close_library`：释放连接、清空 AI 运行时状态与 `libraryPath`，不动文件。
+- `close_library`：清空当前图库的临时文件夹，再释放连接、清空 AI 运行时状态与 `libraryPath`，不动其它文件。应用退出时同样尽力清空一次。
 - `rename_library`：更新清单名称与当前 `LibraryInfo.name`；不改目录名，也不写设置。
 - 应用内没有多库列表与“移除图库”操作；换库由“打开另一个图库”完成。
 - 导入/AI 任务/文件操作运行时，创建与打开图库会被拒绝；关闭图库在 write 任务进行时拒绝，只有 ai/scan 任务时先取消再关闭。
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v6（含 v1→v2→v3→v4→v5→v6 迁移）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -300,10 +312,11 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 `cargo test` 覆盖：
 
 - 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
-- 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝；
+- 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝、临时文件夹不进入排序；
+- 临时文件夹：每库恰好一个隐藏行、清空行/文件/集合引用、普通视图与全库搜索不可见、临时元数据不写操作记录、禁止移动/回收站/编辑/加入集合；
 - 导入仓储插入、内容哈希冲突与合并元数据；
 - 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）；
 - S2 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；文件夹子树筛选（后代命中、相似前缀不误匹配、根目录等价全库）、直接/子树计数、文件夹分面按子树展开；

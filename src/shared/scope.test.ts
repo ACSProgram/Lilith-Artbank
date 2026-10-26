@@ -32,6 +32,7 @@ function context(overrides: Partial<BatchTaskContextInfo> = {}): BatchTaskContex
     collectionName: null,
     collectionTotal: null,
     libraryTotal: 9_000,
+    tempTotal: 3,
     ...overrides,
   };
 }
@@ -51,6 +52,7 @@ test("build_scope_maps_each_choice_and_rejects_missing_context", () => {
   });
   assert.deepEqual(buildScope("collection", base), { type: "collection", collectionId: 5 });
   assert.deepEqual(buildScope("view", base), { type: "view", query });
+  assert.deepEqual(buildScope("temp", base), { type: "temp" });
   assert.deepEqual(buildScope("library", base), { type: "library" });
 
   const empty = context({ query: null, folderId: null, collectionId: null });
@@ -77,6 +79,7 @@ test("folder_count_label_follows_subfolder_toggle", () => {
     "20 张",
   );
   assert.equal(scopeCountLabel("selected", base), "1 张");
+  assert.equal(scopeCountLabel("temp", base), "3 张");
   assert.equal(scopeCountLabel("library", base), "9,000 张");
   assert.equal(scopeCountLabel("collection", base), "");
 });
@@ -87,7 +90,11 @@ test("availability_disables_choices_without_context", () => {
   assert.equal(availability.folder.enabled, true);
   assert.equal(availability.collection.enabled, false);
   assert.equal(availability.view.enabled, true);
+  assert.equal(availability.temp.enabled, true);
   assert.equal(availability.library.enabled, true);
+
+  const noTemp = scopeAvailability(context({ tempTotal: 0 }));
+  assert.equal(noTemp.temp.enabled, false);
 
   const empty = scopeAvailability(null);
   for (const choice of Object.keys(empty) as ScopeChoice[]) {

@@ -692,8 +692,29 @@ pub fn write_with_id<T>(
     op: NewOperation<'_>,
     work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
 ) -> AppResult<(T, Option<i64>)> {
+    write_with_id_mode(database, op, true, work)
+}
+
+/// 只在 `record = false` 时使用的无记录事务：临时图片的元数据修改用它，
+/// 既不写 operations，也不清空重做分支。`draft` 只是为了让工作闭包保持同一签名。
+pub fn write_with_id_mode<T>(
+    database: &LibraryDb,
+    op: NewOperation<'_>,
+    record: bool,
+    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
+) -> AppResult<(T, Option<i64>)> {
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !record {
+            let mut draft = OperationDraft {
+                id: 0,
+                affected: 0,
+                chunks: Vec::new(),
+            };
+            let value = work(&transaction, &mut draft)?;
+            transaction.commit()?;
+            return Ok((value, None));
+        }
         // 新的写入开启新时间线：被撤销的灰记录与它们的暂存文件都不再可重做。
         discard_redo_branch(&transaction)?;
         transaction.execute(
@@ -5034,7 +5055,7 @@ mod tests {
     #[test]
     fn undoes_import_new_rows_and_merges() {
         use crate::import::{
-            FolderMode, ImportRequest, ImportSource,
+            FolderMode, ImportRequest, ImportSource, ImportTarget,
             job::{DuplicatePolicy, ImportJob},
             pipeline,
         };
@@ -5047,6 +5068,7 @@ mod tests {
 
         let request = |merge: bool, tag: &str, score: u8| ImportRequest {
             paths: vec![source_dir.to_string_lossy().into_owned()],
+            target: ImportTarget::Library,
             folder: "导入".into(),
             folder_mode: FolderMode::Flat,
             tags: vec![tag.to_owned()],
@@ -5069,7 +5091,11 @@ mod tests {
                 root: fixture.root.clone(),
                 operation_id: Some(operation_id),
             };
-            let job = Arc::new(ImportJob::new("import-history", "测试"));
+            let job = Arc::new(ImportJob::new(
+                "import-history",
+                "测试",
+                ImportTarget::Library,
+            ));
             pipeline::run(source, job, request(merge, tag, score)).unwrap();
             finish_live(fixture.db(), operation_id, "").unwrap();
         };

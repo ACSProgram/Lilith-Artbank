@@ -81,6 +81,7 @@ pub enum SimilarMode {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FindSimilarScope {
     Library,
+    Temp,
     #[serde(rename_all = "camelCase")]
     Folder {
         folder_id: i64,
@@ -109,6 +110,7 @@ impl FindSimilarScope {
     fn to_task_scope(&self) -> TaskScope {
         match self {
             Self::Library => TaskScope::Library,
+            Self::Temp => TaskScope::Temp,
             Self::Folder {
                 folder_id,
                 include_subfolders,
@@ -152,7 +154,7 @@ pub struct FindSimilarInput {
     pub limit: Option<u32>,
     #[schemars(description = "返回多少条预览，1-25；默认 12")]
     pub preview_limit: Option<u32>,
-    #[schemars(description = "扫描范围；默认整个图库")]
+    #[schemars(description = "扫描范围；默认整个图库（不含临时文件夹），type=temp 只看临时区")]
     pub scope: Option<FindSimilarScope>,
 }
 
@@ -175,7 +177,8 @@ pub struct SheetToolResult {
 }
 
 pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value> {
-    let (image_count, trash_count) = context.database.counts()?;
+    let (image_count, trash_count, temp_count) = context.database.counts()?;
+    let temp_path = context.database.with_reader(crate::library::temp::path)?;
     let features = capability::feature_summary(&context.database)?;
     Ok(json!({
         "library": {
@@ -187,6 +190,14 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
         "counts": {
             "images": image_count,
             "trash": trash_count,
+            "temp": temp_count,
+        },
+        "tempFolder": {
+            "available": temp_path.is_some(),
+            // 内部路径只用于诊断；查询临时图片用 view=temp，不要把它当普通文件夹。
+            "path": temp_path,
+            "count": temp_count,
+            "note": "只能通过 import_start(target=temp) 进入；关闭、切换图库或退出应用时清空，不写操作记录。",
         },
         "features": {
             "descriptions": features.description,
@@ -628,13 +639,14 @@ mod tests {
         _temp: TempDir,
         context: ReadContext,
         ai: AiRuntime,
+        works_folder: i64,
     }
 
     fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("library");
         let (session, _) = service::create(&root, "MCP 测试", 1).unwrap();
-        session
+        let works_folder = session
             .db
             .with_writer(|connection| {
                 connection.execute(
@@ -687,7 +699,7 @@ mod tests {
                     "INSERT INTO image_tags(image_id, tag_id) VALUES (1, ?1), (2, ?2)",
                     params![people, scenery],
                 )?;
-                Ok(())
+                Ok(works)
             })
             .unwrap();
 
@@ -739,6 +751,7 @@ mod tests {
             _temp: temp,
             context,
             ai,
+            works_folder,
         }
     }
 
@@ -755,7 +768,7 @@ mod tests {
         let input = SearchImagesInput {
             query: McpQuery {
                 filters: McpFilters {
-                    folder_ids: vec![2],
+                    folder_ids: vec![fixture.works_folder],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -952,7 +965,7 @@ mod tests {
                     search: "人物".into(),
                     search_scope: QueryScope::Library,
                     filters: McpFilters {
-                        folder_ids: vec![2],
+                        folder_ids: vec![fixture.works_folder],
                         ..Default::default()
                     },
                     ..Default::default()

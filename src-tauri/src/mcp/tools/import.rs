@@ -14,7 +14,7 @@ use crate::{
         settings::McpMode,
         state::AppState,
     },
-    import::{FolderMode, ImportRequest, job::DuplicatePolicy},
+    import::{FolderMode, ImportRequest, ImportTarget, job::DuplicatePolicy},
 };
 
 use super::{ToolOutcome, write};
@@ -27,7 +27,13 @@ const DEFAULT_PERCEPTUAL_THRESHOLD: u8 = 6;
 pub struct ImportStartInput {
     #[schemars(description = "本机绝对路径，文件或目录；单次最多 10000 个输入路径")]
     pub paths: Vec<String>,
-    #[schemars(description = "图库内目标文件夹相对路径；省略或空字符串表示根目录")]
+    #[schemars(
+        description = "library=普通图库（默认）；temp=临时文件夹，只能平铺、只能跳过重复，不写操作记录"
+    )]
+    pub target: Option<String>,
+    #[schemars(
+        description = "图库内目标文件夹相对路径；省略或空字符串表示根目录；target=temp 时忽略"
+    )]
     pub folder: Option<String>,
     #[schemars(
         description = "flat=全部放进目标文件夹；preserve=保留每个输入目录下的相对层级；默认 flat"
@@ -56,10 +62,12 @@ fn run_import(
 ) -> AppResult<ToolOutcome> {
     let mode = write::ensure_writable(state)?;
     let request = prepare_request(input)?;
+    let temporary = request.target == ImportTarget::Temp;
     let target = target_label(&request);
     let _exclusive = state.lock_mcp_writes();
 
-    if mode == McpMode::Ask && !approved {
+    // 临时导入是查找用的暂存区，询问档下免确认；普通导入仍然每次确认。
+    if mode == McpMode::Ask && !approved && !temporary {
         return write::enqueue_approval(
             state,
             "import_start",
@@ -73,6 +81,11 @@ fn run_import(
     let (snapshot, operation_id) = state.start_mcp_import(request)?;
     let task_id = snapshot.progress.job_id.clone();
     crate::mcp::audit::import_sources(&paths, &target, mode.as_str(), &task_id, operation_id);
+    let message = if temporary {
+        "临时导入不写操作记录；关闭、切换图库或退出应用时会清空。用 tasks_get 轮询。"
+    } else {
+        "导入在后台进行；用 tasks_get 轮询，完成后可 history_undo 撤销整次导入。"
+    };
     Ok(ToolOutcome::task(
         task_id.clone(),
         json!({
@@ -80,9 +93,10 @@ fn run_import(
             "taskId": task_id,
             "pathCount": paths.len(),
             "target": target,
+            "temporary": temporary,
             "operationId": operation_id,
             "compressed": false,
-            "message": "导入在后台进行；用 tasks_get 轮询，完成后可 history_undo 撤销整次导入。",
+            "message": message,
         }),
     ))
 }
@@ -91,6 +105,7 @@ fn run_import(
 fn prepare_request(input: &ImportStartInput) -> AppResult<ImportRequest> {
     let request = ImportRequest {
         paths: input.paths.clone(),
+        target: target(input.target.as_deref())?,
         folder: input.folder.clone().unwrap_or_default(),
         folder_mode: folder_mode(input.folder_mode.as_deref())?,
         tags: input.tags.clone(),
@@ -103,6 +118,21 @@ fn prepare_request(input: &ImportStartInput) -> AppResult<ImportRequest> {
         cancel_after: None,
     };
     request.normalized()
+}
+
+fn target(value: Option<&str>) -> AppResult<ImportTarget> {
+    match value
+        .unwrap_or("library")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "library" => Ok(ImportTarget::Library),
+        "temp" => Ok(ImportTarget::Temp),
+        other => Err(AppError::message(format!(
+            "target 只能是 library 或 temp，收到 {other}"
+        ))),
+    }
 }
 
 fn folder_mode(value: Option<&str>) -> AppResult<FolderMode> {
@@ -126,6 +156,9 @@ fn duplicate_policy(value: Option<&str>) -> AppResult<DuplicatePolicy> {
 }
 
 fn target_label(request: &ImportRequest) -> String {
+    if request.target == ImportTarget::Temp {
+        return "临时文件夹".to_owned();
+    }
     let folder = if request.folder.is_empty() {
         "根目录".to_owned()
     } else {
@@ -138,6 +171,7 @@ fn target_label(request: &ImportRequest) -> String {
 }
 
 fn preview(request: &ImportRequest, target: &str) -> Value {
+    let temporary = request.target == ImportTarget::Temp;
     let paths = request
         .paths
         .iter()
@@ -157,11 +191,19 @@ fn preview(request: &ImportRequest, target: &str) -> Value {
             DuplicatePolicy::Skip => "skip",
             DuplicatePolicy::Merge => "merge",
         },
-        "consequences": [
-            "图片会复制进图库，原文件不移动",
-            "不会压缩图片",
-            "完成后可以撤销整次导入",
-        ],
+        "consequences": if temporary {
+            vec![
+                "图片会复制到临时文件夹，原文件不移动",
+                "不会压缩图片",
+                "不写操作记录；关闭、切换图库或退出应用时清空",
+            ]
+        } else {
+            vec![
+                "图片会复制进图库，原文件不移动",
+                "不会压缩图片",
+                "完成后可以撤销整次导入",
+            ]
+        },
     })
 }
 
@@ -187,6 +229,23 @@ mod tests {
         assert!(request.worker_threads.is_none());
         assert_eq!(request.folder_mode, FolderMode::Flat);
         assert_eq!(request.duplicate_policy, DuplicatePolicy::Skip);
+    }
+
+    #[test]
+    fn temp_target_clears_folder_and_rejects_merge_or_preserve() {
+        let mut value = input(vec![absolute_temp_path()]);
+        value.target = Some("temp".into());
+        value.folder = Some("人物".into());
+        let request = prepare_request(&value).unwrap();
+        assert_eq!(request.target, ImportTarget::Temp);
+        assert_eq!(request.folder, "");
+
+        value.duplicate_policy = Some("merge".into());
+        assert!(prepare_request(&value).is_err());
+
+        value.duplicate_policy = Some("skip".into());
+        value.folder_mode = Some("preserve".into());
+        assert!(prepare_request(&value).is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 代码任务先读 `docs/architecture/ai-reading-guide.md` 选择路由；不要默认通读整个仓库。
 
 - 图库打开/创建/关闭、设置、SQLite schema：读 `docs/modules/library.md`，再进入 `src-tauri/src/app/`、`src-tauri/src/library/`。
+- 临时文件夹（`folders.kind = 'temp'`）：读 `docs/modules/library.md` 的“临时文件夹”，再进入 `src-tauri/src/library/temp.rs`、`src-tauri/src/import/pipeline.rs`、`src-tauri/src/app/state.rs`。
 - 操作记录、撤销、待释放文件：读 `docs/modules/library.md` 的“操作记录与撤销”，再进入 `src-tauri/src/library/history.rs`、`src-tauri/src/app/state.rs`、`src/modules/library/OperationHistoryPanel.tsx`。
 - 导入、哈希、pHash、主色、缩略图包：读 `docs/modules/import.md`，再进入 `src-tauri/src/import/`、`src-tauri/src/imageops/`。
 - 网格/列表、分页、筛选、排序、集合、回收站：读 `docs/modules/browse-and-query.md`，再进入 `src/modules/library/`、`src-tauri/src/library/query.rs`、`src-tauri/src/library/`。
@@ -22,6 +23,7 @@
 
 - 元数据只走 SQLite；不要把整库元数据载入内存或一次性发给前端。页面查询使用键集游标。
 - 会改变图库内容的写路径必须接入操作记录（`history::write` 或 live operation）；永久删除与清空回收站只写待释放标记，原图由释放任务删除。
+- 临时文件夹（`folders.kind = 'temp'`）是生命周期数据，是上面这条的唯一例外：只能通过导入 `target=temp` 进入，不能移入/移出，临时图片的评分/描述/标签与临时导入都不写操作记录；打开、关闭、换库与退出时整目录清空。
 - 原图按 BLAKE3 内容哈希命名；图片 id 是稳定代理键。编辑产生新内容哈希文件，标签/集合引用 id。
 - 缩略图写追加式 `.pack`，数据库只记录 segment/offset/length；不要改成 20 万个独立小文件。
 - 浏览器只解码当前页缩略图；Rust 不做 DDS/BC 缩略图管线。

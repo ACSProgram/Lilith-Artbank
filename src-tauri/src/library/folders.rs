@@ -43,6 +43,19 @@ fn folder_path(connection: &Connection, id: i64) -> AppResult<String> {
         .ok_or_else(|| AppError::message("文件夹不存在"))
 }
 
+/// 临时文件夹由生命周期管理，禁止重命名、移动、删除或参与同级排序。
+fn ensure_normal_folder(connection: &Connection, id: i64) -> AppResult<()> {
+    let kind: Option<String> = connection
+        .query_row("SELECT kind FROM folders WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if kind.as_deref() == Some("temp") {
+        return Err(AppError::message("临时文件夹不能重命名、移动、删除或排序"));
+    }
+    Ok(())
+}
+
 fn ensure_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
     let canonical_root = root.canonicalize()?;
     let canonical_directory = directory.canonicalize()?;
@@ -100,6 +113,7 @@ pub fn rename(
             format!("重命名文件夹为「{name}」"),
         ),
         |transaction, draft| {
+            ensure_normal_folder(transaction, folder_id_value)?;
             let old_path = folder_path(transaction, folder_id_value)?;
             if old_path.is_empty() {
                 return Err(AppError::message("不能重命名图库根目录"));
@@ -171,6 +185,8 @@ pub fn move_to(
         db,
         NewOperation::new(HistoryKind::FolderMove, "移动文件夹"),
         |transaction, draft| {
+            ensure_normal_folder(transaction, folder_id_value)?;
+            ensure_normal_folder(transaction, parent_id)?;
             let old_path = folder_path(transaction, folder_id_value)?;
             if old_path.is_empty() {
                 return Err(AppError::message("不能移动图库根目录"));
@@ -270,10 +286,16 @@ pub fn reorder(
         db,
         NewOperation::new(HistoryKind::FolderReorder, "调整文件夹顺序"),
         |transaction, draft| {
+            ensure_normal_folder(transaction, parent_id)?;
+            for id in folder_ids {
+                ensure_normal_folder(transaction, *id)?;
+            }
             let parent = folder_path(transaction, parent_id)?;
             // 同级文件夹一次读出来：手动排序只在拖放时发生，几千行路径的读取代价可以接受。
-            let mut statement = transaction
-                .prepare("SELECT id, path, sort_index FROM folders ORDER BY sort_index, id")?;
+            let mut statement = transaction.prepare(
+                "SELECT id, path, sort_index FROM folders
+                 WHERE kind = 'normal' ORDER BY sort_index, id",
+            )?;
             let folders = statement
                 .query_map([], |row| {
                     Ok((
@@ -345,6 +367,7 @@ pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Ve
         db,
         NewOperation::new(HistoryKind::FolderDelete, "删除文件夹"),
         |transaction, draft| {
+            ensure_normal_folder(transaction, folder_id_value)?;
             let (path, created_at, sort_index): (String, i64, i64) = transaction
                 .query_row(
                     "SELECT path, created_at, sort_index FROM folders WHERE id = ?1",
@@ -924,7 +947,8 @@ mod tests {
         let order = |db: &LibraryDb| {
             db.with_reader(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT path FROM folders WHERE instr(path, '/') = 0 AND path <> ''
+                    "SELECT path FROM folders
+                     WHERE kind = 'normal' AND instr(path, '/') = 0 AND path <> ''
                      ORDER BY sort_index, id",
                 )?;
                 let paths = statement
@@ -1058,7 +1082,7 @@ mod tests {
             .with_reader(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT path FROM folders
-                     WHERE instr(path, '/') = 0 AND path <> ''
+                     WHERE kind = 'normal' AND instr(path, '/') = 0 AND path <> ''
                      ORDER BY sort_index, id",
                 )?;
                 let paths = statement

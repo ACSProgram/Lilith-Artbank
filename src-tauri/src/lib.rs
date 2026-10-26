@@ -87,6 +87,7 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             let state = app_handle.state::<app::state::AppState>();
             let settings = state.settings.snapshot().ai;
+            state.shutdown();
             state.ai.shutdown(&settings);
             state.mcp.stop();
         }

@@ -13,6 +13,7 @@ use crate::{
         },
         placeholders,
         service::now_ms,
+        temp,
     },
 };
 
@@ -41,16 +42,18 @@ pub enum CombineMode {
 
 pub fn list(database: &LibraryDb) -> AppResult<Vec<CollectionInfo>> {
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&format!(
             "SELECT collections.id, collections.name, collections.sort_order,
                     collections.created_at, collections.updated_at,
                     (SELECT count(*) FROM collection_items
                      JOIN images ON images.id = collection_items.image_id
                      WHERE collection_items.collection_id = collections.id
-                       AND images.deleted_at IS NULL)
+                       AND images.deleted_at IS NULL
+                       AND {})
              FROM collections
              ORDER BY collections.sort_order, collections.id",
-        )?;
+            temp::EXCLUDE_SQL
+        ))?;
         let rows = statement.query_map([], |row| {
             Ok(CollectionInfo {
                 id: row.get(0)?,
@@ -81,6 +84,11 @@ pub fn create_with_images(
     } else {
         validate_ids(image_ids, MAX_IMAGES)?
     };
+    temp::reject_images(
+        database,
+        &ids,
+        "临时图片不能加入集合；关闭或切换图库时会自动清空",
+    )?;
     let label = if ids.is_empty() {
         format!("创建集合「{name}」")
     } else {
@@ -258,6 +266,11 @@ pub fn add_images_with_id(
 ) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
     let ids = validate_ids(image_ids, MAX_IMAGES)?;
+    temp::reject_images(
+        database,
+        &ids,
+        "临时图片不能加入集合；关闭或切换图库时会自动清空",
+    )?;
     let name = collection_name(database, collection_id)?;
     history::write_with_id(
         database,
@@ -458,9 +471,13 @@ pub fn combine(
             draft.affected(items.len() as u64);
             // imageCount 与 list() 保持同一口径：只统计未删除图片。
             let image_count: i64 = transaction.query_row(
-                "SELECT count(*) FROM collection_items
-                 JOIN images ON images.id = collection_items.image_id
-                 WHERE collection_items.collection_id = ?1 AND images.deleted_at IS NULL",
+                &format!(
+                    "SELECT count(*) FROM collection_items
+                     JOIN images ON images.id = collection_items.image_id
+                     WHERE collection_items.collection_id = ?1 AND images.deleted_at IS NULL
+                       AND {}",
+                    temp::EXCLUDE_SQL
+                ),
                 [collection_id],
                 |row| row.get(0),
             )?;
@@ -497,6 +514,12 @@ pub fn create_groups(
     if groups.is_empty() {
         return Err(AppError::message("没有可保存的分组"));
     }
+    let group_ids: Vec<i64> = groups.iter().flatten().copied().collect();
+    temp::reject_images(
+        database,
+        &group_ids,
+        "临时图片不能保存为集合；关闭或切换图库时会自动清空",
+    )?;
     history::write(
         database,
         NewOperation::new(

@@ -1,4 +1,4 @@
-export type LibraryView = "all" | "trash" | "collection";
+export type LibraryView = "all" | "trash" | "collection" | "temp";
 export type SortKey =
   | "importedAt"
   | "modifiedAt"

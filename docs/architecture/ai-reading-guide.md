@@ -4,7 +4,7 @@
 
 | 问题 | 起点文档 | 实现位置 |
 | --- | --- | --- |
-| 设置、图库创建/打开/关闭、schema | `docs/modules/library.md` | `src-tauri/src/app/`、`src-tauri/src/library/` |
+| 设置、图库创建/打开/关闭、schema、临时文件夹 | `docs/modules/library.md` | `src-tauri/src/app/`、`src-tauri/src/library/`（临时文件夹在 `library/temp.rs`） |
 | 导入、BLAKE3、pHash、主色、缩略图包 | `docs/modules/import.md` | `src-tauri/src/import/`、`src-tauri/src/imageops/` |
 | 网格/列表、分页、搜索、筛选、排序、集合、回收站、元数据编辑 | `docs/modules/browse-and-query.md` | `src/modules/library/`、`src-tauri/src/library/query.rs`、`metadata.rs`、`collections.rs` |
 | 操作记录、撤销、待释放文件 | `docs/modules/library.md`（操作记录与撤销） | `src-tauri/src/library/history.rs`、`src-tauri/src/app/state.rs`、`src/modules/library/OperationHistoryPanel.tsx` |

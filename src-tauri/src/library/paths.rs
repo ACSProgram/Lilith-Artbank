@@ -13,6 +13,9 @@ pub const TEMP_DIR: &str = "temp";
 pub const UNDO_DIR: &str = "undo";
 pub const RECYCLE_DIR: &str = "recycle";
 pub const OUTPUT_DIR: &str = "output";
+/// 临时文件夹的默认内部目录名。迁移遇到同名普通文件夹时会追加后缀，
+/// 因此读写都以 `folders.kind = 'temp'` 记录的路径为准，不要直接拼这个常量。
+pub const TEMP_FOLDER_DIR: &str = ".artbank-temp";
 pub const LIBRARY_FORMAT: &str = "lilith-artbank";
 pub const LIBRARY_FORMAT_VERSION: u32 = 1;
 
@@ -99,6 +102,17 @@ pub fn subtree_like_pattern(path: &str) -> String {
 
 /// 图库内文件夹使用 `/` 分隔的相对路径；根目录用空字符串表示。
 pub fn normalize_folder(value: &str) -> AppResult<String> {
+    normalize_folder_with(value, false)
+}
+
+/// 已存进数据库的文件夹路径（图片文件定位、撤销/重做）使用。
+///
+/// 只额外允许临时文件夹的内部路径；其它保留目录仍然拒绝。
+pub fn normalize_stored_folder(value: &str) -> AppResult<String> {
+    normalize_folder_with(value, true)
+}
+
+fn normalize_folder_with(value: &str, allow_temp: bool) -> AppResult<String> {
     let raw = value.trim().replace('\\', "/");
     if raw.starts_with('/') || raw.contains(':') {
         return Err(AppError::message("文件夹必须是图库内的相对路径"));
@@ -114,7 +128,7 @@ pub fn normalize_folder(value: &str) -> AppResult<String> {
         return Err(AppError::message("文件夹路径包含控制字符"));
     }
     for segment in trimmed.split('/') {
-        validate_folder_segment(segment)?;
+        validate_folder_segment(segment, allow_temp)?;
     }
     let path = Path::new(trimmed);
     if path.is_absolute()
@@ -136,11 +150,11 @@ pub fn normalize_folder_name(value: &str) -> AppResult<String> {
     if name.contains('/') || name.contains('\\') {
         return Err(AppError::message("文件夹名称不能包含路径分隔符"));
     }
-    validate_folder_segment(name)?;
+    validate_folder_segment(name, false)?;
     Ok(name.to_owned())
 }
 
-fn validate_folder_segment(segment: &str) -> AppResult<()> {
+fn validate_folder_segment(segment: &str, allow_temp: bool) -> AppResult<()> {
     if segment.is_empty() {
         return Err(AppError::message("文件夹路径包含空目录名"));
     }
@@ -163,7 +177,12 @@ fn validate_folder_segment(segment: &str) -> AppResult<()> {
         return Err(AppError::message("文件夹名称不能以空格或点结尾"));
     }
     let lower = segment.to_lowercase();
-    if RESERVED_DIRECTORY_NAMES.iter().any(|name| lower == *name) {
+    if allow_temp && lower.starts_with(TEMP_FOLDER_DIR) {
+        return Ok(());
+    }
+    if RESERVED_DIRECTORY_NAMES.iter().any(|name| lower == *name)
+        || lower.starts_with(TEMP_FOLDER_DIR)
+    {
         return Err(AppError::message(format!(
             "「{segment}」是图库保留目录名，不能用作文件夹"
         )));
@@ -237,6 +256,14 @@ mod tests {
         assert!(normalize_folder_name("速写").is_ok());
         assert!(normalize_folder_name("a/b").is_err());
         assert!(normalize_folder_name("NUL").is_err());
+
+        assert!(normalize_folder(".artbank-temp").is_err());
+        assert_eq!(
+            normalize_stored_folder(".artbank-temp").unwrap(),
+            ".artbank-temp"
+        );
+        assert!(normalize_stored_folder(".artbank").is_err());
+        assert!(normalize_stored_folder("recycle").is_err());
     }
 
     #[test]

@@ -2,7 +2,13 @@ import type { LibraryQuery } from "../modules/library/types";
 import type { BatchTaskContextInfo } from "./batchTaskContext";
 import type { ActionAvailability } from "./capability";
 
-export type ScopeChoice = "selected" | "folder" | "collection" | "view" | "library";
+export type ScopeChoice =
+  | "selected"
+  | "folder"
+  | "collection"
+  | "view"
+  | "temp"
+  | "library";
 
 /** 前端只传语义范围；id 集合由 Rust 侧解析。 */
 export type TaskScope =
@@ -10,6 +16,7 @@ export type TaskScope =
   | { type: "folder"; folderId: number; includeSubfolders: boolean }
   | { type: "collection"; collectionId: number }
   | { type: "view"; query: LibraryQuery }
+  | { type: "temp" }
   | { type: "library" };
 
 export const SCOPE_ORDER: ScopeChoice[] = [
@@ -17,6 +24,7 @@ export const SCOPE_ORDER: ScopeChoice[] = [
   "folder",
   "collection",
   "view",
+  "temp",
   "library",
 ];
 
@@ -49,6 +57,8 @@ export function buildScope(
         : null;
     case "view":
       return context.query ? { type: "view", query: context.query } : null;
+    case "temp":
+      return { type: "temp" };
     case "library":
       return { type: "library" };
   }
@@ -81,6 +91,8 @@ export function scopeName(
       return context?.collectionName || "当前集合";
     case "view":
       return "当前视图";
+    case "temp":
+      return "临时文件夹";
     case "library":
       return "整个图库";
   }
@@ -107,6 +119,8 @@ export function scopeCountLabel(
         : "";
     case "view":
       return context.viewTotal != null ? `${context.viewTotal.toLocaleString()} 张` : "";
+    case "temp":
+      return `${context.tempTotal.toLocaleString()} 张`;
     case "library":
       return `${context.libraryTotal.toLocaleString()} 张`;
   }
@@ -132,6 +146,10 @@ export function scopeAvailability(
       context?.query != null
         ? { enabled: true }
         : { enabled: false, reason: "当前视图不能作为范围" },
+    temp:
+      context && context.tempTotal > 0
+        ? { enabled: true }
+        : { enabled: false, reason: "临时文件夹没有图片" },
     library: { enabled: true },
   };
 }

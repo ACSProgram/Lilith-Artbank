@@ -113,6 +113,8 @@ export interface LibraryInfo {
   path: string;
   imageCount: number;
   trashCount: number;
+  /** 临时文件夹图片数；关闭/切换图库或退出时清空。 */
+  tempCount: number;
   schemaVersion: number;
   openedAt: number;
 }

@@ -41,6 +41,8 @@ interface InspectorPanelProps {
   version: number;
   folders: FolderInfo[];
   currentCollectionId: number | null;
+  /** 当前在临时视图：隐藏移动、集合与回收站操作。 */
+  inTemp: boolean;
   onClose: () => void;
   onChanged: () => void;
   onAddToCollection: () => void;
@@ -69,6 +71,7 @@ export function InspectorPanel({
   version,
   folders,
   currentCollectionId,
+  inTemp,
   onClose,
   onChanged,
   onAddToCollection,
@@ -114,6 +117,7 @@ export function InspectorPanel({
           version={version}
           folders={folders}
           currentCollectionId={currentCollectionId}
+          inTemp={inTemp}
           onChanged={onChanged}
           onAddToCollection={onAddToCollection}
           onRemoveFromCollection={() => onRemoveFromCollection([single])}
@@ -131,6 +135,7 @@ export function InspectorPanel({
           imageIds={selectedIds}
           folders={folders}
           currentCollectionId={currentCollectionId}
+          inTemp={inTemp}
           onChanged={onChanged}
           onAddToCollection={onAddToCollection}
           onRemoveFromCollection={() => onRemoveFromCollection(selectedIds)}
@@ -148,6 +153,7 @@ interface ImageInspectorProps {
   version: number;
   folders: FolderInfo[];
   currentCollectionId: number | null;
+  inTemp: boolean;
   onChanged: () => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
@@ -166,6 +172,7 @@ function ImageInspector({
   version,
   folders,
   currentCollectionId,
+  inTemp,
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
@@ -638,57 +645,59 @@ function ImageInspector({
         </div>
       </section>
 
-      <section className="inspector-section">
-        <div className="inspector-section-heading">
-          <h4>
-            <FolderInput size={12} /> 文件夹
-          </h4>
-          <span>{folderLabel(detail.folderPath)}</span>
-        </div>
-        <div className="inspector-inline-actions">
-          <input
-            className="input"
-            value={folderDraft}
-            list="inspector-folders"
-            placeholder="根目录或 人物/速写"
-            disabled={busy}
-            onChange={(event) => setFolderDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                moveFolder();
-              }
+      {!inTemp ? (
+        <section className="inspector-section">
+          <div className="inspector-section-heading">
+            <h4>
+              <FolderInput size={12} /> 文件夹
+            </h4>
+            <span>{folderLabel(detail.folderPath)}</span>
+          </div>
+          <div className="inspector-inline-actions">
+            <input
+              className="input"
+              value={folderDraft}
+              list="inspector-folders"
+              placeholder="根目录或 人物/速写"
+              disabled={busy}
+              onChange={(event) => setFolderDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  moveFolder();
+                }
+              }}
+            />
+            <Button size="sm" loading={busy} onClick={() => moveFolder()}>
+              移动
+            </Button>
+            <IconButton
+              label="从文件夹树选择"
+              disabled={busy}
+              onClick={() => setFolderPickerOpen(true)}
+            >
+              <FolderInput size={13} />
+            </IconButton>
+          </div>
+          <datalist id="inspector-folders">
+            {folders.map((folder) => (
+              <option key={folder.id} value={folder.path} />
+            ))}
+          </datalist>
+          <FolderPickerDialog
+            open={folderPickerOpen}
+            title="移动图片"
+            subtitle="选择目标文件夹；图片会移动到该文件夹下。"
+            folders={folders}
+            selectedPath={detail.folderPath}
+            onClose={() => setFolderPickerOpen(false)}
+            onSelect={(target) => {
+              setFolderPickerOpen(false);
+              moveFolder(target.path);
             }}
           />
-          <Button size="sm" loading={busy} onClick={() => moveFolder()}>
-            移动
-          </Button>
-          <IconButton
-            label="从文件夹树选择"
-            disabled={busy}
-            onClick={() => setFolderPickerOpen(true)}
-          >
-            <FolderInput size={13} />
-          </IconButton>
-        </div>
-        <datalist id="inspector-folders">
-          {folders.map((folder) => (
-            <option key={folder.id} value={folder.path} />
-          ))}
-        </datalist>
-        <FolderPickerDialog
-          open={folderPickerOpen}
-          title="移动图片"
-          subtitle="选择目标文件夹；图片会移动到该文件夹下。"
-          folders={folders}
-          selectedPath={detail.folderPath}
-          onClose={() => setFolderPickerOpen(false)}
-          onSelect={(target) => {
-            setFolderPickerOpen(false);
-            moveFolder(target.path);
-          }}
-        />
-      </section>
+        </section>
+      ) : null}
 
       <section className="inspector-section">
         <h4>
@@ -715,33 +724,41 @@ function ImageInspector({
           <IconButton label="复制文件路径" onClick={() => void copy(detail.filePath, "文件路径")}>
             <Copy size={13} />
           </IconButton>
-          <IconButton label="加入集合" onClick={onAddToCollection}>
-            <Layers size={13} />
-          </IconButton>
+          {!inTemp ? (
+            <IconButton label="加入集合" onClick={onAddToCollection}>
+              <Layers size={13} />
+            </IconButton>
+          ) : null}
         </div>
       </section>
 
-      <section className="inspector-section inspector-actions">
-        {detail.deletedAt == null ? (
-          <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
-            移入回收站
-          </Button>
-        ) : (
-          <>
-            <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
-              恢复
+      {inTemp ? (
+        <section className="inspector-section">
+          <span className="field-hint">临时图片关闭、切换图库或退出应用时会自动清空。</span>
+        </section>
+      ) : (
+        <section className="inspector-section inspector-actions">
+          {detail.deletedAt == null ? (
+            <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
+              移入回收站
             </Button>
-            <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
-              永久删除
+          ) : (
+            <>
+              <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
+                恢复
+              </Button>
+              <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
+                永久删除
+              </Button>
+            </>
+          )}
+          {inCollection ? (
+            <Button size="sm" variant="ghost" icon={<Layers size={13} />} onClick={onRemoveFromCollection}>
+              移出当前集合
             </Button>
-          </>
-        )}
-        {inCollection ? (
-          <Button size="sm" variant="ghost" icon={<Layers size={13} />} onClick={onRemoveFromCollection}>
-            移出当前集合
-          </Button>
-        ) : null}
-      </section>
+          ) : null}
+        </section>
+      )}
     </div>
   );
 }
@@ -770,6 +787,7 @@ interface BatchInspectorProps {
   imageIds: number[];
   folders: FolderInfo[];
   currentCollectionId: number | null;
+  inTemp: boolean;
   onChanged: () => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
@@ -782,6 +800,7 @@ function BatchInspector({
   imageIds,
   folders,
   currentCollectionId,
+  inTemp,
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
@@ -958,91 +977,99 @@ function BatchInspector({
         </div>
       </section>
 
-      <section className="inspector-section">
-        <h4>
-          <FolderInput size={12} /> 移动到文件夹
-        </h4>
-        <div className="inspector-inline-actions">
-          <input
-            className="input"
-            value={folderDraft}
-            list="inspector-folders-batch"
-            placeholder="目标文件夹路径"
-            disabled={busy}
-            onChange={(event) => setFolderDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                applyMove();
-              }
-            }}
-          />
-          <Button size="sm" loading={busy} disabled={!folderDraft.trim()} onClick={() => applyMove()}>
-            移动
-          </Button>
-          <IconButton
-            label="从文件夹树选择"
-            disabled={busy}
-            onClick={() => setFolderPickerOpen(true)}
-          >
-            <FolderInput size={13} />
-          </IconButton>
-        </div>
-        <datalist id="inspector-folders-batch">
-          {folders.map((folder) => (
-            <option key={folder.id} value={folder.path} />
-          ))}
-        </datalist>
-        <FolderPickerDialog
-          open={folderPickerOpen}
-          title="移动选中图片"
-          subtitle={`将 ${count.toLocaleString()} 张图片移动到…`}
-          folders={folders}
-          onClose={() => setFolderPickerOpen(false)}
-          onSelect={(target) => {
-            setFolderPickerOpen(false);
-            // 根目录的路径是空串，走专门的“移动到根目录”入口，避免被当成未填写。
-            if (target.id == null || target.path === "") moveToRoot();
-            else applyMove(target.path);
-          }}
-        />
-        <button
-          type="button"
-          className="text-button"
-          disabled={busy}
-          onClick={moveToRoot}
-        >
-          移动到根目录
-        </button>
-      </section>
+      {!inTemp ? (
+        <>
+          <section className="inspector-section">
+            <h4>
+              <FolderInput size={12} /> 移动到文件夹
+            </h4>
+            <div className="inspector-inline-actions">
+              <input
+                className="input"
+                value={folderDraft}
+                list="inspector-folders-batch"
+                placeholder="目标文件夹路径"
+                disabled={busy}
+                onChange={(event) => setFolderDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    applyMove();
+                  }
+                }}
+              />
+              <Button size="sm" loading={busy} disabled={!folderDraft.trim()} onClick={() => applyMove()}>
+                移动
+              </Button>
+              <IconButton
+                label="从文件夹树选择"
+                disabled={busy}
+                onClick={() => setFolderPickerOpen(true)}
+              >
+                <FolderInput size={13} />
+              </IconButton>
+            </div>
+            <datalist id="inspector-folders-batch">
+              {folders.map((folder) => (
+                <option key={folder.id} value={folder.path} />
+              ))}
+            </datalist>
+            <FolderPickerDialog
+              open={folderPickerOpen}
+              title="移动选中图片"
+              subtitle={`将 ${count.toLocaleString()} 张图片移动到…`}
+              folders={folders}
+              onClose={() => setFolderPickerOpen(false)}
+              onSelect={(target) => {
+                setFolderPickerOpen(false);
+                // 根目录的路径是空串，走专门的“移动到根目录”入口，避免被当成未填写。
+                if (target.id == null || target.path === "") moveToRoot();
+                else applyMove(target.path);
+              }}
+            />
+            <button
+              type="button"
+              className="text-button"
+              disabled={busy}
+              onClick={moveToRoot}
+            >
+              移动到根目录
+            </button>
+          </section>
 
-      <section className="inspector-section">
-        <h4>
-          <Layers size={12} /> 集合
-        </h4>
-        <div className="inspector-stack">
-          <Button size="sm" variant="secondary" icon={<Layers size={13} />} onClick={onAddToCollection}>
-            加入集合
-          </Button>
-          {currentCollectionId != null ? (
-            <Button size="sm" variant="ghost" onClick={onRemoveFromCollection}>
-              移出当前集合
+          <section className="inspector-section">
+            <h4>
+              <Layers size={12} /> 集合
+            </h4>
+            <div className="inspector-stack">
+              <Button size="sm" variant="secondary" icon={<Layers size={13} />} onClick={onAddToCollection}>
+                加入集合
+              </Button>
+              {currentCollectionId != null ? (
+                <Button size="sm" variant="ghost" onClick={onRemoveFromCollection}>
+                  移出当前集合
+                </Button>
+              ) : null}
+            </div>
+          </section>
+
+          <section className="inspector-section inspector-actions">
+            <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
+              移入回收站
             </Button>
-          ) : null}
-        </div>
-      </section>
-
-      <section className="inspector-section inspector-actions">
-        <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
-          移入回收站
-        </Button>
-        <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
-          恢复
-        </Button>
-        <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
-          永久删除
-        </Button>
-      </section>
+            <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
+              恢复
+            </Button>
+            <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
+              永久删除
+            </Button>
+          </section>
+        </>
+      ) : (
+        <section className="inspector-section">
+          <span className="field-hint">临时图片关闭、切换图库或退出应用时会自动清空。</span>
+        </section>
+      )}
     </div>
   );
 }

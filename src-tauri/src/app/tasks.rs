@@ -749,6 +749,7 @@ pub enum TaskScope {
     View {
         query: Box<LibraryQuery>,
     },
+    Temp,
     #[default]
     Library,
 }
@@ -770,6 +771,7 @@ impl TaskScope {
             }
             Self::Collection { .. } => "当前集合".to_owned(),
             Self::View { .. } => "当前视图".to_owned(),
+            Self::Temp => "临时文件夹".to_owned(),
             Self::Library => "整个图库".to_owned(),
         }
     }
@@ -837,6 +839,13 @@ impl TaskScope {
                 )
             }
             Self::View { query } => query::query_ids(database, query.as_ref().clone()),
+            Self::Temp => query::query_ids(
+                database,
+                LibraryQuery {
+                    view: LibraryView::Temp,
+                    ..Default::default()
+                },
+            ),
             Self::Library => query::query_ids(database, LibraryQuery::default()),
         }
     }
