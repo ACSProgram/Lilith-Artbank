@@ -14,6 +14,9 @@ use crate::{
 
 const MAX_FAILURES: usize = 200;
 const MAX_HINTS: usize = 100;
+/// 四组归因清单（精确重复、批内重复、合并目标、源文件映射）各自最多保留这么多条；
+/// 精确总数另计，不受截断影响。
+const MAX_PAIRS: usize = 200;
 /// 与拼图最大格数一致，导入完成后可以直接拼一张 5×5。
 const MAX_PREVIEWS: usize = 25;
 
@@ -51,6 +54,31 @@ pub struct ImportHint {
     pub distance: u32,
 }
 
+/// 精确重复：某个源文件撞上了库里已有的某张图。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDuplicatePair {
+    pub source_path: String,
+    pub image_id: i64,
+    pub trashed: bool,
+}
+
+/// 批内重复：同一次导入里内容相同的多份源文件只入库一份。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportBatchPair {
+    pub source_path: String,
+    pub kept_path: String,
+}
+
+/// 新增图片的源文件与图库 id 对应关系。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSourcePair {
+    pub source_path: String,
+    pub image_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
@@ -64,6 +92,8 @@ pub struct ImportProgress {
     pub duplicates: usize,
     pub merged: usize,
     pub failed: usize,
+    /// 图库导入时被丢弃的临时区同内容行（这些图改在图库里入库）。
+    pub temp_replaced: usize,
     pub similar: usize,
     /// 勾选「导入时压缩」后实际被替换为压缩版本的新增图片数。
     pub optimized: usize,
@@ -83,6 +113,48 @@ pub struct ImportSnapshot {
     pub failures: Vec<ImportFailure>,
     pub hints: Vec<ImportHint>,
     pub preview_ids: Vec<i64>,
+    pub duplicate_pairs: Vec<ImportDuplicatePair>,
+    pub duplicate_pair_count: usize,
+    pub duplicate_pairs_truncated: bool,
+    pub batch_duplicate_pairs: Vec<ImportBatchPair>,
+    pub batch_duplicate_pair_count: usize,
+    pub batch_duplicate_pairs_truncated: bool,
+    pub merged_image_ids: Vec<i64>,
+    pub merged_image_ids_truncated: bool,
+    pub imported_pairs: Vec<ImportSourcePair>,
+    pub imported_pairs_truncated: bool,
+}
+
+/// 有上限的归因清单：只保留前 `MAX_PAIRS` 条，总数单独精确计数。
+struct PairLog<T> {
+    items: Mutex<Vec<T>>,
+    count: AtomicUsize,
+}
+
+impl<T> PairLog<T> {
+    fn new() -> Self {
+        Self {
+            items: Mutex::new(Vec::new()),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, item: T) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut items = self.items.lock();
+        if items.len() < MAX_PAIRS {
+            items.push(item);
+        }
+    }
+
+    fn snapshot(&self) -> (Vec<T>, usize)
+    where
+        T: Clone,
+    {
+        let items = self.items.lock().clone();
+        let count = self.count.load(Ordering::Relaxed);
+        (items, count)
+    }
 }
 
 /// 可跨线程共享的导入任务状态。进度与取消由通用任务句柄统一承载，
@@ -97,6 +169,7 @@ pub struct ImportJob {
     duplicates: AtomicUsize,
     merged: AtomicUsize,
     failed: AtomicUsize,
+    temp_replaced: AtomicUsize,
     similar: AtomicUsize,
     optimized: AtomicUsize,
     optimized_bytes: AtomicU64,
@@ -104,6 +177,10 @@ pub struct ImportJob {
     failures: Mutex<Vec<ImportFailure>>,
     hints: Mutex<Vec<ImportHint>>,
     preview_ids: Mutex<Vec<i64>>,
+    duplicate_pairs: PairLog<ImportDuplicatePair>,
+    batch_duplicate_pairs: PairLog<ImportBatchPair>,
+    merged_image_ids: PairLog<i64>,
+    imported_pairs: PairLog<ImportSourcePair>,
     started_at: i64,
     finished_at: Mutex<Option<i64>>,
 }
@@ -133,6 +210,7 @@ impl ImportJob {
             duplicates: AtomicUsize::new(0),
             merged: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
+            temp_replaced: AtomicUsize::new(0),
             similar: AtomicUsize::new(0),
             optimized: AtomicUsize::new(0),
             optimized_bytes: AtomicU64::new(0),
@@ -140,6 +218,10 @@ impl ImportJob {
             failures: Mutex::new(Vec::new()),
             hints: Mutex::new(Vec::new()),
             preview_ids: Mutex::new(Vec::new()),
+            duplicate_pairs: PairLog::new(),
+            batch_duplicate_pairs: PairLog::new(),
+            merged_image_ids: PairLog::new(),
+            imported_pairs: PairLog::new(),
             started_at: now_ms(),
             finished_at: Mutex::new(None),
         }
@@ -201,6 +283,11 @@ impl ImportJob {
         self.merged.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// 图库导入把同内容的临时行丢弃后，这张图是正常入库的，不算重复。
+    pub fn inc_temp_replaced(&self, count: usize) {
+        self.temp_replaced.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn inc_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
         self.handle.inc_failed();
@@ -255,6 +342,32 @@ impl ImportJob {
         previews.push(image_id);
     }
 
+    pub fn add_duplicate_pair(&self, source_path: String, image_id: i64, trashed: bool) {
+        self.duplicate_pairs.push(ImportDuplicatePair {
+            source_path,
+            image_id,
+            trashed,
+        });
+    }
+
+    pub fn add_batch_duplicate_pair(&self, source_path: String, kept_path: String) {
+        self.batch_duplicate_pairs.push(ImportBatchPair {
+            source_path,
+            kept_path,
+        });
+    }
+
+    pub fn add_merged_image(&self, image_id: i64) {
+        self.merged_image_ids.push(image_id);
+    }
+
+    pub fn add_imported_pair(&self, source_path: String, image_id: i64) {
+        self.imported_pairs.push(ImportSourcePair {
+            source_path,
+            image_id,
+        });
+    }
+
     pub fn finish(&self, phase: ImportPhase) {
         *self.phase.lock() = phase;
         *self.finished_at.lock() = Some(now_ms());
@@ -275,6 +388,7 @@ impl ImportJob {
             duplicates: self.duplicates.load(Ordering::Relaxed),
             merged: self.merged.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            temp_replaced: self.temp_replaced.load(Ordering::Relaxed),
             similar: self.similar.load(Ordering::Relaxed),
             optimized: self.optimized.load(Ordering::Relaxed),
             optimized_bytes: self.optimized_bytes.load(Ordering::Relaxed),
@@ -284,6 +398,11 @@ impl ImportJob {
     }
 
     pub fn snapshot(&self) -> ImportSnapshot {
+        let (duplicate_pairs, duplicate_pair_count) = self.duplicate_pairs.snapshot();
+        let (batch_duplicate_pairs, batch_duplicate_pair_count) =
+            self.batch_duplicate_pairs.snapshot();
+        let (merged_image_ids, merged_count) = self.merged_image_ids.snapshot();
+        let (imported_pairs, imported_count) = self.imported_pairs.snapshot();
         ImportSnapshot {
             progress: self.progress(),
             started_at: self.started_at,
@@ -291,6 +410,17 @@ impl ImportJob {
             failures: self.failures.lock().clone(),
             hints: self.hints.lock().clone(),
             preview_ids: self.preview_ids.lock().clone(),
+            duplicate_pairs_truncated: duplicate_pair_count > duplicate_pairs.len(),
+            duplicate_pairs,
+            duplicate_pair_count,
+            batch_duplicate_pairs_truncated: batch_duplicate_pair_count
+                > batch_duplicate_pairs.len(),
+            batch_duplicate_pairs,
+            batch_duplicate_pair_count,
+            merged_image_ids_truncated: merged_count > merged_image_ids.len(),
+            merged_image_ids,
+            imported_pairs_truncated: imported_count > imported_pairs.len(),
+            imported_pairs,
         }
     }
 }

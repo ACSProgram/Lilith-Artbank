@@ -570,6 +570,55 @@ impl AiRuntime {
             ..request
         }
         .normalized()?;
+        self.launch_ai_job(app, bus, settings, request, scope.label(), None, policy)
+    }
+
+    /// 临时区特征生成：只写入 feature_blobs，不产生操作记录；
+    /// 任务占用 write lane，跑完让语义结果与均值失效。
+    pub fn start_temp_features(
+        &self,
+        app: AppHandle,
+        bus: &TaskBus,
+        settings: &AiSettings,
+        kind: AiJobKind,
+        image_ids: Vec<i64>,
+        policy: ConflictPolicy,
+    ) -> AppResult<TaskStartResult> {
+        if !matches!(kind, AiJobKind::Embedding | AiJobKind::Pose) {
+            return Err(AppError::message("临时区只支持生成 embedding 或姿势特征"));
+        }
+        let label = format!("临时区 {} 张 · {}", image_ids.len(), kind.label());
+        let request = AiJobRequest {
+            kind,
+            image_ids,
+            overwrite: false,
+            prompt: None,
+            max_tokens: None,
+        }
+        .normalized()?;
+        self.launch_ai_job(
+            app,
+            bus,
+            settings,
+            request,
+            label,
+            Some(TaskKind::TempFeatures),
+            policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_ai_job(
+        &self,
+        app: AppHandle,
+        bus: &TaskBus,
+        settings: &AiSettings,
+        request: AiJobRequest,
+        scope_label: String,
+        task_kind: Option<TaskKind>,
+        policy: ConflictPolicy,
+    ) -> AppResult<TaskStartResult> {
+        let handles = self.handles()?;
         let context = JobContext {
             database: handles.database.clone(),
             thumbs: handles.thumbs.clone(),
@@ -578,10 +627,11 @@ impl AiRuntime {
             settings: settings.clone(),
         };
         let writes_history = request.kind == AiJobKind::Description;
+        let temp_features = task_kind == Some(TaskKind::TempFeatures);
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
-            request.kind.task_kind(),
-            scope.label(),
+            task_kind.unwrap_or_else(|| request.kind.task_kind()),
+            scope_label,
         );
         let worker_handle = handle.clone();
         let runtime = self.clone();
@@ -601,11 +651,18 @@ impl AiRuntime {
                     Err(_) => Err(AppError::message("AI 任务异常终止")),
                 };
                 task.finish_from(&result);
+                if temp_features {
+                    // 特征集合变了：旧的语义结果与均值都不能再用。
+                    runtime.invalidate_similarity();
+                    *runtime.inner.mean.write() =
+                        MeanSlot::missing("临时区特征已更新，下次搜索会重新计算均值");
+                } else {
+                    *runtime.inner.results.lock() = None;
+                }
                 // 只有描述任务会产生操作记录：收尾后按最大步数裁剪并安排释放。
                 if writes_history && let Some(state) = state_app.try_state::<AppState>() {
                     state.after_history_write();
                 }
-                *runtime.inner.results.lock() = None;
             });
         })
     }

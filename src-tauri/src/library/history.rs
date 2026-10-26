@@ -3256,14 +3256,15 @@ fn undo_edit(
     }
 
     // 行已改回旧哈希；当前内容里的新原图若还在（暂存已有副本），直接删掉。
-    if new_content.exists() && new_staged.is_file() {
-        if let Err(error) = metadata::remove_content_file(root, &new_content) {
-            log::warn!(
-                "撤销编辑后清理新原图失败 image={} path={}: {error}",
-                snapshot.image_id,
-                new_content.display()
-            );
-        }
+    if new_content.exists()
+        && new_staged.is_file()
+        && let Err(error) = metadata::remove_content_file(root, &new_content)
+    {
+        log::warn!(
+            "撤销编辑后清理新原图失败 image={} path={}: {error}",
+            snapshot.image_id,
+            new_content.display()
+        );
     }
     let _ = fs::remove_file(viewer::preview_path(
         &paths,
@@ -3425,14 +3426,15 @@ fn redo_edit(
     if new_staged.is_file() {
         let _ = fs::remove_file(&new_staged);
     }
-    if old_content != new_content && old_content.exists() {
-        if let Err(error) = metadata::remove_content_file(root, &old_content) {
-            log::warn!(
-                "重做编辑后清理旧原图失败 image={} path={}: {error}",
-                state.image_id,
-                old_content.display()
-            );
-        }
+    if old_content != new_content
+        && old_content.exists()
+        && let Err(error) = metadata::remove_content_file(root, &old_content)
+    {
+        log::warn!(
+            "重做编辑后清理旧原图失败 image={} path={}: {error}",
+            state.image_id,
+            old_content.display()
+        );
     }
     let _ = fs::remove_file(viewer::preview_path(
         &paths,
@@ -3809,12 +3811,16 @@ fn import_collection_relations(
     Ok(relations)
 }
 
+/// 导入原图暂存结果：撤销目录里的文件名，以及本次真的搬动过的 `(原路径, 暂存路径)`；
+/// 写事务失败时按后者把文件放回原处。
+type StagedImportFile = (Option<String>, Option<(PathBuf, PathBuf)>);
+
 fn stage_import_file(
     root: &Path,
     operation_id: i64,
     row: &ImportedRow,
     folder_path: &str,
-) -> AppResult<(Option<String>, Option<(PathBuf, PathBuf)>)> {
+) -> AppResult<StagedImportFile> {
     let name = format!("import-{}.{}", row.id, row.file_ext);
     let staged = undo_dir(root, operation_id).join(&name);
     if staged.is_file() {
@@ -4086,7 +4092,7 @@ fn load_chunks(connection: &Connection, operation_id: i64) -> AppResult<Vec<Chun
 }
 
 fn decode_triples(bytes: &[u8]) -> AppResult<Vec<(i64, i64, i64)>> {
-    if bytes.len() % 24 != 0 {
+    if !bytes.len().is_multiple_of(24) {
         return Err(AppError::message("记录数据长度无效"));
     }
     Ok(bytes
@@ -4102,7 +4108,7 @@ fn decode_triples(bytes: &[u8]) -> AppResult<Vec<(i64, i64, i64)>> {
 }
 
 fn decode_moves(bytes: &[u8]) -> AppResult<Vec<(i64, i64, i64, i64)>> {
-    if bytes.len() % 32 != 0 {
+    if !bytes.len().is_multiple_of(32) {
         return Err(AppError::message("记录数据长度无效"));
     }
     Ok(bytes

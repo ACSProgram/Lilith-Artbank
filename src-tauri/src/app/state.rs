@@ -523,6 +523,12 @@ impl AppState {
                                 let _ = history::prefix_label(&database, *operation_id, "AI · ");
                             }
                             task.set_operation_id(*operation_id);
+                            // 计数字段与 message 用同一份报告，别出现「跳过 1 张」但 skipped=0。
+                            task.set_skipped(report.skipped as usize);
+                            task.set_failed(report.failures.len());
+                            for failure in &report.failures {
+                                task.add_failure(failure.image_id, &failure.path, &failure.reason);
+                            }
                             let mut summary =
                                 format!("移动 {} 张，跳过 {} 张", report.moved, report.skipped);
                             if !report.failures.is_empty() {
@@ -1360,6 +1366,23 @@ impl AppState {
     pub fn feature_summary(&self) -> AppResult<FeatureSummary> {
         let (database, _) = self.query_source()?;
         capability::feature_summary(&database)
+    }
+
+    /// 临时区特征生成：只接受已校验的临时图片 id，占用 write lane，不写操作记录。
+    pub fn start_temp_features(
+        &self,
+        kind: crate::ai::job::AiJobKind,
+        image_ids: Vec<i64>,
+    ) -> AppResult<TaskStartResult> {
+        let settings = self.settings.snapshot().ai;
+        self.ai.start_temp_features(
+            self.app.clone(),
+            &self.tasks,
+            &settings,
+            kind,
+            image_ids,
+            ConflictPolicy::Fail,
+        )
     }
 
     /// 统一批量任务入口：缩略图重建、三种 AI 任务、全库相似分组。

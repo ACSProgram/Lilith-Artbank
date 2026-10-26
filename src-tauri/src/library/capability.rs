@@ -86,34 +86,65 @@ pub fn image_capabilities(
 }
 
 pub fn feature_summary(database: &LibraryDb) -> AppResult<FeatureSummary> {
+    // 临时文件夹是会话级暂存区，不计入图库的特征覆盖度。
+    let exclude = crate::library::temp::EXCLUDE_SQL;
+    let sql = format!(
+        "SELECT
+            (SELECT count(*) FROM images
+             WHERE deleted_at IS NULL AND description <> '' AND {exclude}),
+            (SELECT count(DISTINCT feature_blobs.image_id)
+             FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
+             WHERE feature_blobs.kind = 'embedding' AND images.deleted_at IS NULL
+               AND {exclude}),
+            (SELECT count(DISTINCT feature_blobs.image_id)
+             FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
+             WHERE feature_blobs.kind = 'pose' AND images.deleted_at IS NULL
+               AND {exclude}),
+            (SELECT count(*) FROM images
+             WHERE deleted_at IS NULL AND length(phash) = 32 AND {exclude}),
+            (SELECT count(*) FROM images
+             WHERE deleted_at IS NULL
+               AND length(colors4) = 16 AND length(colors8) = 32 AND {exclude})"
+    );
     database.with_reader(|connection| {
-        let summary = connection.query_row(
-            "SELECT
-                (SELECT count(*) FROM images
-                 WHERE deleted_at IS NULL AND description <> ''),
-                (SELECT count(DISTINCT feature_blobs.image_id)
-                 FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
-                 WHERE feature_blobs.kind = 'embedding' AND images.deleted_at IS NULL),
-                (SELECT count(DISTINCT feature_blobs.image_id)
-                 FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
-                 WHERE feature_blobs.kind = 'pose' AND images.deleted_at IS NULL),
-                (SELECT count(*) FROM images
-                 WHERE deleted_at IS NULL AND length(phash) = 32),
-                (SELECT count(*) FROM images
-                 WHERE deleted_at IS NULL
-                   AND length(colors4) = 16 AND length(colors8) = 32)",
+        let summary = connection.query_row(&sql, [], |row| {
+            Ok(FeatureSummary {
+                description: row.get::<_, i64>(0)?.max(0) as u64,
+                embedding: row.get::<_, i64>(1)?.max(0) as u64,
+                pose: row.get::<_, i64>(2)?.max(0) as u64,
+                phash: row.get::<_, i64>(3)?.max(0) as u64,
+                colors: row.get::<_, i64>(4)?.max(0) as u64,
+            })
+        })?;
+        Ok(summary)
+    })
+}
+
+/// 临时区自己的 embedding 与姿势数量；与 [`FeatureSummary`] 分开，
+/// 避免 AI 把临时特征误当成整库覆盖度。
+pub fn temp_feature_summary(database: &LibraryDb) -> AppResult<(u64, u64)> {
+    let only = crate::library::temp::ONLY_SQL;
+    database.with_reader(|connection| {
+        Ok(connection.query_row(
+            &format!(
+                "SELECT
+                    (SELECT count(DISTINCT feature_blobs.image_id)
+                     FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
+                     WHERE feature_blobs.kind = 'embedding' AND images.deleted_at IS NULL
+                       AND {only}),
+                    (SELECT count(DISTINCT feature_blobs.image_id)
+                     FROM feature_blobs JOIN images ON images.id = feature_blobs.image_id
+                     WHERE feature_blobs.kind = 'pose' AND images.deleted_at IS NULL
+                       AND {only})"
+            ),
             [],
             |row| {
-                Ok(FeatureSummary {
-                    description: row.get::<_, i64>(0)?.max(0) as u64,
-                    embedding: row.get::<_, i64>(1)?.max(0) as u64,
-                    pose: row.get::<_, i64>(2)?.max(0) as u64,
-                    phash: row.get::<_, i64>(3)?.max(0) as u64,
-                    colors: row.get::<_, i64>(4)?.max(0) as u64,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
             },
-        )?;
-        Ok(summary)
+        )?)
     })
 }
 

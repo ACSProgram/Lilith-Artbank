@@ -19,8 +19,8 @@ interface ApprovalPreview {
   operation?: string;
   target?: string | null;
   count?: number;
-  /** 导入按输入路径计数，其余写入按图片计数。 */
-  unit?: "path" | "image";
+  /** 导入按输入路径计数，文件夹按个，其余写入按图片计数。 */
+  unit?: "path" | "image" | "folder";
   pathTotal?: number;
   paths?: string[];
   tags?: string[];
@@ -58,12 +58,23 @@ function formatTime(value: number): string {
   });
 }
 
+const UNIT_LABELS: Record<string, string> = {
+  path: "个路径",
+  folder: "个文件夹",
+  image: "张",
+};
+
+/** 数量与目标单独一行，别和操作说明挤在一起。 */
 function amountLine(preview: ApprovalPreview): string {
   const count = preview.count ?? preview.selected;
   if (typeof count === "number") {
-    const target = preview.target ? ` · ${preview.target}` : "";
-    const unit = preview.unit === "path" ? "个路径" : "张";
-    return `${count.toLocaleString()} ${unit}${target}`;
+    const unit = UNIT_LABELS[preview.unit ?? "image"] ?? "张";
+    // 有一部分图片已经是目标状态时，把真正会变的张数一并说清，别让用户以为全都要动。
+    const changed =
+      typeof preview.willChange === "number" && preview.willChange < count
+        ? ` · 其中 ${preview.willChange.toLocaleString()} 张会变`
+        : "";
+    return `${count.toLocaleString()} ${unit}${changed}`;
   }
   if (typeof preview.steps === "number") {
     return `${preview.steps.toLocaleString()} 条记录 · 影响 ${(preview.affected ?? 0).toLocaleString()} 张`;
@@ -127,10 +138,14 @@ export function ApprovalCard({
           {STATUS_LABELS[approval.status]}
         </span>
       </header>
-      <div className="mcp-approval-meta">
-        <span>{preview.operation ?? approval.tool}</span>
-        <span>{amountLine(preview)}</span>
-        <span>{formatTime(approval.createdAt)}</span>
+      <div className="mcp-approval-line">
+        <span className="mcp-approval-operation">{preview.operation ?? approval.tool}</span>
+        <span className="mcp-approval-time">{formatTime(approval.createdAt)}</span>
+      </div>
+
+      <div className="mcp-approval-scope">
+        <span className="mcp-approval-pill">{amountLine(preview)}</span>
+        {preview.target ? <span className="mcp-approval-pill is-target">{preview.target}</span> : null}
       </div>
 
       {paths.length > 0 ? (
@@ -149,9 +164,12 @@ export function ApprovalCard({
       ) : null}
 
       {meta.length > 0 ? (
-        <div className="mcp-approval-meta">
+        <div className="mcp-approval-facts">
+          <span className="mcp-approval-facts-label">导入设置</span>
           {meta.map((item) => (
-            <span key={item}>{item}</span>
+            <span key={item} className="mcp-approval-pill">
+              {item}
+            </span>
           ))}
         </div>
       ) : null}

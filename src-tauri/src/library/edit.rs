@@ -262,10 +262,10 @@ pub fn save(
             }
             // 内容已变，旧的 embedding/pose 不再有效。
             transaction.execute("DELETE FROM feature_blobs WHERE image_id = ?1", [row.id])?;
-            crate::library::import::ensure_thumb_segment(&transaction, location.segment, now)?;
+            crate::library::import::ensure_thumb_segment(transaction, location.segment, now)?;
             if let Ok(size) = thumbs.segment_size_bytes(location.segment) {
                 crate::library::import::update_thumb_segment_size(
-                    &transaction,
+                    transaction,
                     location.segment,
                     size,
                 )?;

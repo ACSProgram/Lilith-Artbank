@@ -85,18 +85,33 @@ pub fn store(
 }
 
 /// 取出参与检索的行指针：同 model/dim、未删除；按包名与偏移排序，便于顺序读。
-pub fn rows(database: &LibraryDb, model: &str, dim: u32) -> AppResult<Vec<EmbeddingRow>> {
+///
+/// `include_temp` 为 false 时跳过临时文件夹里的图片；全库搜索用 false，
+/// 显式范围（包括临时区）用 true，再由调用方的 id 集合收窄。
+pub fn rows(
+    database: &LibraryDb,
+    model: &str,
+    dim: u32,
+    include_temp: bool,
+) -> AppResult<Vec<EmbeddingRow>> {
+    let temp_filter = if include_temp {
+        "1"
+    } else {
+        crate::library::temp::EXCLUDE_SQL
+    };
+    let sql = format!(
+        "SELECT feature_blobs.image_id, feature_blobs.pack_name, feature_blobs.pack_offset
+         FROM feature_blobs
+         JOIN images ON images.id = feature_blobs.image_id
+         WHERE feature_blobs.kind = 'embedding'
+           AND feature_blobs.model = ?1
+           AND feature_blobs.dim = ?2
+           AND images.deleted_at IS NULL
+           AND {temp_filter}
+         ORDER BY feature_blobs.pack_name, feature_blobs.pack_offset"
+    );
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT feature_blobs.image_id, feature_blobs.pack_name, feature_blobs.pack_offset
-             FROM feature_blobs
-             JOIN images ON images.id = feature_blobs.image_id
-             WHERE feature_blobs.kind = 'embedding'
-               AND feature_blobs.model = ?1
-               AND feature_blobs.dim = ?2
-               AND images.deleted_at IS NULL
-             ORDER BY feature_blobs.pack_name, feature_blobs.pack_offset",
-        )?;
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement
             .query_map(params![model, dim], |row| {
                 Ok(EmbeddingRow {
@@ -515,8 +530,13 @@ pub fn mean(
     model: &str,
     dim: u32,
 ) -> AppResult<MeanEmbedding> {
-    let rows = rows(database, model, dim)?;
-    if rows.is_empty() {
+    // 均值用于全库中心化：默认排除临时区。若库里只有临时特征，
+    // 退回到包含临时区，否则临时区自己的相似搜索也会因为“没有均值”而失败。
+    let mut pointers = rows(database, model, dim, false)?;
+    if pointers.is_empty() {
+        pointers = rows(database, model, dim, true)?;
+    }
+    if pointers.is_empty() {
         return Ok(MeanEmbedding {
             vector: vec![0.0; dim as usize],
             count: 0,
@@ -526,7 +546,7 @@ pub fn mean(
     let mut sum = vec![0.0_f32; dim_usize];
     let mut buffer = vec![0.0_f32; dim_usize];
     let mut count = 0_u64;
-    for (pack_name, pack_rows) in group_by_pack(rows) {
+    for (pack_name, pack_rows) in group_by_pack(pointers) {
         let map = store.mmap(&pack_name)?;
         for row in pack_rows {
             let Some(bytes) = record_slice(&map, row.offset, dim_usize * 2) else {
@@ -600,7 +620,8 @@ pub fn search_with_total(
     limit: usize,
     filter: SearchFilter,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
-    let rows = rows(database, model, dim)?;
+    // 全库（allowed 为空）排除临时图片；显式范围由 allowed 收窄，临时区也能参与。
+    let rows = rows(database, model, dim, filter.allowed.is_some())?;
     search_rows_with_total(store, rows, dim, query, mean, limit, filter)
 }
 
@@ -940,7 +961,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(rows(&session.db, "model", 4).unwrap().is_empty());
+        assert!(rows(&session.db, "model", 4, false).unwrap().is_empty());
     }
 
     #[test]

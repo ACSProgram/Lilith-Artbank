@@ -120,7 +120,18 @@ pub struct SheetCellOutput {
     pub score: Option<i64>,
     pub tags: Vec<String>,
     pub folder_path: Option<String>,
+    /// image=画出了图片；missing=有图但缩略图/原图读不出来；empty=这一格没有图。
+    pub status: CellStatus,
+    /// 只表示“有图但没画出来”，空格子不算。
     pub thumb_missing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CellStatus {
+    Image,
+    Missing,
+    Empty,
 }
 
 pub struct BuiltSheet {
@@ -171,6 +182,7 @@ pub fn build(
     }
 
     let labels: Vec<String> = slots.iter().map(|slot| slot.label.clone()).collect();
+    let temp_path = context.database.with_reader(crate::library::temp::path)?;
     let mut pointers = Vec::with_capacity(expected);
     let mut cells = Vec::with_capacity(expected);
     for slot in &slots {
@@ -185,6 +197,7 @@ pub fn build(
                 score: None,
                 tags: Vec::new(),
                 folder_path: None,
+                status: CellStatus::Empty,
                 thumb_missing: false,
             });
             continue;
@@ -202,7 +215,11 @@ pub fn build(
             height: Some(row.height),
             score: Some(row.score),
             tags: row.tags.clone(),
-            folder_path: Some(row.folder_path.clone()),
+            folder_path: Some(super::tools::read::display_folder(
+                &row.folder_path,
+                temp_path.as_deref() == Some(row.folder_path.as_str()),
+            )),
+            status: CellStatus::Image,
             thumb_missing: false,
         });
     }
@@ -218,9 +235,16 @@ pub fn build(
         drawn[index] = decoded.is_some();
         decoded
     })?;
-    // 缩略图/原图缺失、缺行或解码失败都算这一格没画出图片。
+    // 有图但没画出来（缩略图缺失或解码失败）才算 missing；本来没图的格子保持 empty。
     for (cell, drawn) in cells.iter_mut().zip(drawn) {
-        cell.thumb_missing = !drawn;
+        cell.thumb_missing = cell.image_id.is_some() && !drawn;
+        cell.status = if cell.image_id.is_none() {
+            CellStatus::Empty
+        } else if drawn {
+            CellStatus::Image
+        } else {
+            CellStatus::Missing
+        };
     }
     let cached: Vec<SheetCell> = slots
         .iter()

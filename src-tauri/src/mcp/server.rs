@@ -19,6 +19,8 @@ use super::{
     context::ReadContext,
     tools::{
         self, ToolOutcome,
+        feature::{self as feature_tool, TempFeaturesInput},
+        folder::{self as folder_tool, FoldersModifyInput},
         history::{HistoryListInput, HistoryRunInput},
         import::{self as import_tool, ImportStartInput},
         read::{
@@ -34,7 +36,7 @@ use super::{
 };
 
 /// 已注册的工具数，由 `library_info` 报给客户端；测试保证它与路由一致。
-const TOOL_COUNT: usize = 21;
+const TOOL_COUNT: usize = 23;
 
 /// 工具适配器只负责取当前 AppState、调用领域函数并把结果编码成 MCP 内容。
 #[derive(Clone)]
@@ -153,7 +155,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "列文件夹及其直接/子树图片数。parentPath 省略时列根目录；给相对路径时列它的直接子文件夹。"
+        description = "列文件夹及其直接/子树图片数。parentPath 省略时列根目录；给相对路径时列它的直接子文件夹。新建、重命名、移动、删除文件夹用 folders_modify。"
     )]
     async fn folders_list(
         &self,
@@ -165,6 +167,19 @@ impl McpServer {
             })
             .await?;
         Ok(tool_value(result))
+    }
+
+    #[tool(
+        description = "管理文件夹：action=create 用 path 新建（缺失的上级一起建）；action=rename 用 folderId+name 改名；action=move 用 folderId 加 parentPath 或 parentId 换上级；action=delete 只删空文件夹（无子文件夹、无图片、目录为空）。临时文件夹不能改名、移动或删除。先 dryRun 看 willChange 与后果；询问档下 rename/create 直接执行，move/delete 需要用户确认。全部写操作记录，可以撤销。"
+    )]
+    async fn folders_modify(
+        &self,
+        Parameters(input): Parameters<FoldersModifyInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_state("folders_modify", move |state| {
+            folder_tool::folders_modify(state, &input)
+        })
+        .await
     }
 
     #[tool(
@@ -193,7 +208,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "结构化搜索图片，返回总数、紧凑行与下一页游标；pageSize 范围 1-50，超出直接报错。search 会匹配描述与标签名，view=library 时包含回收站，view=temp 只看临时文件夹。includeFacets 会额外计算分面计数，较慢，按需开启。"
+        description = "结构化搜索图片，返回总数、紧凑行与下一页游标；pageSize 范围 1-50，超出直接报错。view 只有 all/trash/collection/temp；要跨回收站搜索请用 searchScope=library。search 匹配描述、标签名与文件夹名。includeFacets 会额外计算分面计数，较慢，按需开启。"
     )]
     async fn search_images(
         &self,
@@ -208,7 +223,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 用语义搜索。scope 可选 library/folder/collection/selection/view/temp，默认 Entire library。threshold：pHash 是 0-256 距离上限，其它指标是 -1 到 1 的分数下限。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
+        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 是语义搜索，请用英文短语描述画面（例如 a woman in a red cloak, side view）：中文也能用，但命中质量明显下降。scope 可选 library/folder/collection/selection/view/temp，默认 Entire library。threshold 一律是上限：pHash 是 0-256 的距离上限，color4/color8 是 0-1 的距离上限，embedding/pose 是 -1 到 1 的相似度下限（距离越小越像、相似度越大越像，所以 embedding/pose 传 1 会什么都命中，color 传 0 会什么都筛掉）。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
     )]
     async fn find_similar(
         &self,
@@ -222,7 +237,9 @@ impl McpServer {
         Ok(tool_value(result))
     }
 
-    #[tool(description = "按 id 批量取详情、标签、描述与能力标记；一次最多 50 张。")]
+    #[tool(
+        description = "按 id 批量取详情、标签、描述与能力标记；一次最多 50 张。tags 是 [{id,name}]（搜索结果行里的 tags 只是名称数组）。临时区图片的 folderPath 显示为「临时」，并带 temporary=true。"
+    )]
     async fn images_get(
         &self,
         Parameters(input): Parameters<ImagesGetInput>,
@@ -236,7 +253,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "把 selector 的前 N 张图拼成 1-5 格拼图，返回图片、A1… 格子映射、sheetId 与下一页。格子标签始终按新拼图布局编号；以拼图格子为来源时用 sourceLabel 记录来源。thumb 读缩略图；detail 直接解码原图且最多 3×3。"
+        description = "把 selector 的前 N 张图拼成 1-5 格拼图，返回图片、A1… 格子映射、sheetId 与下一页。格子标签始终按新拼图布局编号；以拼图格子为来源时用 sourceLabel 记录来源。cells[].status 区分 image（有图）、missing（有图但读不出缩略图/原图）、empty（这一格没有图）；被 excludeCells 排除的格子在 excludedCells 里。thumb 读缩略图；detail 直接解码原图且最多 3×3。"
     )]
     async fn image_sheet(
         &self,
@@ -277,7 +294,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "把 selector 解析的图片移动到目标文件夹（后台任务）。返回 taskId，完成后任务快照带 operationId。正式写入需 confirmedCount；询问档超过 100 张需确认。"
+        description = "把 selector 解析的图片移动到目标文件夹（后台任务）；目标文件夹不存在时会自动建出整条路径。选了临时区图片会直接拒绝。返回 taskId，完成后任务快照带 operationId。正式写入需 confirmedCount；询问档超过 100 张需确认。已经在该文件夹的图片算跳过：任务快照里 completed 是已处理张数（含跳过），skipped 是其中没有移动的张数。"
     )]
     async fn images_move(
         &self,
@@ -290,7 +307,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "把 selector 解析的图片移入回收站；不会删除原图。正式写入需 confirmedCount；询问档不论张数都要用户确认。"
+        description = "把 selector 解析的图片移入回收站；不会删除原图。临时区图片不能移入回收站，选了会直接拒绝。正式写入需 confirmedCount；询问档不论张数都要用户确认。"
     )]
     async fn images_trash(
         &self,
@@ -355,7 +372,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "列操作记录，包含状态、影响数、从这条开始撤销/重做会动几条、是否可执行与阻塞原因；kind 可过滤。"
+        description = "列操作记录，包含状态、影响数、从这条开始撤销/重做会动几条、是否可执行与阻塞原因；kind 可过滤。顶层 canRun 表示返回的条目里是否真有可执行的那一条，单条能不能执行看条目的 canUndo/canRedo。下一次写入会删除所有灰色（可重做）记录，撤销后看到记录消失是这个原因。"
     )]
     async fn history_list(
         &self,
@@ -368,7 +385,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "撤销到指定记录：撤销该记录及之后所有 applied 记录。先 dryRun 看 steps/affected，正式执行必须带一致的 confirmedSteps 与 confirmedAffected；询问档总需确认；撤销链含压缩记录会被明确拒绝，不能绕过。"
+        description = "撤销到指定记录：撤销该记录及之后所有 applied 记录。先 dryRun 看 steps/affected，正式执行必须带一致的 confirmedSteps 与 confirmedAffected；询问档总需确认；撤销链含压缩记录会被明确拒绝，不能绕过。撤销后会产生灰色可重做记录，但下一次写入会清空它们。"
     )]
     async fn history_undo(
         &self,
@@ -381,7 +398,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "重做当前状态到指定记录之间的连续 undone 记录。先 dryRun 看 steps/affected，正式执行必须带一致的 confirmedSteps 与 confirmedAffected；询问档总需确认。新写入会清空可重做分支。"
+        description = "重做当前状态到指定记录之间的连续 undone 记录。先 dryRun 看 steps/affected，正式执行必须带一致的 confirmedSteps 与 confirmedAffected；询问档总需确认。灰色（可重做）记录会被下一次写入删除；撤销后再写入，这些记录就不再存在，history_redo 会报「操作记录不存在」。"
     )]
     async fn history_redo(
         &self,
@@ -394,7 +411,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执与 target。"
+        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执与 target；includePairs=true 才会返回重复对、批内重复、合并目标与源文件映射数组，默认只给精确计数。三个「重复」口径不同：duplicates 是按重复策略被跳过的源文件数，duplicatePairCount 是命中的库内重复对（merge 策略下 duplicates 为 0 但重复对仍计数），merged 是被合并进已有图片的源文件数；tempReplaced 是图库导入时丢弃掉的临时区同内容行数。completed 在导入任务里是已处理文件数，在移动任务里是已处理张数，移动的 skipped 是其中没有移动的张数。通过 MCP 导入的图片没有 embedding 与描述，语义搜索找不到它们，需要用户在界面上跑批量 AI 任务。"
     )]
     async fn tasks_get(
         &self,
@@ -418,7 +435,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "从本机绝对路径导入图片或目录，固定不压缩，也不接受 workerThreads。target=library 导入图库并可用 history_undo 撤销；target=temp 导入临时文件夹，平铺、只跳过重复、不写操作记录，关闭/切换图库或退出应用时清空。返回 taskId；tasks_get 完成后附带导入回执与 previewIds。询问档对图库导入每次都要用户确认，导入临时文件夹不需要确认；只读档拒绝。"
+        description = "从本机绝对路径导入图片或目录，固定不压缩，也不接受 workerThreads。路径不存在会在入队前直接拒绝。target=library 导入图库并可用 history_undo 撤销；同内容的临时区图片会从临时区消失、改为入库。target=temp 导入临时文件夹，平铺、只跳过重复、不写操作记录，关闭/切换图库或退出应用时清空。返回 taskId；tasks_get 完成后附带导入回执与 previewIds。重复策略在导入前整批选定，导入前无法预知哪些源文件会撞库；完成后用 tasks_get(includePairs=true) 查看源路径与对应图片。通过 MCP 导入的图片没有 embedding 与描述，语义搜索找不到它们，需要用户在界面上手动跑批量 AI 任务。询问档对图库导入每次都要用户确认，导入临时文件夹不需要确认；只读档拒绝。"
     )]
     async fn import_start(
         &self,
@@ -426,6 +443,19 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.with_state("import_start", move |state| {
             import_tool::import_start(state, &input)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "为临时文件夹中的图片生成 embedding 或姿势特征（kind=embedding|pose），单次最多 100 张。只接受临时图片 id；混入不存在、已删除或普通图库图片时整批拒绝。不生成描述、不写操作记录、不需要 confirmedCount。临时区关闭即清空；先看 library_info.features，库内没有对应特征时搜索结果为空。询问档每次确认，只读档拒绝。返回 taskId。"
+    )]
+    async fn temp_features_generate(
+        &self,
+        Parameters(input): Parameters<TempFeaturesInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_state("temp_features_generate", move |state| {
+            feature_tool::temp_features_generate(state, &input)
         })
         .await
     }
@@ -440,7 +470,7 @@ impl ServerHandler for McpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。写入受应用内权限档限制：只读档拒绝全部写入，询问档会把危险或超量操作放入待确认队列；没有永久删除、清空回收站、压缩、像素编辑与批量 AI 生成工具。",
+                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。写入受应用内权限档限制：只读档拒绝全部写入，询问档会把危险或超量操作放入待确认队列；没有永久删除、清空回收站、压缩、像素编辑工具。临时区可以生成 embedding 或姿势特征，但必须先在 library_info 确认库内已有对应特征；普通图库不开放批量 AI 生成。",
             )
     }
 }
@@ -486,6 +516,8 @@ mod tests {
             "tasks_get",
             "tasks_cancel",
             "import_start",
+            "temp_features_generate",
+            "folders_modify",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

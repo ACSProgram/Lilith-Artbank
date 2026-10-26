@@ -68,6 +68,7 @@ pub trait GroupProgress {
 #[derive(Clone, Copy)]
 struct VisualRow {
     id: i64,
+    is_temp: bool,
     phash: [u64; 4],
     colors4: [LabColor; 4],
     colors8: [LabColor; 8],
@@ -87,9 +88,13 @@ impl VisualIndex {
         let stamp = visual_stamp(database)?;
         let rows = database.with_reader(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, phash, colors4, colors8 FROM images
-                 WHERE deleted_at IS NULL
-                   AND length(phash) = 32 AND length(colors4) = 16 AND length(colors8) = 32",
+                "SELECT images.id, images.phash, images.colors4, images.colors8,
+                        COALESCE(folders.kind = 'temp', 0)
+                 FROM images
+                 LEFT JOIN folders ON folders.id = images.folder_id
+                 WHERE images.deleted_at IS NULL
+                   AND length(images.phash) = 32
+                   AND length(images.colors4) = 16 AND length(images.colors8) = 32",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
@@ -97,15 +102,17 @@ impl VisualIndex {
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)? != 0,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, phash, colors4, colors8) = row?;
+                let (id, phash, colors4, colors8, is_temp) = row?;
                 let mut hash = [0_u8; 32];
                 hash.copy_from_slice(&phash);
                 out.push(VisualRow {
                     id,
+                    is_temp,
                     phash: phash::words(&hash),
                     colors4: colors::prepare_palette::<4>(&colors4),
                     colors8: colors::prepare_palette::<8>(&colors8),
@@ -136,6 +143,7 @@ impl VisualIndex {
     /// 与 [`Self::similar_phash`] 相同，同时返回截断前的命中总数。
     ///
     /// `exclude` 是所有参考图；`allowed` 非空时只统计范围内的行。
+    /// `allowed` 为空表示全库：临时文件夹里的图片不参与。
     pub fn similar_phash_with_total(
         &self,
         target: [u64; 4],
@@ -147,6 +155,9 @@ impl VisualIndex {
         let mut scored = Vec::new();
         for row in &self.rows {
             if exclude.contains(&row.id) {
+                continue;
+            }
+            if allowed.is_none() && row.is_temp {
                 continue;
             }
             if let Some(allowed) = allowed
@@ -181,6 +192,7 @@ impl VisualIndex {
     /// 与 [`Self::similar_color`] 相同，同时返回截断前的命中总数。
     ///
     /// `threshold` 是 OKLab 距离上限；`allowed` 非空时只统计范围内的行。
+    /// `allowed` 为空表示全库：临时文件夹里的图片不参与。
     pub fn similar_color_with_total(
         &self,
         target: &[LabColor],
@@ -193,6 +205,9 @@ impl VisualIndex {
         let mut scored = Vec::new();
         for row in &self.rows {
             if exclude.contains(&row.id) {
+                continue;
+            }
+            if allowed.is_none() && row.is_temp {
                 continue;
             }
             if let Some(allowed) = allowed
@@ -224,7 +239,7 @@ impl VisualIndex {
         (scored, total)
     }
 
-    /// 全库 pHash 相似对分组；索引已常驻，不再读库。
+    /// 全库 pHash 相似对分组；索引已常驻，不再读库。临时图片不参与分组。
     pub fn phash_groups(
         &self,
         threshold: u32,
@@ -235,14 +250,15 @@ impl VisualIndex {
                 "全库 pHash 分组只支持 0-7；更大阈值请使用目标图相似",
             ));
         }
-        if self.rows.len() < 2 {
+        let rows: Vec<&VisualRow> = self.rows.iter().filter(|row| !row.is_temp).collect();
+        if rows.len() < 2 {
             return Ok(PhashGroups {
                 groups: Vec::new(),
                 truncated: false,
             });
         }
-        let words: Vec<[u64; 4]> = self.rows.iter().map(|row| row.phash).collect();
-        let ids: Vec<i64> = self.rows.iter().map(|row| row.id).collect();
+        let words: Vec<[u64; 4]> = rows.iter().map(|row| row.phash).collect();
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
         let mut union = UnionFind::new(words.len());
 
         // 完全相同的哈希先并组，避免纯色图等大组在分段候选里重复枚举。
@@ -582,6 +598,17 @@ mod tests {
         colors4: [u8; 16],
         colors8: [u8; 32],
     ) {
+        insert_in(session, id, 1, phash, colors4, colors8);
+    }
+
+    fn insert_in(
+        session: &service::LibrarySession,
+        id: i64,
+        folder_id: i64,
+        phash: [u8; 32],
+        colors4: [u8; 16],
+        colors8: [u8; 32],
+    ) {
         session
             .db
             .with_writer(|connection| {
@@ -590,10 +617,11 @@ mod tests {
                         id, content_hash, file_ext, folder_id, file_size, width, height, format,
                         has_alpha, phash, colors4, colors8, score, description, imported_at,
                         modified_at
-                     ) VALUES (?1, ?2, 'png', 1, 10, 4, 4, 'png', 0, ?3, ?4, ?5, 0, '', 1, 1)",
+                     ) VALUES (?1, ?2, 'png', ?3, 10, 4, 4, 'png', 0, ?4, ?5, ?6, 0, '', 1, 1)",
                     params![
                         id,
                         format!("{id:064x}"),
+                        folder_id,
                         phash.as_slice(),
                         colors4.as_slice(),
                         colors8.as_slice()
@@ -645,6 +673,37 @@ mod tests {
         assert_eq!(results[0], (2, 1));
         assert_eq!(results[1].0, 3);
         assert!(results.iter().all(|(id, _)| *id != 1));
+    }
+
+    #[test]
+    fn full_library_scan_skips_temp_but_explicit_scope_can_use_it() {
+        let (_temp, session) = fixture();
+        let temp_folder = session
+            .db
+            .with_reader(crate::library::temp::folder)
+            .unwrap()
+            .unwrap();
+        let hash = phash_with_bits(&[]);
+        let colors4: [u8; 16] = solid_palette(4, [10, 20, 30]).try_into().unwrap();
+        let colors8: [u8; 32] = solid_palette(8, [10, 20, 30]).try_into().unwrap();
+        insert(&session, 1, hash, colors4, colors8);
+        insert_in(&session, 2, temp_folder.id, hash, colors4, colors8);
+        insert(&session, 3, hash, colors4, colors8);
+
+        let index = VisualIndex::load(&session.db).unwrap();
+        let target = phash::words(&hash);
+        let (hits, total) = index.similar_phash_with_total(target, 0, 10, &HashSet::new(), None);
+        assert_eq!(total, 2);
+        assert!(hits.iter().all(|(id, _)| *id != 2));
+
+        let allowed = HashSet::from([2_i64]);
+        let (hits, total) =
+            index.similar_phash_with_total(target, 0, 10, &HashSet::new(), Some(&allowed));
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].0, 2);
+
+        let groups = index.phash_groups(0, None).unwrap();
+        assert_eq!(groups.groups, vec![vec![1, 3]]);
     }
 
     #[test]

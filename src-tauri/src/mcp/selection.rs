@@ -245,12 +245,14 @@ pub enum Selector {
         #[serde(default)]
         exclude_ids: Vec<i64>,
     },
-    /// 上一次 find_similar 返回的 token；offset 用于翻页。
+    /// 上一次 find_similar 返回的 token；offset/limit 在写入与读取时都按切片生效。
     #[serde(rename_all = "camelCase")]
     Similarity {
         token: String,
+        #[schemars(description = "跳过结果槽里的前 offset 条")]
         #[serde(default)]
         offset: usize,
+        #[schemars(description = "最多取多少条；省略表示取到结果槽末尾（最多 10000 条）")]
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
@@ -334,37 +336,44 @@ pub fn resolve_ids(
                 missing_ids: Vec::new(),
             })
         }
-        // 写入按全部命中解析：`limit` 只影响读取分页，这里忽略。
+        // 写入与读取同口径：offset 跳过前若干条，limit 决定最多取多少条。
+        // limit 省略时取整个结果槽（最多 MAX_SELECTION_LIMIT 条）。
         Selector::Similarity {
             token,
             offset,
-            limit: _,
+            limit,
             exclude_ids,
         } => {
+            let take = limit.map(|value| value.clamp(1, MAX_SELECTION_LIMIT));
             let excluded: HashSet<i64> = exclude_ids.iter().copied().collect();
             let mut ids = Vec::new();
             let mut seen = HashSet::new();
             let mut cursor = *offset;
-            let mut total = None;
             loop {
+                if take.is_some_and(|take| ids.len() >= take) {
+                    break;
+                }
                 let page = ai.similarity_page(token, cursor, Some(300))?;
                 let page_total = page.total;
                 let page_next = page.next_offset;
-                total.get_or_insert(page_total);
                 let page_len = page.items.len();
                 for row in page.items {
                     if !excluded.contains(&row.id) && seen.insert(row.id) {
                         ids.push(row.id);
+                        if take.is_some_and(|take| ids.len() >= take) {
+                            break;
+                        }
                     }
                 }
+                if ids.len() >= MAX_SELECTION_LIMIT {
+                    break;
+                }
                 let next = page_next.unwrap_or(cursor + page_len);
-                if next <= cursor || page_len == 0 || ids.len() >= MAX_SELECTION_LIMIT {
+                if next <= cursor || page_len == 0 {
                     break;
                 }
                 cursor = next;
-                if let Some(total) = total
-                    && cursor >= total
-                {
+                if cursor >= page_total {
                     break;
                 }
             }

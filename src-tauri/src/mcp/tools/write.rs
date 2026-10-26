@@ -9,7 +9,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use rmcp::schemars;
-use rusqlite::params_from_iter;
+use rusqlite::{OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-use super::{ToolOutcome, read::compact_row};
+use super::{ToolOutcome, merge_object, read::compact_row};
 
 /// 询问档只拦“影响超过这个张数”的批量写入；回收站与撤销/重做另外始终要确认。
 pub const APPROVAL_THRESHOLD: usize = 100;
@@ -188,13 +188,14 @@ fn inspect(state: &AppState, selector: &Selector, sample_active: bool) -> AppRes
         }
     }
     let sample_source = if sample_active { &active } else { &trashed };
+    let temp_path = context.database.with_reader(crate::library::temp::path)?;
     let sample = query::rows_by_ids(
         &context.database,
         &context.root,
         &sample_source[..sample_source.len().min(SAMPLE_SIZE)],
     )?
     .iter()
-    .map(compact_row)
+    .map(|row| compact_row(row, temp_path.as_deref()))
     .collect();
     Ok(Inspection {
         database: context.database,
@@ -286,18 +287,25 @@ fn confirmed_outcome(explicit: Option<u64>, actual: usize, preview: Value) -> Op
     }
 }
 
-fn sample_preview(inspection: &Inspection, will_change: u64, want_active: bool) -> Value {
-    let skipped = if want_active {
-        inspection.missing.len() + inspection.trashed.len()
-    } else {
-        inspection.missing.len() + inspection.active.len()
-    };
+/// 确认单与 dryRun 共用的一份数量说明：`skipped` 与 `willChange` 加起来一定等于 `selected`，
+/// 其中 skipped 既包含不可用的图片，也包含“已经是目标状态、不需要改”的图片。
+fn sample_preview(inspection: &Inspection, will_change: u64) -> Value {
     json!({
         "selected": inspection.selected,
         "willChange": will_change,
-        "skipped": skipped as u64,
+        "skipped": (inspection.selected as u64).saturating_sub(will_change),
         "sample": inspection.sample,
     })
+}
+
+/// 目标状态与现状一致：不写库，也不产生操作记录。
+fn no_change_outcome(selected: usize) -> ToolOutcome {
+    ToolOutcome::value(json!({
+        "status": "noop",
+        "selected": selected,
+        "affected": 0,
+        "reason": "这些图片已经是目标状态，没有需要改动的内容",
+    }))
 }
 
 /// selector 解析为空：不写库，也不产生操作记录。
@@ -384,18 +392,8 @@ fn finish_write(state: &AppState, finish: WriteFinish<'_>) -> Value {
         "affected": finish.affected,
         "operationId": finish.operation_id,
     });
-    if let Value::Object(extra) = finish.extra {
-        for (key, extra_value) in extra {
-            value_object_insert(&mut value, key, extra_value);
-        }
-    }
+    merge_object(&mut value, finish.extra);
     value
-}
-
-fn value_object_insert(target: &mut Value, key: String, value: Value) {
-    if let Value::Object(object) = target {
-        object.insert(key, value);
-    }
 }
 
 fn classify(input: &ImagesUpdateInput) -> AppResult<UpdateKind> {
@@ -422,9 +420,10 @@ fn classify(input: &ImagesUpdateInput) -> AppResult<UpdateKind> {
     ))
 }
 
-fn update_will_change(kind: &UpdateKind, inspection: &Inspection) -> u64 {
+/// 实际会改动的图片数：已经是目标状态的图片不计入，避免 dryRun 报大数。
+fn update_will_change(kind: &UpdateKind, inspection: &Inspection) -> AppResult<u64> {
     match kind {
-        UpdateKind::Description(text) if inspection.active.len() == 1 => {
+        UpdateKind::Description(text) if inspection.active.len() == 1 => Ok(
             metadata::image_details(&inspection.database, &inspection.root, inspection.active[0])
                 .map(|details| {
                     u64::from(
@@ -433,11 +432,205 @@ fn update_will_change(kind: &UpdateKind, inspection: &Inspection) -> u64 {
                             || !details.description_model.is_empty(),
                     )
                 })
-                .unwrap_or(0)
+                .unwrap_or(0),
+        ),
+        UpdateKind::Description(_) => Ok(0),
+        UpdateKind::Score(score) => {
+            count_score_changes(&inspection.database, &inspection.active, *score)
         }
-        // 标签可能一次改多条关系；这里报“会涉及的图片数”，实际 affected 由领域层返回。
-        _ => inspection.active.len() as u64,
+        UpdateKind::AddTags(names) => {
+            count_tag_changes(&inspection.database, &inspection.active, names, true)
+        }
+        UpdateKind::RemoveTags(names) => {
+            count_tag_changes(&inspection.database, &inspection.active, names, false)
+        }
     }
+}
+
+fn count_score_changes(database: &LibraryDb, ids: &[i64], score: i64) -> AppResult<u64> {
+    let mut changed = 0_u64;
+    for chunk in ids.chunks(SQL_CHUNK) {
+        let marks = placeholders(chunk.len());
+        let mut values: Vec<i64> = chunk.to_vec();
+        values.push(score);
+        changed += database.with_reader(|connection| {
+            let count: i64 = connection.query_row(
+                &format!("SELECT count(*) FROM images WHERE id IN ({marks}) AND score <> ?"),
+                params_from_iter(values.iter()),
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })?;
+    }
+    Ok(changed)
+}
+
+/// 会新增/移除标签关系的图片数。
+///
+/// 要加的标签还不存在时，标签行会先建出来，所以每张图都算一次改动；
+/// 要删的标签不存在时，一条关系也不会动。
+fn count_tag_changes(
+    database: &LibraryDb,
+    ids: &[i64],
+    names: &[String],
+    adding: bool,
+) -> AppResult<u64> {
+    let names = normalize_tag_names(names);
+    if ids.is_empty() || names.is_empty() {
+        return Ok(0);
+    }
+    let Some(tag_ids) = tag_ids_by_name(database, &names)? else {
+        return Ok(if adding { ids.len() as u64 } else { 0 });
+    };
+    let condition = if adding { "NOT EXISTS" } else { "EXISTS" };
+    let tag_marks = placeholders(tag_ids.len());
+    let mut changed = 0_u64;
+    for chunk in ids.chunks(SQL_CHUNK) {
+        let id_marks = placeholders(chunk.len());
+        let mut values: Vec<i64> = chunk.to_vec();
+        values.extend(tag_ids.iter().copied());
+        changed += database.with_reader(|connection| {
+            let count: i64 = connection.query_row(
+                &format!(
+                    "SELECT count(*) FROM images
+                     WHERE id IN ({id_marks}) AND {condition} (
+                        SELECT 1 FROM image_tags
+                        WHERE image_tags.image_id = images.id
+                          AND image_tags.tag_id IN ({tag_marks})
+                     )"
+                ),
+                params_from_iter(values.iter()),
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })?;
+    }
+    Ok(changed)
+}
+
+fn normalize_tag_names(names: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if !name.is_empty() && seen.insert(name.to_lowercase()) {
+            result.push(name.to_owned());
+        }
+    }
+    result
+}
+
+/// 全部标签都存在时返回 id；有一个不存在就返回 `None`。
+fn tag_ids_by_name(database: &LibraryDb, names: &[String]) -> AppResult<Option<Vec<i64>>> {
+    database.with_reader(|connection| {
+        let mut statement =
+            connection.prepare("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE")?;
+        let mut ids = Vec::with_capacity(names.len());
+        for name in names {
+            let id: Option<i64> = statement
+                .query_row([name], |row| row.get(0))
+                .optional()
+                .map_err(AppError::from)?;
+            match id {
+                Some(id) => ids.push(id),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(ids))
+    })
+}
+
+/// 已经在这个文件夹里的图片数：它们不会移动，dryRun 里应当算跳过。
+///
+/// 用 `folders.path = ?` 的精确比较，与移动任务内部 `old_folder == folder_path` 的判断同口径。
+fn count_already_in_folder(database: &LibraryDb, ids: &[i64], folder_path: &str) -> AppResult<u64> {
+    let mut count = 0_u64;
+    for chunk in ids.chunks(SQL_CHUNK) {
+        let marks = placeholders(chunk.len());
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+        params.extend(chunk.iter().map(|id| rusqlite::types::Value::from(*id)));
+        params.push(rusqlite::types::Value::from(folder_path.to_owned()));
+        count += database.with_reader(|connection| {
+            let matched: i64 = connection.query_row(
+                &format!(
+                    "SELECT count(*) FROM images JOIN folders ON folders.id = images.folder_id
+                     WHERE images.id IN ({marks}) AND folders.path = ?"
+                ),
+                params_from_iter(params.iter()),
+                |row| row.get(0),
+            )?;
+            Ok(matched as u64)
+        })?;
+    }
+    Ok(count)
+}
+
+/// 集合里实际会新增/移除的图片数；已经是目标状态的图片不计入。
+fn count_membership_changes(
+    database: &LibraryDb,
+    collection_id: i64,
+    ids: &[i64],
+    adding: bool,
+) -> AppResult<u64> {
+    let condition = if adding { "NOT EXISTS" } else { "EXISTS" };
+    let mut changed = 0_u64;
+    for chunk in ids.chunks(SQL_CHUNK) {
+        let marks = placeholders(chunk.len());
+        // 占位符按出现顺序编号：先 IN 里的 id，再子查询的 collection_id。
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+        params.extend(chunk.iter().map(|id| rusqlite::types::Value::from(*id)));
+        params.push(rusqlite::types::Value::from(collection_id));
+        changed += database.with_reader(|connection| {
+            let count: i64 = connection.query_row(
+                &format!(
+                    "SELECT count(*) FROM images
+                     WHERE id IN ({marks}) AND {condition} (
+                        SELECT 1 FROM collection_items
+                        WHERE collection_items.collection_id = ?
+                          AND collection_items.image_id = images.id
+                     )"
+                ),
+                params_from_iter(params.iter()),
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })?;
+    }
+    Ok(changed)
+}
+
+/// 集合不存在时早点报错，不要让确认卡指向一个不存在的集合。
+fn ensure_collection_exists(database: &LibraryDb, collection_id: i64) -> AppResult<()> {
+    let exists: bool = database.with_reader(|connection| {
+        Ok(connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+            [collection_id],
+            |row| row.get(0),
+        )?)
+    })?;
+    if !exists {
+        return Err(AppError::message("集合不存在"));
+    }
+    Ok(())
+}
+
+/// 选择里有临时图片时整批拒绝：它们不能移动、移入回收站或加入集合，
+/// 同步拦下比先让用户确认一次再失败好。
+fn temporary_outcome(inspection: &Inspection) -> AppResult<Option<ToolOutcome>> {
+    let temporary = crate::library::temp::ids_in(&inspection.database, &inspection.active)?;
+    if temporary.is_empty() {
+        return Ok(None);
+    }
+    let mut ids: Vec<i64> = temporary.into_iter().collect();
+    ids.sort_unstable();
+    ids.truncate(MAX_FAILURES_REPORTED);
+    Ok(Some(ToolOutcome::value(json!({
+        "status": "rejected",
+        "reason": "选择里有临时区的图片；临时图片不能移动、移入回收站或加入集合，关闭或切换图库时会自动清空",
+        "selected": inspection.selected,
+        "latestCount": inspection.selected,
+        "temporaryIds": ids,
+    }))))
 }
 
 fn conflict_error(active: &[crate::app::tasks::TaskSummary]) -> AppError {
@@ -460,11 +653,7 @@ fn started_outcome(
                 "taskId": task.task_id,
                 "selected": selected,
             });
-            if let Value::Object(extra) = extra {
-                for (key, extra_value) in extra {
-                    value_object_insert(&mut value, key, extra_value);
-                }
-            }
+            merge_object(&mut value, extra);
             Ok(ToolOutcome::task(task.task_id.clone(), value))
         }
         TaskStartResult::Conflict { active } => Err(conflict_error(&active)),
@@ -496,21 +685,16 @@ fn run_update(
                 inspection.selected
             )));
         }
-        let will_change = update_will_change(&kind, &inspection);
+        let will_change = update_will_change(&kind, &inspection)?;
         let operation = match &kind {
             UpdateKind::Score(score) => format!("把评分改为 {score} 星"),
             UpdateKind::AddTags(_) => "添加标签".to_owned(),
             UpdateKind::RemoveTags(_) => "移除标签".to_owned(),
             UpdateKind::Description(_) => "修改描述".to_owned(),
         };
-        return Ok(ToolOutcome::value(json!({
-            "status": "dryRun",
-            "operation": operation,
-            "selected": inspection.selected,
-            "willChange": will_change,
-            "skipped": (inspection.missing.len() + inspection.trashed.len()) as u64,
-            "sample": inspection.sample,
-        })));
+        let mut value = json!({ "status": "dryRun", "operation": operation });
+        merge_object(&mut value, sample_preview(&inspection, will_change));
+        return Ok(ToolOutcome::value(value));
     }
 
     let before = inspect(state, &input.selector, true)?;
@@ -520,8 +704,8 @@ fn run_update(
             before.selected
         )));
     }
-    let before_will_change = update_will_change(&kind, &before);
-    let preview = sample_preview(&before, before_will_change, true);
+    let before_will_change = update_will_change(&kind, &before)?;
+    let preview = sample_preview(&before, before_will_change);
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
     {
@@ -532,6 +716,10 @@ fn run_update(
     }
     if before.selected == 0 {
         return Ok(noop_outcome());
+    }
+    // 目标状态与现状一致：不写库，也不留一条 affected=0 的空记录。
+    if before_will_change == 0 {
+        return Ok(no_change_outcome(before.selected));
     }
     if needs_approval(mode, before.selected, false) && !approved {
         let operation = match &kind {
@@ -578,7 +766,11 @@ fn run_update(
     if let Some(outcome) = ineligible_outcome(&inspection, true) {
         return Ok(outcome);
     }
-    let will_change = update_will_change(&kind, &inspection);
+    let will_change = update_will_change(&kind, &inspection)?;
+    if will_change == 0 {
+        drop(lane);
+        return Ok(no_change_outcome(inspection.selected));
+    }
     let (affected, operation_id) = match kind {
         UpdateKind::Score(score) => {
             let (changed, operation_id) =
@@ -633,16 +825,21 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
     let _exclusive = state.lock_mcp_writes();
 
     let before = inspect(state, &input.selector, true)?;
-    let preview = sample_preview(&before, before.active.len() as u64, true);
+    // 临时图片本来就不能移动：同步拒绝，不要先问用户一次再失败。
+    if let Some(outcome) = temporary_outcome(&before)? {
+        return Ok(outcome);
+    }
+    let already = count_already_in_folder(&before.database, &before.active, &folder_path)?;
+    let will_change = before.active.len() as u64 - already;
+    let preview = sample_preview(&before, will_change);
     if input.dry_run {
-        return Ok(ToolOutcome::value(json!({
+        let mut value = json!({
             "status": "dryRun",
             "operation": format!("移动到{target}"),
-            "selected": before.selected,
-            "willChange": before.active.len(),
-            "skipped": (before.missing.len() + before.trashed.len()) as u64,
-            "sample": before.sample,
-        })));
+            "alreadyInTarget": already,
+        });
+        merge_object(&mut value, preview.clone());
+        return Ok(ToolOutcome::value(value));
     }
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
@@ -655,6 +852,9 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
     if before.selected == 0 {
         return Ok(noop_outcome());
     }
+    if will_change == 0 {
+        return Ok(no_change_outcome(before.selected));
+    }
     if needs_approval(mode, before.selected, false) && !approved {
         return enqueue_approval(
             state,
@@ -664,7 +864,7 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
             guide_preview(
                 &format!("移动到{target}"),
                 &before,
-                before.active.len() as u64,
+                will_change,
                 &["原图会从旧文件夹移动到目标文件夹", "可以撤销"],
                 Some(&target),
             ),
@@ -703,16 +903,15 @@ fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppR
     let mode = ensure_writable(state)?;
     let _exclusive = state.lock_mcp_writes();
     let before = inspect(state, &input.selector, true)?;
-    let preview = sample_preview(&before, before.active.len() as u64, true);
+    // 临时图片不能移入回收站：同步拒绝，别弹一张注定失败的确认卡。
+    if let Some(outcome) = temporary_outcome(&before)? {
+        return Ok(outcome);
+    }
+    let preview = sample_preview(&before, before.active.len() as u64);
     if input.dry_run {
-        return Ok(ToolOutcome::value(json!({
-            "status": "dryRun",
-            "operation": "移入回收站",
-            "selected": before.selected,
-            "willChange": before.active.len(),
-            "skipped": (before.missing.len() + before.trashed.len()) as u64,
-            "sample": before.sample,
-        })));
+        let mut value = json!({ "status": "dryRun", "operation": "移入回收站" });
+        merge_object(&mut value, preview.clone());
+        return Ok(ToolOutcome::value(value));
     }
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
@@ -789,16 +988,11 @@ fn run_restore(
     let mode = ensure_writable(state)?;
     let _exclusive = state.lock_mcp_writes();
     let before = inspect(state, &input.selector, false)?;
-    let preview = sample_preview(&before, before.trashed.len() as u64, false);
+    let preview = sample_preview(&before, before.trashed.len() as u64);
     if input.dry_run {
-        return Ok(ToolOutcome::value(json!({
-            "status": "dryRun",
-            "operation": "恢复图片",
-            "selected": before.selected,
-            "willChange": before.trashed.len(),
-            "skipped": (before.missing.len() + before.active.len()) as u64,
-            "sample": before.sample,
-        })));
+        let mut value = json!({ "status": "dryRun", "operation": "恢复图片" });
+        merge_object(&mut value, preview.clone());
+        return Ok(ToolOutcome::value(value));
     }
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
@@ -879,6 +1073,12 @@ fn run_collection_create(
         Some(selector) => Some(inspect(state, selector, true)?),
         None => None,
     };
+    // 临时图片不能加入集合；有就整批拒绝，别让用户确认一次再失败。
+    if let Some(inspection) = &inspection
+        && let Some(outcome) = temporary_outcome(inspection)?
+    {
+        return Ok(outcome);
+    }
     let selected = inspection.as_ref().map(|item| item.selected).unwrap_or(0);
     let active_count = inspection
         .as_ref()
@@ -898,13 +1098,12 @@ fn run_collection_create(
         "sample": sample,
     });
     if input.dry_run {
-        return Ok(ToolOutcome::value(json!({
+        let mut value = json!({
             "status": "dryRun",
             "operation": format!("创建集合「{}」", input.name.trim()),
-            "selected": selected,
-            "willChange": active_count,
-            "sample": sample,
-        })));
+        });
+        merge_object(&mut value, preview.clone());
+        return Ok(ToolOutcome::value(value));
     }
     if input.selector.is_some()
         && let Some(outcome) = confirmed_outcome(input.confirmed_count, selected, preview.clone())
@@ -1082,21 +1281,33 @@ fn run_collection_membership(
 ) -> AppResult<ToolOutcome> {
     let mode = ensure_writable(state)?;
     let _exclusive = state.lock_mcp_writes();
+    ensure_collection_exists(
+        &state
+            .current_library()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?
+            .0,
+        input.collection_id,
+    )?;
     let before = inspect(state, &input.selector, true)?;
-    let preview = sample_preview(&before, before.active.len() as u64, true);
+    if let Some(outcome) = temporary_outcome(&before)? {
+        return Ok(outcome);
+    }
+    let adding = matches!(input.action, CollectionMembershipAction::Add);
+    let will_change = count_membership_changes(
+        &before.database,
+        input.collection_id,
+        &before.active,
+        adding,
+    )?;
+    let preview = sample_preview(&before, will_change);
     let operation = match input.action {
         CollectionMembershipAction::Add => "加入集合",
         CollectionMembershipAction::Remove => "移出集合",
     };
     if input.dry_run {
-        return Ok(ToolOutcome::value(json!({
-            "status": "dryRun",
-            "operation": operation,
-            "selected": before.selected,
-            "willChange": before.active.len(),
-            "skipped": (before.missing.len() + before.trashed.len()) as u64,
-            "sample": before.sample,
-        })));
+        let mut value = json!({ "status": "dryRun", "operation": operation });
+        merge_object(&mut value, preview.clone());
+        return Ok(ToolOutcome::value(value));
     }
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
@@ -1109,6 +1320,9 @@ fn run_collection_membership(
     if before.selected == 0 {
         return Ok(noop_outcome());
     }
+    if will_change == 0 {
+        return Ok(no_change_outcome(before.selected));
+    }
     if needs_approval(mode, before.selected, false) && !approved {
         return enqueue_approval(
             state,
@@ -1118,7 +1332,7 @@ fn run_collection_membership(
             guide_preview(
                 operation,
                 &before,
-                before.active.len() as u64,
+                will_change,
                 &["只改集合成员，不改动原图", "可以撤销"],
                 None,
             ),
@@ -1165,6 +1379,121 @@ fn run_collection_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 预检 SQL 只靠库表，不需要完整的 AppState；用隔离的临时库验证计数口径。
+    fn fixture() -> (tempfile::TempDir, Arc<LibraryDb>) {
+        use rusqlite::params;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = crate::library::service::create(&root, "写工具测试", 1).unwrap();
+        session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO folders(path, created_at) VALUES ('作品', 1)",
+                    [],
+                )?;
+                let folder = connection.last_insert_rowid();
+                for (id, score) in [(1_i64, 5_i64), (2, 3), (3, 1)] {
+                    connection.execute(
+                        "INSERT INTO images(
+                            id, content_hash, file_ext, folder_id, file_size, width, height,
+                            format, has_alpha, phash, colors4, colors8, score, description,
+                            imported_at, modified_at
+                         ) VALUES (?1, ?2, 'png', ?3, 10, 10, 10, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), ?4, '', 1, 1)",
+                        params![id, format!("{id:0>64}"), folder, score],
+                    )?;
+                }
+                connection.execute("INSERT INTO tags(name) VALUES ('人物')", [])?;
+                let people = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO image_tags(image_id, tag_id) VALUES (1, ?1)",
+                    [people],
+                )?;
+                connection.execute(
+                    "INSERT INTO collections(name, sort_order, created_at, updated_at)
+                     VALUES ('精选', 0, 1, 1)",
+                    [],
+                )?;
+                let collection = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO collection_items(collection_id, image_id, position)
+                     VALUES (?1, 1, 0)",
+                    [collection],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        (temp, session.db)
+    }
+
+    #[test]
+    fn counts_only_rows_that_really_change() {
+        let (_temp, database) = fixture();
+        let ids = [1_i64, 2, 3];
+
+        // 评分已经是 5 星的图片不算改动。
+        assert_eq!(count_score_changes(&database, &ids, 5).unwrap(), 2);
+        assert_eq!(count_score_changes(&database, &ids, 3).unwrap(), 2);
+
+        // 加标签：已经有「人物」的图片不算；标签不存在时每张图都要建关系。
+        assert_eq!(
+            count_tag_changes(&database, &ids, &["人物".into()], true).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_tag_changes(&database, &ids, &["新标签".into()], true).unwrap(),
+            3
+        );
+        // 删标签：没有这个标签的图片不算；标签不存在时一条关系也不用动。
+        assert_eq!(
+            count_tag_changes(&database, &ids, &["人物".into()], false).unwrap(),
+            1
+        );
+        assert_eq!(
+            count_tag_changes(&database, &ids, &["不存在".into()], false).unwrap(),
+            0
+        );
+
+        // 集合成员：已在集合里的 1 号不算新增，其余两张才算。
+        assert_eq!(
+            count_membership_changes(&database, 1, &ids, true).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_membership_changes(&database, 1, &ids, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_collection_is_reported_before_queueing() {
+        let (_temp, database) = fixture();
+        assert!(ensure_collection_exists(&database, 1).is_ok());
+        let error = ensure_collection_exists(&database, 99).unwrap_err();
+        assert!(error.to_string().contains("集合不存在"));
+    }
+
+    #[test]
+    fn preview_counts_add_up_to_selected() {
+        let (_temp, database) = fixture();
+        let inspection = Inspection {
+            database,
+            root: PathBuf::from("."),
+            selected: 5,
+            active: vec![1, 2, 3],
+            trashed: vec![4],
+            missing: vec![5],
+            sample: Vec::new(),
+        };
+        // skipped 同时包含不可用的图片与“已经是目标状态”的图片。
+        let preview = sample_preview(&inspection, 2);
+        assert_eq!(preview["selected"], 5);
+        assert_eq!(preview["willChange"], 2);
+        assert_eq!(preview["skipped"], 3);
+    }
 
     #[test]
     fn update_requires_exactly_one_kind() {

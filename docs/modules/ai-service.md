@@ -227,14 +227,14 @@ Content-Type: application/octet-stream
 
 相似度有三类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding）、feature pack（pose）。三者都只返回 id + 分数，按 token 分页后再回填元数据。
 
-- **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行，pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。
+- **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行（临时区行带 `is_temp` 标记），pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。全库扫描与全库相似分组跳过临时行，显式范围仍可使用。
 - **pHash 相似**：参考图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。只支持单张参考图。
 - **主色相似**：参考主色（单张的 4/8 色，或多张等权合并后的代表色）与索引逐项做对称加权 OKLab 距离（每项匹配对方最近色、按自身权重平均，两个方向再取均值），距离升序。
-- **均值中心化**：打开图库后在后台扫描当前 model/dim 的全部 image embeddings，求 fp32 均值并保存在内存；会话内不随新增/编辑更新。关闭并重新打开图库刷新。
+- **均值中心化**：打开图库后在后台扫描当前 model/dim 的普通图 embedding，求 fp32 均值并保存在内存；会话内不随新增/编辑更新，关闭并重新打开图库刷新。MCP 的临时区特征生成完成后会显式失效均值缓存。
 - **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
 - **相似 embedding**：参考图的 image embedding（单张，或多张平均后归一化）同样减均值后扫描。参考图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
-- **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做固定种子的加权 k-means，保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
-- **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。
+- **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做加权 k-means（初始质心按权重最高、随后每次取最远点，不用随机种子），保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
+- **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
 - **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。
 - **姿势相似**：按原程序 `MediaPipePoseData::similarity` 1:1 移植（`ai/pose_similarity.rs`），33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。原实现源码见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md` 的记录路径。
 - **全库相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。

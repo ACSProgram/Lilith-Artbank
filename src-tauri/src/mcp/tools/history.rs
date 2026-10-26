@@ -61,21 +61,32 @@ pub fn history_list(state: &AppState, input: &HistoryListInput) -> AppResult<Too
         .map(str::trim)
         .filter(|kind| !kind.is_empty());
     let all = &page.entries;
-    let entries = all
+    let entries: Vec<Value> = all
         .iter()
         .enumerate()
         .filter(|(_, entry)| kind.is_none_or(|kind| entry.kind.as_str() == kind))
         .take(limit)
         .map(|(index, entry)| decorate_entry(all, index, entry, can_run, &blocked_reason))
-        .collect::<Vec<_>>();
+        .collect();
+    // 顶层 canRun 只表示“返回的条目里真有一条能执行”，具体看条目的 canUndo/canRedo。
+    let actionable = entries.iter().any(|entry| {
+        entry["canUndo"] == Value::Bool(true) || entry["canRedo"] == Value::Bool(true)
+    });
+    let top_reason = if actionable {
+        None
+    } else if !can_run {
+        blocked_reason.clone()
+    } else {
+        Some("返回的记录里没有可撤销或可重做的条目".to_owned())
+    };
     Ok(ToolOutcome::value(json!({
         "entries": entries,
         "count": entries.len(),
         "total": all.len(),
         "maxSteps": page.max_steps,
         "mode": mode.as_str(),
-        "canRun": can_run,
-        "blockedReason": blocked_reason,
+        "canRun": actionable,
+        "blockedReason": top_reason,
         "pendingPurgeCount": page.pending_purge_count,
         "pendingPurgeBytes": page.pending_purge_bytes,
         "note": "新写入会清空灰色重做分支；撤销链包含压缩记录时会被明确拒绝。",

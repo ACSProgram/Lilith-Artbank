@@ -211,18 +211,66 @@ pub fn attach_tags(connection: &Connection, image_id: i64, tag_ids: &[i64]) -> A
     Ok(())
 }
 
-pub fn find_by_hash(connection: &Connection, hash: &str) -> AppResult<Option<i64>> {
+/// 按内容哈希找已有图片，同时返回它是否在回收站（待释放行也算已存在）。
+///
+/// `include_temp = false` 时忽略临时文件夹里的行：图库导入要真正入库，不能把
+/// 「临时区看过一眼的同内容图」当成已存在的库内图片。
+pub fn find_by_hash_state(
+    connection: &Connection,
+    hash: &str,
+    include_temp: bool,
+) -> AppResult<Option<(i64, bool)>> {
+    // 排除临时行直接复用 `temp::EXCLUDE_SQL`，避免两处口径漂移。
+    let filter = if include_temp {
+        String::new()
+    } else {
+        format!(" AND {}", crate::library::temp::EXCLUDE_SQL)
+    };
     connection
         .query_row(
-            "SELECT id FROM images WHERE content_hash = ?1",
+            &format!(
+                "SELECT id, deleted_at IS NOT NULL FROM images
+                 WHERE content_hash = ?1{filter}"
+            ),
             [hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
         )
         .map(Some)
         .or_else(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(other.into()),
         })
+}
+
+/// 丢弃占着这个内容哈希的临时行，把唯一约束让给图库导入。
+///
+/// 临时区是「只看不留」的暂存，关闭图库即清空；图库导入命中同内容时如果不让出
+/// 这一行，内容哈希的唯一约束会让这张图永远进不了图库，而临时区里的 id 又不能移动、
+/// 不能入集合、没有删除入口。返回临时目录里的原图文件名，由调用方在提交后清理。
+pub fn discard_temporary_duplicate(
+    connection: &Connection,
+    hash: &str,
+) -> AppResult<Option<String>> {
+    let row = connection
+        .query_row(
+            "SELECT images.id, images.content_hash, images.file_ext
+             FROM images JOIN folders ON folders.id = images.folder_id
+             WHERE images.content_hash = ?1 AND folders.kind = 'temp'",
+            [hash],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((image_id, content_hash, file_ext)) = row else {
+        return Ok(None);
+    };
+    connection.execute("DELETE FROM images WHERE id = ?1", [image_id])?;
+    Ok(Some(format!("{content_hash}.{file_ext}")))
 }
 
 /// 合并重复项：评分取较高值，标签取并集，不改描述与收藏状态（后续阶段接入）。
@@ -263,9 +311,13 @@ pub fn update_thumb_segment_size(
     Ok(())
 }
 
+/// 库内 pHash 索引；临时区的行不算库内图片，不参与“疑似重复”提示。
 pub fn load_phashes(connection: &Connection) -> AppResult<Vec<(i64, [u8; 32])>> {
-    let mut statement = connection
-        .prepare("SELECT id, phash FROM images WHERE deleted_at IS NULL AND length(phash) = 32")?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, phash FROM images
+         WHERE deleted_at IS NULL AND length(phash) = 32 AND {}",
+        crate::library::temp::EXCLUDE_SQL
+    ))?;
     let rows = statement.query_map([], |row| {
         let id: i64 = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
@@ -380,7 +432,7 @@ mod tests {
                     )?
                     .is_none()
                 );
-                let existing = find_by_hash(connection, &hash)?.unwrap();
+                let existing = find_by_hash_state(connection, &hash, true)?.unwrap().0;
                 merge_metadata(connection, existing, 4, &tags, 3)?;
                 Ok(())
             })
@@ -408,6 +460,90 @@ mod tests {
                 let hashes = load_phashes(connection)?;
                 assert_eq!(hashes.len(), 1);
                 assert_eq!(hashes[0].1, [7; 32]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn temp_row_is_invisible_to_library_dedup_and_yields_the_hash() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = service::create(&root, "测试", 1).unwrap();
+        let hash = sample_hash(3);
+        let temp_folder = session
+            .db
+            .with_reader(crate::library::temp::folder)
+            .unwrap()
+            .unwrap();
+
+        let insert = |seed: u8| ImageInsert {
+            content_hash: hash.clone(),
+            file_ext: "png".into(),
+            file_size: 10,
+            width: 4,
+            height: 3,
+            format: "png".into(),
+            has_alpha: false,
+            phash: [seed; 32],
+            colors4: [seed; 16],
+            colors8: [seed; 32],
+            score: 0,
+            thumb: ThumbLocation {
+                segment: 1,
+                offset: 16,
+                length: 4,
+            },
+            thumb_format: "webp".into(),
+            thumb_width: 4,
+            thumb_height: 3,
+            imported_at: 1,
+            optimized_at: 0,
+            origin_operation_id: None,
+        };
+
+        let temp_image = session
+            .db
+            .with_writer(|connection| insert_image(connection, temp_folder.id, &insert(1)))
+            .unwrap()
+            .unwrap();
+
+        // 临时行对图库导入不可见，但临时导入仍然看得到它。
+        session
+            .db
+            .with_reader(|connection| {
+                assert!(find_by_hash_state(connection, &hash, false)?.is_none());
+                assert_eq!(
+                    find_by_hash_state(connection, &hash, true)?.map(|item| item.0),
+                    Some(temp_image)
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        session
+            .db
+            .with_writer(|connection| {
+                let discarded = discard_temporary_duplicate(connection, &hash)?.unwrap();
+                assert_eq!(discarded, format!("{hash}.png"));
+                let left: i64 = connection.query_row(
+                    "SELECT count(*) FROM images WHERE id = ?1",
+                    [temp_image],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(left, 0, "临时行应当被删掉");
+                // 让出唯一约束后，图库行才能真正插入。
+                let folder = ensure_folder(connection, "人物", 2)?;
+                assert!(insert_image(connection, folder, &insert(2))?.is_some());
+                Ok(())
+            })
+            .unwrap();
+
+        session
+            .db
+            .with_reader(|connection| {
+                // 图库行拿到的是新的 rowid；这里只关心它确实存在且不再是临时行。
+                assert!(find_by_hash_state(connection, &hash, false)?.is_some());
                 Ok(())
             })
             .unwrap();

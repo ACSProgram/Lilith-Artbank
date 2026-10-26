@@ -16,7 +16,8 @@ export type TaskKind =
   | "redo"
   | "releaseGarbage"
   | "optimizeEstimate"
-  | "optimize";
+  | "optimize"
+  | "tempFeatures";
 
 export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =

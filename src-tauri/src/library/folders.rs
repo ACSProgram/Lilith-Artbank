@@ -66,12 +66,20 @@ fn ensure_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
 }
 
 pub fn create(db: &LibraryDb, root: &Path, path: &str) -> AppResult<Vec<FolderInfo>> {
+    create_with_id(db, root, path).map(|(folders, _)| folders)
+}
+
+pub fn create_with_id(
+    db: &LibraryDb,
+    root: &Path,
+    path: &str,
+) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let path = normalize_folder(path)?;
     if path.is_empty() {
         return Err(AppError::message("根目录已经存在"));
     }
     let target = LibraryPaths::new(root).folder_dir(&path);
-    history::write(
+    let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(HistoryKind::FolderCreate, format!("新建文件夹「{path}」")),
         |transaction, draft| {
@@ -95,7 +103,7 @@ pub fn create(db: &LibraryDb, root: &Path, path: &str) -> AppResult<Vec<FolderIn
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    Ok((query::list_folders(db)?, operation_id))
 }
 
 pub fn rename(
@@ -104,9 +112,18 @@ pub fn rename(
     folder_id_value: i64,
     name: &str,
 ) -> AppResult<Vec<FolderInfo>> {
+    rename_with_id(db, root, folder_id_value, name).map(|(folders, _)| folders)
+}
+
+pub fn rename_with_id(
+    db: &LibraryDb,
+    root: &Path,
+    folder_id_value: i64,
+    name: &str,
+) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let name = normalize_folder_name(name)?;
     let paths = LibraryPaths::new(root);
-    history::write(
+    let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(
             HistoryKind::FolderRename,
@@ -171,7 +188,7 @@ pub fn rename(
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    Ok((query::list_folders(db)?, operation_id))
 }
 
 pub fn move_to(
@@ -180,8 +197,17 @@ pub fn move_to(
     folder_id_value: i64,
     parent_id: i64,
 ) -> AppResult<Vec<FolderInfo>> {
+    move_to_with_id(db, root, folder_id_value, parent_id).map(|(folders, _)| folders)
+}
+
+pub fn move_to_with_id(
+    db: &LibraryDb,
+    root: &Path,
+    folder_id_value: i64,
+    parent_id: i64,
+) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let paths = LibraryPaths::new(root);
-    history::write(
+    let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(HistoryKind::FolderMove, "移动文件夹"),
         |transaction, draft| {
@@ -263,7 +289,7 @@ pub fn move_to(
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    Ok((query::list_folders(db)?, operation_id))
 }
 
 /// 把同一父级下的若干文件夹移动到指定位置；只调整 `sort_index`，不动目录。
@@ -362,8 +388,16 @@ pub fn reorder(
 }
 
 pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Vec<FolderInfo>> {
+    delete_with_id(db, root, folder_id_value).map(|(folders, _)| folders)
+}
+
+pub fn delete_with_id(
+    db: &LibraryDb,
+    root: &Path,
+    folder_id_value: i64,
+) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let paths = LibraryPaths::new(root);
-    history::write(
+    let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(HistoryKind::FolderDelete, "删除文件夹"),
         |transaction, draft| {
@@ -376,25 +410,9 @@ pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Ve
                 )
                 .optional()?
                 .ok_or_else(|| AppError::message("文件夹不存在"))?;
-            if path.is_empty() {
-                return Err(AppError::message("不能删除图库根目录"));
-            }
-            let pattern = subtree_like_pattern(&path);
-            let children: i64 = transaction.query_row(
-                "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
-                [pattern],
-                |row| row.get(0),
-            )?;
-            if children > 0 {
-                return Err(AppError::message("文件夹还包含子文件夹，不能删除"));
-            }
-            let images: i64 = transaction.query_row(
-                "SELECT count(*) FROM images WHERE folder_id = ?1",
-                [folder_id_value],
-                |row| row.get(0),
-            )?;
-            if images > 0 {
-                return Err(AppError::message("文件夹中还有图片，不能删除"));
+            // 与 MCP 预检共用同一套判据，避免 dryRun 说能删、真删才报错。
+            if let Some(reason) = deletion_blocker_in(transaction, root, folder_id_value)? {
+                return Err(AppError::message(reason));
             }
 
             let directory = paths.folder_dir(&path);
@@ -427,7 +445,110 @@ pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Ve
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    Ok((query::list_folders(db)?, operation_id))
+}
+
+/// 按相对路径找文件夹 id；大小写不敏感，与建目录时的解析一致。
+pub fn find_id(db: &LibraryDb, path: &str) -> AppResult<Option<i64>> {
+    let path = normalize_folder(path)?;
+    db.with_reader(|connection| folder_id(connection, &path))
+}
+
+/// 单个文件夹的位置与图片数；只查这一棵子树，不做全库扫描。
+pub fn info(db: &LibraryDb, folder_id_value: i64) -> AppResult<FolderInfo> {
+    db.with_reader(|connection| info_in(connection, folder_id_value))
+}
+
+fn info_in(connection: &Connection, folder_id_value: i64) -> AppResult<FolderInfo> {
+    let (path, sort_index): (String, i64) = connection
+        .query_row(
+            "SELECT path, sort_index FROM folders WHERE id = ?1",
+            [folder_id_value],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::message("文件夹不存在"))?;
+    let direct_image_count: i64 = connection.query_row(
+        "SELECT count(*) FROM images
+         WHERE folder_id = ?1 AND deleted_at IS NULL AND purge_operation_id IS NULL",
+        [folder_id_value],
+        |row| row.get(0),
+    )?;
+    let total_image_count: i64 = if path.is_empty() {
+        direct_image_count
+    } else {
+        connection.query_row(
+            "SELECT count(*) FROM images JOIN folders ON folders.id = images.folder_id
+             WHERE folders.path LIKE ?1 ESCAPE '\\'
+               AND images.deleted_at IS NULL AND images.purge_operation_id IS NULL",
+            [subtree_like_pattern(&path)],
+            |row| row.get(0),
+        )?
+    };
+    Ok(FolderInfo {
+        id: folder_id_value,
+        path,
+        sort_index,
+        direct_image_count: direct_image_count.max(0) as u64,
+        total_image_count: total_image_count.max(0) as u64,
+    })
+}
+
+/// 删除的前置条件：没有子文件夹、没有图片、磁盘目录为空。返回不能删的原因。
+pub fn deletion_blocker(
+    db: &LibraryDb,
+    root: &Path,
+    folder_id_value: i64,
+) -> AppResult<Option<String>> {
+    db.with_reader(|connection| deletion_blocker_in(connection, root, folder_id_value))
+}
+
+fn deletion_blocker_in(
+    connection: &Connection,
+    root: &Path,
+    folder_id_value: i64,
+) -> AppResult<Option<String>> {
+    let kind: Option<String> = connection
+        .query_row(
+            "SELECT kind FROM folders WHERE id = ?1",
+            [folder_id_value],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kind.is_none() {
+        return Ok(Some("文件夹不存在".to_owned()));
+    }
+    if kind.as_deref() == Some("temp") {
+        return Ok(Some("临时文件夹不能删除".to_owned()));
+    }
+    let path = folder_path(connection, folder_id_value)?;
+    if path.is_empty() {
+        return Ok(Some("不能删除图库根目录".to_owned()));
+    }
+    let children: i64 = connection.query_row(
+        "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
+        [subtree_like_pattern(&path)],
+        |row| row.get(0),
+    )?;
+    if children > 0 {
+        return Ok(Some("文件夹还包含子文件夹，不能删除".to_owned()));
+    }
+    let images: i64 = connection.query_row(
+        "SELECT count(*) FROM images WHERE folder_id = ?1",
+        [folder_id_value],
+        |row| row.get(0),
+    )?;
+    if images > 0 {
+        return Ok(Some("文件夹中还有图片，不能删除".to_owned()));
+    }
+    let directory = LibraryPaths::new(root).folder_dir(&path);
+    if directory.exists() {
+        ensure_inside_root(root, &directory)?;
+        if std::fs::read_dir(&directory)?.next().is_some() {
+            return Ok(Some("文件夹目录不是空的，不能删除".to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// 撤销“新建文件夹”：记录里的行仍然存在且为空时删目录与行；已经被移动或已有内容则失败。

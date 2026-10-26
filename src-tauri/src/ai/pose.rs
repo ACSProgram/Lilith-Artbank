@@ -147,17 +147,25 @@ pub fn similar_with_total(
     let target_pose = SimilarityPose::from_landmarks(&target.landmarks);
 
     let mut by_pack: BTreeMap<String, Vec<(i64, u64)>> = BTreeMap::new();
+    // 全库（没有显式范围）不包含临时图片；显式范围由 allowed 收窄。
+    let temp_filter = if allowed.is_some() {
+        "1"
+    } else {
+        crate::library::temp::EXCLUDE_SQL
+    };
+    let sql = format!(
+        "SELECT feature_blobs.image_id, feature_blobs.pack_name,
+                feature_blobs.pack_offset, feature_blobs.pack_length
+         FROM feature_blobs
+         JOIN images ON images.id = feature_blobs.image_id
+         WHERE feature_blobs.kind = 'pose'
+           AND feature_blobs.model = ?1
+           AND images.deleted_at IS NULL
+           AND {temp_filter}
+         ORDER BY feature_blobs.pack_name, feature_blobs.pack_offset"
+    );
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT feature_blobs.image_id, feature_blobs.pack_name,
-                    feature_blobs.pack_offset, feature_blobs.pack_length
-             FROM feature_blobs
-             JOIN images ON images.id = feature_blobs.image_id
-             WHERE feature_blobs.kind = 'pose'
-               AND feature_blobs.model = ?1
-               AND images.deleted_at IS NULL
-             ORDER BY feature_blobs.pack_name, feature_blobs.pack_offset",
-        )?;
+        let mut statement = connection.prepare(&sql)?;
         let mut rows = statement.query_map([&target.model], |row| {
             Ok((
                 row.get::<_, i64>(0)?,

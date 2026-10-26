@@ -54,7 +54,7 @@
 - 以下情形保留原图并照常导入（`optimized_at = 0`）：带透明通道但输出 JPEG、非 sRGB 色彩配置而输出装不下、单边超过 16383 且输出 WebP、16 位源、省不到 5%、编码失败。单张失败只写日志，不阻塞整批。
 - 去重语义：内容哈希变成压缩后字节的哈希。同一源图用同样参数重复导入仍判重复（第二次会重新编码后在入库时命中同内容）；改档位或格式会变成两条记录。
 - 不生成独立的 `optimize` 操作记录；导入撤销仍按 `origin_operation_id` 处理，压缩结果与原图走同一条导入记录。
-- MCP 的 `import_start` 固定传 `optimize: null`，也不接受 `workerThreads`；`tasks_get` 的导入回执不返回 `optimized` / `optimizedBytes`，AI 不能触发或感知压缩。
+- MCP 的 `import_start` 固定传 `optimize: null`，也不接受 `workerThreads`；`tasks_get` 的导入回执不返回 `optimized` / `optimizedBytes`，AI 不能触发或感知压缩。回执默认只给重复计数；`tasks_get(includePairs=true)` 才附带精确重复对、批内重复对、合并目标与源文件映射（各自上限 200，`similarPairs` 上限 100）。
 - 完成页在勾选过压缩时显示「其中 N 张已压缩，省 X」；`N` 只统计真正入库的压缩版本，重复项不计。
 
 ### pHash（256 位）
@@ -77,9 +77,9 @@
 
 ### 重复策略
 
-- **精确重复**：`content_hash` 已存在。默认跳过并计入“重复跳过”；选择“合并元数据”时标签取并集、评分取较高值、更新 `modified_at`。合并前会记录评分、`modified_at` 与标签关系快照，撤销导入时恢复。
-- **批内重复**：HashSet 在发布前占位，同一批内相同内容只保留一份。批内重复即使选择合并也按跳过处理，避免写入顺序不确定。
-- **感知重复**：导入时把新 pHash 与库内 pHash 线性比较（默认汉明距离阈值 6/256），只记录提示，不自动跳过。任务开始时一次性载入库内 pHash 的 4×`u64` 紧凑数组；新入库图片在提交后追加。20 万规模约 6.4 MB 原始数据，S7 再加分桶/索引。
+- **精确重复**：`content_hash` 已存在。默认跳过并计入“重复跳过”；选择“合并元数据”时标签取并集、评分取较高值、更新 `modified_at`。合并前会记录评分、`modified_at` 与标签关系快照，撤销导入时恢复。回执同时给出 `duplicatePairs`（源文件 ↔ 已有图片 id、是否在回收站）与 `mergedImageIds`；图库不保存源文件名与源路径，这层对应关系只在导入过程中捕获。
+- **批内重复**：工作线程用哈希占位，同一批内相同内容只保留一份；胜出源路径存在工作线程的 hash → 路径表里并跨 flush 保留。批内重复即使选择合并也按跳过处理，避免写入顺序不确定。回执给出 `batchDuplicatePairs`（`sourcePath` / `keptPath`）。
+- **感知重复**：导入时把新 pHash 与库内 pHash 线性比较（默认汉明距离阈值 6/256），只记录提示，不自动跳过。任务开始时一次性载入库内 pHash 的 4×`u64` 紧凑数组；新入库图片在提交后追加。20 万规模约 6.4 MB 原始数据，S7 再加分桶/索引。MCP 回执里的 `similarPairs` 复用这些 `ImportHint`，每张新图只给最近的一张，阈值固定 6/256。
 - 感知提示最多保留 100 条；结果里显示 `imageId / similarTo / distance`。
 - 回收站中的同内容图片仍视为已存在；导入不会自动恢复。S3 已提供回收站界面，可在导入后手工恢复。
 - 重复检测会把待释放的回收站行视为已存在（延迟释放的已知后果）；撤销导入只删除本次新增行，不删除用户源文件。
@@ -154,7 +154,9 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 `workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
+
+`tempReplaced` 只统计图库导入时被丢弃的临时区同内容行（见上面的“重复策略”），临时导入恒为 0。
 
 事件名：`import-progress`、`import-finished`。
 

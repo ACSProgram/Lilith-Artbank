@@ -58,6 +58,10 @@ struct WriterOptions {
     operation_id: Option<i64>,
     /// 临时导入固定使用该文件夹 id，不再按路径解析。
     folder_id: Option<i64>,
+    /// 图库导入时丢弃占着同内容哈希的临时行；临时导入保持它们之间的查重。
+    replace_temp_duplicate: bool,
+    /// 临时文件夹的物理目录；丢弃临时行后用它清掉原图副本。
+    temp_content_dir: Option<PathBuf>,
 }
 
 struct Staged {
@@ -93,12 +97,18 @@ struct Prepared {
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
     Prepared(Prepared),
-    Duplicate { hash: String, in_batch: bool },
+    Duplicate(DuplicateOutcome),
 }
 
 struct DuplicateOutcome {
     hash: String,
+    source_path: PathBuf,
     in_batch: bool,
+    /// 命中库内已有图片时的 id 与是否在回收站；批内重复没有这两个值。
+    existing_id: Option<i64>,
+    trashed: bool,
+    /// 批内重复的胜出源文件；用于回执里的 keptPath。
+    kept_path: Option<PathBuf>,
 }
 
 struct WorkerContext {
@@ -108,10 +118,13 @@ struct WorkerContext {
     temp_dir: PathBuf,
     folder: String,
     folder_mode: FolderMode,
+    /// 查重时是否把临时区的行算作「已存在」；只有临时导入才看临时区。
+    dedup_includes_temp: bool,
     threshold: u8,
     /// 勾选「导入时压缩」后的编码参数；`None` 表示原样入库。
     optimize: Option<OptimizeOptions>,
-    inflight: Arc<Mutex<HashSet<String>>>,
+    /// 已占位的内容哈希 → 首个源文件；用于批内重复归因，跨 flush 保留。
+    inflight: Arc<Mutex<HashMap<String, PathBuf>>>,
     index: Arc<RwLock<PhashIndex>>,
     sender: mpsc::SyncSender<Outcome>,
     #[cfg(test)]
@@ -129,8 +142,16 @@ struct CommitStats {
     failures: Vec<(String, String)>,
     duplicates: usize,
     merged: usize,
+    /// 图库导入时被丢弃的、占着同内容哈希的临时行。
+    temp_replaced: usize,
     optimized: usize,
     optimized_bytes: u64,
+    duplicate_pairs: Vec<(String, i64, bool)>,
+    batch_duplicate_pairs: Vec<(String, String)>,
+    merged_image_ids: Vec<i64>,
+    imported_pairs: Vec<(String, i64)>,
+    /// 临时行删掉后留在临时目录里的原图，提交成功后再清理。
+    orphan_temp_files: Vec<PathBuf>,
 }
 
 pub fn run(source: ImportSource, job: Arc<ImportJob>, request: ImportRequest) -> AppResult<()> {
@@ -177,15 +198,23 @@ fn run_inner(
             .collect::<Vec<_>>(),
     ));
 
-    let (folder, folder_id) = match request.target {
-        ImportTarget::Library => (request.folder.clone(), None),
+    let (folder, folder_id, temp_content_dir) = match request.target {
+        ImportTarget::Library => {
+            // 图库导入也可能要丢弃临时区的同内容行，提前拿到临时目录好清理副本。
+            let directory = source
+                .database
+                .with_reader(crate::library::temp::path)?
+                .map(|path| paths.folder_dir(&path));
+            (request.folder.clone(), None, directory)
+        }
         ImportTarget::Temp => {
             let temp = source.database.with_reader(crate::library::temp::require)?;
-            (temp.path, Some(temp.id))
+            let directory = paths.folder_dir(&temp.path);
+            (temp.path, Some(temp.id), Some(directory))
         }
     };
 
-    let inflight = Arc::new(Mutex::new(HashSet::new()));
+    let inflight = Arc::new(Mutex::new(HashMap::new()));
     let (sender, receiver) = mpsc::sync_channel::<Outcome>(CHANNEL_DEPTH);
     let writer_options = WriterOptions {
         tags: request.tags.clone(),
@@ -193,6 +222,8 @@ fn run_inner(
         policy: request.duplicate_policy,
         operation_id: source.operation_id,
         folder_id,
+        replace_temp_duplicate: request.target == ImportTarget::Library,
+        temp_content_dir,
     };
 
     let writer = {
@@ -228,6 +259,7 @@ fn run_inner(
             temp_dir: temp_dir.to_path_buf(),
             folder,
             folder_mode: request.folder_mode,
+            dedup_includes_temp: request.target == ImportTarget::Temp,
             threshold: request.perceptual_threshold,
             optimize: request.optimize.map(|value| value.options()),
             inflight,
@@ -310,24 +342,35 @@ fn process_staged(
         return Ok(None);
     }
 
-    let existing = context
-        .database
-        .with_reader(|connection| repository::find_by_hash(connection, &staged.hash))?;
-    if existing.is_some() {
-        return Ok(Some(Outcome::Duplicate {
+    // 库内已有内容优先归因为“精确重复”；只有本次导入尚未入库的哈希才进入批内占位。
+    // 图库导入不看临时区的行：临时区只是“先看一眼”的暂存，同内容的图要真正入库。
+    let existing = context.database.with_reader(|connection| {
+        repository::find_by_hash_state(connection, &staged.hash, context.dedup_includes_temp)
+    })?;
+    if let Some((existing_id, trashed)) = existing {
+        return Ok(Some(Outcome::Duplicate(DuplicateOutcome {
             hash: staged.hash.clone(),
+            source_path: source_path.to_path_buf(),
             in_batch: false,
-        }));
+            existing_id: Some(existing_id),
+            trashed,
+            kept_path: None,
+        })));
     }
 
     {
         let mut inflight = context.inflight.lock();
-        if !inflight.insert(staged.hash.clone()) {
-            return Ok(Some(Outcome::Duplicate {
+        if let Some(kept_path) = inflight.get(&staged.hash) {
+            return Ok(Some(Outcome::Duplicate(DuplicateOutcome {
                 hash: staged.hash.clone(),
+                source_path: source_path.to_path_buf(),
                 in_batch: true,
-            }));
+                existing_id: None,
+                trashed: false,
+                kept_path: Some(kept_path.clone()),
+            })));
         }
+        inflight.insert(staged.hash.clone(), source_path.to_path_buf());
     }
 
     let result = build_prepared(source_path, relative_folder, staged, context);
@@ -605,9 +648,7 @@ fn write_loop(
     loop {
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(Outcome::Prepared(item)) => buffer.prepared.push(item),
-            Ok(Outcome::Duplicate { hash, in_batch }) => {
-                buffer.duplicates.push(DuplicateOutcome { hash, in_batch })
-            }
+            Ok(Outcome::Duplicate(item)) => buffer.duplicates.push(item),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 flush(&database, &pack, &options, &job, &index, &mut buffer);
             }
@@ -652,8 +693,14 @@ fn flush(
             failures: Vec::new(),
             duplicates: 0,
             merged: 0,
+            temp_replaced: 0,
             optimized: 0,
             optimized_bytes: 0,
+            duplicate_pairs: Vec::new(),
+            batch_duplicate_pairs: Vec::new(),
+            merged_image_ids: Vec::new(),
+            imported_pairs: Vec::new(),
+            orphan_temp_files: Vec::new(),
         };
         let mut segments = HashSet::new();
 
@@ -713,6 +760,16 @@ fn flush(
                     id
                 }
             };
+            // 图库导入：同内容的临时行先让出唯一约束，否则这张图永远进不了图库。
+            if options.replace_temp_duplicate
+                && let Some(file_name) =
+                    repository::discard_temporary_duplicate(&transaction, &item.content_hash)?
+            {
+                stats.temp_replaced += 1;
+                if let Some(directory) = &options.temp_content_dir {
+                    stats.orphan_temp_files.push(directory.join(file_name));
+                }
+            }
             match repository::insert_image(&transaction, folder_id, &insert) {
                 Ok(Some(id)) => {
                     repository::attach_tags(&transaction, id, &tag_ids)?;
@@ -721,13 +778,16 @@ fn flush(
                         similar: item.similar,
                         phash: item.phash,
                     });
+                    stats
+                        .imported_pairs
+                        .push((item.source_path.to_string_lossy().into_owned(), id));
                     if let Some(saved) = item.optimized_savings {
                         stats.optimized += 1;
                         stats.optimized_bytes += saved;
                     }
                 }
                 Ok(None) => {
-                    resolve_existing(
+                    if let Some(found) = resolve_existing(
                         &transaction,
                         &item.content_hash,
                         options,
@@ -735,7 +795,13 @@ fn flush(
                         now,
                         &mut stats,
                         &mut merged,
-                    )?;
+                    )? {
+                        stats.duplicate_pairs.push((
+                            item.source_path.to_string_lossy().into_owned(),
+                            found.id,
+                            found.trashed,
+                        ));
+                    }
                     if item.published {
                         let _ = std::fs::remove_file(&item.destination);
                     }
@@ -753,12 +819,28 @@ fn flush(
         }
 
         for duplicate in &dups {
+            let source_path = duplicate.source_path.to_string_lossy().into_owned();
             if duplicate.in_batch {
-                // 批内重复的胜者已由工作线程的 HashSet 占位决定，这里只计数。
+                // 批内重复的胜者已由工作线程的哈希占位决定，这里只计数与归因。
                 stats.duplicates += 1;
+                if let Some(kept_path) = &duplicate.kept_path {
+                    stats
+                        .batch_duplicate_pairs
+                        .push((source_path, kept_path.to_string_lossy().into_owned()));
+                }
                 continue;
             }
-            resolve_existing(
+            if options.policy == DuplicatePolicy::Skip {
+                // 工作线程已经确认过库内这一行，跳过策略不需要在写事务里再查一次。
+                stats.duplicates += 1;
+                if let Some(existing_id) = duplicate.existing_id {
+                    stats
+                        .duplicate_pairs
+                        .push((source_path, existing_id, duplicate.trashed));
+                }
+                continue;
+            }
+            let found = resolve_existing(
                 &transaction,
                 &duplicate.hash,
                 options,
@@ -767,6 +849,11 @@ fn flush(
                 &mut stats,
                 &mut merged,
             )?;
+            if let Some(found) = found {
+                stats
+                    .duplicate_pairs
+                    .push((source_path, found.id, found.trashed));
+            }
         }
 
         for segment in segments {
@@ -826,7 +913,26 @@ fn flush(
             job.inc_imported(stats.inserted.len());
             job.inc_duplicates(stats.duplicates);
             job.inc_merged(stats.merged);
+            job.inc_temp_replaced(stats.temp_replaced);
             job.inc_optimized(stats.optimized, stats.optimized_bytes);
+            // 行已经删掉，原图随临时区清空也会消失；这里只是提前省下磁盘。
+            for file in stats.orphan_temp_files {
+                if let Err(error) = std::fs::remove_file(&file) {
+                    log::debug!("清理临时区重复图失败：{error}；文件位于 {}", file.display());
+                }
+            }
+            for (source, kept) in stats.batch_duplicate_pairs {
+                job.add_batch_duplicate_pair(source, kept);
+            }
+            for (source, existing_id, trashed) in stats.duplicate_pairs {
+                job.add_duplicate_pair(source, existing_id, trashed);
+            }
+            for image_id in stats.merged_image_ids {
+                job.add_merged_image(image_id);
+            }
+            for (source, image_id) in stats.imported_pairs {
+                job.add_imported_pair(source, image_id);
+            }
             {
                 let mut hashes = index.write();
                 for row in &stats.inserted {
@@ -873,7 +979,7 @@ fn flush(
 /// 内容哈希已存在时的统一出口：按策略合并元数据，否则计入重复跳过。
 ///
 /// 合并要在写事务内按哈希重新取 id，这样即使工作线程与写线程之间隔了若干批次，
-/// 也只会改到当前事务可见的那一行。
+/// 也只会改到当前事务可见的那一行。返回命中的图片 id 与回收站状态，供回执归因。
 fn resolve_existing(
     connection: &Connection,
     hash: &str,
@@ -882,33 +988,42 @@ fn resolve_existing(
     now: i64,
     stats: &mut CommitStats,
     merged: &mut Vec<ImportMerged>,
-) -> AppResult<()> {
-    match repository::find_by_hash(connection, hash)? {
-        Some(id) if options.policy == DuplicatePolicy::Merge => {
-            let (old_score, old_modified_at): (i64, i64) = connection.query_row(
-                "SELECT score, modified_at FROM images WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let old_tag_ids: Vec<i64> = {
-                let mut statement = connection
-                    .prepare("SELECT tag_id FROM image_tags WHERE image_id = ?1 ORDER BY tag_id")?;
-                statement
-                    .query_map([id], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            repository::merge_metadata(connection, id, options.score, tag_ids, now)?;
-            merged.push(ImportMerged {
-                image_id: id,
-                old_score,
-                old_modified_at,
-                old_tag_ids,
-            });
-            stats.merged += 1;
-        }
-        _ => stats.duplicates += 1,
+) -> AppResult<Option<ResolvedExisting>> {
+    let Some((id, trashed)) = repository::find_by_hash_state(connection, hash, true)? else {
+        stats.duplicates += 1;
+        return Ok(None);
+    };
+    if options.policy != DuplicatePolicy::Merge {
+        stats.duplicates += 1;
+        return Ok(Some(ResolvedExisting { id, trashed }));
     }
-    Ok(())
+    let (old_score, old_modified_at): (i64, i64) = connection.query_row(
+        "SELECT score, modified_at FROM images WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let old_tag_ids: Vec<i64> = {
+        let mut statement = connection
+            .prepare("SELECT tag_id FROM image_tags WHERE image_id = ?1 ORDER BY tag_id")?;
+        statement
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    repository::merge_metadata(connection, id, options.score, tag_ids, now)?;
+    merged.push(ImportMerged {
+        image_id: id,
+        old_score,
+        old_modified_at,
+        old_tag_ids,
+    });
+    stats.merged += 1;
+    stats.merged_image_ids.push(id);
+    Ok(Some(ResolvedExisting { id, trashed }))
+}
+
+struct ResolvedExisting {
+    id: i64,
+    trashed: bool,
 }
 
 #[cfg(test)]
@@ -1367,6 +1482,88 @@ mod tests {
     }
 
     #[test]
+    fn attributes_exact_duplicates_and_imported_pairs() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        write_samples(&source_dir, 2, (60, 60));
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+
+        let first = run_import(&session, &library_root, &source_dir).snapshot();
+        assert_eq!(first.imported_pairs.len(), 2);
+        assert!(first.duplicate_pairs.is_empty());
+        let mut first_ids: Vec<i64> = first
+            .imported_pairs
+            .iter()
+            .map(|pair| pair.image_id)
+            .collect();
+        first_ids.sort_unstable();
+
+        let second = run_import(&session, &library_root, &source_dir).snapshot();
+        assert_eq!(second.progress.duplicates, 2);
+        assert_eq!(second.duplicate_pair_count, 2);
+        assert_eq!(second.duplicate_pairs.len(), 2);
+        assert!(!second.duplicate_pairs_truncated);
+        let mut duplicate_ids: Vec<i64> = second
+            .duplicate_pairs
+            .iter()
+            .map(|pair| pair.image_id)
+            .collect();
+        duplicate_ids.sort_unstable();
+        assert_eq!(duplicate_ids, first_ids);
+        assert!(second.duplicate_pairs.iter().all(|pair| !pair.trashed));
+        assert!(second.imported_pairs.is_empty());
+    }
+
+    #[test]
+    fn attributes_batch_duplicates_to_the_kept_source() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let bytes = std::fs::read({
+            let path = source_dir.join("origin.png");
+            sample_image(9, 48, 48).save(&path).unwrap();
+            path
+        })
+        .unwrap();
+        std::fs::write(source_dir.join("copy.png"), &bytes).unwrap();
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+
+        let snapshot = run_import(&session, &library_root, &source_dir).snapshot();
+        assert_eq!(snapshot.progress.imported, 1);
+        assert_eq!(snapshot.progress.duplicates, 1);
+        assert_eq!(snapshot.batch_duplicate_pair_count, 1);
+        assert_eq!(snapshot.batch_duplicate_pairs.len(), 1);
+        let pair = &snapshot.batch_duplicate_pairs[0];
+        assert_ne!(pair.source_path, pair.kept_path);
+        assert_eq!(snapshot.imported_pairs[0].source_path, pair.kept_path);
+    }
+
+    #[test]
+    fn duplicate_pairs_mark_trashed_existing_images() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        write_samples(&source_dir, 1, (60, 60));
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let first = run_import(&session, &library_root, &source_dir).snapshot();
+        let image_id = first.imported_pairs[0].image_id;
+        session
+            .db
+            .with_writer(|connection| {
+                connection.execute("UPDATE images SET deleted_at = 1 WHERE id = ?1", [image_id])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let second = run_import(&session, &library_root, &source_dir).snapshot();
+        assert_eq!(second.duplicate_pair_count, 1);
+        assert_eq!(second.duplicate_pairs[0].image_id, image_id);
+        assert!(second.duplicate_pairs[0].trashed);
+    }
+
+    #[test]
     fn merges_metadata_for_existing_content() {
         let temp = tempdir().unwrap();
         let source_dir = temp.path().join("source");
@@ -1389,6 +1586,15 @@ mod tests {
         let snapshot = job.snapshot();
         assert_eq!(snapshot.progress.merged, 1);
         assert_eq!(snapshot.progress.duplicates, 0);
+        let image_id: i64 = session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row("SELECT id FROM images", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(snapshot.merged_image_ids, vec![image_id]);
+        assert_eq!(snapshot.duplicate_pair_count, 1);
+        assert_eq!(snapshot.duplicate_pairs[0].image_id, image_id);
 
         session
             .db
@@ -1405,6 +1611,55 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn library_import_replaces_same_content_in_temp_folder() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        write_samples(&source_dir, 3, (40, 40));
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+
+        // 先进临时区：路径不变，源文件也还在，正好模拟“先看一眼再决定入库”。
+        let mut temp_request = request(&source_dir);
+        temp_request.target = ImportTarget::Temp;
+        temp_request.folder.clear();
+        temp_request.tags.clear();
+        let temp_snapshot = run_with(&session, &library_root, temp_request);
+        assert_eq!(temp_snapshot.progress.imported, 3, "{temp_snapshot:?}");
+
+        // 同一个目录再导图库：临时区的同内容行让位，三张都真正入库。
+        let snapshot = run_with(&session, &library_root, request(&source_dir));
+        assert_eq!(snapshot.progress.imported, 3, "{snapshot:?}");
+        assert_eq!(snapshot.progress.duplicates, 0, "{snapshot:?}");
+        assert_eq!(snapshot.progress.temp_replaced, 3, "{snapshot:?}");
+
+        let (library_rows, temp_rows): (i64, i64) = session
+            .db
+            .with_reader(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT count(*) FROM images JOIN folders ON folders.id = images.folder_id
+                         WHERE folders.kind = 'normal'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM images JOIN folders ON folders.id = images.folder_id
+                         WHERE folders.kind = 'temp'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((library_rows, temp_rows), (3, 0));
+
+        // 临时区留下的原图副本在提交后被清掉，不占着磁盘等关库。
+        let temp_dir = library_root.join(crate::library::paths::TEMP_FOLDER_DIR);
+        let leftover = std::fs::read_dir(&temp_dir).unwrap().count();
+        assert_eq!(leftover, 0, "临时区的原图副本没有清理");
     }
 
     #[test]

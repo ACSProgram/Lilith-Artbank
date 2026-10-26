@@ -25,6 +25,8 @@ use crate::mcp::{
     sheet::{self, SHEET_TTL_MINUTES, SheetResolution},
 };
 
+use super::feature::MAX_TEMP_FEATURE_IDS;
+
 pub const MAX_SEARCH_PAGE: u32 = 50;
 pub const MAX_IMAGE_IDS: usize = 50;
 pub const MAX_PREVIEW: usize = 25;
@@ -180,6 +182,7 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
     let (image_count, trash_count, temp_count) = context.database.counts()?;
     let temp_path = context.database.with_reader(crate::library::temp::path)?;
     let features = capability::feature_summary(&context.database)?;
+    let (temp_embeddings, temp_poses) = capability::temp_feature_summary(&context.database)?;
     Ok(json!({
         "library": {
             "id": context.info.id,
@@ -205,6 +208,8 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
             "poses": features.pose,
             "phash": features.phash,
             "colors": features.colors,
+            "tempEmbeddings": temp_embeddings,
+            "tempPoses": temp_poses,
         },
         "ai": {
             "baseUrl": context.settings.ai.base_url,
@@ -225,6 +230,7 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
                 "maxReferenceImages": MAX_REFERENCE_IDS,
                 "maxImportPaths": 10_000,
                 "maxImportFiles": 100_000,
+                "maxTempFeatureImages": MAX_TEMP_FEATURE_IDS,
                 "sheetTtlMinutes": SHEET_TTL_MINUTES,
                 "importCompresses": false,
             }
@@ -341,10 +347,15 @@ pub fn search_images(context: &ReadContext, input: &SearchImagesInput) -> AppRes
         None => query::query_total(&context.database, base)?,
     };
     let page = query::query_page(&context.database, &context.root, query)?;
+    let temp_path = temp_folder_path(context)?;
     let mut value = json!({
         "total": total,
         "pageSize": page_size,
-        "images": page.items.iter().map(compact_row).collect::<Vec<_>>(),
+        "images": page
+            .items
+            .iter()
+            .map(|row| compact_row(row, temp_path.as_deref()))
+            .collect::<Vec<_>>(),
         "nextCursor": page.next_cursor,
         "nextPageToken": page.next_page_token,
     });
@@ -447,6 +458,7 @@ pub fn find_similar(
             )
         }
     };
+    let temp_path = temp_folder_path(context)?;
     let preview = ai.similarity_page(&token, 0, Some(preview_limit))?;
     let scores = ai.similarity_scores(&token)?;
     let score_kind = if matches!(kind.as_str(), "phash" | "color4" | "color8") {
@@ -468,7 +480,7 @@ pub fn find_similar(
         "limit": limit,
         "elapsedMs": elapsed_ms,
         "preview": preview.items.iter().map(|row| {
-            let mut value = compact_row(row);
+            let mut value = compact_row(row, temp_path.as_deref());
             value["score"] = match scores.get(&row.id) {
                 Some(score) => json!(((f64::from(*score)) * 1e6).round() / 1e6),
                 None => Value::Null,
@@ -489,6 +501,7 @@ pub fn images_get(context: &ReadContext, ids: &[i64]) -> AppResult<Value> {
         .into_iter()
         .map(|item| (item.image_id, item))
         .collect::<HashMap<_, _>>();
+    let temp_path = temp_folder_path(context)?;
     let mut images = Vec::with_capacity(existing.len());
     let mut missing_ids = Vec::new();
     for id in &ids {
@@ -497,12 +510,16 @@ pub fn images_get(context: &ReadContext, ids: &[i64]) -> AppResult<Value> {
             continue;
         };
         let details = metadata::image_details(&context.database, &context.root, *id)?;
+        let temporary = temp_path
+            .as_deref()
+            .is_some_and(|path| details.folder_path == path);
         images.push(json!({
             "id": details.id,
             "contentHash": details.content_hash,
             "filePath": details.file_path,
             "folderId": details.folder_id,
-            "folderPath": details.folder_path,
+            "folderPath": display_folder(&details.folder_path, temporary),
+            "temporary": temporary,
             "fileSize": details.file_size,
             "width": details.width,
             "height": details.height,
@@ -572,6 +589,8 @@ pub fn image_sheet(
             cell.source_label = Some(source.clone());
         }
     }
+    // 被 excludeCells 剔掉的格子不会出现在 cells 里；单独列出来，别和“本来没图”混在一起。
+    let excluded_cells = excluded_labels(context, &input.selector);
     let mapping = json!({
         "sheetId": built.record.id,
         "grid": grid,
@@ -579,7 +598,9 @@ pub fn image_sheet(
         "total": selection.total,
         "next": selection.next,
         "missingIds": selection.missing_ids,
+        "excludedCells": excluded_cells,
         "cells": built.cells,
+        "note": "cells[].status：image=有图，missing=有图但缩略图/原图读不出来，empty=这一格没有图；被 excludeCells 排除的格子在 excludedCells 里，不占 cells。",
     });
     Ok(SheetToolResult {
         mapping,
@@ -587,11 +608,40 @@ pub fn image_sheet(
     })
 }
 
-pub fn compact_row(row: &ImageRow) -> Value {
-    json!({
+/// 从来源拼图里找出真正被 `excludeCells` 排除掉的格子；没被排除的标签不算。
+fn excluded_labels(context: &ReadContext, selector: &Selector) -> Vec<String> {
+    let Selector::Sheet {
+        sheet_id,
+        exclude_cells,
+        ..
+    } = selector
+    else {
+        return Vec::new();
+    };
+    if exclude_cells.is_empty() {
+        return Vec::new();
+    }
+    let Ok(record) = context.sheets.lock().get(sheet_id) else {
+        return Vec::new();
+    };
+    let wanted: std::collections::HashSet<String> = exclude_cells
+        .iter()
+        .map(|label| label.trim().to_ascii_uppercase())
+        .collect();
+    record
+        .cells
+        .iter()
+        .filter(|cell| wanted.contains(&cell.label.to_ascii_uppercase()))
+        .map(|cell| cell.label.clone())
+        .collect()
+}
+
+pub fn compact_row(row: &ImageRow, temp_path: Option<&str>) -> Value {
+    let temporary = temp_path.is_some_and(|path| row.folder_path == path);
+    let mut value = json!({
         "id": row.id,
         "folderId": row.folder_id,
-        "folderPath": row.folder_path,
+        "folderPath": display_folder(&row.folder_path, temporary),
         "format": row.format,
         "fileExt": row.file_ext,
         "width": row.width,
@@ -604,7 +654,24 @@ pub fn compact_row(row: &ImageRow) -> Value {
         "deletedAt": row.deleted_at,
         "thumbWidth": row.thumb_width,
         "thumbHeight": row.thumb_height,
-    })
+    });
+    if temporary && let Value::Object(object) = &mut value {
+        object.insert("temporary".to_owned(), Value::Bool(true));
+    }
+    value
+}
+
+/// `.artbank-temp` 这类内部目录名不该出现在给 AI 的结果里。
+pub(crate) fn display_folder(path: &str, temporary: bool) -> String {
+    if temporary {
+        "临时".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn temp_folder_path(context: &ReadContext) -> AppResult<Option<String>> {
+    context.database.with_reader(crate::library::temp::path)
 }
 
 fn dedupe_ids(ids: &[i64]) -> AppResult<Vec<i64>> {
@@ -928,8 +995,12 @@ mod tests {
         assert_eq!(cells.len(), 4);
         assert_eq!(cells[0]["label"], "A1");
         assert_eq!(cells[0]["imageId"], 1);
+        assert_eq!(cells[0]["status"], "image");
         assert_eq!(cells[2]["label"], "A2");
         assert_eq!(cells[3]["imageId"], Value::Null);
+        // 没有图的格子是 empty，不是“有图但读不出缩略图”。
+        assert_eq!(cells[3]["status"], "empty");
+        assert_eq!(cells[3]["thumbMissing"], false);
         assert!(!result.image.is_empty());
         let sheet_id = result.mapping["sheetId"].as_str().unwrap().to_owned();
 
@@ -1115,9 +1186,9 @@ mod tests {
                             id, content_hash, file_ext, folder_id, file_size, width, height,
                             format, has_alpha, phash, colors4, colors8, score, description,
                             imported_at, modified_at
-                         ) VALUES (?1, ?2, 'png', 2, 1, 10, 10, 'png', 0,
+                         ) VALUES (?1, ?2, 'png', ?3, 1, 10, 10, 'png', 0,
                             zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 500, 500)",
-                        params![id, format!("{id:0>64}")],
+                        params![id, format!("{id:0>64}"), fixture.works_folder],
                     )?;
                 }
                 Ok(())
@@ -1158,6 +1229,87 @@ mod tests {
             }
         }
         assert_eq!(seen, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn similarity_selector_honours_offset_and_limit_for_writes() {
+        let fixture = fixture();
+        fixture
+            .context
+            .database
+            .with_writer(|connection| {
+                for id in [4_i64, 5] {
+                    connection.execute(
+                        "INSERT INTO images(
+                            id, content_hash, file_ext, folder_id, file_size, width, height,
+                            format, has_alpha, phash, colors4, colors8, score, description,
+                            imported_at, modified_at
+                         ) VALUES (?1, ?2, 'png', ?3, 1, 10, 10, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 500, 500)",
+                        params![id, format!("{id:0>64}"), fixture.works_folder],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        fixture.ai.invalidate_similarity();
+
+        let found = find_similar(
+            &fixture.context,
+            &fixture.ai,
+            &FindSimilarInput {
+                mode: SimilarMode::Image,
+                target_id: Some(1),
+                kind: Some("phash".into()),
+                threshold: Some(6.0),
+                limit: Some(10),
+                preview_limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let token = found["token"].as_str().unwrap().to_owned();
+
+        // 写入也按 offset/limit 切片，不会把整个结果槽都放进来。
+        let limited = selection::resolve_ids(
+            &Selector::Similarity {
+                token: token.clone(),
+                offset: 0,
+                limit: Some(2),
+                exclude_ids: Vec::new(),
+            },
+            &fixture.context,
+            &fixture.ai,
+        )
+        .unwrap();
+        assert_eq!(limited.ids, vec![2, 3]);
+
+        let skipped = selection::resolve_ids(
+            &Selector::Similarity {
+                token: token.clone(),
+                offset: 2,
+                limit: Some(2),
+                exclude_ids: Vec::new(),
+            },
+            &fixture.context,
+            &fixture.ai,
+        )
+        .unwrap();
+        assert_eq!(skipped.ids, vec![4, 5]);
+
+        // 省略 limit 时仍是“取整个结果槽”。
+        let all = selection::resolve_ids(
+            &Selector::Similarity {
+                token,
+                offset: 0,
+                limit: None,
+                exclude_ids: Vec::new(),
+            },
+            &fixture.context,
+            &fixture.ai,
+        )
+        .unwrap();
+        assert_eq!(all.ids, vec![2, 3, 4, 5]);
     }
 
     #[test]

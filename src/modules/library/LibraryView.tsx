@@ -1680,7 +1680,7 @@ export function LibraryView({
                 className={semanticMode ? "is-active" : ""}
                 aria-pressed={semanticMode}
                 disabled={!similarity || Boolean(semanticBlockedReason)}
-                title={semanticBlockedReason ?? "用一句话描述想找的画面"}
+                title={semanticBlockedReason ?? "用一句话描述想找的画面；英文描述命中更准"}
                 onClick={() => switchSearchMode("semantic")}
               >
                 语义
@@ -1692,7 +1692,7 @@ export function LibraryView({
               value={semanticMode ? semanticDraft : searchDraft}
               placeholder={
                 semanticMode
-                  ? "描述想找的画面，例如：红色斗篷的侧身人物"
+                  ? "a woman in a red cloak, side view（英文更准）"
                   : "搜索描述、标签、文件夹"
               }
               aria-label={semanticMode ? "语义搜索" : "搜索图片"}

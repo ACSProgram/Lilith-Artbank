@@ -1,3 +1,5 @@
+pub mod feature;
+pub mod folder;
 pub mod history;
 pub mod import;
 pub mod read;
@@ -52,6 +54,10 @@ pub fn execute_approval(state: &AppState, action: &ApprovalAction) -> AppResult<
         "history_undo" => history::execute_undo(state, &parse(&action.arguments)?),
         "history_redo" => history::execute_redo(state, &parse(&action.arguments)?),
         "import_start" => import::execute_import(state, &parse(&action.arguments)?),
+        "temp_features_generate" => {
+            feature::execute_temp_features(state, &parse(&action.arguments)?)
+        }
+        "folders_modify" => folder::execute_folders_modify(state, &parse(&action.arguments)?),
         other => Err(AppError::message(format!("未知的待确认工具：{other}"))),
     }
 }
@@ -59,4 +65,15 @@ pub fn execute_approval(state: &AppState, action: &ApprovalAction) -> AppResult<
 fn parse<T: DeserializeOwned>(value: &Value) -> AppResult<T> {
     serde_json::from_value(value.clone())
         .map_err(|error| AppError::message(format!("待确认参数无法解析：{error}")))
+}
+
+/// 把一份 JSON 对象合并进另一份；非对象直接忽略。
+///
+/// 各工具都需要「顶层状态 + 一份预览/计划」拼结果，合并写法只留这一处。
+pub(super) fn merge_object(target: &mut Value, extra: Value) {
+    if let (Value::Object(target), Value::Object(extra)) = (target, extra) {
+        for (key, value) in extra {
+            target.insert(key, value);
+        }
+    }
 }

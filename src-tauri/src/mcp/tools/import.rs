@@ -66,6 +66,11 @@ fn run_import(
     let target = target_label(&request);
     let _exclusive = state.lock_mcp_writes();
 
+    // 路径不存在就别排队等用户批准了：批准之后也只会失败。
+    if let Some(outcome) = missing_paths(&request.paths) {
+        return Ok(outcome);
+    }
+
     // 临时导入是查找用的暂存区，询问档下免确认；普通导入仍然每次确认。
     if mode == McpMode::Ask && !approved && !temporary {
         return write::enqueue_approval(
@@ -99,6 +104,25 @@ fn run_import(
             "message": message,
         }),
     ))
+}
+
+/// 入队前确认每个输入路径都存在；缺失的直接拒绝并列出。
+fn missing_paths(paths: &[String]) -> Option<ToolOutcome> {
+    let missing: Vec<String> = paths
+        .iter()
+        .filter(|path| std::fs::metadata(path).is_err())
+        .take(MAX_PATHS_REPORTED)
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(ToolOutcome::value(json!({
+        "status": "rejected",
+        "reason": "有路径不存在或无法访问，未开始导入",
+        "missingPaths": missing,
+        "pathTotal": paths.len(),
+    })))
 }
 
 /// 组装并规范化导入请求；`optimize` 永远为 `None`，`workerThreads` 由设置决定。
@@ -272,6 +296,18 @@ mod tests {
         let mut value = input(vec![absolute_temp_path()]);
         value.duplicate_policy = Some("overwrite".into());
         assert!(prepare_request(&value).is_err());
+    }
+
+    #[test]
+    fn missing_paths_are_rejected_before_queueing() {
+        let existing = absolute_temp_path();
+        assert!(missing_paths(std::slice::from_ref(&existing)).is_none());
+
+        let missing = format!("{existing}/definitely-not-here.png");
+        let outcome = missing_paths(&[existing, missing]).unwrap().value;
+        assert_eq!(outcome["status"], "rejected");
+        assert_eq!(outcome["missingPaths"].as_array().unwrap().len(), 1);
+        assert_eq!(outcome["pathTotal"], 2);
     }
 
     #[test]

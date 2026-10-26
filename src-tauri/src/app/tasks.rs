@@ -51,6 +51,8 @@ pub enum TaskKind {
     ReleaseGarbage,
     OptimizeEstimate,
     Optimize,
+    /// 仅用于临时区的 embedding/pose 生成；占用 write lane。
+    TempFeatures,
 }
 
 impl TaskKind {
@@ -64,7 +66,8 @@ impl TaskKind {
             | Self::Undo
             | Self::Redo
             | Self::ReleaseGarbage
-            | Self::Optimize => TaskLane::Write,
+            | Self::Optimize
+            | Self::TempFeatures => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription => TaskLane::Ai,
             Self::SimilarityGroups | Self::OptimizeEstimate => TaskLane::Scan,
         }
@@ -86,6 +89,7 @@ impl TaskKind {
             Self::ReleaseGarbage => "释放删除文件",
             Self::OptimizeEstimate => "估算压缩空间",
             Self::Optimize => "优化图片空间",
+            Self::TempFeatures => "生成临时区特征",
         }
     }
 }
@@ -284,6 +288,15 @@ impl TaskHandle {
 
     pub fn inc_skipped(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 批量任务结束后按领域层的报告对齐计数，避免 message 与字段各说一套。
+    pub fn set_skipped(&self, skipped: usize) {
+        self.skipped.store(skipped, Ordering::Relaxed);
+    }
+
+    pub fn set_failed(&self, failed: usize) {
+        self.failed.store(failed, Ordering::Relaxed);
     }
 
     pub fn set_current(&self, image_id: Option<i64>) {

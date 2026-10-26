@@ -6218,12 +6218,59 @@ body.is-drag-sorting * {
   color: var(--danger);
 }
 
-.mcp-approval-meta {
+/* 操作说明、数量目标、导入附加信息各占一行，避免一行挤四种信息。 */
+.mcp-approval-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mcp-approval-operation {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-approval-time {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.mcp-approval-scope,
+.mcp-approval-facts {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 10px;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.mcp-approval-facts-label {
   color: var(--text-faint);
+  font-size: 10px;
+}
+
+.mcp-approval-pill {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--text-muted);
   font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-approval-pill.is-target {
+  color: var(--text-faint);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
 }
 
 .mcp-approval-sample,
@@ -6287,6 +6334,7 @@ body.is-drag-sorting * {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  margin-top: 2px;
   color: var(--text-faint);
   font-size: 10.5px;
   line-height: 1.55;
