@@ -15,6 +15,8 @@ export type CombineMode = "union" | "intersection" | "difference";
 
 export interface LibraryFilters {
   folderIds: number[];
+  /** 选中文件夹只匹配直接位于其中的图片，不包含子文件夹。 */
+  folderDirect: boolean;
   extensions: string[];
   scores: number[];
   tagIds: number[];
@@ -115,6 +117,13 @@ export interface FolderInfo {
   directImageCount: number;
   /** 包含全部后代的未删除图片数。 */
   totalImageCount: number;
+}
+
+export type FolderSortKey = "name" | "total";
+
+export interface FolderOrder {
+  parentId: number;
+  folderIds: number[];
 }
 
 export interface TagInfo {

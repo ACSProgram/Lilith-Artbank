@@ -187,6 +187,8 @@ pub enum ChunkFormat {
     Triples,
     Moves,
     Json,
+    /// 文件夹批量移动时目标父级兄弟的排序位变化（id、旧值、新值）。
+    SortJson,
     /// 撤销时捕获的“当前状态”，只用于重做；原 chunks 保持描述撤销方向。
     Redo,
 }
@@ -198,6 +200,7 @@ impl ChunkFormat {
             Self::Triples => "triples",
             Self::Moves => "moves",
             Self::Json => "json",
+            Self::SortJson => "sortJson",
             Self::Redo => "redo",
         }
     }
@@ -208,6 +211,7 @@ impl ChunkFormat {
             "triples" => Ok(Self::Triples),
             "moves" => Ok(Self::Moves),
             "json" => Ok(Self::Json),
+            "sortJson" => Ok(Self::SortJson),
             "redo" => Ok(Self::Redo),
             other => Err(AppError::message(format!("未知的记录数据格式：{other}"))),
         }
@@ -291,6 +295,17 @@ impl OperationDraft {
         });
         Ok(())
     }
+
+    pub fn sort_changes(&mut self, rows: &FolderSortChange) -> AppResult<()> {
+        if rows.rows.is_empty() {
+            return Ok(());
+        }
+        self.chunks.push(Chunk {
+            format: ChunkFormat::SortJson,
+            data: serde_json::to_vec(rows)?,
+        });
+        Ok(())
+    }
 }
 
 /// 记录格式：文件夹创建时新建的行；撤销时按深度从深到浅删除。
@@ -327,6 +342,13 @@ pub struct FolderPathChange {
 #[serde(rename_all = "camelCase")]
 pub struct FolderReorder {
     pub rows: Vec<(i64, i64)>,
+}
+
+/// 记录格式：批量移动时目标父级非移动兄弟的排序位（id、旧值、新值）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSortChange {
+    pub rows: Vec<(i64, i64, i64)>,
 }
 
 /// 记录格式：编辑前的完整内容快照。
@@ -2727,6 +2749,13 @@ fn undo_folder(
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for chunk in load_chunks(&transaction, operation_id)? {
+            if chunk.format == ChunkFormat::SortJson {
+                if matches!(kind, HistoryKind::FolderRename | HistoryKind::FolderMove) {
+                    let change: FolderSortChange = decode_json(&chunk.data)?;
+                    folders::undo_sort_change(&transaction, &change)?;
+                }
+                continue;
+            }
             if chunk.format != ChunkFormat::Json {
                 continue;
             }
@@ -2836,6 +2865,13 @@ fn redo_folder(
                 {
                     let change: FolderPathChange = decode_json(&chunk.data)?;
                     folders::redo_path_change(&transaction, root, &change)?;
+                }
+                for chunk in chunks
+                    .iter()
+                    .filter(|chunk| chunk.format == ChunkFormat::SortJson)
+                {
+                    let change: FolderSortChange = decode_json(&chunk.data)?;
+                    folders::redo_sort_change(&transaction, &change)?;
                 }
             }
             HistoryKind::FolderDelete => {

@@ -139,6 +139,25 @@ test("移动图片离开当前文件夹时剔除选择", () => {
   );
 });
 
+test("直属模式下移动到子文件夹即离开结果，移动到本文件夹保留", () => {
+  const current = query({ filters: { folderIds: [2], folderDirect: true } });
+  const toChild = change({
+    kind: "folder",
+    fields: ["folder"],
+    ids: [1],
+    targetFolderPath: "人物/线稿",
+  });
+  assert.deepEqual(
+    [...selectionAfterChange(new Set([1, 2]), toChild, current, ["人物"])],
+    [2],
+  );
+  const toSelf = { ...toChild, targetFolderPath: "人物" };
+  assert.deepEqual(
+    [...selectionAfterChange(new Set([1]), toSelf, current, ["人物"])],
+    [1],
+  );
+});
+
 test("集合视图移出成员时刷新并剔除选择；其它视图保持", () => {
   const inside = query({ view: "collection", collectionId: 3 });
   const remove = change({ kind: "collection", ids: [1] });

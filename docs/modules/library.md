@@ -170,7 +170,9 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `create_folder` | `{ path }` | `FolderInfo[]`（完整列表） |
 | `rename_folder` | `{ folderId, name }` | `FolderInfo[]` |
 | `move_folder` | `{ folderId, parentId }` | `FolderInfo[]` |
+| `place_folders` | `{ folderIds, parentId, sortIndex? }` | `FolderInfo[]`（多文件夹一次移动/插入，一条记录） |
 | `reorder_folders` | `{ folderIds, parentId, sortIndex }` | `FolderInfo[]` |
+| `apply_folder_order` | `{ folderId, key, descending, recursive, orders }` | `FolderInfo[]`（一次性排序，一条记录） |
 | `delete_folder` | `{ folderId }` | `FolderInfo[]` |
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]` |
@@ -215,6 +217,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `get_app_info` | — | `{ version, settingsPath, logPath }` |
 | `reveal_path` | `{ path }` | `null`（在系统文件管理器里选中该文件，或打开该目录） |
 
+主窗口的位置、大小与最大化由 `tauri-plugin-window-state` 持久化到系统应用配置目录，不保存全屏。启动后 `app::window_state::ensure_main_window_visible` 检查窗口与任一显示器是否至少有 120×40 物理像素的交集，完全离屏时移回主显示器并收缩到可见范围。
+
 `LibraryInspection`：
 
 ```text
@@ -225,7 +229,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 `LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`tempCount`、`schemaVersion`、`openedAt`。计数分别对应普通图片、回收站与临时文件夹；临时图片不计入 `imageCount`。
 
-`FolderInfo`：`{ id, path, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。`sortIndex` 只在同级内比较，决定“手动”排序模式下的顺序。
+`FolderInfo`：`{ id, path, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。`sortIndex` 只在同级内比较，决定文件夹树的显示顺序。
 
 S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
 
@@ -243,10 +247,15 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 新建可以给出多级路径；不存在的祖先会同时创建物理目录与数据库行。路径按 NOCASE 判重，大小写不同也视为已存在。
 - 重命名只改最后一段，保留父路径；仅大小写变化时通过临时目录中转（Windows 不能直接改大小写）。移动接收目标父文件夹 id，拒绝移动到自身或后代。
 - 重命名/移动会先改物理目录，再在单写事务里更新整个子树的 `path`；数据库失败时把目录移回。目标位置已有同名文件夹或磁盘目录时拒绝。
+- `place_folders` 一次把多个文件夹移动到同一父级，可插入到指定同级位置；父子同时选中只保留最外层父。先校验全部目录与名称冲突，再依次 rename，任一失败反向搬回；整次操作一条 `FolderMove` 记录。
 - 删除只允许空文件夹：没有子文件夹、没有任何图片（包括回收站图片）、物理目录为空。删除先移除空目录，再删数据库行；数据库失败时重建目录。
-- 四个命令都返回完整 `FolderInfo[]`，前端用返回值整体刷新树，不做本地路径推算。
+- 文件夹命令都返回完整 `FolderInfo[]`，前端用返回值整体刷新树，不做本地路径推算。
 - 文件夹计数由 `get_folders` 用一条直接计数查询在内存中沿路径前缀累加到祖先，结果随命令返回。
-- `folders.sort_index` 在新建、移动与手动排序时维护：新建与移动追加到同级末尾；`reorder_folders` 只接受同一父级的子文件夹，在事务里插入到指定位置并重新编号同级。前端“手动”排序模式按 `sortIndex` 显示，名称/图片数排序只是显示顺序，不会改写 `sortIndex`。
+- `folders.sort_index` 在新建、移动与排序时维护：新建与移动追加到同级末尾；`reorder_folders` 只接受同一父级的子文件夹，在事务里插入到指定位置并重新编号同级。
+- 文件夹树始终按 `sort_index`、id 显示，不再提供常驻的名称/图片数显示模式。右键文件夹（含“全部图片”根行）可做一次性排序：依据为名称或图片数（含子文件夹），可升降序，可勾选“包含所有后代”逐层排序；前端算好每个父级的完整同级顺序，`apply_folder_order` 校验集合后一次写回，只产生一条 `FolderReorder` 记录。
+- 直属图片：`LibraryFilters.folderDirect = true` 时，`folderIds` 只匹配直接位于这些文件夹的图片，不展开子文件夹；根目录只匹配根目录直属图片。前端在“有子文件夹且有直属图片”的文件夹展开后显示虚拟行“直属图片 N”，点击后进入单文件夹直属视图；多选文件夹不提供该入口。
+- 排序与移动记录标题包含路径：例如“移动文件夹「人物/速写」”“移动 3 个文件夹到「风景」”“删除空文件夹「草稿」”。
+- 文件夹展开集合按图库保存在前端 `localStorage`（`lilith.folderExpanded.<libraryId>`，值为相对路径数组）；换库各自恢复，没有记录时展开顶层文件夹。改名或移动后的子树按新路径找不到旧展开项。
 - 临时文件夹（`kind='temp'`）不参与文件夹树、计数与同级排序；普通文件夹的创建、重命名、移动、删除与排序都拒绝临时文件夹与 `.artbank-temp*` 路径。
 
 ## 临时文件夹
@@ -279,10 +288,10 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ### 逆数据格式与撤销/重做语义
 
-- 原始逆数据写在 `ids` / `triples` / `moves` / `json` chunks；撤销时另写 `redo` chunks（同一张表，`format='redo'`），只描述“撤销前是什么”，原始 chunks 不动。每次从 `applied` 进入撤销会先清掉旧 `redo` chunks；崩溃续做保留已写入的快照。
+- 原始逆数据写在 `ids` / `triples` / `moves` / `json` / `sortJson` chunks；撤销时另写 `redo` chunks（同一张表，`format='redo'`），只描述“撤销前是什么”，原始 chunks 不动。每次从 `applied` 进入撤销会先清掉旧 `redo` chunks；崩溃续做保留已写入的快照。
 - 回收站/恢复：`triples(imageId, oldDeletedAt, oldModifiedAt)`。撤销写回旧状态；重做使用撤销时捕获的 `ImageStates`（当前 `deleted_at` / `modified_at`）。永久删除/清空回收站撤销时先记下 `purge_operation_id` 的图片 id，再清空标记；重做重新写标记。
 - `moves`：`(imageId, fromFolderId, toFolderId, oldModifiedAt)`。撤销按当前 `folder_id` 判断：已是源文件夹就跳过，仍是目标文件夹才把文件移回并恢复 `modified_at`；文件移动失败会回滚本记录已完成的移动。重做按相反方向执行，并恢复撤销时的修改时间。移动时隐式新建的目标文件夹会在撤销后按空文件夹清理；重做按捕获的完整文件夹行重建。
-- 文件夹：创建记录本次新建的全部 `(id, path)`（多级路径会同时新建祖先）；撤销时从深到浅，仅在仍为空时删目录与行，重做用原 id、路径、`created_at`、`sort_index` 补回。重命名/移动记录旧/新路径与旧/新 `sort_index`；撤销与重做都以当前路径判断方向。删除记录 `id`、路径、`created_at`、`sort_index`，撤销用原 id 重建行与目录，重做在仍为空时再次删除。排序记录同级全部旧 `sort_index`，撤销逐个恢复，重做使用撤销时捕获的目标排序位。
+- 文件夹：创建记录本次新建的全部 `(id, path)`（多级路径会同时新建祖先）；撤销时从深到浅，仅在仍为空时删目录与行，重做用原 id、路径、`created_at`、`sort_index` 补回。重命名/移动记录旧/新路径与旧/新 `sort_index`；撤销与重做都以当前路径判断方向。删除记录 `id`、路径、`created_at`、`sort_index`，撤销用原 id 重建行与目录，重做在仍为空时再次删除。排序记录同级发生变化的旧 `sort_index`，撤销逐个恢复，重做使用撤销时捕获的目标排序位。批量移动（`place_folders`）另外写一条 `sortJson`，记录目标父级被挤动的兄弟 `(id, 旧位, 新位)`：撤销恢复旧位、重做恢复新位，不依赖 `redo` 捕获；没有 `sortJson` 的旧记录行为不变。
 - 编辑：保存时在事务内暂存旧原图到 `.artbank/undo/<operationId>/`、写入编辑前完整内容快照（含 pHash / 主色 / `modified_at`）与本次新哈希。撤销要求当前哈希等于本次新哈希，用暂存文件恢复内容、重新编码缩略图、递增 `thumb_version`、清空 `feature_blobs`，并把新原图移入暂存目录（不删除）；重做使用撤销时捕获的完整内容状态，把新原图移回、恢复行与缩略图。撤销/重做都会删除另一侧的预览缓存；旧图暂存会保留以便再次撤销。
 - 导入：新增行带 `origin_operation_id`；chunk 记录新建文件夹、新建标签与合并前快照。撤销按 origin 分块把原图移入 `.artbank/undo/<op>/`、捕获完整行（含标签、集合位置、缩略图指针）后删行，恢复合并项，再删除本次新建且仍为空的文件夹与无引用的标签。重做用原 id 插回行、移回原图、补标签/集合位置并恢复合并后的评分/时间，再重建本次新建的文件夹与标签。
 - 评分：`triples(imageId, oldScore, oldModifiedAt)`。撤销恢复旧评分与修改时间，重做使用撤销时捕获的新值。
@@ -304,7 +313,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）；使用反馈批次 3（文件夹一次性排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、窗口状态与展开集合持久化）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -317,6 +326,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝、临时文件夹不进入排序；
+- 文件夹批次：多文件夹移动/插入与撤销重做、父子同时选中只移动最外层、批量排序的完整集合校验与一条记录、直属筛选（含根目录与后代排除）、移动/删除标题包含路径、窗口可见性回退；
 - 临时文件夹：每库恰好一个隐藏行、清空行/文件/集合引用、普通视图与全库搜索不可见、临时元数据不写操作记录、禁止移动/回收站/编辑/加入集合；
 - 导入仓储插入、内容哈希冲突与合并元数据；
 - 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）；

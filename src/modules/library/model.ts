@@ -115,6 +115,7 @@ export function sortKeyAvailable(key: SortKey, view: LibraryView): boolean {
 export function emptyFilters(): LibraryFilters {
   return {
     folderIds: [],
+    folderDirect: false,
     extensions: [],
     scores: [],
     tagIds: [],
@@ -132,6 +133,7 @@ export function emptyFilters(): LibraryFilters {
 export function normalizeFilters(filters: LibraryFilters): LibraryFilters {
   return {
     folderIds: [...new Set(filters.folderIds)].sort((a, b) => a - b),
+    folderDirect: filters.folderIds.length > 0 && filters.folderDirect === true,
     extensions: [...new Set(filters.extensions)].sort(),
     scores: [...new Set(filters.scores)].sort((a, b) => a - b),
     tagIds: [...new Set(filters.tagIds)].sort((a, b) => a - b),
@@ -293,6 +295,7 @@ export function tagFilterState(
     filters: {
       ...emptyFilters(),
       folderIds: scope === "folder" ? state.filters.folderIds : [],
+      folderDirect: scope === "folder" ? state.filters.folderDirect : false,
       tagIds: [tagId],
     },
   };
@@ -302,13 +305,19 @@ export function tagFilterState(
 export function rowInTagScope(
   row: ImageRow,
   scope: TagFilterScope,
-  context: { folderPaths: string[]; hasCollection: boolean; similarityActive: boolean },
+  context: {
+    folderPaths: string[];
+    folderDirect: boolean;
+    hasCollection: boolean;
+    similarityActive: boolean;
+  },
 ): boolean {
   switch (scope) {
     case "folder":
-      return context.folderPaths.some(
-        (path) =>
-          path === "" || row.folderPath === path || row.folderPath.startsWith(`${path}/`),
+      return context.folderPaths.some((path) =>
+        context.folderDirect
+          ? row.folderPath === path
+          : path === "" || row.folderPath === path || row.folderPath.startsWith(`${path}/`),
       );
     case "collection":
       return context.hasCollection;

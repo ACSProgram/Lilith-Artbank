@@ -391,9 +391,11 @@ export function planDataChange(
   }
 }
 
-function pathInFolderScope(target: string, folderPaths: string[]): boolean {
-  return folderPaths.some(
-    (path) => path === "" || target === path || target.startsWith(`${path}/`),
+function pathInFolderScope(target: string, folderPaths: string[], direct: boolean): boolean {
+  return folderPaths.some((path) =>
+    direct
+      ? target === path
+      : path === "" || target === path || target.startsWith(`${path}/`),
   );
 }
 
@@ -417,7 +419,11 @@ export function selectionAfterChange(
       change.ids?.length &&
       change.targetFolderPath != null &&
       query.filters.folderIds.length > 0 &&
-      !pathInFolderScope(change.targetFolderPath, folderPaths)
+      !pathInFolderScope(
+        change.targetFolderPath,
+        folderPaths,
+        query.filters.folderDirect === true,
+      )
     ) {
       return new Set([...selected].filter((id) => !change.ids!.includes(id)));
     }

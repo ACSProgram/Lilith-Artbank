@@ -785,6 +785,34 @@ impl AppState {
         self.mutate(|| folder_service::move_to(&database, &root, folder_id, parent_id))
     }
 
+    pub fn place_folders(
+        &self,
+        folder_ids: &[i64],
+        parent_id: i64,
+        sort_index: Option<i64>,
+    ) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, root) = self.query_source()?;
+        self.mutate(|| {
+            folder_service::place_many(&database, &root, folder_ids, parent_id, sort_index)
+        })
+    }
+
+    pub fn apply_folder_order(
+        &self,
+        folder_id: i64,
+        key: folder_service::FolderSortKey,
+        descending: bool,
+        recursive: bool,
+        orders: &[(i64, Vec<i64>)],
+    ) -> AppResult<Vec<FolderInfo>> {
+        let _guard = self.begin_maintenance()?;
+        let (database, _) = self.query_source()?;
+        self.mutate(|| {
+            folder_service::apply_order(&database, folder_id, key, descending, recursive, orders)
+        })
+    }
+
     pub fn reorder_folders(
         &self,
         folder_ids: &[i64],

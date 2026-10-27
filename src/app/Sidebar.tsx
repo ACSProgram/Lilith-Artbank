@@ -9,14 +9,17 @@ interface SidebarProps {
   onOpenSettings: () => void;
   /** 只用于“还没有打开图库”时的引导按钮；换库入口在设置里。 */
   onOpenLibrary: () => void;
+  libraryId?: string;
   folders?: FolderInfo[];
   selectedFolderIds?: number[];
+  directFolderId?: number | null;
   selectedImageIds?: number[];
   onSelectFolders?: (folderIds: number[]) => void;
+  onSelectDirect?: (folderId: number) => void;
   onFoldersChanged?: (folders: FolderInfo[]) => void;
   onDataChanged?: () => void;
   onBeginFolderDrag?: (
-    folderId: number,
+    folderIds: number[],
     label: string,
     event: ReactPointerEvent<HTMLDivElement>,
   ) => void;
@@ -26,10 +29,13 @@ interface SidebarProps {
 export function Sidebar({
   onOpenSettings,
   onOpenLibrary,
+  libraryId = "",
   folders,
   selectedFolderIds = [],
+  directFolderId = null,
   selectedImageIds = [],
   onSelectFolders,
+  onSelectDirect,
   onFoldersChanged,
   onDataChanged,
   onBeginFolderDrag,
@@ -59,10 +65,14 @@ export function Sidebar({
 
       {browsing ? (
         <FolderTree
+          key={libraryId}
+          libraryId={libraryId}
           folders={folders}
           selectedFolderIds={selectedFolderIds}
+          directFolderId={directFolderId}
           selectedImageIds={selectedImageIds}
           onSelect={onSelectFolders ?? (() => undefined)}
+          onSelectDirect={onSelectDirect ?? (() => undefined)}
           onFoldersChanged={onFoldersChanged ?? (() => undefined)}
           onDataChanged={onDataChanged ?? (() => undefined)}
           onBeginFolderDrag={onBeginFolderDrag ?? (() => undefined)}

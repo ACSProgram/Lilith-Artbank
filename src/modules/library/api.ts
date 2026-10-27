@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { TaskStartResult } from "../../app/taskTypes";
 import {
   mockAddTags,
+  mockApplyFolderOrder,
   mockAddToCollection,
   mockClearOperationHistory,
   mockCollections,
@@ -21,6 +22,7 @@ import {
   mockLibraryCounts,
   mockMoveFolder,
   mockMoveImages,
+  mockPlaceFolders,
   mockOperationHistory,
   mockQueryIds,
   mockQueryPage,
@@ -50,6 +52,8 @@ import type {
   FilterCounts,
   FeatureSummary,
   FolderInfo,
+  FolderOrder,
+  FolderSortKey,
   HistoryPage,
   ImageCapabilities,
   ImageDetails,
@@ -113,6 +117,34 @@ export const libraryApi = {
   ): Promise<FolderInfo[]> {
     if (!isTauri()) return mockReorderFolders(folderIds, parentId, sortIndex);
     return invoke<FolderInfo[]>("reorder_folders", { folderIds, parentId, sortIndex });
+  },
+
+  async placeFolders(
+    folderIds: number[],
+    parentId: number,
+    sortIndex: number | null,
+  ): Promise<FolderInfo[]> {
+    if (!isTauri()) return mockPlaceFolders(folderIds, parentId, sortIndex);
+    return invoke<FolderInfo[]>("place_folders", { folderIds, parentId, sortIndex });
+  },
+
+  async applyFolderOrder(
+    folderId: number,
+    key: FolderSortKey,
+    descending: boolean,
+    recursive: boolean,
+    orders: FolderOrder[],
+  ): Promise<FolderInfo[]> {
+    if (!isTauri()) {
+      return mockApplyFolderOrder(folderId, key, descending, recursive, orders);
+    }
+    return invoke<FolderInfo[]>("apply_folder_order", {
+      folderId,
+      key,
+      descending,
+      recursive,
+      orders,
+    });
   },
 
   async deleteFolder(folderId: number): Promise<FolderInfo[]> {

@@ -1,5 +1,5 @@
 import { MOCK_IMAGE_COUNT } from "./mockConfig";
-import { isSameOrDescendant } from "./folderTreeModel";
+import { isSameOrDescendant, outermostFolders, parentFolderPath } from "./folderTreeModel";
 import type { TaskKind, TaskSnapshot, TaskStartResult } from "../../app/taskTypes";
 import type {
   ColorEntry,
@@ -9,6 +9,8 @@ import type {
   FilterCounts,
   FolderCount,
   FolderInfo,
+  FolderOrder,
+  FolderSortKey,
   HistoryEntry,
   HistoryPage,
   ImageDetails,
@@ -52,11 +54,6 @@ const DIMENSIONS: [number, number][] = [
   [900, 1600],
 ];
 
-function parentOf(path: string): string {
-  const index = path.lastIndexOf("/");
-  return index < 0 ? "" : path.slice(0, index);
-}
-
 const folderState = FOLDER_PATHS.map((path, index) => ({
   id: index + 1,
   path,
@@ -65,7 +62,7 @@ const folderState = FOLDER_PATHS.map((path, index) => ({
 {
   const counters = new Map<string, number>();
   for (const folder of folderState) {
-    const parent = parentOf(folder.path);
+    const parent = parentFolderPath(folder.path);
     const next = counters.get(parent) ?? 0;
     folder.sortIndex = next;
     counters.set(parent, next + 1);
@@ -686,12 +683,12 @@ function ensureMockFolder(path: string): number {
       id = found.id;
       continue;
     }
-    const parent = parentOf(current);
+    const parent = parentFolderPath(current);
     const sortIndex =
       Math.max(
         -1,
         ...folderState
-          .filter((folder) => parentOf(folder.path) === parent)
+          .filter((folder) => parentFolderPath(folder.path) === parent)
           .map((folder) => folder.sortIndex),
       ) + 1;
     const folder = { id: nextFolderId++, path: current, sortIndex };
@@ -774,12 +771,12 @@ export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
 
 function assignSortIndexAtEnd(id: number) {
   const folder = findFolder(id);
-  const parent = parentOf(folder.path);
+  const parent = parentFolderPath(folder.path);
   folder.sortIndex =
     Math.max(
       -1,
       ...folderState
-        .filter((item) => item.id !== id && parentOf(item.path) === parent)
+        .filter((item) => item.id !== id && parentFolderPath(item.path) === parent)
         .map((item) => item.sortIndex),
     ) + 1;
 }
@@ -791,7 +788,7 @@ export function mockReorderFolders(
 ): FolderInfo[] {
   const parent = findFolder(parentId);
   const siblings = folderState
-    .filter((folder) => folder.path !== "" && parentOf(folder.path) === parent.path)
+    .filter((folder) => folder.path !== "" && parentFolderPath(folder.path) === parent.path)
     .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
   if (ids.some((id) => !siblings.some((folder) => folder.id === id))) {
     throw new Error("只能调整同一级文件夹的顺序");
@@ -805,6 +802,100 @@ export function mockReorderFolders(
     const folder = byId.get(id);
     if (folder) folder.sortIndex = index;
   });
+  return mockFolders();
+}
+
+export function mockPlaceFolders(
+  ids: number[],
+  parentId: number,
+  sortIndex: number | null,
+): FolderInfo[] {
+  const parent = findFolder(parentId);
+  const dragged = outermostFolders([...new Set(ids)].map((id) => findFolder(id)));
+  if (dragged.length === 0) return mockFolders();
+  if (dragged.some((folder) => !folder.path)) throw new Error("不能移动图库根目录");
+  if (dragged.some((folder) => isSameOrDescendant(parent.path, folder.path))) {
+    throw new Error("不能把文件夹移动到自身或子文件夹");
+  }
+
+  const moved = new Set(dragged.map((folder) => folder.id));
+  const leafNames = new Set<string>();
+  const targets = dragged.map((folder) => {
+    const leaf = folder.path.slice(folder.path.lastIndexOf("/") + 1);
+    const nextPath = parent.path ? `${parent.path}/${leaf}` : leaf;
+    if (leafNames.has(leaf.toLowerCase())) {
+      throw new Error("目标位置有同名文件夹");
+    }
+    leafNames.add(leaf.toLowerCase());
+    if (
+      folderState.some(
+        (item) =>
+          !moved.has(item.id) &&
+          item.path.toLowerCase() === nextPath.toLowerCase(),
+      )
+    ) {
+      throw new Error("目标位置已经有同名文件夹");
+    }
+    return { folder, nextPath };
+  });
+
+  for (const { folder, nextPath } of targets) {
+    if (nextPath !== folder.path) replaceFolderPrefix(folder.path, nextPath);
+  }
+
+  const siblings = folderState
+    .filter(
+      (folder) =>
+        folder.path !== "" &&
+        parentFolderPath(folder.path) === parent.path &&
+        !moved.has(folder.id),
+    )
+    .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id)
+    .map((folder) => folder.id);
+  const at =
+    sortIndex == null
+      ? siblings.length
+      : Math.max(0, Math.min(siblings.length, sortIndex));
+  siblings.splice(at, 0, ...dragged.map((folder) => folder.id));
+  const byId = new Map(folderState.map((folder) => [folder.id, folder]));
+  siblings.forEach((id, index) => {
+    const folder = byId.get(id);
+    if (folder) folder.sortIndex = index;
+  });
+  return mockFolders();
+}
+
+export function mockApplyFolderOrder(
+  folderId: number,
+  _key: FolderSortKey,
+  _descending: boolean,
+  _recursive: boolean,
+  orders: FolderOrder[],
+): FolderInfo[] {
+  const root = findFolder(folderId);
+  const byId = new Map(folderState.map((folder) => [folder.id, folder]));
+  for (const order of orders) {
+    const parent = byId.get(order.parentId);
+    if (!parent) throw new Error("文件夹不存在");
+    if (!isSameOrDescendant(parent.path, root.path)) {
+      throw new Error("排序范围包含其它文件夹");
+    }
+    const children = folderState
+      .filter((folder) => folder.path !== "" && parentFolderPath(folder.path) === parent.path)
+      .map((folder) => folder.id)
+      .sort((a, b) => a - b);
+    const requested = [...new Set(order.folderIds)].sort((a, b) => a - b);
+    if (
+      children.length !== requested.length ||
+      children.some((id, index) => id !== requested[index])
+    ) {
+      throw new Error("文件夹已变化，请重新排序");
+    }
+    order.folderIds.forEach((id, index) => {
+      const folder = byId.get(id);
+      if (folder) folder.sortIndex = index;
+    });
+  }
   return mockFolders();
 }
 

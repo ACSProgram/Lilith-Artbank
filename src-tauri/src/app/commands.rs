@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
@@ -24,6 +24,7 @@ use crate::{
         capability::{FeatureSummary, ImageCapabilities},
         collections::{CollectionInfo, CombineMode},
         edit::{self, EditRequest, EditResult, EditSizeEstimate},
+        folders::FolderSortKey,
         history::HistoryPage,
         manifest::LibraryInspection,
         metadata::{DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef},
@@ -336,6 +337,39 @@ pub fn reorder_folders(
     sort_index: i64,
 ) -> Result<Vec<FolderInfo>, String> {
     AppError::command(state.reorder_folders(&folder_ids, parent_id, sort_index))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderOrderInput {
+    parent_id: i64,
+    folder_ids: Vec<i64>,
+}
+
+#[tauri::command]
+pub fn place_folders(
+    state: State<'_, AppState>,
+    folder_ids: Vec<i64>,
+    parent_id: i64,
+    sort_index: Option<i64>,
+) -> Result<Vec<FolderInfo>, String> {
+    AppError::command(state.place_folders(&folder_ids, parent_id, sort_index))
+}
+
+#[tauri::command]
+pub fn apply_folder_order(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    key: FolderSortKey,
+    descending: bool,
+    recursive: bool,
+    orders: Vec<FolderOrderInput>,
+) -> Result<Vec<FolderInfo>, String> {
+    let orders: Vec<(i64, Vec<i64>)> = orders
+        .into_iter()
+        .map(|order| (order.parent_id, order.folder_ids))
+        .collect();
+    AppError::command(state.apply_folder_order(folder_id, key, descending, recursive, &orders))
 }
 
 #[tauri::command]
@@ -875,6 +909,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         rename_folder,
         move_folder,
         reorder_folders,
+        place_folders,
+        apply_folder_order,
         delete_folder,
         get_tags,
         search_tags,

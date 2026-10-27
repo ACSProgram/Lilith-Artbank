@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef } from "react";
 
-/** 指针拖动的载荷：图片集合或单个文件夹。 */
+/** 指针拖动的载荷：图片集合或多选文件夹。 */
 export type DragPayload =
   | { kind: "images"; imageIds: number[]; label: string }
-  | { kind: "folder"; folderId: number; label: string };
+  | { kind: "folders"; folderIds: number[]; label: string };
 
 export type DropPosition = "before" | "inside" | "after";
 

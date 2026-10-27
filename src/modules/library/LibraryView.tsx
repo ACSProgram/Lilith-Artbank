@@ -1448,6 +1448,7 @@ export function LibraryView({
             folderPaths: folders
               .filter((folder) => currentState.filters.folderIds.includes(folder.id))
               .map((folder) => folder.path),
+            folderDirect: currentState.filters.folderDirect,
             hasCollection: effectiveCollectionId != null,
             similarityActive,
           }));
@@ -1744,6 +1745,7 @@ export function LibraryView({
         filters: {
           ...currentState.filters,
           folderIds: folderId == null ? [] : [folderId],
+          folderDirect: false,
         },
       });
     },
@@ -1840,7 +1842,11 @@ export function LibraryView({
     if (browse.search) {
       parts.push(`搜索「${browse.search}」${browse.searchScope === "library" ? "（全库）" : ""}`);
     }
-    if (browse.filters.folderIds.length > 0) parts.push(`文件夹 ${browse.filters.folderIds.length}`);
+    if (browse.filters.folderIds.length > 0) {
+      parts.push(
+        `文件夹 ${browse.filters.folderIds.length}${browse.filters.folderDirect ? "（直属）" : ""}`,
+      );
+    }
     if (browse.filters.extensions.length > 0) parts.push(`扩展名 ${browse.filters.extensions.length}`);
     if (browse.filters.scores.length > 0) parts.push(`评分 ${browse.filters.scores.length}`);
     if (browse.filters.tagIds.length > 0) {
@@ -2031,7 +2037,11 @@ export function LibraryView({
                 onClick={() =>
                   applyBrowse({
                     ...browseRef.current,
-                    filters: { ...browseRef.current.filters, folderIds: [] },
+                    filters: {
+                      ...browseRef.current.filters,
+                      folderIds: [],
+                      folderDirect: false,
+                    },
                   })
                 }
               >
@@ -2044,7 +2054,11 @@ export function LibraryView({
                 <ChevronRight size={12} className="folder-crumb-separator" />
                 <button
                   type="button"
-                  className={`folder-crumb${index === trail.length - 1 ? " is-current" : ""}`}
+                  className={`folder-crumb${
+                    index === trail.length - 1 && !browse.filters.folderDirect
+                      ? " is-current"
+                      : ""
+                  }`}
                   onClick={() => showFolder(crumb.id)}
                   disabled={crumb.id == null}
                   title={crumb.path}
@@ -2054,6 +2068,12 @@ export function LibraryView({
               </span>
             ))
           )}
+          {browse.filters.folderDirect && browse.filters.folderIds.length === 1 ? (
+            <>
+              <ChevronRight size={12} className="folder-crumb-separator" />
+              <span className="folder-crumb is-current">直属图片</span>
+            </>
+          ) : null}
         </div>
 
         <div className="library-toolbar-right">

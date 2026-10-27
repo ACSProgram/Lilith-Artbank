@@ -185,6 +185,7 @@ impl McpQuery {
             search_scope: self.search_scope.into(),
             filters: LibraryFilters {
                 folder_ids: self.filters.folder_ids.clone(),
+                folder_direct: false,
                 extensions: self.filters.extensions.clone(),
                 scores: self.filters.scores.clone(),
                 tag_ids: self.filters.tag_ids.clone(),

@@ -1,6 +1,10 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     app::error::{AppError, AppResult},
@@ -8,7 +12,7 @@ use crate::{
         db::LibraryDb,
         history::{
             self, FolderDeleted, FolderPathChange, FolderRef, FolderReorder, FolderRow,
-            HistoryKind, NewOperation,
+            FolderSortChange, HistoryKind, NewOperation,
         },
         import::{ensure_folder_tracked, next_sort_index},
         paths::{
@@ -207,9 +211,13 @@ pub fn move_to_with_id(
     parent_id: i64,
 ) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let paths = LibraryPaths::new(root);
+    let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
     let ((), operation_id) = history::write_with_id(
         db,
-        NewOperation::new(HistoryKind::FolderMove, "移动文件夹"),
+        NewOperation::new(
+            HistoryKind::FolderMove,
+            format!("移动文件夹「{label_path}」"),
+        ),
         |transaction, draft| {
             ensure_normal_folder(transaction, folder_id_value)?;
             ensure_normal_folder(transaction, parent_id)?;
@@ -387,6 +395,366 @@ pub fn reorder(
     query::list_folders(db)
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderSortKey {
+    Name,
+    Total,
+}
+
+impl FolderSortKey {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "名称",
+            Self::Total => "图片数",
+        }
+    }
+}
+
+fn folder_rows_in(connection: &Connection) -> AppResult<Vec<(i64, String, i64)>> {
+    let mut statement = connection
+        .prepare("SELECT id, path, sort_index FROM folders WHERE kind = 'normal' ORDER BY path")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn is_in_subtree(path: &str, ancestor: &str) -> bool {
+    ancestor.is_empty() || path == ancestor || path.starts_with(&format!("{ancestor}/"))
+}
+
+fn rollback_renames(done: &[(PathBuf, PathBuf)]) {
+    for (old, new) in done.iter().rev() {
+        if let Err(error) = std::fs::rename(new, old) {
+            log::error!("回滚文件夹移动失败：{error}；目录位于 {}", new.display());
+        }
+    }
+}
+
+/// 一次把多个文件夹移动/插入到目标父级；只写一条操作记录。
+pub fn place_many(
+    db: &LibraryDb,
+    root: &Path,
+    folder_ids: &[i64],
+    parent_id: i64,
+    sort_index: Option<i64>,
+) -> AppResult<Vec<FolderInfo>> {
+    if folder_ids.is_empty() {
+        return Err(AppError::message("没有要移动的文件夹"));
+    }
+    let mut seen = HashSet::new();
+    for id in folder_ids {
+        if *id <= 0 || !seen.insert(*id) {
+            return Err(AppError::message("文件夹 id 无效或重复"));
+        }
+    }
+    let label_parent = db.with_reader(|connection| folder_path(connection, parent_id))?;
+    let label_target = if label_parent.is_empty() {
+        "根目录".to_owned()
+    } else {
+        format!("「{label_parent}」")
+    };
+    let paths = LibraryPaths::new(root);
+    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let result = history::write_with_id(
+        db,
+        NewOperation::new(
+            HistoryKind::FolderMove,
+            format!("移动 {} 个文件夹到{label_target}", folder_ids.len()),
+        ),
+        |transaction, draft| {
+            ensure_normal_folder(transaction, parent_id)?;
+            let target_parent_path = folder_path(transaction, parent_id)?;
+            let rows = folder_rows_in(transaction)?;
+            let by_id: HashMap<i64, (String, i64)> = rows
+                .iter()
+                .map(|(id, path, sort_index)| (*id, (path.clone(), *sort_index)))
+                .collect();
+
+            let mut selected = Vec::new();
+            for id in folder_ids {
+                let Some((path, sort_index)) = by_id.get(id) else {
+                    return Err(AppError::message("文件夹不存在"));
+                };
+                if path.is_empty() {
+                    return Err(AppError::message("不能移动图库根目录"));
+                }
+                selected.push((*id, path.clone(), *sort_index));
+            }
+            selected.sort_by_key(|(_, path, _)| path.matches('/').count());
+            let mut kept: Vec<(i64, String, i64)> = Vec::new();
+            for item in selected {
+                if kept.iter().any(|(_, path, _)| is_in_subtree(&item.1, path)) {
+                    continue;
+                }
+                kept.push(item);
+            }
+            if kept
+                .iter()
+                .any(|(_, path, _)| is_in_subtree(&target_parent_path, path))
+            {
+                return Err(AppError::message("不能把文件夹移动到自身或子文件夹"));
+            }
+
+            let kept_ids: HashSet<i64> = kept.iter().map(|(id, _, _)| *id).collect();
+            let mut leaves = HashSet::new();
+            let mut targets = Vec::with_capacity(kept.len());
+            for (id, old_path, old_sort_index) in &kept {
+                let leaf = old_path
+                    .rsplit_once('/')
+                    .map_or(old_path.as_str(), |(_, leaf)| leaf);
+                if !leaves.insert(leaf.to_lowercase()) {
+                    return Err(AppError::message("目标位置有同名文件夹"));
+                }
+                let new_path = if target_parent_path.is_empty() {
+                    leaf.to_owned()
+                } else {
+                    format!("{target_parent_path}/{leaf}")
+                };
+                if rows.iter().any(|(existing_id, path, _)| {
+                    !kept_ids.contains(existing_id) && path.eq_ignore_ascii_case(&new_path)
+                }) {
+                    return Err(AppError::message("目标位置已经有同名文件夹"));
+                }
+                let old_dir = paths.folder_dir(old_path);
+                let new_dir = paths.folder_dir(&new_path);
+                if !old_dir.is_dir() {
+                    return Err(AppError::message(format!(
+                        "文件夹目录不存在：{}",
+                        old_dir.display()
+                    )));
+                }
+                if new_path != *old_path && new_dir.exists() {
+                    return Err(AppError::message("目标文件夹目录已存在"));
+                }
+                targets.push((
+                    *id,
+                    old_path.clone(),
+                    *old_sort_index,
+                    new_path,
+                    old_dir,
+                    new_dir,
+                ));
+            }
+
+            let mut siblings: Vec<(i64, i64)> = rows
+                .iter()
+                .filter(|(id, path, _)| {
+                    !path.is_empty()
+                        && !kept_ids.contains(id)
+                        && parent_path(path) == target_parent_path
+                })
+                .map(|(id, _, sort_index)| (*id, *sort_index))
+                .collect();
+            siblings.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+            let at = sort_index
+                .unwrap_or(siblings.len() as i64)
+                .clamp(0, siblings.len() as i64) as usize;
+            let mut order: Vec<i64> = siblings.iter().map(|(id, _)| *id).collect();
+            order.splice(at..at, kept.iter().map(|(id, _, _)| *id));
+            let positions: HashMap<i64, i64> = order
+                .iter()
+                .enumerate()
+                .map(|(position, id)| (*id, position as i64))
+                .collect();
+            let old_positions: HashMap<i64, i64> = rows
+                .iter()
+                .map(|(id, _, sort_index)| (*id, *sort_index))
+                .collect();
+            let path_changed = targets
+                .iter()
+                .any(|(_, old_path, _, new_path, _, _)| old_path != new_path);
+            let index_changed = order.iter().enumerate().any(|(position, id)| {
+                old_positions.get(id).copied().unwrap_or(position as i64) != position as i64
+            });
+            if !path_changed && !index_changed {
+                return Ok(());
+            }
+
+            if !target_parent_path.is_empty() {
+                let parent_dir = paths.folder_dir(&target_parent_path);
+                std::fs::create_dir_all(&parent_dir)?;
+                ensure_inside_root(root, &parent_dir)?;
+            }
+            for (_, old_path, _, new_path, old_dir, new_dir) in &targets {
+                if old_path == new_path {
+                    continue;
+                }
+                if let Err(error) = std::fs::rename(old_dir, new_dir) {
+                    rollback_renames(&done);
+                    done.clear();
+                    return Err(error.into());
+                }
+                done.push((old_dir.clone(), new_dir.clone()));
+            }
+
+            let write_result = (|| -> AppResult<()> {
+                for (id, old_path, _, new_path, _, _) in &targets {
+                    if old_path != new_path {
+                        ensure_inside_root(root, &paths.folder_dir(new_path))?;
+                        update_subtree_paths(transaction, old_path, new_path, *id)?;
+                    }
+                }
+                for (id, position) in &positions {
+                    transaction.execute(
+                        "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                        params![position, id],
+                    )?;
+                }
+                for (id, old_path, old_sort_index, new_path, _, _) in &targets {
+                    if old_path == new_path
+                        && old_sort_index == positions.get(id).unwrap_or(old_sort_index)
+                    {
+                        continue;
+                    }
+                    draft.json(&FolderPathChange {
+                        id: *id,
+                        old_path: old_path.clone(),
+                        new_path: new_path.clone(),
+                        old_sort_index: *old_sort_index,
+                        new_sort_index: *positions.get(id).unwrap_or(old_sort_index),
+                    })?;
+                }
+                let sort_rows: Vec<(i64, i64, i64)> = siblings
+                    .iter()
+                    .filter_map(|(id, old_index)| {
+                        let new_index = *positions.get(id)?;
+                        (*old_index != new_index).then_some((*id, *old_index, new_index))
+                    })
+                    .collect();
+                draft.sort_changes(&FolderSortChange { rows: sort_rows })?;
+                draft.affected(kept.len() as u64);
+                Ok(())
+            })();
+            if let Err(error) = write_result {
+                rollback_renames(&done);
+                done.clear();
+                return Err(error);
+            }
+            Ok(())
+        },
+    );
+    if result.is_err() {
+        rollback_renames(&done);
+    }
+    result?;
+    query::list_folders(db)
+}
+
+/// 把前端算好的同级顺序写回 `sort_index`；一次操作一条记录。
+pub fn apply_order(
+    db: &LibraryDb,
+    folder_id: i64,
+    key: FolderSortKey,
+    descending: bool,
+    recursive: bool,
+    orders: &[(i64, Vec<i64>)],
+) -> AppResult<Vec<FolderInfo>> {
+    if orders.len() > 20_000 {
+        return Err(AppError::message("排序范围过大"));
+    }
+    let total: usize = orders.iter().map(|(_, ids)| ids.len()).sum();
+    if total > 100_000 {
+        return Err(AppError::message("排序范围过大"));
+    }
+    let label_path = db.with_reader(|connection| folder_path(connection, folder_id))?;
+    let scope = if label_path.is_empty() {
+        "顶层文件夹".to_owned()
+    } else {
+        format!("「{label_path}」的子文件夹")
+    };
+    let suffix = if recursive {
+        "（含所有后代）"
+    } else {
+        ""
+    };
+    let direction = if descending { "降序" } else { "升序" };
+    history::write_with_id(
+        db,
+        NewOperation::new(
+            HistoryKind::FolderReorder,
+            format!("按{}排序{scope}{suffix}·{direction}", key.label()),
+        ),
+        |transaction, draft| {
+            ensure_normal_folder(transaction, folder_id)?;
+            let root_path = folder_path(transaction, folder_id)?;
+            if orders.is_empty() {
+                return Ok(());
+            }
+            // 一次建好“父路径 -> 直接子文件夹”，避免每个父级都扫一遍全表。
+            let mut children_by_parent: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+            for (id, path, sort_index) in folder_rows_in(transaction)? {
+                if path.is_empty() {
+                    continue;
+                }
+                children_by_parent
+                    .entry(parent_path(&path).to_owned())
+                    .or_default()
+                    .push((id, sort_index));
+            }
+
+            let mut seen_parents = HashSet::new();
+            let mut changes: Vec<(i64, i64, i64)> = Vec::new();
+            for (parent_id, ids) in orders {
+                if !seen_parents.insert(*parent_id) {
+                    return Err(AppError::message("排序父级重复"));
+                }
+                ensure_normal_folder(transaction, *parent_id)?;
+                let sort_parent_path = folder_path(transaction, *parent_id)?;
+                if !is_in_subtree(&sort_parent_path, &root_path) {
+                    return Err(AppError::message("排序范围包含其它文件夹"));
+                }
+                if !recursive && *parent_id != folder_id {
+                    return Err(AppError::message("非递归排序只能调整直接子文件夹"));
+                }
+                let children = children_by_parent
+                    .get(&sort_parent_path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let old_by_id: HashMap<i64, i64> = children.iter().copied().collect();
+                let requested: HashSet<i64> = ids.iter().copied().collect();
+                // 必须与当前直接子文件夹完全一致，否则前端顺序已经过期。
+                if requested.len() != ids.len()
+                    || requested.len() != old_by_id.len()
+                    || !requested.iter().all(|id| old_by_id.contains_key(id))
+                {
+                    return Err(AppError::message("文件夹已变化，请重新排序"));
+                }
+                for (position, id) in ids.iter().enumerate() {
+                    let Some(old_index) = old_by_id.get(id) else {
+                        continue;
+                    };
+                    if *old_index != position as i64 {
+                        changes.push((*id, *old_index, position as i64));
+                    }
+                }
+            }
+            if changes.is_empty() {
+                return Ok(());
+            }
+            for (id, _, new_index) in &changes {
+                transaction.execute(
+                    "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                    params![new_index, id],
+                )?;
+            }
+            draft.json(&FolderReorder {
+                rows: changes.iter().map(|(id, old, _)| (*id, *old)).collect(),
+            })?;
+            draft.affected(changes.len() as u64);
+            Ok(())
+        },
+    )?;
+    query::list_folders(db)
+}
+
 pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Vec<FolderInfo>> {
     delete_with_id(db, root, folder_id_value).map(|(folders, _)| folders)
 }
@@ -397,9 +765,13 @@ pub fn delete_with_id(
     folder_id_value: i64,
 ) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let paths = LibraryPaths::new(root);
+    let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
     let ((), operation_id) = history::write_with_id(
         db,
-        NewOperation::new(HistoryKind::FolderDelete, "删除文件夹"),
+        NewOperation::new(
+            HistoryKind::FolderDelete,
+            format!("删除空文件夹「{label_path}」"),
+        ),
         |transaction, draft| {
             ensure_normal_folder(transaction, folder_id_value)?;
             let (path, created_at, sort_index): (String, i64, i64) = transaction
@@ -751,6 +1123,40 @@ pub(crate) fn undo_reorder(
         let changed = transaction.execute(
             "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
             params![sort_index, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::message("排序记录中的文件夹不存在"));
+        }
+    }
+    Ok(())
+}
+
+/// 撤销批量移动时目标父级兄弟的排序位变化。
+pub(crate) fn undo_sort_change(
+    transaction: &Transaction<'_>,
+    change: &FolderSortChange,
+) -> AppResult<()> {
+    for (id, old_index, _) in &change.rows {
+        let changed = transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![old_index, id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::message("排序记录中的文件夹不存在"));
+        }
+    }
+    Ok(())
+}
+
+/// 重做批量移动时目标父级兄弟的排序位变化。
+pub(crate) fn redo_sort_change(
+    transaction: &Transaction<'_>,
+    change: &FolderSortChange,
+) -> AppResult<()> {
+    for (id, _, new_index) in &change.rows {
+        let changed = transaction.execute(
+            "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+            params![new_index, id],
         )?;
         if changed == 0 {
             return Err(AppError::message("排序记录中的文件夹不存在"));
@@ -1213,5 +1619,216 @@ mod tests {
             })
             .unwrap();
         assert_eq!(order, vec!["风景".to_owned(), "人物".to_owned()]);
+    }
+
+    fn id_of(db: &LibraryDb, path: &str) -> i64 {
+        db.with_reader(|connection| folder_id(connection, path))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn children(db: &LibraryDb, parent: &str) -> Vec<String> {
+        db.with_reader(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT path FROM folders WHERE kind = 'normal' AND path <> '' ORDER BY sort_index, id",
+            )?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(paths)
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|path| parent_path(path) == parent)
+        .collect()
+    }
+
+    fn undo_last(db: &LibraryDb, root: &Path) -> i64 {
+        let target = history::list(db).unwrap().first().unwrap().id;
+        let thumbs = crate::library::thumbs::ThumbPack::open(
+            crate::library::paths::LibraryPaths::new(root).thumbs,
+        )
+        .unwrap();
+        let task = crate::app::tasks::TaskHandle::new(
+            "folder-test-undo",
+            crate::app::tasks::TaskKind::Undo,
+            "测试",
+        );
+        history::run_undo(db, root, &thumbs, target, task).unwrap();
+        target
+    }
+
+    fn redo(db: &LibraryDb, root: &Path, target: i64) {
+        let thumbs = crate::library::thumbs::ThumbPack::open(
+            crate::library::paths::LibraryPaths::new(root).thumbs,
+        )
+        .unwrap();
+        let task = crate::app::tasks::TaskHandle::new(
+            "folder-test-redo",
+            crate::app::tasks::TaskKind::Redo,
+            "测试",
+        );
+        history::run_redo(db, root, &thumbs, target, task).unwrap();
+    }
+
+    #[test]
+    fn places_multiple_folders_in_one_operation_and_undoes() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "甲").unwrap();
+        create(&db, &root, "乙").unwrap();
+        create(&db, &root, "目标").unwrap();
+        let (甲, 乙, 目标) = (id_of(&db, "甲"), id_of(&db, "乙"), id_of(&db, "目标"));
+
+        place_many(&db, &root, &[甲, 乙], 目标, None).unwrap();
+        assert!(root.join("目标").join("甲").is_dir());
+        assert!(root.join("目标").join("乙").is_dir());
+        assert!(!root.join("甲").exists());
+        assert_eq!(children(&db, "目标"), vec!["目标/甲", "目标/乙"]);
+        let entries = history::list(&db).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].kind, HistoryKind::FolderMove);
+        assert!(entries[0].label.contains("目标"));
+
+        let target = undo_last(&db, &root);
+        assert!(root.join("甲").is_dir());
+        assert!(root.join("乙").is_dir());
+        assert!(!root.join("目标").join("甲").exists());
+        assert_eq!(children(&db, ""), vec!["甲", "乙", "目标"]);
+
+        redo(&db, &root, target);
+        assert!(root.join("目标").join("甲").is_dir());
+        assert_eq!(children(&db, "目标"), vec!["目标/甲", "目标/乙"]);
+    }
+
+    #[test]
+    fn places_multiple_folders_at_a_position_and_restores_sibling_order() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "目标/一").unwrap();
+        create(&db, &root, "目标/二").unwrap();
+        create(&db, &root, "甲").unwrap();
+        create(&db, &root, "乙").unwrap();
+        let (甲, 乙, 目标) = (id_of(&db, "甲"), id_of(&db, "乙"), id_of(&db, "目标"));
+
+        place_many(&db, &root, &[甲, 乙], 目标, Some(1)).unwrap();
+        assert_eq!(
+            children(&db, "目标"),
+            vec!["目标/一", "目标/甲", "目标/乙", "目标/二"]
+        );
+
+        let target = undo_last(&db, &root);
+        assert_eq!(children(&db, "目标"), vec!["目标/一", "目标/二"]);
+        assert_eq!(children(&db, ""), vec!["目标", "甲", "乙"]);
+
+        redo(&db, &root, target);
+        assert_eq!(
+            children(&db, "目标"),
+            vec!["目标/一", "目标/甲", "目标/乙", "目标/二"]
+        );
+    }
+
+    #[test]
+    fn place_many_keeps_only_outermost_selected_folders() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "父/子").unwrap();
+        create(&db, &root, "目标").unwrap();
+        let 父 = id_of(&db, "父");
+        let 子 = id_of(&db, "父/子");
+        let 目标 = id_of(&db, "目标");
+        place_many(&db, &root, &[父, 子], 目标, None).unwrap();
+        assert!(root.join("目标").join("父").join("子").is_dir());
+        assert_eq!(children(&db, "目标"), vec!["目标/父"]);
+    }
+
+    #[test]
+    fn applies_folder_order_in_one_record_and_undoes() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "丙").unwrap();
+        create(&db, &root, "甲").unwrap();
+        create(&db, &root, "乙").unwrap();
+        let root_id = id_of(&db, "");
+        let (甲, 乙, 丙) = (id_of(&db, "甲"), id_of(&db, "乙"), id_of(&db, "丙"));
+        let before = children(&db, "");
+
+        apply_order(
+            &db,
+            root_id,
+            FolderSortKey::Name,
+            false,
+            false,
+            &[(root_id, vec![甲, 乙, 丙])],
+        )
+        .unwrap();
+        assert_eq!(children(&db, ""), vec!["甲", "乙", "丙"]);
+        let entries = history::list(&db).unwrap();
+        assert_eq!(entries[0].kind, HistoryKind::FolderReorder);
+        assert!(entries[0].label.contains("按名称"));
+        assert_eq!(entries[0].affected, 3);
+
+        let target = undo_last(&db, &root);
+        assert_eq!(children(&db, ""), before);
+        redo(&db, &root, target);
+        assert_eq!(children(&db, ""), vec!["甲", "乙", "丙"]);
+    }
+
+    #[test]
+    fn apply_order_rejects_stale_or_foreign_children() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "甲").unwrap();
+        create(&db, &root, "乙").unwrap();
+        create(&db, &root, "组/子").unwrap();
+        let root_id = id_of(&db, "");
+        let (甲, 乙) = (id_of(&db, "甲"), id_of(&db, "乙"));
+        let 子 = id_of(&db, "组/子");
+
+        assert!(
+            apply_order(
+                &db,
+                root_id,
+                FolderSortKey::Total,
+                true,
+                false,
+                &[(root_id, vec![甲])],
+            )
+            .is_err()
+        );
+        assert!(
+            apply_order(
+                &db,
+                root_id,
+                FolderSortKey::Name,
+                false,
+                false,
+                &[(root_id, vec![甲, 乙, 子])],
+            )
+            .is_err()
+        );
+        let 组 = id_of(&db, "组");
+        assert!(
+            apply_order(
+                &db,
+                root_id,
+                FolderSortKey::Name,
+                false,
+                false,
+                &[(组, vec![子])],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn move_and_delete_labels_include_paths() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "父/子").unwrap();
+        create(&db, &root, "目标").unwrap();
+        let 子 = id_of(&db, "父/子");
+        let 目标 = id_of(&db, "目标");
+        move_to(&db, &root, 子, 目标).unwrap();
+        let entries = history::list(&db).unwrap();
+        assert!(entries[0].label.contains("父/子"));
+        delete(&db, &root, id_of(&db, "目标/子")).unwrap();
+        let entries = history::list(&db).unwrap();
+        assert_eq!(entries[0].kind, HistoryKind::FolderDelete);
+        assert!(entries[0].label.contains("目标/子"));
     }
 }

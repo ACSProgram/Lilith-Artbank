@@ -113,6 +113,8 @@ pub enum TagMode {
 #[serde(rename_all = "camelCase", default)]
 pub struct LibraryFilters {
     pub folder_ids: Vec<i64>,
+    /// true 时只匹配直接位于选中文件夹的图片，不展开子文件夹。
+    pub folder_direct: bool,
     pub extensions: Vec<String>,
     pub scores: Vec<i64>,
     pub tag_ids: Vec<i64>,
@@ -1095,7 +1097,16 @@ impl FilterSet {
         folder_paths: &[String],
     ) {
         if exclude != Some(Facet::Folders) && !filters.folder_ids.is_empty() {
-            if folder_paths.iter().any(String::is_empty) {
+            if filters.folder_direct {
+                let marks = placeholders(filters.folder_ids.len());
+                self.clauses.push(format!("images.folder_id IN ({marks})"));
+                self.params.extend(
+                    filters
+                        .folder_ids
+                        .iter()
+                        .map(|folder_id| Value::Integer(*folder_id)),
+                );
+            } else if folder_paths.iter().any(String::is_empty) {
                 // 根目录的子树就是整库，等价于不限制文件夹。
             } else if folder_paths.is_empty() {
                 self.clauses.push("0".to_owned());
@@ -2092,6 +2103,100 @@ mod tests {
         assert_eq!(people.total_image_count, 3);
         let root = folders.iter().find(|item| item.path.is_empty()).unwrap();
         assert_eq!(root.total_image_count, 6);
+    }
+
+    #[test]
+    fn folder_direct_filter_excludes_descendants_and_handles_root() {
+        let fixture = fixture();
+        let (_nested_id, _lookalike_id) = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                let nested = ensure_folder(connection, "人物/速写", 1)?;
+                let lookalike = ensure_folder(connection, "人物速写", 1)?;
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    2,
+                    nested,
+                    600,
+                    6_000,
+                    600,
+                    600,
+                    None,
+                    &[],
+                );
+                insert_image(
+                    connection,
+                    "g",
+                    "jpg",
+                    2,
+                    lookalike,
+                    700,
+                    7_000,
+                    600,
+                    600,
+                    None,
+                    &[],
+                );
+                Ok((nested, lookalike))
+            })
+            .unwrap();
+
+        let direct = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_people],
+                    folder_direct: true,
+                    ..Default::default()
+                },
+                limit: Some(10),
+                ..base_query()
+            },
+        )
+        .unwrap();
+        let mut direct_ids = ids(&direct);
+        direct_ids.sort_unstable();
+        assert_eq!(direct_ids, vec![1, 2]);
+
+        let counts = filter_counts(
+            &fixture.session.db,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_people],
+                    folder_direct: true,
+                    ..Default::default()
+                },
+                ..base_query()
+            },
+        )
+        .unwrap();
+        assert_eq!(counts.total, 2);
+
+        let root_id = list_folders(&fixture.session.db)
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.path.is_empty())
+            .unwrap()
+            .id;
+        let root_direct = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![root_id],
+                    folder_direct: true,
+                    ..Default::default()
+                },
+                limit: Some(10),
+                ..base_query()
+            },
+        )
+        .unwrap();
+        assert!(root_direct.items.is_empty());
     }
 
     #[test]

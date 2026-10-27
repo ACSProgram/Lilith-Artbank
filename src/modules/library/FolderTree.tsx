@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -15,40 +16,46 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  Images,
   Pencil,
   Plus,
   Trash2,
 } from "lucide-react";
 import { IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
-import { MenuSection } from "../../shared/components/MenuSection";
-import { Popover } from "../../shared/components/Popover";
 import { useNotices } from "../../app/noticeContext";
 import { errorMessage } from "../../shared/errors";
 import { FOLDER_DRAG_HOVER_EVENT } from "../../shared/useDragSort";
 import { libraryApi } from "./api";
-import { FolderNameDialog } from "./FolderDialogs";
+import { FolderNameDialog, FolderSortDialog } from "./FolderDialogs";
 import {
-  DEFAULT_FOLDER_SORT,
-  FOLDER_SORT_LABELS,
   ancestorPaths,
   buildFolderTree,
+  defaultExpandedIds,
+  expandedPaths,
   flattenVisible,
+  hasNestedSortable,
+  needsFolderSort,
+  parentFolderPath,
+  resolveExpandedPaths,
+  sortFolderOrders,
   type FolderNode,
-  type FolderSortMode,
-  type FolderSortSpec,
+  type FolderSortKey,
 } from "./folderTreeModel";
 import type { FolderInfo } from "./types";
 
 interface FolderTreeProps {
+  libraryId: string;
   folders: FolderInfo[];
   selectedFolderIds: number[];
+  directFolderId: number | null;
   selectedImageIds: number[];
   onSelect: (folderIds: number[]) => void;
+  onSelectDirect: (folderId: number) => void;
   onFoldersChanged: (folders: FolderInfo[]) => void;
   onDataChanged: () => void;
   onBeginFolderDrag: (
-    folderId: number,
+    folderIds: number[],
     label: string,
     event: ReactPointerEvent<HTMLDivElement>,
   ) => void;
@@ -57,56 +64,91 @@ interface FolderTreeProps {
 interface FolderMenu {
   x: number;
   y: number;
-  node: FolderNode;
+  /** null 表示“全部图片”根行。 */
+  node: FolderNode | null;
 }
 
-function initialFolderSort(): FolderSortSpec {
+interface SortTarget {
+  id: number;
+  path: string;
+}
+
+const EXPANDED_STORAGE_PREFIX = "lilith.folderExpanded.";
+
+function readExpandedPaths(libraryId: string): string[] | null {
   try {
-    const raw = localStorage.getItem("lilith.folderSort");
-    if (!raw) return DEFAULT_FOLDER_SORT;
-    const parsed = JSON.parse(raw) as Partial<FolderSortSpec>;
-    const modes: FolderSortMode[] = ["manual", "name", "total", "direct"];
-    if (!parsed.mode || !modes.includes(parsed.mode)) return DEFAULT_FOLDER_SORT;
-    return { mode: parsed.mode, descending: Boolean(parsed.descending) };
+    const raw = localStorage.getItem(`${EXPANDED_STORAGE_PREFIX}${libraryId}`);
+    if (raw == null) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
+      return null;
+    }
+    return parsed;
   } catch {
-    return DEFAULT_FOLDER_SORT;
+    return null;
+  }
+}
+
+function writeExpandedPaths(libraryId: string, paths: string[]) {
+  try {
+    localStorage.setItem(`${EXPANDED_STORAGE_PREFIX}${libraryId}`, JSON.stringify(paths));
+  } catch {
+    // 忽略浏览器限制；展开状态仍在本会话内生效。
   }
 }
 
 export function FolderTree({
+  libraryId,
   folders,
   selectedFolderIds,
+  directFolderId,
   selectedImageIds,
   onSelect,
+  onSelectDirect,
   onFoldersChanged,
   onDataChanged,
   onBeginFolderDrag,
 }: FolderTreeProps) {
   const { notify, confirm } = useNotices();
-  const [folderSort, setFolderSort] = useState<FolderSortSpec>(initialFolderSort);
-  const [sortOpen, setSortOpen] = useState(false);
-  const sortAnchorRef = useRef<HTMLSpanElement>(null);
-  const tree = useMemo(() => buildFolderTree(folders, folderSort), [folders, folderSort]);
+  const tree = useMemo(() => buildFolderTree(folders), [folders]);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
   const [anchorId, setAnchorId] = useState<number | null>(null);
   const [menu, setMenu] = useState<FolderMenu | null>(null);
   const [createParent, setCreateParent] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<FolderNode | null>(null);
   const [moveTarget, setMoveTarget] = useState<FolderNode | null>(null);
+  const [sortTarget, setSortTarget] = useState<SortTarget | null>(null);
+  const [sortBusy, setSortBusy] = useState(false);
+  const [sortError, setSortError] = useState<string | null>(null);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const initialized = useRef(false);
+  const hydrated = useRef(false);
+  const skipPersist = useRef(true);
 
   const rootFolder = folders.find((folder) => folder.path === "");
   const selected = useMemo(() => new Set(selectedFolderIds), [selectedFolderIds]);
   const rows = useMemo(() => flattenVisible(tree.nodes, expanded), [tree, expanded]);
 
+  // 换库时 Sidebar 用 libraryId 作 key 重新挂载本组件，展开状态无需手动重置。
   useEffect(() => {
-    if (initialized.current || tree.nodes.length === 0) return;
-    initialized.current = true;
-    setExpanded(new Set(tree.nodes.map((node) => node.id)));
-  }, [tree]);
+    if (hydrated.current || tree.nodes.length === 0) return;
+    hydrated.current = true;
+    skipPersist.current = true;
+    const saved = readExpandedPaths(libraryId);
+    setExpanded(
+      saved ? resolveExpandedPaths(saved, tree.byPath) : defaultExpandedIds(tree.nodes),
+    );
+  }, [tree, libraryId]);
+
+  useEffect(() => {
+    if (!hydrated.current) return;
+    if (skipPersist.current) {
+      skipPersist.current = false;
+      return;
+    }
+    writeExpandedPaths(libraryId, expandedPaths(expanded, tree.byId));
+  }, [expanded, tree, libraryId]);
 
   useEffect(() => {
     if (selectedFolderIds.length === 0) return;
@@ -127,14 +169,6 @@ export function FolderTree({
       return changed ? next : current;
     });
   }, [selectedFolderIds, tree]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("lilith.folderSort", JSON.stringify(folderSort));
-    } catch {
-      // 忽略浏览器限制；排序方式仍在本会话内生效。
-    }
-  }, [folderSort]);
 
   useEffect(() => {
     const onHover = (event: Event) => {
@@ -294,6 +328,39 @@ export function FolderTree({
     }
   };
 
+  const sortChildren = async (
+    key: FolderSortKey,
+    descending: boolean,
+    recursive: boolean,
+  ) => {
+    if (!sortTarget) return;
+    const orders = sortFolderOrders(tree, sortTarget.id, key, descending, recursive);
+    if (orders.length === 0) {
+      setSortTarget(null);
+      notify("没有需要排序的子文件夹", "info");
+      return;
+    }
+    setSortBusy(true);
+    setSortError(null);
+    try {
+      const next = await libraryApi.applyFolderOrder(
+        sortTarget.id,
+        key,
+        descending,
+        recursive,
+        orders,
+      );
+      onFoldersChanged(next);
+      setSortTarget(null);
+      const count = orders.reduce((sum, order) => sum + order.folderIds.length, 0);
+      notify(`已调整 ${count.toLocaleString()} 个文件夹的顺序`, "success");
+    } catch (cause) {
+      setSortError(errorMessage(cause));
+    } finally {
+      setSortBusy(false);
+    }
+  };
+
   const disabledMoveIds = useMemo(() => {
     if (!moveTarget) return new Set<number>();
     const ids = new Set<number>();
@@ -307,21 +374,16 @@ export function FolderTree({
   }, [folders, moveTarget]);
 
   const menuNode = menu?.node ?? null;
+  const menuIsRoot = menu != null && menu.node == null;
+  const canSort = menuNode ? needsFolderSort(tree, menuNode.id) : false;
+  const canSortRoot = tree.rootId != null && needsFolderSort(tree, tree.rootId);
+  const sortDisabled = menuIsRoot ? !canSortRoot : !canSort;
 
   return (
     <div className="folder-tree">
       <div className="folder-tree-heading">
         <span>文件夹</span>
         <div className="folder-tree-heading-actions">
-          <span ref={sortAnchorRef} className="folder-tree-sort-anchor">
-            <IconButton
-              label={`文件夹排序：${FOLDER_SORT_LABELS[folderSort.mode]}${folderSort.descending ? "降序" : "升序"}`}
-              className={folderSort.mode === "manual" ? "" : "is-active"}
-              onClick={() => setSortOpen((open) => !open)}
-            >
-              <ArrowDownUp size={14} />
-            </IconButton>
-          </span>
           <IconButton
             label="新建文件夹"
             onClick={() => {
@@ -348,6 +410,11 @@ export function FolderTree({
           aria-selected={selectedFolderIds.length === 0}
           data-drop-root="true"
           onClick={selectRoot}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setMenu({ x: event.clientX, y: event.clientY, node: null });
+          }}
         >
           <span className="folder-tree-toggle">
             <span className="folder-tree-spacer" />
@@ -361,54 +428,87 @@ export function FolderTree({
           const hasChildren = node.children.length > 0;
           const isExpanded = expanded.has(node.id);
           const isSelected = selected.has(node.id);
+          const showDirect = hasChildren && isExpanded && node.directImageCount > 0;
           return (
-            <div
-              key={node.id}
-              className={`folder-tree-row${isSelected ? " is-selected" : ""}`}
-              role="treeitem"
-              aria-selected={isSelected}
-              aria-expanded={hasChildren ? isExpanded : undefined}
-              style={{ paddingLeft: 6 + node.depth * 14 }}
-              title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
-              data-drop-folder={node.id}
-              onPointerDown={(event) => {
-                if (folderSort.mode === "manual") onBeginFolderDrag(node.id, node.name, event);
-              }}
-              onClick={(event) => selectNode(node, event)}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                if (!selected.has(node.id)) {
-                  onSelect([node.id]);
-                  setAnchorId(node.id);
-                }
-                setMenu({ x: event.clientX, y: event.clientY, node });
-              }}
-            >
-              <button
-                type="button"
-                className="folder-tree-toggle"
-                aria-label={isExpanded ? "折叠" : "展开"}
-                disabled={!hasChildren}
-                onClick={(event) => {
+            <Fragment key={node.id}>
+              <div
+                className={`folder-tree-row${isSelected ? " is-selected" : ""}`}
+                role="treeitem"
+                aria-selected={isSelected}
+                aria-expanded={hasChildren ? isExpanded : undefined}
+                style={{ paddingLeft: 6 + node.depth * 14 }}
+                title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
+                data-drop-folder={node.id}
+                onPointerDown={(event) => {
+                  const ids =
+                    selected.size > 1 && selected.has(node.id)
+                      ? selectedFolderIds.filter((id) => tree.byId.has(id))
+                      : [node.id];
+                  onBeginFolderDrag(
+                    ids,
+                    ids.length > 1 ? `${ids.length} 个文件夹` : node.name,
+                    event,
+                  );
+                }}
+                onClick={(event) => selectNode(node, event)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
-                  if (hasChildren) toggleExpanded(node.id);
+                  if (!selected.has(node.id)) {
+                    onSelect([node.id]);
+                    setAnchorId(node.id);
+                  }
+                  setMenu({ x: event.clientX, y: event.clientY, node });
                 }}
               >
-                {hasChildren ? (
-                  isExpanded ? (
-                    <ChevronDown size={13} />
+                <button
+                  type="button"
+                  className="folder-tree-toggle"
+                  aria-label={isExpanded ? "折叠" : "展开"}
+                  disabled={!hasChildren}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (hasChildren) toggleExpanded(node.id);
+                  }}
+                >
+                  {hasChildren ? (
+                    isExpanded ? (
+                      <ChevronDown size={13} />
+                    ) : (
+                      <ChevronRight size={13} />
+                    )
                   ) : (
-                    <ChevronRight size={13} />
-                  )
-                ) : (
-                  <span className="folder-tree-spacer" />
-                )}
-              </button>
-              {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
-              <span className="folder-tree-name">{node.name}</span>
-              <em>{node.totalImageCount.toLocaleString()}</em>
-            </div>
+                    <span className="folder-tree-spacer" />
+                  )}
+                </button>
+                {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
+                <span className="folder-tree-name">{node.name}</span>
+                <em>{node.totalImageCount.toLocaleString()}</em>
+              </div>
+              {showDirect ? (
+                <div
+                  className={`folder-tree-row folder-tree-direct${
+                    directFolderId === node.id ? " is-selected" : ""
+                  }`}
+                  role="treeitem"
+                  aria-selected={directFolderId === node.id}
+                  style={{ paddingLeft: 6 + (node.depth + 1) * 14 }}
+                  title={`只显示直接放在「${node.path}」的 ${node.directImageCount.toLocaleString()} 张图片`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setMenu(null);
+                    onSelectDirect(node.id);
+                  }}
+                >
+                  <span className="folder-tree-toggle">
+                    <span className="folder-tree-spacer" />
+                  </span>
+                  <Images size={13} />
+                  <span className="folder-tree-name">直属图片</span>
+                  <em>{node.directImageCount.toLocaleString()}</em>
+                </div>
+              ) : null}
+            </Fragment>
           );
         })}
       </div>
@@ -419,124 +519,119 @@ export function FolderTree({
           className="context-menu folder-context-menu"
           style={{
             left: Math.min(menu.x, Math.max(8, window.innerWidth - 224)),
-            top: Math.min(menu.y, Math.max(8, window.innerHeight - 240)),
+            top: Math.min(menu.y, Math.max(8, window.innerHeight - 320)),
           }}
           onContextMenu={(event) => event.preventDefault()}
         >
+          {menuIsRoot ? (
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={() => {
+                setMenu(null);
+                setDialogError(null);
+                setCreateParent("");
+              }}
+            >
+              <FolderPlus size={14} />
+              <span>新建文件夹</span>
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setMenu(null);
+                  setDialogError(null);
+                  setCreateParent(menuNode?.path ?? "");
+                }}
+              >
+                <FolderPlus size={14} />
+                <span>新建子文件夹</span>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setMenu(null);
+                  setDialogError(null);
+                  setRenameTarget(menuNode);
+                }}
+              >
+                <Pencil size={14} />
+                <span>重命名</span>
+              </button>
+            </>
+          )}
           <button
             type="button"
             className="context-menu-item"
+            disabled={sortDisabled}
+            title={sortDisabled ? "没有需要排序的子文件夹" : undefined}
             onClick={() => {
               setMenu(null);
-              setDialogError(null);
-              setCreateParent(menuNode?.path ?? "");
+              setSortError(null);
+              if (menuIsRoot) {
+                if (tree.rootId != null) setSortTarget({ id: tree.rootId, path: "" });
+              } else if (menuNode) {
+                setSortTarget({ id: menuNode.id, path: menuNode.path });
+              }
             }}
           >
-            <FolderPlus size={14} />
-            <span>新建子文件夹</span>
+            <ArrowDownUp size={14} />
+            <span>排序子文件夹…</span>
           </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              setMenu(null);
-              setDialogError(null);
-              setRenameTarget(menuNode);
-            }}
-          >
-            <Pencil size={14} />
-            <span>重命名</span>
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            onClick={() => {
-              setMenu(null);
-              setMoveTarget(menuNode);
-            }}
-          >
-            <FolderInput size={14} />
-            <span>移动到…</span>
-          </button>
-          <button
-            type="button"
-            className="context-menu-item"
-            disabled={selectedImageIds.length === 0}
-            onClick={() => {
-              const target = menuNode;
-              setMenu(null);
-              if (target) void moveImagesTo(selectedImageIds, target);
-            }}
-          >
-            <Folder size={14} />
-            <span>将选中图片移入</span>
-            {selectedImageIds.length > 0 ? <em>{selectedImageIds.length}</em> : null}
-          </button>
-          <div className="context-menu-separator" />
-          <button
-            type="button"
-            className="context-menu-item context-menu-danger"
-            disabled={
-              !menuNode ||
-              menuNode.children.length > 0 ||
-              menuNode.directImageCount > 0
-            }
-            title={
-              menuNode && (menuNode.children.length > 0 || menuNode.directImageCount > 0)
-                ? "只能删除没有子文件夹且没有图片的空文件夹"
-                : undefined
-            }
-            onClick={() => {
-              const target = menuNode;
-              setMenu(null);
-              if (target) void deleteFolder(target);
-            }}
-          >
-            <Trash2 size={14} />
-            <span>删除空文件夹</span>
-          </button>
+          {menuIsRoot ? null : (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  setMenu(null);
+                  setMoveTarget(menuNode);
+                }}
+              >
+                <FolderInput size={14} />
+                <span>移动到…</span>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={selectedImageIds.length === 0}
+                onClick={() => {
+                  const target = menuNode;
+                  setMenu(null);
+                  if (target) void moveImagesTo(selectedImageIds, target);
+                }}
+              >
+                <Folder size={14} />
+                <span>将选中图片移入</span>
+                {selectedImageIds.length > 0 ? <em>{selectedImageIds.length}</em> : null}
+              </button>
+              <div className="context-menu-separator" />
+              <button
+                type="button"
+                className="context-menu-item context-menu-danger"
+                disabled={!menuNode || menuNode.children.length > 0 || menuNode.directImageCount > 0}
+                title={
+                  menuNode && (menuNode.children.length > 0 || menuNode.directImageCount > 0)
+                    ? "只能删除没有子文件夹且没有图片的空文件夹"
+                    : undefined
+                }
+                onClick={() => {
+                  const target = menuNode;
+                  setMenu(null);
+                  if (target) void deleteFolder(target);
+                }}
+              >
+                <Trash2 size={14} />
+                <span>删除空文件夹</span>
+              </button>
+            </>
+          )}
         </div>
       ) : null}
-
-      <Popover
-        open={sortOpen}
-        anchorRef={sortAnchorRef}
-        placement="bottom-start"
-        onClose={() => setSortOpen(false)}
-        minWidth={220}
-      >
-        <MenuSection title="排序方式">
-          {(Object.keys(FOLDER_SORT_LABELS) as FolderSortMode[]).map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              className={`context-menu-item${folderSort.mode === mode ? " is-active" : ""}`}
-              onClick={() => setFolderSort((current) => ({ ...current, mode }))}
-            >
-              <span>{FOLDER_SORT_LABELS[mode]}</span>
-            </button>
-          ))}
-        </MenuSection>
-        <MenuSection title="方向">
-          <button
-            type="button"
-            className={`context-menu-item${folderSort.descending ? "" : " is-active"}`}
-            onClick={() => setFolderSort((current) => ({ ...current, descending: false }))}
-          >
-            <span>升序</span>
-          </button>
-          <button
-            type="button"
-            className={`context-menu-item${folderSort.descending ? " is-active" : ""}`}
-            onClick={() => setFolderSort((current) => ({ ...current, descending: true }))}
-          >
-            <span>降序</span>
-          </button>
-        </MenuSection>
-        {folderSort.mode === "manual" ? null : (
-          <div className="folder-sort-note">切换到“手动”后才能拖动文件夹调整顺序。</div>
-        )}
-      </Popover>
 
       <FolderNameDialog
         open={createParent != null}
@@ -564,6 +659,19 @@ export function FolderTree({
           if (!dialogBusy) setRenameTarget(null);
         }}
         onSubmit={(name) => void renameFolder(name)}
+      />
+      <FolderSortDialog
+        open={sortTarget != null}
+        path={sortTarget?.path ?? ""}
+        canRecurse={sortTarget != null && hasNestedSortable(tree, sortTarget.id)}
+        busy={sortBusy}
+        error={sortError}
+        onClose={() => {
+          if (!sortBusy) setSortTarget(null);
+        }}
+        onSubmit={(key, descending, recursive) =>
+          void sortChildren(key, descending, recursive)
+        }
       />
       <FolderPickerDialog
         open={moveTarget != null}

@@ -26,7 +26,12 @@ import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 import { useDragSort, type DragPayload, type DropTarget } from "../shared/useDragSort";
-import { isSameOrDescendant, parentFolderPath } from "../modules/library/folderTreeModel";
+import {
+  foldersById,
+  isSameOrDescendant,
+  outermostFolders,
+  parentFolderPath,
+} from "../modules/library/folderTreeModel";
 
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
@@ -196,7 +201,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       browse.applyBrowse(
         {
           ...browse.browse,
-          filters: { ...browse.browse.filters, folderIds: next },
+          filters: {
+            ...browse.browse.filters,
+            folderIds: next,
+            folderDirect: next.length > 0 && browse.browse.filters.folderDirect,
+          },
         },
         false,
       );
@@ -305,41 +314,62 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
         return;
       }
 
-      const dragged = folders.find((folder) => folder.id === item.folderId);
-      if (!dragged) return;
+      const dragged = outermostFolders(foldersById(folders, item.folderIds));
+      if (dragged.length === 0) return;
       const targetFolder =
         target.kind === "root"
           ? folders.find((folder) => folder.path === "")
           : folders.find((folder) => folder.id === target.folderId);
       if (!targetFolder) return;
-      if (isSameOrDescendant(targetFolder.path, dragged.path)) {
+      if (dragged.some((folder) => isSameOrDescendant(targetFolder.path, folder.path))) {
         notify("不能把文件夹移动到自身或子文件夹", "error");
         return;
       }
+      const draggedIds = [...dragged]
+        .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id)
+        .map((folder) => folder.id);
+      const movedIds = new Set(draggedIds);
+      /** 目标父级下排除被拖文件夹后的同级顺序。 */
+      const siblingsOf = (parentPath: string) =>
+        folders
+          .filter(
+            (folder) =>
+              folder.path !== "" &&
+              parentFolderPath(folder.path) === parentPath &&
+              !movedIds.has(folder.id),
+          )
+          .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
 
       try {
         if (target.position === "inside") {
-          await libraryApi.moveFolder(dragged.id, targetFolder.id);
+          const alreadyInside = dragged.every(
+            (folder) => parentFolderPath(folder.path) === targetFolder.path,
+          );
+          if (alreadyInside) {
+            await libraryApi.reorderFolders(
+              draggedIds,
+              targetFolder.id,
+              siblingsOf(targetFolder.path).length,
+            );
+          } else {
+            await libraryApi.placeFolders(draggedIds, targetFolder.id, null);
+          }
         } else {
           const parentPath = parentFolderPath(targetFolder.path);
           const parent = folders.find((folder) => folder.path === parentPath);
           if (!parent) return;
-          const sameParent = parentFolderPath(dragged.path) === parentPath;
-          if (!sameParent) {
-            await libraryApi.moveFolder(dragged.id, parent.id);
-          }
-          const siblings = folders
-            .filter(
-              (folder) =>
-                folder.path !== "" &&
-                parentFolderPath(folder.path) === parentPath &&
-                folder.id !== dragged.id,
-            )
-            .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
+          const siblings = siblingsOf(parentPath);
           const position = siblings.findIndex((folder) => folder.id === targetFolder.id);
           if (position < 0) return;
           const index = target.position === "before" ? position : position + 1;
-          await libraryApi.reorderFolders([dragged.id], parent.id, index);
+          const sameParent = dragged.every(
+            (folder) => parentFolderPath(folder.path) === parentPath,
+          );
+          if (sameParent) {
+            await libraryApi.reorderFolders(draggedIds, parent.id, index);
+          } else {
+            await libraryApi.placeFolders(draggedIds, parent.id, index);
+          }
         }
         emitChange({
           kind: "folder",
@@ -358,17 +388,20 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const { beginDrag } = useDragSort({
     onDrop: (item, target) => handleDrop(item, target),
     onReject: (item, target) => {
-      if (item.kind === "folder" && target.kind === "folder") {
+      if (item.kind === "folders" && target.kind === "folder") {
         notify("不能把文件夹移动到自身或子文件夹", "error");
       }
     },
     canDrop: (item, target) => {
       if (item.kind === "images") return target.position === "inside";
       if (target.kind === "root") return true;
-      const dragged = folders.find((folder) => folder.id === item.folderId);
       const targetFolder = folders.find((folder) => folder.id === target.folderId);
-      if (!dragged || !targetFolder) return false;
-      return !isSameOrDescendant(targetFolder.path, dragged.path);
+      if (!targetFolder) return false;
+      const dragged = foldersById(folders, item.folderIds);
+      if (dragged.length !== item.folderIds.length) return false;
+      return !dragged.some((folder) =>
+        isSameOrDescendant(targetFolder.path, folder.path),
+      );
     },
   });
 
@@ -473,15 +506,19 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     });
   };
 
-  const selectFolders = (folderIds: number[]) => {
+  const selectFolderScope = (folderIds: number[], folderDirect: boolean) => {
     const leavingTemp = browse.browse.view === "temp";
     browse.applyBrowse({
       ...browse.browse,
       ...(leavingTemp ? sortForViewChange(browse.browse, "all") : {}),
       view: leavingTemp ? "all" : browse.browse.view,
       collectionId: leavingTemp ? null : browse.browse.collectionId,
-      filters: { ...browse.browse.filters, folderIds },
+      filters: { ...browse.browse.filters, folderIds, folderDirect },
     });
+  };
+
+  const selectFolders = (folderIds: number[]) => {
+    selectFolderScope(folderIds, false);
   };
 
   const handleCopyImage = async (imageId: number) => {
@@ -512,14 +549,21 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       <Sidebar
         onOpenSettings={onOpenSettings}
         onOpenLibrary={onChangeLibrary}
+        libraryId={current.id}
         folders={folders}
         selectedFolderIds={browse.browse.filters.folderIds}
+        directFolderId={
+          browse.browse.filters.folderDirect && browse.browse.filters.folderIds.length === 1
+            ? browse.browse.filters.folderIds[0]
+            : null
+        }
         selectedImageIds={selectedImageIds}
         onSelectFolders={selectFolders}
+        onSelectDirect={(folderId) => selectFolderScope([folderId], true)}
         onFoldersChanged={setFolders}
         onDataChanged={handleDataChanged}
-        onBeginFolderDrag={(folderId, label, event) =>
-          beginDrag({ kind: "folder", folderId, label }, event)
+        onBeginFolderDrag={(folderIds, label, event) =>
+          beginDrag({ kind: "folders", folderIds, label }, event)
         }
       />
       <main className="app-main">

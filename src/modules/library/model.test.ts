@@ -197,12 +197,29 @@ test("rowInTagScope matches folder subtrees and trash state", () => {
   const item = row();
   const context = {
     folderPaths: ["人物"],
+    folderDirect: false,
     hasCollection: true,
     similarityActive: false,
   };
   assert.equal(rowInTagScope(item, "folder", context), true);
   assert.equal(rowInTagScope(item, "folder", { ...context, folderPaths: ["背景"] }), false);
   assert.equal(rowInTagScope(item, "folder", { ...context, folderPaths: [""] }), true);
+  assert.equal(
+    rowInTagScope(item, "folder", { ...context, folderDirect: true, folderPaths: [""] }),
+    false,
+  );
+  assert.equal(
+    rowInTagScope(item, "folder", { ...context, folderDirect: true, folderPaths: ["人物"] }),
+    false,
+  );
+  assert.equal(
+    rowInTagScope(item, "folder", {
+      ...context,
+      folderDirect: true,
+      folderPaths: ["人物/线稿"],
+    }),
+    true,
+  );
   assert.equal(rowInTagScope(item, "collection", context), true);
   assert.equal(rowInTagScope(item, "library", context), true);
   assert.equal(

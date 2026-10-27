@@ -4944,14 +4944,32 @@ textarea:focus-visible {
   gap: 2px;
 }
 
-.folder-tree-sort-anchor {
-  display: inline-flex;
-}
-
 .folder-sort-note {
   padding: 6px 10px 2px;
   color: var(--text-faint);
   font-size: 10px;
+}
+
+.folder-tree-direct {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.folder-tree-direct svg {
+  opacity: 0.8;
+}
+
+.folder-sort-recursive {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.folder-sort-recursive.is-disabled {
+  color: var(--text-faint);
+  opacity: 0.6;
 }
 
 .folder-tree-row[data-drop-position="inside"] {

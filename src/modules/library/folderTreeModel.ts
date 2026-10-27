@@ -1,4 +1,6 @@
-import type { FolderInfo } from "./types";
+import type { FolderInfo, FolderOrder, FolderSortKey } from "./types";
+
+export type { FolderOrder, FolderSortKey } from "./types";
 
 export interface FolderNode extends FolderInfo {
   name: string;
@@ -15,20 +17,9 @@ export interface FolderTreeModel {
 
 const collator = new Intl.Collator("zh-Hans-CN", { numeric: true, sensitivity: "base" });
 
-export type FolderSortMode = "manual" | "name" | "total" | "direct";
-
-export interface FolderSortSpec {
-  mode: FolderSortMode;
-  descending: boolean;
-}
-
-export const DEFAULT_FOLDER_SORT: FolderSortSpec = { mode: "manual", descending: false };
-
-export const FOLDER_SORT_LABELS: Record<FolderSortMode, string> = {
-  manual: "手动",
+export const FOLDER_SORT_LABELS: Record<FolderSortKey, string> = {
   name: "名称",
   total: "图片数（含子文件夹）",
-  direct: "图片数（直接）",
 };
 
 export function folderName(path: string): string {
@@ -41,10 +32,7 @@ export function parentFolderPath(path: string): string {
   return index < 0 ? "" : path.slice(0, index);
 }
 
-export function buildFolderTree(
-  folders: FolderInfo[],
-  sort: FolderSortSpec = DEFAULT_FOLDER_SORT,
-): FolderTreeModel {
+export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {
   const byId = new Map<number, FolderNode>();
   const byPath = new Map<string, FolderNode>();
   const rootId = folders.find((folder) => folder.path === "")?.id ?? null;
@@ -71,15 +59,8 @@ export function buildFolderTree(
     else nodes.push(node);
   }
 
-  const direction = sort.descending ? -1 : 1;
-  const compareNodes = (left: FolderNode, right: FolderNode) => {
-    let difference = 0;
-    if (sort.mode === "name") difference = collator.compare(left.name, right.name);
-    else if (sort.mode === "total") difference = left.totalImageCount - right.totalImageCount;
-    else if (sort.mode === "direct") difference = left.directImageCount - right.directImageCount;
-    else difference = left.sortIndex - right.sortIndex;
-    return difference !== 0 ? difference * direction : left.id - right.id;
-  };
+  const compareNodes = (left: FolderNode, right: FolderNode) =>
+    left.sortIndex - right.sortIndex || left.id - right.id;
   const sortNodes = (items: FolderNode[]) => {
     items.sort(compareNodes);
     for (const item of items) sortNodes(item.children);
@@ -101,6 +82,63 @@ export function flattenVisible(nodes: FolderNode[], expanded: Set<number>): Fold
   return rows;
 }
 
+/** 某个文件夹的直接子文件夹；根目录返回顶层节点，id 不存在时返回空数组。 */
+export function childrenOf(tree: FolderTreeModel, folderId: number): FolderNode[] {
+  if (tree.rootId === folderId) return tree.nodes;
+  return tree.byId.get(folderId)?.children ?? [];
+}
+
+function compareByKey(key: FolderSortKey, descending: boolean) {
+  const direction = descending ? -1 : 1;
+  return (left: FolderNode, right: FolderNode) => {
+    const difference =
+      key === "name"
+        ? collator.compare(left.name, right.name)
+        : left.totalImageCount - right.totalImageCount;
+    return difference !== 0 ? difference * direction : left.id - right.id;
+  };
+}
+
+/** 一次性排序需要写回的同级顺序；没有可调整的父级时返回空数组。 */
+export function sortFolderOrders(
+  tree: FolderTreeModel,
+  rootId: number,
+  key: FolderSortKey,
+  descending: boolean,
+  recursive: boolean,
+): FolderOrder[] {
+  const compareNodes = compareByKey(key, descending);
+  const order = (items: FolderNode[], parentId: number): FolderOrder => ({
+    parentId,
+    folderIds: [...items].sort(compareNodes).map((node) => node.id),
+  });
+
+  const rootChildren = childrenOf(tree, rootId);
+  const orders: FolderOrder[] = [];
+  const visit = (items: FolderNode[], parentId: number) => {
+    if (items.length >= 2) orders.push(order(items, parentId));
+    for (const item of items) visit(item.children, item.id);
+  };
+
+  if (recursive) visit(rootChildren, rootId);
+  else if (rootChildren.length >= 2) orders.push(order(rootChildren, rootId));
+  return orders;
+}
+
+/** 该文件夹自身或任一后代是否有可排序的同级；没有时排序菜单项置灰。 */
+export function needsFolderSort(tree: FolderTreeModel, folderId: number): boolean {
+  const hasSortable = (items: FolderNode[]): boolean =>
+    items.length >= 2 || items.some((item) => hasSortable(item.children));
+  return hasSortable(childrenOf(tree, folderId));
+}
+
+/** 该文件夹的后代里是否有可排序的同级；只用于决定是否允许勾选递归。 */
+export function hasNestedSortable(tree: FolderTreeModel, folderId: number): boolean {
+  const hasSortableBelow = (items: FolderNode[]): boolean =>
+    items.some((item) => item.children.length >= 2 || hasSortableBelow(item.children));
+  return hasSortableBelow(childrenOf(tree, folderId));
+}
+
 /** 祖先路径（不含根与自身），例如 人物/速写/手部 -> [人物, 人物/速写]。 */
 export function ancestorPaths(path: string): string[] {
   const parts = path.split("/").filter(Boolean);
@@ -111,6 +149,28 @@ export function ancestorPaths(path: string): string[] {
     result.push(current);
   }
   return result;
+}
+
+export function expandedPaths(ids: Set<number>, byId: Map<number, FolderNode>): string[] {
+  return [...ids]
+    .map((id) => byId.get(id)?.path)
+    .filter((path): path is string => path != null);
+}
+
+export function resolveExpandedPaths(
+  paths: string[],
+  byPath: Map<string, FolderNode>,
+): Set<number> {
+  const ids = new Set<number>();
+  for (const path of paths) {
+    const node = byPath.get(path);
+    if (node) ids.add(node.id);
+  }
+  return ids;
+}
+
+export function defaultExpandedIds(nodes: FolderNode[]): Set<number> {
+  return new Set(nodes.map((node) => node.id));
 }
 
 export function breadcrumbsFor(
@@ -131,4 +191,25 @@ export function breadcrumbsFor(
 
 export function isSameOrDescendant(path: string, ancestor: string): boolean {
   return ancestor === "" || path === ancestor || path.startsWith(`${ancestor}/`);
+}
+
+/** 按 id 取出文件夹，保持传入顺序，不存在的 id 直接跳过。 */
+export function foldersById(folders: FolderInfo[], ids: number[]): FolderInfo[] {
+  return ids
+    .map((id) => folders.find((folder) => folder.id === id))
+    .filter((folder): folder is FolderInfo => folder != null);
+}
+
+/** 去掉被另一个选中文件夹包含的后代，只保留最外层；顺序按路径深度、id。 */
+export function outermostFolders<T extends { id: number; path: string }>(folders: T[]): T[] {
+  const sorted = [...folders].sort(
+    (left, right) => left.path.length - right.path.length || left.id - right.id,
+  );
+  return sorted.filter(
+    (folder) =>
+      !sorted.some(
+        (other) =>
+          other.id !== folder.id && isSameOrDescendant(folder.path, other.path),
+      ),
+  );
 }

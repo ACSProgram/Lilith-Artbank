@@ -28,6 +28,15 @@ pub fn run() {
                 }
             },
         ))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -84,6 +93,9 @@ pub fn run() {
         .expect("error while building Lilith Artbank");
 
     application.run(|app_handle, event| {
+        if let tauri::RunEvent::Ready = event {
+            app::window_state::ensure_main_window_visible(app_handle);
+        }
         if let tauri::RunEvent::Exit = event {
             let state = app_handle.state::<app::state::AppState>();
             let settings = state.settings.snapshot().ai;

@@ -466,6 +466,32 @@ fn perf_metadata_200k() {
         ms(p95)
     );
 
+    let leaf_folder_id = folder_id(database, "folder0/set0/leaf0");
+    let direct_query = LibraryQuery {
+        filters: LibraryFilters {
+            folder_ids: vec![leaf_folder_id],
+            folder_direct: true,
+            ..Default::default()
+        },
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let direct_page =
+        query::query_page(database, &root, direct_query.clone()).expect("direct page");
+    assert!(!direct_page.items.is_empty(), "直属条件应命中叶子文件夹");
+    let (p50, p95) = time_query(database, &root, direct_query.clone(), 40);
+    println!(
+        "[perf] query engine direct folder 150: p50={:.2}ms p95={:.2}ms",
+        ms(p50),
+        ms(p95)
+    );
+    let direct_count_start = Instant::now();
+    let direct_count = query::query_total(database, direct_query).expect("direct folder total");
+    println!(
+        "[perf] query engine direct folder total ({direct_count} images): {:.2}ms",
+        ms(direct_count_start.elapsed())
+    );
+
     let mut folder_list_samples = Vec::with_capacity(20);
     for _ in 0..20 {
         let start = Instant::now();
