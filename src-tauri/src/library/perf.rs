@@ -1445,3 +1445,150 @@ fn perf_estimate_vs_actual() {
     );
     assert!(report.processed > 0);
 }
+
+/// 抽样离散度：同一份库、同一档位连抽多次，打印节省空间与耗时的极差。
+///
+/// 库里的图片按真实库的尺寸构成生成（小图多、体积集中在大图），否则抽样误差被
+/// 均匀数据抹平，测不出东西。复测：
+/// `cargo test --lib -- --ignored --nocapture perf_estimate_sampling_spread`。
+#[test]
+#[ignore = "抽样离散度；cargo test --lib -- --ignored --nocapture perf_estimate_sampling_spread"]
+fn perf_estimate_sampling_spread() {
+    use crate::{
+        imageops::optimize::OptimizeOptions,
+        library::{
+            NoopReporter,
+            optimize_estimate::{self, OptimizeEstimate},
+        },
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("library");
+    let (session, _) = service::create(&root, "抽样离散度", 1).expect("create library");
+
+    // 尺寸构成大致照抄真实库 s5：多数小图，体积与像素集中在大图。
+    let buckets: [(u32, u32, usize); 5] = [
+        (400, 300, 96),
+        (800, 600, 64),
+        (1_600, 1_200, 40),
+        (2_400, 1_800, 20),
+        (3_200, 2_400, 12),
+    ];
+    let mut ids = Vec::new();
+    let mut index = 0_u32;
+    for (width, height, count) in buckets {
+        for _ in 0..count {
+            let mut image = image::RgbImage::new(width, height);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                // 一半图细节多（难压），一半图平滑（好压），让节省率分散。
+                let detail = index.is_multiple_of(2);
+                let value = if detail {
+                    ((x * 7 + y * 13 + index * 31) % 256) as u8
+                } else {
+                    ((x * 255 / width.max(1) + index * 5) % 256) as u8
+                };
+                *pixel = image::Rgb([value, value.wrapping_mul(3), value.wrapping_mul(7)]);
+            }
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .expect("encode png");
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            std::fs::write(root.join(format!("{hash}.png")), &bytes).expect("write content");
+            let id = session
+                .db
+                .with_writer(|connection| {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description, imported_at,
+                            modified_at
+                         ) VALUES (?1, 'png', 1, ?2, ?3, ?4, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        rusqlite::params![hash, bytes.len() as i64, width, height],
+                    )?;
+                    Ok(connection.last_insert_rowid())
+                })
+                .expect("insert row");
+            ids.push(id);
+            index += 1;
+        }
+    }
+
+    let options = OptimizeOptions::default();
+    let run = |budget: usize| -> OptimizeEstimate {
+        optimize_estimate::estimate(
+            &session.db,
+            &root,
+            "perf-spread",
+            &ids,
+            &options,
+            budget,
+            "fingerprint",
+            &NoopReporter,
+        )
+        .expect("estimate")
+        .expect("not cancelled")
+    };
+
+    // 全量抽样等于真值，用来算每次抽样的相对偏差。
+    let truth = run(2_000);
+    println!(
+        "[perf] truth: images={} bytes={} savings={} seconds={} sample={} sample_ms={} work={}",
+        truth.candidate_count,
+        truth.candidate_bytes,
+        truth.savings_bytes,
+        truth.estimated_seconds,
+        truth.sample_count,
+        truth.sample_elapsed_ms,
+        truth.estimated_work_seconds
+    );
+    let truth_savings = truth.savings_bytes.max(1) as f64;
+    let truth_seconds = truth.estimated_seconds.max(1) as f64;
+    assert!(truth.candidate_count > 0);
+
+    let rounds = 10_usize;
+    let mut savings_ratio = Vec::with_capacity(rounds);
+    let mut seconds_ratio = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let estimate = run(50);
+        let savings = (estimate.savings_bytes as f64 - truth_savings) / truth_savings;
+        let seconds = (estimate.estimated_seconds as f64 - truth_seconds) / truth_seconds;
+        savings_ratio.push(savings);
+        seconds_ratio.push(seconds);
+        println!(
+            "[perf] round={round} sample={} coverage={:.2}% sample_ms={} bytes={} savings={} ({:+.1}%) ±{} seconds={} ({:+.1}%) ±{} work={}",
+            estimate.sample_count,
+            estimate.coverage * 100.0,
+            estimate.sample_elapsed_ms,
+            estimate.sample_bytes,
+            estimate.savings_bytes,
+            savings * 100.0,
+            estimate.savings_margin_bytes,
+            estimate.estimated_seconds,
+            seconds * 100.0,
+            estimate.estimated_seconds_margin,
+            estimate.estimated_work_seconds
+        );
+    }
+    let spread = |values: &[f64]| -> (f64, f64, f64) {
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        (min * 100.0, sorted[sorted.len() / 2] * 100.0, max * 100.0)
+    };
+    let (savings_min, savings_median, savings_max) = spread(&savings_ratio);
+    let (seconds_min, seconds_median, seconds_max) = spread(&seconds_ratio);
+    println!(
+        "[perf] savings: min={savings_min:+.1}% median={savings_median:+.1}% max={savings_max:+.1}% range={:.1}pt",
+        savings_max - savings_min
+    );
+    println!(
+        "[perf] seconds: min={seconds_min:+.1}% median={seconds_median:+.1}% max={seconds_max:+.1}% range={:.1}pt",
+        seconds_max - seconds_min
+    );
+}

@@ -50,6 +50,10 @@ pub(crate) const BATCH_SIZE: usize = 1000;
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const MAX_REPORTED_FAILURES: usize = 50;
 const CHUNK: usize = 400;
+/// 执行前逐张 `stat` 原图的线程数；热缓存下约 19 µs/张，冷盘会明显更慢。
+const SOURCE_CHECK_THREADS: usize = 8;
+/// 原图缺失或大小不符的允许比例；超过就拒绝执行，要求重新估算。
+pub(crate) const SOURCE_DRIFT_LIMIT: f64 = 0.01;
 
 #[derive(Debug, Clone)]
 pub struct CandidateRow {
@@ -149,12 +153,34 @@ pub fn eligible_summary(candidates: &[CandidateRow], options: &OptimizeOptions) 
     (count, bytes)
 }
 
-/// 执行凭证：指纹一致，且候选集在估算值的 ±10% 以内。
+/// 候选集合指纹：对排好序的 id 折叠，用来发现“张数与体积都对、但换了一批图”。
+pub fn fingerprint_ids(ids: &[i64]) -> String {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for id in sorted {
+        hasher.update(&id.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// 当前候选集合的指纹；口径与估算一致，只算前置判据通过的图片。
+pub fn candidate_fingerprint(candidates: &[CandidateRow], options: &OptimizeOptions) -> String {
+    let ids: Vec<i64> = candidates
+        .iter()
+        .filter(|row| optimize::prefilter(&row.source_info(), options).is_ok())
+        .map(|row| row.id)
+        .collect();
+    fingerprint_ids(&ids)
+}
+
+/// 执行凭证：指纹一致、候选集在估算值的 ±10% 以内，且集合本身没换。
 pub fn verify_grant(
     estimate: &OptimizeEstimate,
     options_fingerprint: &str,
     candidate_count: u64,
     candidate_bytes: u64,
+    candidate_fingerprint: &str,
 ) -> AppResult<()> {
     if estimate.options_fingerprint != options_fingerprint {
         return Err(AppError::message(
@@ -171,7 +197,99 @@ pub fn verify_grant(
             "候选图片已变化，估算不再可靠，请重新估算",
         ));
     }
+    // 删掉一批又导入一批体积接近的图，张数与体积都能对上，只有集合指纹能发现。
+    if !estimate.candidate_fingerprint.is_empty()
+        && estimate.candidate_fingerprint != candidate_fingerprint
+    {
+        return Err(AppError::message(
+            "候选图片已换成另一批（数量与体积接近，但不是同一批图），请重新估算",
+        ));
+    }
     Ok(())
+}
+
+/// 执行前逐张核对原图的结果。
+#[derive(Debug, Default)]
+pub struct SourceCheck {
+    /// 文件不存在（或被移走、路径不可用）。
+    pub missing: u64,
+    /// 文件还在，但大小与数据库记录不一致（被外部替换或截断）。
+    pub changed: u64,
+    /// 有问题、要从候选里剔除的行。
+    pub bad_ids: Vec<i64>,
+    /// 候选涉及的、已经不存在的文件夹路径。
+    pub missing_dirs: Vec<String>,
+}
+
+impl SourceCheck {
+    pub fn drifted(&self) -> u64 {
+        self.missing + self.changed
+    }
+}
+
+/// 逐张 `stat` 候选原图并与 `images.file_size` 比对，同时确认文件夹还在。
+///
+/// 274 068 个候选在热缓存下约 5 s（8 线程），相对整次执行只占百分之几；串行要
+/// 30 s 以上，不能放进执行路径。
+pub fn verify_sources(
+    root: &Path,
+    candidates: &[CandidateRow],
+    options: &OptimizeOptions,
+) -> SourceCheck {
+    let paths = LibraryPaths::new(root);
+    let rows: Vec<&CandidateRow> = candidates
+        .iter()
+        .filter(|row| optimize::prefilter(&row.source_info(), options).is_ok())
+        .collect();
+
+    let mut folders: HashSet<&str> = HashSet::new();
+    for row in &rows {
+        folders.insert(row.folder_path.as_str());
+    }
+    let mut missing_dirs: Vec<String> = folders
+        .into_iter()
+        .filter(|folder| !paths.folder_dir(folder).is_dir())
+        .map(str::to_owned)
+        .collect();
+    missing_dirs.sort();
+
+    let check = |row: &CandidateRow| -> (bool, bool) {
+        let path = match metadata::content_path(
+            &paths,
+            &row.folder_path,
+            &row.content_hash,
+            &row.file_ext,
+        ) {
+            Ok(path) => path,
+            // 路径不合法说明行本身有问题，按缺失处理，交给重新估算。
+            Err(_) => return (true, false),
+        };
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => (false, meta.len() != row.file_size.max(0) as u64),
+            _ => (true, false),
+        }
+    };
+    let outcomes: Vec<(bool, bool)> =
+        match crate::library::encode_pool_with(SOURCE_CHECK_THREADS, "原图校验") {
+            Ok(pool) => pool.install(|| rows.par_iter().map(|row| check(row)).collect()),
+            // 建不了池就串行跑：慢一点，但不能因此跳过校验。
+            Err(_) => rows.iter().map(|row| check(row)).collect(),
+        };
+
+    let mut result = SourceCheck {
+        missing_dirs,
+        ..SourceCheck::default()
+    };
+    for (row, (missing, changed)) in rows.iter().zip(outcomes) {
+        if missing {
+            result.missing += 1;
+            result.bad_ids.push(row.id);
+        } else if changed {
+            result.changed += 1;
+            result.bad_ids.push(row.id);
+        }
+    }
+    result
 }
 
 /// 实际值与估算值相差不超过 10%。
@@ -201,6 +319,8 @@ pub struct OptimizeReport {
     /// 目标内容已被其他行占用而没有落盘的张数。
     pub duplicate_skipped: u64,
     pub failed: u64,
+    /// 原图在编码前就找不到或读不出来：不当作解码/磁盘故障，也不触发连续失败停止。
+    pub source_missing: u64,
     pub old_bytes: u64,
     pub new_bytes: u64,
     pub savings_bytes: u64,
@@ -283,6 +403,8 @@ struct EncodedItem {
 enum EncodeOutcome {
     Encoded(Box<EncodedItem>),
     Skipped(SkipReason),
+    /// 原图缺失或读不出来；单独计数，不累加连续失败。
+    SourceMissing(String),
 }
 
 struct Published {
@@ -400,6 +522,18 @@ pub(crate) fn optimize_with_batch_size(
                     report.candidate_skipped += 1;
                     consecutive_failures = 0;
                 }
+                Ok(Some(EncodeOutcome::SourceMissing(reason))) => {
+                    // 原图缺失是外部改动，不是系统性故障：单独计数，不触发停止。
+                    log::debug!("原图缺失 image={}：{reason}", row.id);
+                    report.source_missing += 1;
+                    if report.failures.len() < MAX_REPORTED_FAILURES {
+                        report.failures.push(OptimizeFailure {
+                            image_id: row.id,
+                            path: display_path(&paths, row),
+                            reason,
+                        });
+                    }
+                }
                 Ok(None) => {
                     // 取消后没编码的图既不算处理也不算跳过：进度停在真实张数。
                     consecutive_failures = 0;
@@ -485,7 +619,15 @@ fn encode_one(
     let source_path =
         metadata::content_path(paths, &row.folder_path, &row.content_hash, &row.file_ext)?;
     // 只读一次盘：色彩配置、动画判据、解码与 EXIF 搬运共用这份字节。
-    let bytes = std::fs::read(&source_path)?;
+    let bytes = match std::fs::read(&source_path) {
+        Ok(bytes) => bytes,
+        // 原图被外部删掉或挪走：不当作解码/磁盘故障，否则 5 张缺失就会停掉整任务。
+        Err(error) => {
+            return Ok(EncodeOutcome::SourceMissing(format!(
+                "原图缺失或无法读取：{error}"
+            )));
+        }
+    };
     if optimize::multiframe_guard(&bytes, &row.format).is_err() {
         return Ok(EncodeOutcome::Skipped(SkipReason::AnimatedOrMultipage));
     }
@@ -1005,18 +1147,110 @@ mod tests {
     fn grant_requires_matching_fingerprint_and_stable_candidates() {
         let mut estimate = OptimizeEstimate {
             options_fingerprint: "fp".to_owned(),
+            candidate_fingerprint: "set".to_owned(),
             candidate_count: 100,
             candidate_bytes: 1_000_000,
             ..OptimizeEstimate::default()
         };
 
-        assert!(verify_grant(&estimate, "fp", 100, 1_000_000).is_ok());
-        assert!(verify_grant(&estimate, "fp", 110, 1_100_000).is_ok());
-        assert!(verify_grant(&estimate, "other", 100, 1_000_000).is_err());
-        assert!(verify_grant(&estimate, "fp", 120, 1_000_000).is_err());
-        assert!(verify_grant(&estimate, "fp", 100, 1_200_000).is_err());
+        assert!(verify_grant(&estimate, "fp", 100, 1_000_000, "set").is_ok());
+        assert!(verify_grant(&estimate, "fp", 110, 1_100_000, "set").is_ok());
+        assert!(verify_grant(&estimate, "other", 100, 1_000_000, "set").is_err());
+        assert!(verify_grant(&estimate, "fp", 120, 1_000_000, "set").is_err());
+        assert!(verify_grant(&estimate, "fp", 100, 1_200_000, "set").is_err());
+        // 张数与体积都在范围内，但集合换了另一批图。
+        assert!(verify_grant(&estimate, "fp", 100, 1_000_000, "other-set").is_err());
+        // 旧结果没有集合指纹时不因此拒绝（升级后的首次执行）。
+        estimate.candidate_fingerprint.clear();
+        assert!(verify_grant(&estimate, "fp", 100, 1_000_000, "other-set").is_ok());
         estimate.candidate_count = 0;
-        assert!(verify_grant(&estimate, "fp", 0, 0).is_err());
+        assert!(verify_grant(&estimate, "fp", 0, 0, "set").is_err());
+    }
+
+    #[test]
+    fn source_check_reports_missing_and_changed_files() {
+        let (fixture, image_id, _hash, path) = fixture();
+        let rows = collect_candidates(&fixture.session.db, &[image_id]).unwrap();
+        let options = OptimizeOptions::default();
+        let ok = verify_sources(&fixture.root, &rows, &options);
+        assert_eq!((ok.missing, ok.changed), (0, 0), "{ok:?}");
+        assert!(ok.missing_dirs.is_empty());
+
+        // 大小不符（被外部替换或截断）。
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, &original[..original.len() / 2]).unwrap();
+        let changed = verify_sources(&fixture.root, &rows, &options);
+        assert_eq!((changed.missing, changed.changed), (0, 1), "{changed:?}");
+        assert_eq!(changed.bad_ids, vec![image_id]);
+
+        // 原图被删。
+        fs::remove_file(&path).unwrap();
+        let missing = verify_sources(&fixture.root, &rows, &options);
+        assert_eq!((missing.missing, missing.changed), (1, 0), "{missing:?}");
+
+        // 整个目录被删：目录缺失要能单独报出来。
+        let mut ghost = rows[0].clone();
+        ghost.folder_path = "已经不存在的目录".to_owned();
+        let gone = verify_sources(&fixture.root, &[ghost], &options);
+        assert_eq!(
+            gone.missing_dirs,
+            vec!["已经不存在的目录".to_owned()],
+            "{gone:?}"
+        );
+    }
+
+    /// 原图缺失只计数，不触发“连续 5 张失败即停止”。
+    #[test]
+    fn missing_sources_are_counted_without_stopping_the_run() {
+        let (fixture, first_id, _, _) = fixture();
+        let mut ids = vec![first_id];
+        let mut paths = Vec::new();
+        for index in 1..12_u32 {
+            let mut image = RgbImage::new(96, 64);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                *pixel = Rgb([
+                    ((x * 7 + index * 11) % 256) as u8,
+                    ((y * 5 + index * 17) % 256) as u8,
+                    ((x + y + index * 29) % 256) as u8,
+                ]);
+            }
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgb8(image)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            let path = fixture.root.join(format!("{hash}.png"));
+            fs::write(&path, &bytes).unwrap();
+            paths.push(path);
+            let id = fixture
+                .session
+                .db
+                .with_writer(|connection| {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description, imported_at,
+                            modified_at
+                         ) VALUES (?1, 'png', 1, ?2, 96, 64, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        params![hash, bytes.len() as i64],
+                    )?;
+                    Ok(connection.last_insert_rowid())
+                })
+                .unwrap();
+            ids.push(id);
+        }
+        // 前 6 张原图被外部删掉：超过连续失败阈值，但不应停掉任务。
+        for path in paths.iter().take(6) {
+            fs::remove_file(path).unwrap();
+        }
+
+        let report = run(&fixture, &ids, &OptimizeOptions::default());
+        assert_eq!(report.source_missing, 6, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert_eq!(report.stop_reason, None, "{report:?}");
+        // 其余 6 张照常处理（fixture 的首张 + 后面 5 张）。
+        assert_eq!(report.processed, 6, "{report:?}");
     }
 
     #[test]

@@ -79,6 +79,8 @@ export interface OptimizeEstimate {
   taskId: string;
   createdAt: number;
   optionsFingerprint: string;
+  /** 估算时候选集合的指纹；执行前比对，挡住“数量体积都对但换了一批图”。 */
+  candidateFingerprint: string;
   /** 估算参数；接管任务时据此重建执行请求。 */
   options?: OptimizeOptions | null;
   /** 估算范围；接管任务时直接复用，不按当前浏览状态重拼。 */
@@ -89,6 +91,9 @@ export interface OptimizeEstimate {
   sampleCount: number;
   sampleBytes: number;
   coverage: number;
+  /** 样本里 ≥ 32 MP 的张数；与候选同口径，用来说明尾部有没有被代表。 */
+  sampleLargeCount: number;
+  candidateLargeCount: number;
   /** 样本编码阶段的墙钟耗时（毫秒）。 */
   sampleElapsedMs: number;
   sampleBadPixelRatio: number;
@@ -118,6 +123,8 @@ export interface OptimizeEstimate {
   savingsMarginBytes: number;
   predictedBytes: number;
   estimatedSeconds: number;
+  /** 预计耗时的误差区间（±秒）；覆盖 100% 时为 0。 */
+  estimatedSecondsMargin: number;
   estimatedWorkSeconds: number;
   estimatedWriteSeconds: number;
   estimatedFinishSeconds: number;

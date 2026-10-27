@@ -5833,6 +5833,13 @@ body.is-drag-sorting * {
   line-height: 1.4;
 }
 
+/* 覆盖率太低时单独提示：± 只覆盖已抽到的部分，别让它看起来像保证。 */
+.optimize-coverage-hint {
+  color: var(--warning);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .optimize-error-row {
   display: flex;
   align-items: flex-start;

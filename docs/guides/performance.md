@@ -84,11 +84,13 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 - `perf_encode_threads`：16 张 1200×900 确定性 PNG，在内存里解码并阶梯编码到 JPEG，比较 4 / 8 / 12 / 核数−1 线程的吞吐。只衡量解码 + 编码 + PSNR 的并行扩展性，不含磁盘。
 - `perf_optimize_batch_size`：600 张 320×240 PNG 的临时库，分别按 500 / 1000 / 2000 张一批执行完整写路径，每档都用新库（同一批图压第二次会被判「省得太少」而全部跳过）。
 - `perf_estimate_vs_actual`：400 张 800×600 PNG 的临时库，先估算再执行，比较预计耗时与实际墙钟，并打印执行报告的分段耗时。
+- `perf_estimate_sampling_spread`：232 张、5 个尺寸桶（0.12–7.68 MP，一半图细节多一半平滑）的临时库，先按全量抽样取真值，再在同一档位连抽 10 次，打印节省空间与耗时的相对偏差与极差。用来验证层内切片抽样有没有把误差压下去。
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_encode_threads
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_optimize_batch_size
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_estimate_vs_actual
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_estimate_sampling_spread
 ```
 
 本机（16 核、NVMe、开发档）实测：
@@ -103,11 +105,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 | 其中删旧图与预览 | 88 / 121 / 117 ms |
 | 预计 vs 实际（400 张 800×600，无校准记录） | 预计 13.0 s（work 11 s、write 2 s、finish 0 s），实际 11.4 s，比值 0.88 |
 | 实际分段（同上） | 编码 86.6 s（8 线程折算约 10.8 s 墙钟）、写盘 559 ms、发布 173 ms、提交 4 ms、删除 108 ms |
+| 抽样离散度（232 张混合尺寸，50 张档位 10 次） | 节省空间 −0.1%…+0.1%（极差 0.3 个百分点）；耗时 −9.1%…+9.1%（10/11/12 s，受 1 秒取整限制） |
 
 结论：
 
 - 写入侧的断电保护代价主要是 rename + 目录 flush（约 0.4 ms/张），提交本身可忽略；批次大小对总耗时没有决定性影响，保留 1000。
 - 首次估算在无校准记录时略偏高（约 14%），来自保守的写入常数；执行一次后校准记录接管，误差来源只剩编码耗时外推。
+- 批次 7 把层内抽样改成按体积等分切片后，同一份 301 张真实图片副本上，50 张档位连抽 10 次的节省空间偏差从 −59.5%…+28.7%（中位 +17.3%）收到 −7.1%…+10.2%（中位 +0.6%）；耗时从 −23%…+29%（中位 −16%）变成 +15.3%…+34.5%（中位 +21.7%），方向偏保守但中位偏差仍未达标，来源是「有损 bpp ≥ 0.50」这一层内部的每像素成本异质。详见[批次 7](../planning/archive/2026-10-27-批次7-压缩估算准确性.md)。
+- 抽样离散度的两个指标对环境的敏感度差别很大：同一份 232 张合成库重跑时，机器有负载把样本编码墙钟从 10–12 s 拉到 10–25 s，节省空间仍稳定在 −0.2%…+0.3%，耗时偏差却从 ±9% 扩到 −16.7%…+94.4%。耗时外推完全继承采样那一刻的墙钟，误差区间只覆盖抽样误差、不覆盖负载；跨机器或跨负载比较耗时偏差没有意义。
 - 这些是开发档、合成图的数字，只用于同机对比；真实库的预计/实际对比仍要由用户手工跑。
 
 ### 查询引擎（S2）

@@ -1718,12 +1718,13 @@ impl AppState {
 
                     let prepared = recheck_optimize_scope(
                         &database,
+                        &root,
                         &scope,
                         &options,
                         &estimate,
                         &fingerprint,
                     );
-                    let (candidates, count) = match prepared {
+                    let (candidates, count, dropped) = match prepared {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             worker.set_message(error.to_string());
@@ -1783,6 +1784,15 @@ impl AppState {
                             );
                             if report.skipped > 0 {
                                 summary.push_str(&format!("，跳过 {} 张", report.skipped));
+                            }
+                            if dropped > 0 {
+                                summary.push_str(&format!("，{dropped} 张原图缺失或已变化未纳入"));
+                            }
+                            if report.source_missing > 0 {
+                                summary.push_str(&format!(
+                                    "，{} 张原图缺失已跳过",
+                                    report.source_missing
+                                ));
                             }
                             if report.failed > 0 {
                                 summary.push_str(&format!("，失败 {} 张", report.failed));
@@ -1856,22 +1866,56 @@ fn optimize_fingerprint(scope: &crate::app::tasks::TaskScope, options: &Optimize
 }
 
 /// 排队期间范围、文件与估算凭证都可能变化，真正开始执行前重新收集与核对。
-/// 任一环节与提交估算时不一致就返回错误，由调用方把任务标成失败，不使用过期候选。
+///
+/// 三道关：参数指纹与张数/体积、候选集合指纹（都在 `verify_grant` 里）、逐张
+/// `stat` 原图与目录存在性。任一环节与提交估算时不一致就返回错误，由调用方把任务
+/// 标成失败，不使用过期候选。返回 `(候选, 可处理张数, 被剔除的张数)`。
 fn recheck_optimize_scope(
     database: &LibraryDb,
+    root: &std::path::Path,
     scope: &TaskScope,
     options: &OptimizeOptions,
     estimate: &OptimizeEstimate,
     fingerprint: &str,
-) -> AppResult<(Vec<crate::library::optimize::CandidateRow>, u64)> {
+) -> AppResult<(Vec<crate::library::optimize::CandidateRow>, u64, u64)> {
     let ids = scope.resolve(database)?;
     if ids.is_empty() {
         return Err(AppError::message("当前范围没有图片"));
     }
-    let candidates = crate::library::optimize::collect_candidates(database, &ids)?;
+    let mut candidates = crate::library::optimize::collect_candidates(database, &ids)?;
     let (count, bytes) = crate::library::optimize::eligible_summary(&candidates, options);
-    crate::library::optimize::verify_grant(estimate, fingerprint, count, bytes)?;
-    Ok((candidates, count))
+    let set = crate::library::optimize::candidate_fingerprint(&candidates, options);
+    crate::library::optimize::verify_grant(estimate, fingerprint, count, bytes, &set)?;
+
+    // 目录被删时每个文件都会“缺失”，先给出更可操作的原因。
+    let check = crate::library::optimize::verify_sources(root, &candidates, options);
+    if let Some(folder) = check.missing_dirs.first() {
+        return Err(AppError::message(format!(
+            "有 {} 个文件夹已不存在（例如「{}」），请重新估算",
+            check.missing_dirs.len(),
+            if folder.is_empty() {
+                "根目录"
+            } else {
+                folder
+            }
+        )));
+    }
+    let drifted = check.drifted();
+    if drifted == 0 {
+        return Ok((candidates, count, 0));
+    }
+    let ratio = drifted as f64 / count.max(1) as f64;
+    if ratio > crate::library::optimize::SOURCE_DRIFT_LIMIT {
+        return Err(AppError::message(format!(
+            "有 {drifted} 张原图缺失或已变化（占 {:.1}%），请重新估算",
+            ratio * 100.0
+        )));
+    }
+    // 少量漂移：剔除这几张继续跑，任务摘要里说明。
+    let bad: std::collections::HashSet<i64> = check.bad_ids.iter().copied().collect();
+    candidates.retain(|row| !bad.contains(&row.id));
+    let (remaining, _) = crate::library::optimize::eligible_summary(&candidates, options);
+    Ok((candidates, remaining, drifted))
 }
 
 fn format_savings(bytes: u64) -> String {

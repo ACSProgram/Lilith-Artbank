@@ -69,11 +69,14 @@ const SAMPLE_CHOICES: ReadonlyArray<{ size: number; label: string }> = [
   { size: 2_000, label: "2000（准）" },
 ];
 const DEFAULT_SAMPLE_INDEX = 1;
+/** 覆盖率低于这个值时提示“抽样很浅”，不再让 ± 单独背锅。 */
+const SHALLOW_COVERAGE = 0.01;
 
-/** 一次已完成的估算，用来给同一组设置提示抽样等待时间。 */
+/** 一次已完成的估算，用来给同一组设置提示抽样等待时间与实际覆盖率。 */
 interface SampleMeasurement {
   elapsedMs: number;
   count: number;
+  coverage: number;
 }
 
 interface RunConfig {
@@ -98,6 +101,14 @@ function parseEdge(text: string): { value: number | null; invalid: boolean } {
 
 function sampleKey(format: OptimizeOptions["outputFormat"], edge: number | null, size: number) {
   return `${format}|${edge ?? "none"}|${size}`;
+}
+
+/** 覆盖率显示：默认档在真实库只有 0.08%，四舍五入到 0.1% 会看起来像 0。 */
+function coverageLabel(value: number): string {
+  const percent = value * 100;
+  if (percent >= 10) return `${percent.toFixed(0)}%`;
+  if (percent >= 1) return `${percent.toFixed(1)}%`;
+  return `${percent.toFixed(2)}%`;
 }
 
 /** 抽样提示只描述“抽样编码要等多久”，与结果页的总预计耗时是两件事。 */
@@ -470,7 +481,11 @@ export function OptimizeDialog({
       const key = sampleKey(normalized.outputFormat, normalized.maxLongEdge, result.sampleSize);
       setMeasurements((previous) => ({
         ...previous,
-        [key]: { elapsedMs: result.sampleElapsedMs, count: result.sampleCount },
+        [key]: {
+          elapsedMs: result.sampleElapsedMs,
+          count: result.sampleCount,
+          coverage: result.coverage,
+        },
       }));
     }
     // 结果对应的签名按回填后的设置算，避免回填本身触发“设置已改”。
@@ -676,7 +691,8 @@ export function OptimizeDialog({
   const sampleIndex = SAMPLE_CHOICES.findIndex((choice) => choice.size === sampleSize);
   const measurement = measurements[sampleKey(outputFormat, edge.value, sampleSize)];
   const waitLabel = sampleWaitLabel(measurement, sampleSize);
-  const sampleShort = estimate ? estimate.sampleCount < estimate.sampleSize : false;
+  // “候选不足”说的是候选张数少于档位；切片抽样时实际样本数可能因合并略少于档位。
+  const sampleShort = estimate ? estimate.candidateCount < estimate.sampleSize : false;
   const timingParts = estimate
     ? [
         { label: "读取/编码", value: estimate.estimatedWorkSeconds },
@@ -824,7 +840,16 @@ export function OptimizeDialog({
               <Field label="估算抽样" hint="样本越多越准，也越慢。">
                 <div className="optimize-slider-head">
                   <strong>{sampleSize.toLocaleString()} 张</strong>
-                  {waitLabel ? <span>约 {waitLabel}</span> : null}
+                  {measurement ? (
+                    <span>
+                      {[
+                        `覆盖 ${coverageLabel(measurement.coverage)} 体积`,
+                        waitLabel ? `约 ${waitLabel}` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  ) : null}
                 </div>
                 <input
                   className="range"
@@ -925,7 +950,10 @@ export function OptimizeDialog({
               <span>
                 样本 {estimate.sampleCount.toLocaleString()} 张
                 {sampleShort ? "（候选不足）" : ""} · 覆盖{" "}
-                {(estimate.coverage * 100).toFixed(1)}% 的候选体积
+                {coverageLabel(estimate.coverage)} 体积
+                {estimate.candidateLargeCount > 0
+                  ? ` · 含 ≥32MP 大图 ${estimate.sampleLargeCount.toLocaleString()} 张`
+                  : ""}
               </span>
             </div>
 
@@ -984,7 +1012,12 @@ export function OptimizeDialog({
                   </div>
                   <div className="optimize-outcome-row">
                     <span>预计耗时</span>
-                    <strong>{formatDuration(estimate.estimatedSeconds)}</strong>
+                    <strong>
+                      {formatDuration(estimate.estimatedSeconds)}
+                      {estimate.estimatedSecondsMargin > 0
+                        ? ` ± ${formatDuration(estimate.estimatedSecondsMargin)}`
+                        : ""}
+                    </strong>
                   </div>
                   {timingParts.length > 0 ? (
                     <div className="optimize-timing-detail">
@@ -992,6 +1025,12 @@ export function OptimizeDialog({
                       {timingParts
                         .map((part) => `${part.label} ${formatDuration(part.value)}`)
                         .join(" · ")}
+                    </div>
+                  ) : null}
+                  {estimate.savingsBytes > 0 && estimate.coverage < SHALLOW_COVERAGE ? (
+                    <div className="optimize-coverage-hint">
+                      抽样只读取了 {coverageLabel(estimate.coverage)}{" "}
+                      的候选体积，实际误差可能大于上面的 ± 值。
                     </div>
                   ) : null}
                 </div>

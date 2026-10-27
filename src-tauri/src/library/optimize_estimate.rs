@@ -1,10 +1,11 @@
 //! 图片空间优化的只读估算：分层抽样、真实编码、外推与分文件夹明细。
 //!
-//! 估算不写数据库、不碰原文件、不产生临时文件。样本按“格式组 × bpp 桶”分层，
-//! 按候选体积分配样本量，避免随机抽样系统性低估高 bpp 的图。
+//! 估算不写数据库、不碰原文件、不产生临时文件。样本按「有损源 / 无损源 × bpp 桶」
+//! 分层，跨层按候选体积分配样本量、层内按体积等分切片，避免抽样系统性低估高 bpp
+//! 的图。
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -40,6 +41,9 @@ const MIN_PER_STRATUM: usize = 3;
 const BOOTSTRAP_ROUNDS: usize = 300;
 const MAX_SAMPLE_FAILURES: usize = 20;
 const CHUNK: usize = 400;
+
+/// “大图”门槛：结果页拿样本与候选里 ≥ 32 MP 的张数对比，说明尾部有没有被代表。
+const LARGE_IMAGE_PIXELS: u64 = 32_000_000;
 
 pub const SAMPLE_MIN: usize = 50;
 pub const SAMPLE_MAX: usize = 2000;
@@ -157,6 +161,8 @@ pub struct OptimizeEstimate {
     pub task_id: String,
     pub created_at: i64,
     pub options_fingerprint: String,
+    /// 估算时候选集合的指纹；执行前比对，挡住“张数与体积都对、但换了一批图”。
+    pub candidate_fingerprint: String,
     /// 估算用的参数与范围：接管任务时据此重建执行请求，不依赖前端内存。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OptimizeOptions>,
@@ -170,6 +176,9 @@ pub struct OptimizeEstimate {
     pub sample_count: u64,
     pub sample_bytes: u64,
     pub coverage: f64,
+    /// 样本里 ≥ 32 MP 的张数（按解码后尺寸）；候选那一侧按数据库宽高，两边同阈值。
+    pub sample_large_count: u64,
+    pub candidate_large_count: u64,
     /// 样本编码阶段的墙钟耗时（毫秒），界面用它折算抽样大概要等多久。
     pub sample_elapsed_ms: u64,
     /// 样本中编码成功图片的平均局部坏点占比；只作诊断，不参与裁决。
@@ -202,6 +211,8 @@ pub struct OptimizeEstimate {
     pub savings_margin_bytes: u64,
     pub predicted_bytes: u64,
     pub estimated_seconds: u64,
+    /// 预计耗时的误差区间（±秒）；覆盖 100% 时为 0。
+    pub estimated_seconds_margin: u64,
     /// 读取、解码、阶梯编码、哈希与重算的耗时。
     pub estimated_work_seconds: u64,
     /// 写新文件与逐张 fsync 的耗时；优先用本库上次执行的实测校准。
@@ -222,6 +233,28 @@ struct StratumTotals {
     pixels: u64,
 }
 
+/// 扫描阶段留下的候选：层内要按累计体积切片，所以必须逐张保留字节数。
+#[derive(Debug, Clone, Copy)]
+struct StratumEntry {
+    id: i64,
+    bytes: u64,
+    pixels: u64,
+}
+
+/// 一张样本，以及它代表的整份切片。
+///
+/// 外推按切片权重走，不再假设“层内按张数均匀”：切片等体积，样本的体积与像素
+/// 构成由构造贴合总体，节省率与耗时都不再依赖抽到的是哪一批图。
+#[derive(Debug, Clone, Copy)]
+struct SampleTask {
+    stratum: usize,
+    id: i64,
+    /// 数据库行已被删除时用它兜底像素。
+    db_pixels: u64,
+    weight_bytes: u64,
+    weight_count: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FolderTotals {
     path: String,
@@ -234,6 +267,9 @@ struct FolderTotals {
 struct SampleOutcome {
     old_bytes: u64,
     new_bytes: u64,
+    /// 这张样本代表的候选体积与张数（整份切片）；由抽样阶段回填。
+    weight_bytes: u64,
+    weight_count: u64,
     quality: Option<u8>,
     skip: Option<SkipReason>,
     failed: bool,
@@ -419,12 +455,14 @@ pub fn estimate(
     reporter: &dyn BatchReporter,
 ) -> AppResult<Option<OptimizeEstimate>> {
     options.validate()?;
-    let sample_budget = sample_budget.clamp(1, 2000);
+    let sample_budget = sample_budget.clamp(1, SAMPLE_MAX);
     let mut totals = std::array::from_fn::<_, STRATUM_COUNT, _>(|_| StratumTotals::default());
-    let mut strata_ids: [Vec<i64>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
+    let mut strata_entries: [Vec<StratumEntry>; STRATUM_COUNT] =
+        std::array::from_fn(|_| Vec::new());
     let mut folders: HashMap<i64, FolderTotals> = HashMap::new();
     let mut total_count = 0_u64;
     let mut total_bytes = 0_u64;
+    let mut candidate_large_count = 0_u64;
     let mut skips = PrefilterSkips::default();
 
     // 统计阶段只报百分比、不报张数：这一段的“张数”就是整个范围，当成抽样进度会让人
@@ -463,6 +501,9 @@ pub fn estimate(
             totals[stratum].count += 1;
             totals[stratum].bytes += bytes;
             totals[stratum].pixels += row.pixels();
+            if row.pixels() >= LARGE_IMAGE_PIXELS {
+                candidate_large_count += 1;
+            }
             let folder = folders
                 .entry(row.folder_id)
                 .or_insert_with(|| FolderTotals {
@@ -472,7 +513,11 @@ pub fn estimate(
             folder.count += 1;
             folder.bytes += bytes;
             folder.stratum_bytes[stratum] += bytes;
-            strata_ids[stratum].push(row.id);
+            strata_entries[stratum].push(StratumEntry {
+                id: row.id,
+                bytes,
+                pixels: row.pixels(),
+            });
         }
         reporter.percent(scan_percentage(scanned, scan_total));
     }
@@ -480,6 +525,14 @@ pub fn estimate(
     let candidate_count: u64 = totals.iter().map(|stratum| stratum.count).sum();
     let candidate_bytes: u64 = totals.iter().map(|stratum| stratum.bytes).sum();
     let candidate_pixels: u64 = totals.iter().map(|stratum| stratum.pixels).sum();
+    let candidate_fingerprint = {
+        let ids: Vec<i64> = strata_entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.id)
+            .collect();
+        crate::library::optimize::fingerprint_ids(&ids)
+    };
     if candidate_count == 0 {
         finish_progress(reporter);
         return Ok(Some(empty_estimate(
@@ -493,16 +546,28 @@ pub fn estimate(
 
     let allocation = allocate_samples(&totals, sample_budget);
     let mut rng = Rng::new(seed());
-    let mut sample_tasks: Vec<(usize, i64, u64)> = Vec::new();
+    let mut sample_tasks: Vec<SampleTask> = Vec::new();
     for (stratum, &take) in allocation.iter().enumerate() {
-        if take == 0 || strata_ids[stratum].is_empty() {
+        if take == 0 || strata_entries[stratum].is_empty() {
             continue;
         }
         // 行已被删除时用该层平均像素兜底，只影响失败样本的耗时外推。
-        let pixels = totals[stratum].pixels / totals[stratum].count.max(1);
-        for index in choose_indices(strata_ids[stratum].len(), take, &mut rng) {
-            let id = strata_ids[stratum][index];
-            sample_tasks.push((stratum, id, pixels));
+        let average_pixels = totals[stratum].pixels / totals[stratum].count.max(1);
+        for (index, weight_bytes, weight_count) in
+            slice_indices(&strata_entries[stratum], take, &mut rng)
+        {
+            let entry = strata_entries[stratum][index];
+            sample_tasks.push(SampleTask {
+                stratum,
+                id: entry.id,
+                db_pixels: if entry.pixels > 0 {
+                    entry.pixels
+                } else {
+                    average_pixels
+                },
+                weight_bytes,
+                weight_count,
+            });
         }
     }
     let sample_total = sample_tasks.len();
@@ -520,7 +585,7 @@ pub fn estimate(
         )));
     }
 
-    let sample_ids: Vec<i64> = sample_tasks.iter().map(|(_, id, _)| *id).collect();
+    let sample_ids: Vec<i64> = sample_tasks.iter().map(|task| task.id).collect();
     let sample_rows: HashMap<i64, CandidateRow> = collect_candidates(database, &sample_ids)?
         .into_iter()
         .map(|row| (row.id, row))
@@ -535,11 +600,11 @@ pub fn estimate(
     let records = pool.install(|| {
         sample_tasks
             .par_iter()
-            .filter_map(|(stratum, id, db_pixels)| {
+            .filter_map(|task| {
                 if reporter.cancelled() {
                     return None;
                 }
-                let row = sample_rows.get(id);
+                let row = sample_rows.get(&task.id);
                 let (outcome, error) = match row {
                     Some(row) => {
                         let outcome = sample_one(root, row, options);
@@ -547,14 +612,18 @@ pub fn estimate(
                         (outcome, error)
                     }
                     None => (
-                        failed_outcome(*db_pixels, 0, 0.0, "图片行已被删除".to_owned()),
+                        failed_outcome(task.db_pixels, 0, 0.0, "图片行已被删除".to_owned()),
                         Some("图片行已被删除".to_owned()),
                     ),
                 };
+                // 切片权重由抽样阶段决定，这里回填给后面的外推与区间重抽。
+                let mut outcome = outcome;
+                outcome.weight_bytes = task.weight_bytes;
+                outcome.weight_count = task.weight_count;
                 let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
                 reporter.report(completed, sample_total);
                 reporter.percent(sample_percentage(completed, sample_total));
-                Some((*stratum, *id, outcome, error))
+                Some((task.stratum, task.id, outcome, error))
             })
             .collect::<Vec<_>>()
     });
@@ -569,17 +638,17 @@ pub fn estimate(
 
     let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
     let mut sample_bytes = 0_u64;
-    let mut sample_pixels = 0_u64;
+    let mut sample_large_count = 0_u64;
     let mut read_secs = 0.0_f64;
-    let mut work_secs = 0.0_f64;
     let mut sample_failures = Vec::new();
     let mut bad_pixel_sum = 0.0_f64;
     let mut bad_pixel_count = 0_u64;
     for (stratum, id, outcome, error) in records {
         sample_bytes += outcome.old_bytes;
-        sample_pixels += outcome.source_pixels;
+        if outcome.source_pixels >= LARGE_IMAGE_PIXELS {
+            sample_large_count += 1;
+        }
         read_secs += outcome.read_secs;
-        work_secs += outcome.encode_secs + outcome.hash_secs + outcome.recalc_secs;
         if outcome.quality.is_some() {
             bad_pixel_sum += outcome.bad_pixel_ratio;
             bad_pixel_count += 1;
@@ -593,7 +662,6 @@ pub fn estimate(
     }
 
     let savings_bytes = point_savings(&totals, &samples);
-    let savings_margin_bytes = bootstrap_margin(&totals, &samples, BOOTSTRAP_ROUNDS);
     let mut skip_totals = cumulative_skips(&totals, &samples);
     // 外推后的各桶可能略超候选总量；先收窄再算 process，漏斗才不会出现负数或重复。
     skip_totals.fit_within(candidate_count, candidate_bytes);
@@ -642,25 +710,41 @@ pub fn estimate(
     });
 
     let calibration = OptimizeCalibration::load(database)?.unwrap_or(CONSERVATIVE_CALIBRATION);
-    let timing = estimate_seconds(
-        elapsed,
+    let inputs = TimingInputs {
         read_secs,
-        work_secs,
         threads,
         sample_bytes,
         candidate_pixels,
         candidate_bytes,
+    };
+    // 点估计用实测墙钟，比逐张累加更准；放大倍率仍按各层自己的像素比算。
+    let measured = WorkTotals {
+        total_secs: elapsed,
+        ..WorkTotals::collect(&totals, &samples)
+    };
+    let timing = estimate_seconds(
+        &inputs,
+        &measured,
         process_count,
         process_bytes,
         savings_bytes,
-        sample_pixels,
         calibration,
+    );
+    let margins = margins(
+        &totals,
+        &samples,
+        BOOTSTRAP_ROUNDS,
+        &inputs,
+        timing,
+        candidate_count,
+        sample_total as u64,
     );
 
     Ok(Some(OptimizeEstimate {
         task_id: task_id.to_owned(),
         created_at: now_ms(),
         options_fingerprint: options_fingerprint.to_owned(),
+        candidate_fingerprint,
         options: Some(options.clone()),
         // 范围与图库标识由 `AppState` 在写入缓存前补齐。
         scope: None,
@@ -671,6 +755,8 @@ pub fn estimate(
         sample_count: sample_total as u64,
         sample_bytes,
         coverage: sample_bytes as f64 / candidate_bytes.max(1) as f64,
+        sample_large_count,
+        candidate_large_count,
         sample_elapsed_ms: (elapsed * 1000.0).round() as u64,
         sample_bad_pixel_ratio: if bad_pixel_count > 0 {
             bad_pixel_sum / bad_pixel_count as f64
@@ -697,9 +783,10 @@ pub fn estimate(
         failed_count: skip_totals.failed_count,
         failed_bytes: skip_totals.failed_bytes,
         savings_bytes,
-        savings_margin_bytes,
+        savings_margin_bytes: margins.savings,
         predicted_bytes,
         estimated_seconds: timing.total(),
+        estimated_seconds_margin: margins.seconds,
         estimated_work_seconds: timing.work,
         estimated_write_seconds: timing.write,
         estimated_finish_seconds: timing.finish,
@@ -721,6 +808,7 @@ fn empty_estimate(
         task_id: task_id.to_owned(),
         created_at: now_ms(),
         options_fingerprint: fingerprint.to_owned(),
+        candidate_fingerprint: String::new(),
         options: None,
         scope: None,
         scope_label: String::new(),
@@ -729,6 +817,8 @@ fn empty_estimate(
         sample_count: 0,
         sample_bytes: 0,
         coverage: 0.0,
+        sample_large_count: 0,
+        candidate_large_count: 0,
         sample_elapsed_ms: 0,
         sample_bad_pixel_ratio: 0.0,
         total_count,
@@ -754,6 +844,7 @@ fn empty_estimate(
         savings_margin_bytes: 0,
         predicted_bytes: total_bytes,
         estimated_seconds: 0,
+        estimated_seconds_margin: 0,
         estimated_work_seconds: 0,
         estimated_write_seconds: 0,
         estimated_finish_seconds: 0,
@@ -768,6 +859,8 @@ fn failed_outcome(pixels: u64, bytes: u64, read_secs: f64, error: String) -> Sam
     SampleOutcome {
         old_bytes: bytes,
         new_bytes: bytes,
+        weight_bytes: 0,
+        weight_count: 0,
         quality: None,
         skip: None,
         failed: true,
@@ -814,6 +907,8 @@ fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> Sam
     let skip_now = |skip: SkipReason| SampleOutcome {
         old_bytes,
         new_bytes: old_bytes,
+        weight_bytes: 0,
+        weight_count: 0,
         quality: None,
         skip: Some(skip),
         failed: false,
@@ -858,6 +953,8 @@ fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> Sam
             return SampleOutcome {
                 old_bytes,
                 new_bytes: old_bytes,
+                weight_bytes: 0,
+                weight_count: 0,
                 quality: None,
                 skip: Some(reason),
                 failed: false,
@@ -918,6 +1015,8 @@ fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> Sam
     SampleOutcome {
         old_bytes,
         new_bytes,
+        weight_bytes: 0,
+        weight_count: 0,
         quality,
         skip,
         failed: false,
@@ -999,28 +1098,68 @@ fn allocate_samples(
     allocation
 }
 
-fn choose_indices(length: usize, take: usize, rng: &mut Rng) -> Vec<usize> {
+/// 层内抽样：按累计体积把该层切成至多 `take` 份，每份随机取一张代表整份。
+///
+/// 返回 `(下标, 该份字节, 该份张数)`，各份字节之和恒等于层体积、张数之和恒等于
+/// 层张数，所以外推不需要再按张数等比例放大。层内候选不足 `take` 时退化为全取。
+///
+/// 层内按张数等概率抽会让样本的体积构成变成一次独立的重尾抽样，节省率与耗时
+/// 外推会被同时带偏。这里按“最后一个字节落在第几份”归组：等体积切片让样本的
+/// 体积与像素构成由构造贴合总体；某张图独占若干份时它会自成一份并被必然抽到，
+/// 尾部不会整体缺席。
+fn slice_indices(entries: &[StratumEntry], take: usize, rng: &mut Rng) -> Vec<(usize, u64, u64)> {
+    let length = entries.len();
     let take = take.min(length);
     if take == 0 {
         return Vec::new();
     }
     if take == length {
-        return (0..length).collect();
+        return entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.bytes, 1))
+            .collect();
     }
-    if take * 3 >= length {
-        let mut indices: Vec<usize> = (0..length).collect();
-        for position in 0..take {
-            let swap = position + rng.below(length - position);
-            indices.swap(position, swap);
+    let total: u128 = entries.iter().map(|entry| entry.bytes as u128).sum();
+    // 整层都是 0 字节（极少见）：按张数等分，权重仍然精确。
+    let weight_of =
+        |entry: &StratumEntry| -> u128 { if total == 0 { 1 } else { entry.bytes as u128 } };
+    let total_weight: u128 = entries.iter().map(weight_of).sum();
+
+    let mut order: Vec<usize> = (0..length).collect();
+    order.sort_unstable_by_key(|index| (weight_of(&entries[*index]), entries[*index].id));
+
+    let mut groups: Vec<(Vec<usize>, u64, u64)> = vec![(Vec::new(), 0, 0); take];
+    let mut cumulative = 0_u128;
+    for index in order {
+        cumulative += weight_of(&entries[index]);
+        // 用“最后一个字节”的位置归组；0 字节的成员不推进累计量，所以这里要防下溢。
+        let group =
+            ((cumulative.saturating_sub(1)) * take as u128 / total_weight).min((take - 1) as u128);
+        let slot = &mut groups[group as usize];
+        slot.0.push(index);
+        slot.1 += entries[index].bytes;
+        slot.2 += 1;
+    }
+    let mut result = Vec::with_capacity(take);
+    for (members, bytes, count) in groups {
+        if members.is_empty() {
+            // 某张图占满多份时会出现空份：它已经由那一份代表，不再重复计数。
+            continue;
         }
-        indices.truncate(take);
-        return indices;
+        result.push((members[rng.below(members.len())], bytes, count));
     }
-    let mut chosen = HashSet::with_capacity(take);
-    while chosen.len() < take {
-        chosen.insert(rng.below(length));
+    result
+}
+
+/// 单张样本的节省率；跳过与失败都按“零节省”计。
+fn sample_rate(sample: &SampleOutcome) -> f64 {
+    if sample.old_bytes == 0 {
+        return 0.0;
     }
-    chosen.into_iter().collect()
+    // 节省率是“新/旧”的比例，上限是 1.0；`MAX_SIZE_RATIO` 是替换阈值，
+    // 不是节省率上限，用它夹会把 PNG→JPEG 这类高压缩比图低估。
+    (1.0 - sample.new_bytes as f64 / sample.old_bytes as f64).clamp(0.0, 1.0)
 }
 
 fn stratum_rates(
@@ -1032,13 +1171,19 @@ fn stratum_rates(
         if totals[index].count == 0 || outcomes.is_empty() {
             continue;
         }
-        let old: u64 = outcomes.iter().map(|sample| sample.old_bytes).sum();
-        let new: u64 = outcomes.iter().map(|sample| sample.new_bytes).sum();
-        if old > 0 {
-            // 节省率是“新/旧”的比例，上限是 1.0；`MAX_SIZE_RATIO` 是替换阈值，
-            // 不是节省率上限，用它夹会把 PNG→JPEG 这类高压缩比图低估。
-            rates[index] = (1.0 - new as f64 / old as f64).clamp(0.0, 1.0);
+        let weight: u64 = outcomes.iter().map(|sample| sample.weight_bytes).sum();
+        if weight > 0 {
+            // 切片等体积，按切片字节加权就是这个层的字节加权节省率。
+            let weighted: f64 = outcomes
+                .iter()
+                .map(|sample| sample.weight_bytes as f64 * sample_rate(sample))
+                .sum();
+            rates[index] = (weighted / weight as f64).clamp(0.0, 1.0);
+            continue;
         }
+        // 整层都是 0 字节：退化成按张数加权。
+        let sum: f64 = outcomes.iter().map(sample_rate).sum();
+        rates[index] = (sum / outcomes.len() as f64).clamp(0.0, 1.0);
     }
     rates
 }
@@ -1127,106 +1272,117 @@ fn share(total: u64, part: u64, whole: u64) -> u64 {
 
 /// 把所有 `SkipReason` 归到候选内跳过桶；没有落点的原因一律进 `late`，
 /// 保证 `process = candidate - Σskip` 不会把张数算多。
+///
+/// 每张样本带的是它代表的整份切片，所以这里直接累加权重，不再按张数等比例放大。
 fn cumulative_skips(
     totals: &[StratumTotals; STRATUM_COUNT],
     samples: &[Vec<SampleOutcome>; STRATUM_COUNT],
 ) -> SkipTotals {
     let mut result = SkipTotals::default();
     for (index, outcomes) in samples.iter().enumerate() {
-        let total = &totals[index];
-        if total.count == 0 || outcomes.is_empty() {
+        if totals[index].count == 0 || outcomes.is_empty() {
             continue;
         }
-        let sample_count = outcomes.len() as u64;
-        let mut depth_samples = 0_u64;
-        let mut quality_samples = 0_u64;
-        let mut not_smaller_samples = 0_u64;
-        let mut color_samples = 0_u64;
-        let mut multiframe_samples = 0_u64;
-        let mut late_samples = 0_u64;
-        let mut failed_samples = 0_u64;
         for sample in outcomes {
+            let (count, bytes) = (sample.weight_count, sample.weight_bytes);
             if sample.failed {
-                failed_samples += 1;
+                result.failed_count += count;
+                result.failed_bytes += bytes;
                 continue;
             }
             match sample.skip {
-                Some(SkipReason::SixteenBit) => depth_samples += 1,
-                Some(SkipReason::QualityNotMet) => quality_samples += 1,
-                Some(SkipReason::NotSmallEnough) => not_smaller_samples += 1,
-                Some(SkipReason::ColorProfile) => color_samples += 1,
-                Some(SkipReason::AnimatedOrMultipage) => multiframe_samples += 1,
+                Some(SkipReason::SixteenBit) => result.depth.add(count, bytes),
+                Some(SkipReason::QualityNotMet) => result.quality.add(count, bytes),
+                Some(SkipReason::NotSmallEnough) => result.not_smaller.add(count, bytes),
+                Some(SkipReason::ColorProfile) => result.color_profile.add(count, bytes),
+                Some(SkipReason::AnimatedOrMultipage) => result.multiframe.add(count, bytes),
                 // 扫描时用的 `has_alpha`、宽高与字节数来自数据库列，解码后换成
                 // 真实值；两者不一致时（实际有 alpha、实际尺寸更大）前置判据会
                 // 在这里才失败，单列一桶，保证漏斗不缺口。
-                Some(_) => late_samples += 1,
+                Some(_) => result.late.add(count, bytes),
                 None => {}
             }
         }
-        let add = |bucket: &mut SkipBucket, part: u64| {
-            bucket.add(
-                scale(total.count, part, sample_count),
-                scale(total.bytes, part, sample_count),
-            );
-        };
-        add(&mut result.depth, depth_samples);
-        add(&mut result.quality, quality_samples);
-        add(&mut result.not_smaller, not_smaller_samples);
-        add(&mut result.color_profile, color_samples);
-        add(&mut result.multiframe, multiframe_samples);
-        add(&mut result.late, late_samples);
-        result.failed_count += scale(total.count, failed_samples, sample_count);
-        result.failed_bytes += scale(total.bytes, failed_samples, sample_count);
     }
     result
 }
 
-fn scale(total: u64, part: u64, sample_count: u64) -> u64 {
-    if sample_count == 0 || part == 0 {
-        return 0;
-    }
-    ((total as f64 * part as f64 / sample_count as f64).round() as u64).min(total)
+/// 节省空间与耗时的误差区间。
+#[derive(Debug, Clone, Copy, Default)]
+struct Margins {
+    savings: u64,
+    seconds: u64,
 }
 
-fn bootstrap_margin(
+/// 以“切片”为单位重抽：切片等体积，方差估计才有意义。
+///
+/// 抽样就是全体时不存在抽样误差，直接返回 0——旧实现即使在覆盖 100%、估算与
+/// 实际逐字节相等时仍报 ±8%…±18%，那是重抽本身产生的方差，不是误差。
+fn margins(
     totals: &[StratumTotals; STRATUM_COUNT],
     samples: &[Vec<SampleOutcome>; STRATUM_COUNT],
     rounds: usize,
-) -> u64 {
-    if rounds == 0 {
-        return 0;
+    inputs: &TimingInputs,
+    timing: TimeBreakdown,
+    candidate_count: u64,
+    sample_count: u64,
+) -> Margins {
+    if rounds == 0 || sample_count == 0 || sample_count >= candidate_count {
+        return Margins::default();
     }
     let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
     let mut savings = Vec::with_capacity(rounds);
+    let mut seconds = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        let mut total = 0.0_f64;
+        let mut round_savings = 0.0_f64;
+        let mut round = WorkTotals::default();
         for (index, outcomes) in samples.iter().enumerate() {
-            let stratum = &totals[index];
-            if stratum.count == 0 || outcomes.is_empty() {
+            if totals[index].count == 0 || outcomes.is_empty() {
                 continue;
             }
-            let sample_count = outcomes.len();
-            let mut old = 0_u64;
-            let mut new = 0_u64;
-            for _ in 0..sample_count {
-                let sample = &outcomes[rng.below(sample_count)];
-                old += sample.old_bytes;
-                new += sample.new_bytes;
+            let count = outcomes.len();
+            let mut work = 0.0_f64;
+            let mut pixels = 0.0_f64;
+            for _ in 0..count {
+                let sample = &outcomes[rng.below(count)];
+                round_savings += sample.weight_bytes as f64 * sample_rate(sample);
+                round.total_secs +=
+                    sample.read_secs + sample.encode_secs + sample.hash_secs + sample.recalc_secs;
+                work += sample.encode_secs + sample.hash_secs + sample.recalc_secs;
+                pixels += sample.source_pixels as f64;
             }
-            if old > 0 {
-                let rate = 1.0 - new as f64 / old as f64;
-                total += stratum.bytes as f64 * rate.clamp(0.0, 1.0);
+            round.work_secs += work;
+            round.pixels += pixels;
+            if pixels > 0.0 && totals[index].pixels > 0 {
+                round.scaled_work += work * (totals[index].pixels as f64 / pixels);
             }
         }
-        savings.push(total);
+        savings.push(round_savings);
+        // 逐张累加得到的是串行 CPU 秒，点估计用的是并行墙钟。不折算的话区间会围
+        // 绕「串行总和」展开，比点估计大出一个线程数倍。
+        round.total_secs /= inputs.threads.max(1) as f64;
+        seconds.push(inputs.work(&round) + timing.write as f64 + timing.finish as f64);
     }
-    let mean = savings.iter().sum::<f64>() / rounds as f64;
-    let variance = savings
+    let work_margin = 1.96 * deviation(&seconds);
+    // 写入与提交侧没有抽样，用校准值的 ±50% 当固定项，与抽样波动按平方和合成。
+    let fixed = 0.5 * (timing.write + timing.finish) as f64;
+    Margins {
+        savings: (1.96 * deviation(&savings)).round() as u64,
+        seconds: (work_margin * work_margin + fixed * fixed).sqrt().round() as u64,
+    }
+}
+
+fn deviation(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
         .iter()
         .map(|value| (value - mean) * (value - mean))
         .sum::<f64>()
-        / rounds as f64;
-    (1.96 * variance.sqrt()).round() as u64
+        / values.len() as f64;
+    variance.sqrt()
 }
 
 /// 预计耗时的三段拆分；写入侧优先用本库实测校准值，没有记录时用保守常数。
@@ -1243,41 +1399,102 @@ impl TimeBreakdown {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn estimate_seconds(
-    elapsed: f64,
+/// 一次抽样（或一次重抽）的耗时统计。
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkTotals {
+    /// 读取 + 编码 + 哈希 + 重算的秒数。点估计直接换成实测墙钟；区间重抽是逐张
+    /// 串行累加的，用前要按线程数折算成墙钟（见 `margins`）。
+    total_secs: f64,
+    /// 只有编码 + 哈希 + 重算的秒数。
+    work_secs: f64,
+    /// 按各层自己的像素比放大后的 CPU 秒数。
+    scaled_work: f64,
+    /// 样本像素总量。
+    pixels: f64,
+}
+
+impl WorkTotals {
+    fn collect(
+        totals: &[StratumTotals; STRATUM_COUNT],
+        samples: &[Vec<SampleOutcome>; STRATUM_COUNT],
+    ) -> Self {
+        let mut result = WorkTotals::default();
+        for (index, outcomes) in samples.iter().enumerate() {
+            let mut work = 0.0_f64;
+            let mut secs = 0.0_f64;
+            let mut pixels = 0.0_f64;
+            for sample in outcomes {
+                secs +=
+                    sample.read_secs + sample.encode_secs + sample.hash_secs + sample.recalc_secs;
+                work += sample.encode_secs + sample.hash_secs + sample.recalc_secs;
+                pixels += sample.source_pixels as f64;
+            }
+            result.total_secs += secs;
+            result.work_secs += work;
+            result.pixels += pixels;
+            // 每层各自按自己的像素比放大：样本量按体积分配，高 bpp 层拿到的样本
+            // 远多于它的像素份额，用全局像素比会把耗时整体放大一倍以上。
+            if pixels > 0.0 && totals[index].pixels > 0 {
+                result.scaled_work += work * (totals[index].pixels as f64 / pixels);
+            }
+        }
+        result
+    }
+}
+
+/// 耗时外推的固定输入：候选总量与采样带宽。区间重抽时只换样本侧。
+struct TimingInputs {
     read_secs: f64,
-    sample_work_secs: f64,
     threads: usize,
     sample_bytes: u64,
     candidate_pixels: u64,
     candidate_bytes: u64,
+}
+
+impl TimingInputs {
+    /// 把一次抽样的实测耗时外推到全库。
+    fn work(&self, measured: &WorkTotals) -> f64 {
+        if self.candidate_pixels == 0 || measured.pixels <= 0.0 {
+            return 0.0;
+        }
+        let scale = if measured.work_secs > 0.0 {
+            measured.scaled_work / measured.work_secs
+        } else {
+            self.candidate_pixels as f64 / measured.pixels
+        };
+        // 样本墙钟已经包含读取、解码、编码、哈希与重算，按同一个倍率外推。
+        let wall = measured.total_secs * scale;
+        // 分段耗时只算编码/哈希/重算，按线程数折算成墙钟；墙钟更保守，两者取大。
+        let segments = if self.threads == 0 {
+            0.0
+        } else {
+            measured.scaled_work / self.threads as f64
+        };
+        let cpu = wall.max(segments);
+        let io = if self.read_secs > 0.001 && self.sample_bytes > 0 && self.candidate_bytes > 0 {
+            // 采样读取时间按线程数折算成聚合带宽，与执行阶段使用同一档线程数。
+            let bandwidth = self.sample_bytes as f64 * self.threads as f64 / self.read_secs;
+            self.candidate_bytes as f64 / bandwidth
+        } else {
+            0.0
+        };
+        cpu.max(io)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_seconds(
+    inputs: &TimingInputs,
+    measured: &WorkTotals,
     process_count: u64,
     process_bytes: u64,
     savings_bytes: u64,
-    sample_pixels: u64,
     calibration: OptimizeCalibration,
 ) -> TimeBreakdown {
-    if candidate_pixels == 0 || sample_pixels == 0 {
+    if inputs.candidate_pixels == 0 || measured.pixels <= 0.0 {
         return TimeBreakdown::default();
     }
-    // 样本墙钟已经包含读取、解码、编码、哈希与重算，按像素外推。
-    let wall = elapsed * candidate_pixels as f64 / sample_pixels as f64;
-    // 分段耗时只算编码/哈希/重算，按线程数折算成墙钟；墙钟更保守，两者取大。
-    let segments = if threads == 0 {
-        0.0
-    } else {
-        sample_work_secs / threads as f64 * candidate_pixels as f64 / sample_pixels as f64
-    };
-    let cpu = wall.max(segments);
-    let io = if read_secs > 0.001 && sample_bytes > 0 && candidate_bytes > 0 {
-        // 采样读取时间按线程数折算成聚合带宽，与执行阶段使用同一档线程数。
-        let bandwidth = sample_bytes as f64 * threads as f64 / read_secs;
-        candidate_bytes as f64 / bandwidth
-    } else {
-        0.0
-    };
-    let work = cpu.max(io);
+    let work = inputs.work(measured);
     // 跳过图不写盘，所以写盘字节按“处理体积 − 预测节省”算，再计每张的 fsync 成本。
     let output_bytes = process_bytes.saturating_sub(savings_bytes) as f64;
     let write = output_bytes * calibration.write_secs_per_byte
@@ -1401,6 +1618,9 @@ mod tests {
                 SampleOutcome {
                     old_bytes: 100,
                     new_bytes,
+                    // 四份等体积切片：每份代表 25 张 / 2 500 字节。
+                    weight_bytes: 2_500,
+                    weight_count: 25,
                     quality,
                     skip,
                     failed,
@@ -1431,7 +1651,191 @@ mod tests {
         assert_eq!(skips.failed_bytes, 2_500);
         // 候选 100 张 = 处理 50 + 跳过 50，漏斗闭合。
         assert_eq!(skips.count() + 50, 100);
-        assert!(bootstrap_margin(&strata, &samples, 50) > 0);
+    }
+
+    /// 切片权重与“按张数等分”在均匀数据上必须一致：防止权重公式写反。
+    #[test]
+    fn slice_weights_match_count_scaling_on_uniform_data() {
+        let mut strata: [StratumTotals; STRATUM_COUNT] =
+            std::array::from_fn(|_| Default::default());
+        strata[0] = totals(40, 4_000);
+        let entries: Vec<StratumEntry> = (0..40)
+            .map(|index| StratumEntry {
+                id: index,
+                bytes: 100,
+                pixels: 1_000,
+            })
+            .collect();
+        let mut rng = Rng::new(7);
+        let slices = slice_indices(&entries, 4, &mut rng);
+        assert_eq!(slices.len(), 4);
+        // 每份 10 张、1 000 字节，与按张数等分完全一致。
+        assert!(
+            slices
+                .iter()
+                .all(|(_, bytes, count)| *bytes == 1_000 && *count == 10)
+        );
+        assert_eq!(slices.iter().map(|(_, bytes, _)| bytes).sum::<u64>(), 4_000);
+        assert_eq!(slices.iter().map(|(_, _, count)| count).sum::<u64>(), 40);
+
+        let samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|index| {
+            if index != 0 {
+                return Vec::new();
+            }
+            slices
+                .iter()
+                .enumerate()
+                .map(|(position, (_, bytes, count))| SampleOutcome {
+                    old_bytes: 100,
+                    new_bytes: if position == 0 { 50 } else { 90 },
+                    weight_bytes: *bytes,
+                    weight_count: *count,
+                    quality: Some(85),
+                    skip: None,
+                    failed: false,
+                    error: None,
+                    source_pixels: 1_000,
+                    read_secs: 0.0,
+                    encode_secs: 0.0,
+                    hash_secs: 0.0,
+                    recalc_secs: 0.0,
+                    bad_pixel_ratio: 0.0,
+                })
+                .collect()
+        });
+        // 均匀数据上，切片字节加权 = 按样本旧字节加权，两种口径必须给出同一个率。
+        let old: u64 = samples[0].iter().map(|sample| sample.old_bytes).sum();
+        let new: u64 = samples[0].iter().map(|sample| sample.new_bytes).sum();
+        let expected = 1.0 - new as f64 / old as f64;
+        let rates = stratum_rates(&strata, &samples);
+        assert!((rates[0] - expected).abs() < 1e-9, "{:?}", rates[0]);
+    }
+
+    /// 重尾分布下，切片抽样必须让样本的体积构成贴合总体；这是本批次的核心修复。
+    #[test]
+    fn slice_sampling_keeps_volume_share_of_heavy_tail() {
+        // 1 张占 90% 体积的大图 + 999 张小图，只抽 10 张。
+        let mut entries: Vec<StratumEntry> = (0..999)
+            .map(|index| StratumEntry {
+                id: index,
+                bytes: 1_000,
+                pixels: 100_000,
+            })
+            .collect();
+        entries.push(StratumEntry {
+            id: 999,
+            bytes: 9_000_000,
+            pixels: 40_000_000,
+        });
+        let total: u64 = entries.iter().map(|entry| entry.bytes).sum();
+        let mut rng = Rng::new(11);
+        let slices = slice_indices(&entries, 10, &mut rng);
+        // 大图独占若干份时会合成一份，所以份数只保证不超过档位。
+        assert!(slices.len() <= 10, "{slices:?}");
+        // 每张只被选一次。
+        let mut picked: Vec<usize> = slices.iter().map(|(index, _, _)| *index).collect();
+        picked.sort_unstable();
+        picked.dedup();
+        assert_eq!(picked.len(), slices.len(), "{slices:?}");
+        // 大图所在那一份必然把大图抽出来：尾部不会再整体缺席。
+        let big = slices.iter().find(|(index, _, _)| *index == 999);
+        assert!(big.is_some(), "大图没有被抽到：{slices:?}");
+        // 权重之和等于总体，外推不会凭空放大或缩小。
+        assert_eq!(slices.iter().map(|(_, bytes, _)| bytes).sum::<u64>(), total);
+        assert_eq!(slices.iter().map(|(_, _, count)| count).sum::<u64>(), 1_000);
+    }
+
+    /// 抽样就是全体时，两个区间都必须是 0。
+    #[test]
+    fn margins_vanish_when_sampling_is_complete() {
+        let mut strata: [StratumTotals; STRATUM_COUNT] =
+            std::array::from_fn(|_| Default::default());
+        strata[0] = totals(2, 2_000);
+        let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
+        for index in 0..2_u64 {
+            samples[0].push(SampleOutcome {
+                old_bytes: 1_000,
+                new_bytes: 500 + index * 100,
+                weight_bytes: 1_000,
+                weight_count: 1,
+                quality: Some(85),
+                skip: None,
+                failed: false,
+                error: None,
+                source_pixels: 1_000,
+                read_secs: 0.01,
+                encode_secs: 0.05,
+                hash_secs: 0.0,
+                recalc_secs: 0.0,
+                bad_pixel_ratio: 0.0,
+            });
+        }
+        let inputs = TimingInputs {
+            read_secs: 0.02,
+            threads: 8,
+            sample_bytes: 2_000,
+            candidate_pixels: 2_000,
+            candidate_bytes: 2_000,
+        };
+        let timing = TimeBreakdown {
+            work: 1,
+            write: 4,
+            finish: 2,
+        };
+        let complete = margins(&strata, &samples, 50, &inputs, timing, 2, 2);
+        assert_eq!((complete.savings, complete.seconds), (0, 0));
+        // 只抽到一半时才有区间。
+        let partial = margins(&strata, &samples, 50, &inputs, timing, 4, 2);
+        assert!(partial.savings > 0, "{partial:?}");
+        assert!(partial.seconds > 0, "{partial:?}");
+    }
+
+    /// 区间重抽要把逐张累加的串行耗时折算成墙钟：否则耗时段会凭空多出一个线程数倍。
+    #[test]
+    fn seconds_margin_normalizes_serial_time_to_wall() {
+        let mut strata: [StratumTotals; STRATUM_COUNT] =
+            std::array::from_fn(|_| Default::default());
+        strata[0] = totals(100, 100_000);
+        let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
+        // 每像素成本差 10 倍：重抽才有可测的波动。
+        for index in 0..10_u64 {
+            samples[0].push(SampleOutcome {
+                old_bytes: 1_000,
+                new_bytes: 400 + index * 20,
+                weight_bytes: 10_000,
+                weight_count: 10,
+                quality: Some(85),
+                skip: None,
+                failed: false,
+                error: None,
+                source_pixels: 1_000,
+                read_secs: 0.01,
+                encode_secs: 0.02 * (index + 1) as f64,
+                hash_secs: 0.0,
+                recalc_secs: 0.0,
+                bad_pixel_ratio: 0.0,
+            });
+        }
+        let make = |threads: usize| TimingInputs {
+            read_secs: 0.1,
+            threads,
+            sample_bytes: 10_000,
+            candidate_pixels: 100_000,
+            candidate_bytes: 100_000,
+        };
+        let timing = TimeBreakdown {
+            work: 10,
+            write: 0,
+            finish: 0,
+        };
+        let single = margins(&strata, &samples, 120, &make(1), timing, 100, 10);
+        let parallel = margins(&strata, &samples, 120, &make(8), timing, 100, 10);
+        assert!(single.seconds > 0, "{single:?}");
+        // 折算后耗时段随线程数成比例收窄；没折算时两者会一样宽。
+        assert!(
+            parallel.seconds * 4 < single.seconds,
+            "single={single:?} parallel={parallel:?}"
+        );
     }
 
     #[test]
@@ -1441,9 +1845,11 @@ mod tests {
         strata[0] = totals(100, 1_000);
         strata[1] = totals(100, 3_000);
         let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
-        let sample = |new_bytes: u64| SampleOutcome {
+        let sample = |new_bytes: u64, weight_bytes: u64| SampleOutcome {
             old_bytes: 100,
             new_bytes,
+            weight_bytes,
+            weight_count: 100,
             quality: Some(85),
             skip: None,
             failed: false,
@@ -1455,8 +1861,8 @@ mod tests {
             recalc_secs: 0.0,
             bad_pixel_ratio: 0.0,
         };
-        samples[0].push(sample(50));
-        samples[1].push(sample(90));
+        samples[0].push(sample(50, 1_000));
+        samples[1].push(sample(90, 3_000));
         // 三段耗时都只由像素/输出字节/张数决定，这里给 60/30/10 便于断言。
         let curve = benefit_curve(&strata, &samples, 60, 30, 10);
         assert_eq!(curve.len(), 3);
@@ -1478,6 +1884,8 @@ mod tests {
         samples[0].push(SampleOutcome {
             old_bytes: 1_000,
             new_bytes: 20,
+            weight_bytes: 1_000,
+            weight_count: 1,
             quality: Some(75),
             skip: None,
             failed: false,
