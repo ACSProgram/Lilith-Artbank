@@ -139,6 +139,12 @@ pub struct McpFilters {
     #[schemars(description = "标签 id；最多 64 个")]
     pub tag_ids: Vec<i64>,
     pub tag_mode: McpTagMode,
+    #[schemars(
+        description = "标签存在性：has 至少一个标签，missing 一个标签都没有；any 不限制。missing 不能与 tagIds 同时使用"
+    )]
+    pub tag_presence: McpPresence,
+    #[schemars(description = "排除拥有其中任一标签的图片；最多 64 个")]
+    pub exclude_tag_ids: Vec<i64>,
     pub imported_from: Option<i64>,
     pub imported_to: Option<i64>,
     pub size_min: Option<i64>,
@@ -190,6 +196,8 @@ impl McpQuery {
                 scores: self.filters.scores.clone(),
                 tag_ids: self.filters.tag_ids.clone(),
                 tag_mode: self.filters.tag_mode.into(),
+                tag_presence: self.filters.tag_presence.into(),
+                exclude_tag_ids: self.filters.exclude_tag_ids.clone(),
                 imported_from: self.filters.imported_from,
                 imported_to: self.filters.imported_to,
                 size_min: self.filters.size_min,
@@ -707,6 +715,8 @@ mod tests {
                 scores: vec![4, 5],
                 tag_ids: vec![3],
                 tag_mode: McpTagMode::All,
+                tag_presence: McpPresence::Has,
+                exclude_tag_ids: vec![8],
                 imported_from: Some(1),
                 imported_to: Some(2),
                 size_min: Some(10),
@@ -730,6 +740,8 @@ mod tests {
         assert!(matches!(query.search_scope, SearchScope::Library));
         assert_eq!(query.filters.folder_ids, vec![1, 2]);
         assert!(matches!(query.filters.tag_mode, TagMode::All));
+        assert_eq!(query.filters.tag_presence, PresenceFilter::Has);
+        assert_eq!(query.filters.exclude_tag_ids, vec![8]);
         assert!(matches!(query.filters.description, PresenceFilter::Has));
         assert_eq!(query.sort.len(), 1);
         assert!(matches!(query.sort[0].key, SortKey::Score));

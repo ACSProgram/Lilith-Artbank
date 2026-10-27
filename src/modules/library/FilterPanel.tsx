@@ -148,9 +148,12 @@ export function FilterPanel({
     return tags.filter((tag) => {
       if (keyword && !tag.name.toLowerCase().includes(keyword)) return false;
       if (!counts) return true;
+      // “无标签”时不按计数过滤：搜索与集合视图的标签分面按命中集统计，会全是 0；
+      // 仍列出全部标签，方便直接切回按标签筛选。
+      if (filters.tagPresence === "missing") return true;
       return filters.tagIds.includes(tag.id) || (tagCounts.get(tag.id) ?? 0) > 0;
     });
-  }, [counts, filters.tagIds, tagCounts, tagQuery, tags]);
+  }, [counts, filters.tagIds, filters.tagPresence, tagCounts, tagQuery, tags]);
 
   if (!open) return null;
 
@@ -378,6 +381,7 @@ export function FilterPanel({
                 <button
                   type="button"
                   className={filters.tagMode === "any" ? "is-active" : ""}
+                  disabled={filters.tagPresence === "missing"}
                   onClick={() => patch({ tagMode: "any" })}
                 >
                   任一
@@ -385,9 +389,23 @@ export function FilterPanel({
                 <button
                   type="button"
                   className={filters.tagMode === "all" ? "is-active" : ""}
+                  disabled={filters.tagPresence === "missing"}
                   onClick={() => patch({ tagMode: "all" })}
                 >
                   全部
+                </button>
+                <button
+                  type="button"
+                  className={filters.tagPresence === "missing" ? "is-active" : ""}
+                  onClick={() =>
+                    patch(
+                      filters.tagPresence === "missing"
+                        ? { tagPresence: "any" }
+                        : { tagPresence: "missing", tagIds: [] },
+                    )
+                  }
+                >
+                  无标签
                 </button>
               </div>
               <button type="button" className="text-button" onClick={onManageTags}>
@@ -422,7 +440,12 @@ export function FilterPanel({
                     <input
                       type="checkbox"
                       checked={active}
-                      onChange={() => patch({ tagIds: toggleValue(filters.tagIds, tag.id) })}
+                      onChange={() =>
+                        patch({
+                          tagIds: toggleValue(filters.tagIds, tag.id),
+                          tagPresence: "any",
+                        })
+                      }
                     />
                     <span className="filter-option-label">{tag.name}</span>
                     <em>{count}</em>

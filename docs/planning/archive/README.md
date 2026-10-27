@@ -4,6 +4,7 @@
 
 | 日期 | 文档 | 说明 |
 | --- | --- | --- |
+| 2026-10-27 | [使用反馈整改 批次 5：MCP 接口一致性与规则自描述](2026-10-27-批次5-MCP接口一致性与规则自描述.md) | `tags_list` / `folders_list` 的 offset 游标与 `total`、`library_info` 的 `writeAllowed` + 结构化 `approval`、instructions 三档口径、`tagPresence` / `excludeTagIds` 标签筛选与界面“无标签”、`includeFacets` 的 `facetsNote`、新工具 `tags_modify`（重命名/删除/合并）与 `tagMerge` 记录、标签管理器“合并到…”，以及真实库只读测量与查询计划对比；代码已实现，验收未完成。 |
 | 2026-10-27 | [使用反馈整改 批次 4：后台任务健壮性与并发](2026-10-27-批次4-后台任务健壮性与并发.md) | 任务终态兜底（panic / 线程起不来 / 提前返回）、release 移除 `panic = "abort"` 与全局 panic hook、`LiveOperation` 与 `HistoryRunGuard` RAII 收尾、长任务同 lane FIFO 排队与写优先、任务历史只裁剪已结束任务、`HistoryPage.storage` 占用统计与 `recoveryNeeded` 中断恢复提示；代码已实现，验收未完成。 |
 | 2026-10-27 | [使用反馈整改 批次 3：文件夹树与会话状态](2026-10-27-批次3-文件夹树与会话状态.md) | 移除常驻排序、一次性递归排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动与一条记录、批量移动排序位回滚、窗口状态插件与可见性回退、按图库保存展开集合；代码已实现，验收未完成。 |
 | 2026-10-27 | [使用反馈整改 批次 2：详情与批量编辑](2026-10-27-批次2-详情与批量编辑.md) | 详情顺序、描述只读/编辑态与按图草稿、主色比例与点击复制、批量共同/部分标签移除、只读命令 `get_selection_tags` 与两条聚合路径、详情/批量/导入统一的 chip 标签输入、`selection_tags` 基准与手工验收步骤；代码已实现，验收未完成。 |

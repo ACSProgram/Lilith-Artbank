@@ -17,8 +17,10 @@ LibraryQuery {
     folderDirect: boolean,          // true 时只匹配直接位于 folderIds 的图片，不展开子树
     extensions: string[],
     scores: number[],               // 0-5
-    tagIds: number[],
+    tagIds: number[],               // 最多 64 个
     tagMode: "any" | "all",
+    tagPresence: "any" | "has" | "missing",  // has 至少一个标签；missing 一个都没有（与 tagIds 互斥）
+    excludeTagIds: number[],        // 排除拥有其中任一标签的图片，最多 64 个
     importedFrom?: number | null,   // 毫秒时间戳
     importedTo?: number | null,
     sizeMin?: number | null,        // 字节
@@ -41,7 +43,7 @@ SortSpec {
 }
 ```
 
-- 筛选去重并校验：文件夹最多 256、扩展名最多 32、评分只允许 0-5、标签最多 64。
+- 筛选去重并校验：文件夹最多 256、扩展名最多 32、评分只允许 0-5、标签与排除标签各最多 64。`tagPresence` 与 `tagIds` 是两条独立的 AND 条件；`missing` 与 `tagIds` 同时出现直接报错（“一个标签都没有”和“含某些标签”互斥）。
 - 文件夹 id 先解析为路径；每个路径匹配自身与全部后代，使用路径边界（`path = ?` 或 `path LIKE ? || '/%'`），避免 `人物` 命中 `人物速写`。选中的 id 全部失效时查询返回空集；包含根目录时不限制文件夹；多选之间取并集。
 - `folderDirect = true` 时不再解析路径，直接用 `images.folder_id IN (?, …)` 命中选中文件夹本身；根目录只匹配 `folder_id = 根 id` 的图片，不走“空路径等价整库”的分支。`folderIds` 为空时该标记不起作用（前端不会产生这种组合）。直属模式必须保持 `IN (…)` 形状，改成 `images JOIN folders … WHERE folders.path LIKE ?` 会让规划器退化为全表扫描。
 - `collectionPosition` 只在集合视图有效；全库搜索时取不到集合位置，因此也拒绝。`folder`、`pixels` 在所有视图可用。
@@ -73,12 +75,15 @@ tags: string[]
 
 ## 筛选与计数
 
-- 筛选面板覆盖扩展名、评分、标签（任一/全部）、导入时间范围、文件大小范围、有描述/有 embedding/有 pose。文件夹筛选移到左侧文件夹树，不再在面板内重复一套。
+- 筛选面板覆盖扩展名、评分、标签（任一/全部/无标签）、导入时间范围、文件大小范围、有描述/有 embedding/有 pose。文件夹筛选移到左侧文件夹树，不再在面板内重复一套。
+- “无标签”与“任一/全部”互斥：打开“无标签”会清空已选标签，勾选标签会自动关掉它。打开时搜索与集合视图的标签分面全是 0（那两处的分面按命中集统计，而没有标签的图片不可能带标签），普通视图照常给出各标签计数；两种情况都不做“有内容才显示”的过滤，仍列出全部标签，方便直接切回按标签筛选。
+- `excludeTagIds` 只有 MCP 与后端筛选支持，界面暂时没有反选入口；语义只有一份（`LibraryFilters`），界面只是少一个入口。
 - 评分与标签分面按“有内容才显示”渲染：计数为 0 且未被选中的项不渲染，已选中的即使为 0 也保留（否则用户没法取消选择）；整段为 0 时整段不出现。计数尚未返回时按“未过滤”处理（全部渲染），避免打开面板瞬间闪一下。
-- 每个分面计数排除该分面自身的筛选条件。文件夹分面在计数时按子树展开：先统计每个文件夹的直接命中数，再沿路径前缀累加到自身与全部祖先；`FilterCounts.folders[].count` 因此与树上的子树总数一致。
-- 搜索或集合视图下，计数用单条 `WITH matched AS MATERIALIZED (...)` 语句一次求出命中集，再在五个 `UNION ALL` 分支里分别统计总数/文件夹/扩展名/评分/标签；普通视图直接按分面查询。
+- 每个分面计数排除该分面自身的筛选条件；标签维度指 `tagIds`、`tagMode`、`tagPresence`、`excludeTagIds` 四项一起排除。文件夹分面在计数时按子树展开：先统计每个文件夹的直接命中数，再沿路径前缀累加到自身与全部祖先；`FilterCounts.folders[].count` 因此与树上的子树总数一致。
+- 搜索或集合视图下，计数用单条 `WITH matched AS MATERIALIZED (...)` 语句一次求出命中集，再在五个 `UNION ALL` 分支里分别统计总数/文件夹/扩展名/评分/标签；普通视图直接按分面查询。命中集已经带上了全部筛选，所以这条路径里的标签分面只含命中集内的标签——与普通视图的“标签分面自排除”不是一回事，`search_images` 的 `facetsNote` 已写明。
 - 计数只在筛选面板打开时请求，面板内有 160 ms 防抖与加载态；搜索/集合很大时可能超过 100 ms（见[性能](../guides/performance.md)），不会阻塞网格翻页。
-- 标签管理器提供标签搜索、计数、重命名与删除；删除前在确认框显示影响数量。管理器一次只载入图片最多的 500 个标签，搜索在该列表内过滤。
+- 标签管理器提供标签搜索、计数、重命名、删除与合并；删除与合并前在确认框显示影响数量。管理器一次只载入图片最多的 500 个标签，搜索在该列表内过滤。
+- 合并把源标签的全部图片关系迁到目标标签（已存在的关系只去重），然后删除源标签行；一次操作一条 `tagMerge` 记录，撤销按原 id 重建源标签并插回关系。
 
 ## 按标签筛选
 
@@ -147,6 +152,7 @@ tags: string[]
 | `remove_tags_from_images` | `{ imageIds, tagNames }` | 删除关系数 |
 | `rename_tag` | `{ tagId, name }` | `null` |
 | `delete_tag` | `{ tagId }` | 删除关系数 |
+| `merge_tags` | `{ sourceId, targetId }` | `MergeReport`（`sourceImages` / `moved` / `duplicate` / 两个名称） |
 | `move_images_to_folder` | `{ imageIds, folderPath }` | `MoveReport` |
 
 - `get_image_states` 返回 `id` 与 `deletedAt`（回收站状态），供外部变化后复核选择、相似参考与查看器活动图；不复用详情查询，避免逐张读标签与主色。
@@ -230,7 +236,7 @@ WHERE (images.score, images.id) > (?, ?)
 
 - 视图条件：`deleted_at IS NULL`（all）、`deleted_at IS NOT NULL`（trash）、集合 `JOIN collection_items`（collection）。
 - 文件夹筛选先把选中 id 解析为路径，再用 `images.folder_id IN (SELECT id FROM folders WHERE path = ? OR path LIKE ? ESCAPE '\')` 匹配整棵子树。子树展开只扫描 `folders` 行，代价随文件夹数量而不是图片数量增长；路径的唯一性由 `folders(path COLLATE NOCASE)` 保证。
-- 扩展名、评分、标签筛选都用参数化 `IN`；标签 `all` 为每个标签一个 `EXISTS`。
+- 扩展名、评分、标签筛选都用参数化 `IN`；标签 `all` 为每个标签一个 `EXISTS`；`tagPresence=has/missing` 是同一个 `EXISTS` / `NOT EXISTS (SELECT 1 FROM image_tags WHERE image_id = images.id)`；`excludeTagIds` 是一个 `NOT EXISTS (... tag_id IN (...))`。
 - 时间/大小范围是半开区间之外的闭区间（`>=` / `<=`）；描述/embedding/pose 用 `description <> ''` 或 `EXISTS feature_blobs`。
 - 首屏、深分页、文件夹、标签、集合都命中现有索引；20 万行实测见[性能基准](../guides/performance.md)。
 - 标签摘要在一页返回后按页内 id 批量查询，避免 N+1；详情侧栏单独读取 4/8 主色。

@@ -51,6 +51,8 @@ pub enum HistoryKind {
     TagRemove,
     TagRename,
     TagDelete,
+    /// 把源标签的全部关系迁移到目标标签后删除源标签行。
+    TagMerge,
     CollectionCreate,
     CollectionRename,
     CollectionDelete,
@@ -86,6 +88,7 @@ impl HistoryKind {
             Self::TagRemove => "tagRemove",
             Self::TagRename => "tagRename",
             Self::TagDelete => "tagDelete",
+            Self::TagMerge => "tagMerge",
             Self::CollectionCreate => "collectionCreate",
             Self::CollectionRename => "collectionRename",
             Self::CollectionDelete => "collectionDelete",
@@ -120,6 +123,7 @@ impl HistoryKind {
             "tagRemove" => Self::TagRemove,
             "tagRename" => Self::TagRename,
             "tagDelete" => Self::TagDelete,
+            "tagMerge" => Self::TagMerge,
             "collectionCreate" => Self::CollectionCreate,
             "collectionRename" => Self::CollectionRename,
             "collectionDelete" => Self::CollectionDelete,
@@ -630,6 +634,16 @@ pub enum TagRecord {
     Delete {
         tag_id: i64,
         name: String,
+    },
+    /// 合并的表头：源标签被删、关系迁到目标标签；关系清单见 `Pairs` 与 `MergeAdded`。
+    Merge {
+        source_id: i64,
+        source_name: String,
+        target_id: i64,
+    },
+    /// 合并时新写到目标标签上的图片 id；撤销要按它把目标恢复原样。
+    MergeAdded {
+        image_ids: Vec<i64>,
     },
     Pairs {
         pairs: Vec<(i64, i64)>,
@@ -1764,7 +1778,8 @@ fn undo_operation(
         | HistoryKind::TagAdd
         | HistoryKind::TagRemove
         | HistoryKind::TagRename
-        | HistoryKind::TagDelete => undo_tags(database, operation_id, kind)?,
+        | HistoryKind::TagDelete
+        | HistoryKind::TagMerge => undo_tags(database, operation_id, kind)?,
         HistoryKind::CollectionCreate
         | HistoryKind::CollectionRename
         | HistoryKind::CollectionDelete
@@ -1809,7 +1824,8 @@ fn redo_operation(
         | HistoryKind::TagAdd
         | HistoryKind::TagRemove
         | HistoryKind::TagRename
-        | HistoryKind::TagDelete => redo_tags(database, operation_id)?,
+        | HistoryKind::TagDelete
+        | HistoryKind::TagMerge => redo_tags(database, operation_id)?,
         HistoryKind::CollectionCreate
         | HistoryKind::CollectionRename
         | HistoryKind::CollectionDelete
@@ -2356,6 +2372,76 @@ fn undo_tags(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -> AppR
                 // 重建的标签重做时整行删除（关系随外键一起消失）；同名合并时只回退关系。
                 if target_id != tag_id {
                     redo_removals.extend(restored);
+                }
+            }
+            HistoryKind::TagMerge => {
+                let mut header: Option<(i64, String, i64)> = None;
+                let mut images: Vec<i64> = Vec::new();
+                let mut added: Vec<i64> = Vec::new();
+                for record in &records {
+                    match record {
+                        TagRecord::Merge {
+                            source_id,
+                            source_name,
+                            target_id,
+                        } => header = Some((*source_id, source_name.clone(), *target_id)),
+                        TagRecord::Pairs { pairs } => {
+                            images.extend(pairs.iter().map(|(image_id, _)| *image_id));
+                        }
+                        TagRecord::MergeAdded { image_ids } => {
+                            added.extend(image_ids.iter().copied())
+                        }
+                        _ => {}
+                    }
+                }
+                let Some((source_id, source_name, target_id)) = header else {
+                    return Err(AppError::message("这条记录缺少撤销数据"));
+                };
+                // 已经撤过（源标签又在了）就不再动，保证可重复执行。
+                let present: bool = transaction.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM tags WHERE id = ?1)",
+                    [source_id],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    // 1. 把这次加到目标上的关系撤回：目标要回到合并前的样子。
+                    for image_id in &added {
+                        if transaction.execute(
+                            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2",
+                            params![image_id, target_id],
+                        )? > 0
+                        {
+                            redo_adds.push((*image_id, target_id));
+                        }
+                    }
+                    // 2. 重建源标签。同名标签已经存在时把关系插回它（与 `tagDelete` 同一处理）。
+                    let existing: Option<i64> = transaction
+                        .query_row(
+                            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+                            [&source_name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let restore_id = match existing {
+                        Some(id) => id,
+                        None => {
+                            transaction.execute(
+                                "INSERT INTO tags(id, name) VALUES (?1, ?2)",
+                                params![source_id, source_name],
+                            )?;
+                            redo_deletions.push(source_id);
+                            source_id
+                        }
+                    };
+                    let mut restored = Vec::new();
+                    for image_id in &images {
+                        if insert_tag_pair(&transaction, *image_id, restore_id)? {
+                            restored.push((*image_id, restore_id));
+                        }
+                    }
+                    if restore_id != source_id {
+                        redo_removals.extend(restored);
+                    }
                 }
             }
             _ => {}

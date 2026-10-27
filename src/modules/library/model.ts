@@ -120,6 +120,8 @@ export function emptyFilters(): LibraryFilters {
     scores: [],
     tagIds: [],
     tagMode: "any",
+    tagPresence: "any",
+    excludeTagIds: [],
     importedFrom: null,
     importedTo: null,
     sizeMin: null,
@@ -136,8 +138,12 @@ export function normalizeFilters(filters: LibraryFilters): LibraryFilters {
     folderDirect: filters.folderIds.length > 0 && filters.folderDirect === true,
     extensions: [...new Set(filters.extensions)].sort(),
     scores: [...new Set(filters.scores)].sort((a, b) => a - b),
-    tagIds: [...new Set(filters.tagIds)].sort((a, b) => a - b),
+    tagIds: filters.tagPresence === "missing"
+      ? []
+      : [...new Set(filters.tagIds)].sort((a, b) => a - b),
     tagMode: filters.tagMode,
+    tagPresence: filters.tagPresence,
+    excludeTagIds: [...new Set(filters.excludeTagIds ?? [])].sort((a, b) => a - b),
     importedFrom: filters.importedFrom,
     importedTo: filters.importedTo,
     sizeMin: filters.sizeMin,
@@ -199,6 +205,8 @@ export function activeFilterCount(filters: LibraryFilters): number {
     filters.tagIds.length;
   if (filters.importedFrom != null || filters.importedTo != null) count += 1;
   if (filters.sizeMin != null || filters.sizeMax != null) count += 1;
+  if (filters.tagPresence !== "any") count += 1;
+  if (filters.excludeTagIds.length > 0) count += 1;
   if (filters.description !== "any") count += 1;
   if (filters.embedding !== "any") count += 1;
   if (filters.pose !== "any") count += 1;
@@ -269,17 +277,27 @@ export function tagFilterState(
     if (!selected.includes(tagId)) return state;
     return {
       ...state,
-      filters: { ...state.filters, tagIds: selected.filter((id) => id !== tagId) },
+      filters: {
+        ...state.filters,
+        tagIds: selected.filter((id) => id !== tagId),
+        tagPresence: "any",
+      },
     };
   }
   if (action === "append") {
     const tagIds = selected.includes(tagId)
       ? selected.filter((id) => id !== tagId)
       : [...selected, tagId];
-    return { ...state, filters: { ...state.filters, tagIds } };
+    return {
+      ...state,
+      filters: { ...state.filters, tagIds, tagPresence: "any" },
+    };
   }
   if (scope === "view") {
-    return { ...state, filters: { ...state.filters, tagIds: [tagId] } };
+    return {
+      ...state,
+      filters: { ...state.filters, tagIds: [tagId], tagPresence: "any" },
+    };
   }
   if (scope === "folder" && state.filters.folderIds.length === 0) return null;
   if (scope === "collection" && collectionId == null) return null;

@@ -3,6 +3,7 @@ pub mod folder;
 pub mod history;
 pub mod import;
 pub mod read;
+pub mod tag;
 pub mod task;
 pub mod write;
 
@@ -58,6 +59,7 @@ pub fn execute_approval(state: &AppState, action: &ApprovalAction) -> AppResult<
             feature::execute_temp_features(state, &parse(&action.arguments)?)
         }
         "folders_modify" => folder::execute_folders_modify(state, &parse(&action.arguments)?),
+        "tags_modify" => tag::execute_tags_modify(state, &parse(&action.arguments)?),
         other => Err(AppError::message(format!("未知的待确认工具：{other}"))),
     }
 }

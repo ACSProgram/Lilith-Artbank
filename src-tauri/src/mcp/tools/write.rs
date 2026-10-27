@@ -358,19 +358,19 @@ pub(super) fn enqueue_approval<T: Serialize>(
     })))
 }
 
-struct WriteFinish<'a> {
-    tool: &'a str,
-    operation_id: Option<i64>,
-    selected: usize,
-    affected: u64,
-    close_viewer: bool,
-    invalidate_similarity: bool,
+pub(super) struct WriteFinish<'a> {
+    pub tool: &'a str,
+    pub operation_id: Option<i64>,
+    pub selected: usize,
+    pub affected: u64,
+    pub close_viewer: bool,
+    pub invalidate_similarity: bool,
     /// 前端据此判断列表、选择与详情是否需要失效；拿不到受影响 id。
-    change: Value,
-    extra: Value,
+    pub change: Value,
+    pub extra: Value,
 }
 
-fn finish_write(state: &AppState, finish: WriteFinish<'_>) -> Value {
+pub(super) fn finish_write(state: &AppState, finish: WriteFinish<'_>) -> Value {
     if let Some(operation_id) = finish.operation_id
         && let Some((database, _)) = state.current_library()
     {

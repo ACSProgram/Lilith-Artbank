@@ -17,7 +17,7 @@ export type ChangeKind =
 export type ChangeSource = "local" | "task" | "mcp" | "import";
 export type ChangeField = "score" | "tags" | "description" | "folder" | "collection";
 export type FeatureKind = "description" | "embedding" | "pose";
-export type TagChangeAction = "add" | "remove" | "set" | "rename" | "delete";
+export type TagChangeAction = "add" | "remove" | "set" | "rename" | "delete" | "merge";
 
 export interface RowPatch {
   id: number;
@@ -35,6 +35,8 @@ export interface DataChange {
   fields?: ChangeField[];
   tagAction?: TagChangeAction;
   tagId?: number;
+  /** 合并时保留的目标标签。 */
+  targetTagId?: number;
   score?: number | null;
   /** 描述是否为空；外部写入只回传这个判断，不回传整段描述。 */
   descriptionEmpty?: boolean;
@@ -274,8 +276,9 @@ function collectionPlan(change: DataChange, query: LibraryQuery): DataChangePlan
 }
 
 function tagCatalogPlan(change: DataChange, query: LibraryQuery): DataChangePlan {
+  // 合并同样会删掉源标签，筛选里含它时结果集必然变空。
   const deletesFilteredTag =
-    change.tagAction === "delete" &&
+    (change.tagAction === "delete" || change.tagAction === "merge") &&
     change.tagId != null &&
     query.filters.tagIds.includes(change.tagId);
   return {
@@ -439,7 +442,7 @@ export function selectionAfterChange(
 
   if (change.kind === "tagCatalog") {
     if (
-      change.tagAction === "delete" &&
+      (change.tagAction === "delete" || change.tagAction === "merge") &&
       change.tagId != null &&
       query.filters.tagIds.includes(change.tagId)
     ) {
@@ -588,6 +591,7 @@ export interface McpChangePayload {
     fields?: ChangeField[];
     tagAction?: TagChangeAction;
     tagId?: number;
+    targetTagId?: number;
     score?: number | null;
     descriptionEmpty?: boolean;
   } | null;
@@ -626,6 +630,7 @@ export function dataChangeForMcp(payload: McpChangePayload): DataChange {
     fields: structured?.fields,
     tagAction: structured?.tagAction,
     tagId: structured?.tagId,
+    targetTagId: structured?.targetTagId,
     score: structured?.score,
     descriptionEmpty: structured?.descriptionEmpty,
     clearSelection,

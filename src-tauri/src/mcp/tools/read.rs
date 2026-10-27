@@ -8,6 +8,7 @@ use crate::{
     ai::runtime::AiRuntime,
     app::{
         error::{AppError, AppResult},
+        settings::McpMode,
         tasks::TaskScope,
     },
     imageops::contact_sheet,
@@ -30,6 +31,8 @@ use super::feature::MAX_TEMP_FEATURE_IDS;
 pub const MAX_SEARCH_PAGE: u32 = 50;
 pub const MAX_IMAGE_IDS: usize = 50;
 pub const MAX_PREVIEW: usize = 25;
+/// 列表工具（`tags_list` / `folders_list`）的单页上限；分页只让超出的内容可达，不放宽单页。
+pub const MAX_LIST_PAGE: u32 = 500;
 
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -53,6 +56,8 @@ pub struct FoldersListInput {
     pub parent_path: Option<String>,
     #[schemars(description = "最多返回数量，1-500；默认 200")]
     pub limit: Option<u32>,
+    #[schemars(description = "上一页返回的 nextCursor；首页省略")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -60,8 +65,10 @@ pub struct FoldersListInput {
 pub struct TagsListInput {
     /// 按名称模糊匹配；省略时按图片数排序列出。
     pub query: Option<String>,
-    #[schemars(description = "最多返回数量，1-500；默认 100。按名称搜索时最多 200")]
+    #[schemars(description = "最多返回数量，1-500；默认 100")]
     pub limit: Option<u32>,
+    #[schemars(description = "上一页返回的 nextCursor；首页省略")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -216,26 +223,50 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
             "autoStart": context.settings.ai.auto_start,
             "launchConfigured": context.settings.ai.launch_configured(),
         },
-        "mcp": {
-            // 工具按当前设置实时判定，这里返回的就是本次调用的实际档位。
-            "mode": context.settings.mcp.mode.as_str(),
-            "toolCount": tool_count,
-            "writeTools": true,
-            "approvalThreshold": super::write::APPROVAL_THRESHOLD,
-            "approvalTimeoutMinutes": crate::mcp::approval::APPROVAL_TTL.as_secs() / 60,
-            "limits": {
-                "maxSearchPage": MAX_SEARCH_PAGE,
-                "maxSheetCells": u32::from(contact_sheet::MAX_GRID).pow(2),
-                "maxImageIdsPerGet": MAX_IMAGE_IDS,
-                "maxReferenceImages": MAX_REFERENCE_IDS,
-                "maxImportPaths": 10_000,
-                "maxImportFiles": 100_000,
-                "maxTempFeatureImages": MAX_TEMP_FEATURE_IDS,
-                "sheetTtlMinutes": SHEET_TTL_MINUTES,
-                "importCompresses": false,
-            }
-        }
+        "mcp": mcp_limits(context, tool_count),
     }))
+}
+
+/// 当前档位下的权限事实。阈值只在询问档生效，其它档给 `null`，
+/// 避免 AI 把 `threshold` 当成全局规则。
+fn mcp_limits(context: &ReadContext, tool_count: usize) -> Value {
+    let mode = context.settings.mcp.mode;
+    let ask = mode == McpMode::Ask;
+    json!({
+        // 工具按当前设置实时判定，这里返回的就是本次调用的实际档位。
+        "mode": mode.as_str(),
+        "toolCount": tool_count,
+        // 三档都注册写工具，客户端缓存的 tools/list 不会因为切档失效。
+        "writeTools": true,
+        "writeAllowed": mode != McpMode::ReadOnly,
+        "approval": {
+            "requiredInMode": "ask",
+            "appliesToCurrentMode": ask,
+            "threshold": ask.then_some(super::write::APPROVAL_THRESHOLD),
+            "alwaysApproveInAsk": [
+                "import_start（target=library）",
+                "images_trash",
+                "history_undo",
+                "history_redo",
+                "folders_modify（move / delete）",
+                "tags_modify（delete / merge）",
+            ],
+            "queueClearedOnFull": true,
+            "timeoutMinutes": crate::mcp::approval::APPROVAL_TTL.as_secs() / 60,
+        },
+        "limits": {
+            "maxSearchPage": MAX_SEARCH_PAGE,
+            "maxSheetCells": u32::from(contact_sheet::MAX_GRID).pow(2),
+            "maxImageIdsPerGet": MAX_IMAGE_IDS,
+            "maxReferenceImages": MAX_REFERENCE_IDS,
+            "maxImportPaths": 10_000,
+            "maxImportFiles": 100_000,
+            "maxTempFeatureImages": MAX_TEMP_FEATURE_IDS,
+            "maxListPage": MAX_LIST_PAGE,
+            "sheetTtlMinutes": SHEET_TTL_MINUTES,
+            "importCompresses": false,
+        },
+    })
 }
 
 pub fn folders_list(context: &ReadContext, input: &FoldersListInput) -> AppResult<Value> {
@@ -249,7 +280,8 @@ pub fn folders_list(context: &ReadContext, input: &FoldersListInput) -> AppResul
     if !parent.is_empty() && !folders.iter().any(|folder| folder.path == parent) {
         return Err(AppError::message(format!("文件夹不存在：{parent}")));
     }
-    let limit = input.limit.unwrap_or(200).clamp(1, 500) as usize;
+    let limit = input.limit.unwrap_or(200).clamp(1, MAX_LIST_PAGE) as usize;
+    let offset = parse_cursor(input.cursor.as_deref())? as usize;
     let mut children: Vec<_> = folders
         .into_iter()
         .filter(|folder| parent_path(&folder.path) == parent && folder.path != parent)
@@ -260,8 +292,10 @@ pub fn folders_list(context: &ReadContext, input: &FoldersListInput) -> AppResul
             .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
     });
     let total = children.len();
+    let next_cursor = (offset + limit < total).then(|| (offset + limit).to_string());
     let items: Vec<Value> = children
         .into_iter()
+        .skip(offset)
         .take(limit)
         .map(|folder| {
             json!({
@@ -278,27 +312,43 @@ pub fn folders_list(context: &ReadContext, input: &FoldersListInput) -> AppResul
         "parentPath": parent,
         "total": total,
         "folders": items,
+        "nextCursor": next_cursor,
+        "pagingNote": PAGE_NOTE,
     }))
 }
 
+/// 游标是不透明的十进制偏移量；解析失败直接报错，不静默回到第一页。
+fn parse_cursor(cursor: Option<&str>) -> AppResult<u32> {
+    match cursor.map(str::trim).filter(|text| !text.is_empty()) {
+        None => Ok(0),
+        Some(text) => text
+            .parse::<u32>()
+            .map_err(|_| AppError::message(format!("游标无效：{text}"))),
+    }
+}
+
+const PAGE_NOTE: &str =
+    "把 nextCursor 原样传给 cursor 取下一页；两次翻页之间有写入时可能重复或漏掉条目。";
+
 pub fn tags_list(context: &ReadContext, input: &TagsListInput) -> AppResult<Value> {
     let query_text = input.query.as_deref().unwrap_or("").trim();
-    let limit = input.limit.unwrap_or(100).clamp(1, 500);
-    let mut tags = if query_text.is_empty() {
-        query::list_tags(&context.database, Some(limit))?
-    } else {
-        // search_tags 自己把上限收到 200。
-        query::search_tags(&context.database, query_text, Some(limit))?
-    };
-    // 去掉图片后标签记录仍在，0 张的标签对“有哪些标签”没有意义。
-    tags.retain(|tag| tag.image_count > 0);
+    let search = (!query_text.is_empty()).then_some(query_text);
+    let limit = input.limit.unwrap_or(100).clamp(1, MAX_LIST_PAGE);
+    let offset = parse_cursor(input.cursor.as_deref())?;
+    let tags = query::list_tags_page(&context.database, search, limit, offset)?;
+    let total = query::count_tags(&context.database, search)?;
+    let next_cursor = (u64::from(offset) + u64::from(limit) < total)
+        .then(|| (u64::from(offset) + u64::from(limit)).to_string());
     Ok(json!({
         "query": query_text,
+        "total": total,
         "tags": tags.iter().map(|tag| json!({
             "id": tag.id,
             "name": tag.name,
             "imageCount": tag.image_count,
         })).collect::<Vec<_>>(),
+        "nextCursor": next_cursor,
+        "pagingNote": PAGE_NOTE,
     }))
 }
 
@@ -361,9 +411,15 @@ pub fn search_images(context: &ReadContext, input: &SearchImagesInput) -> AppRes
     });
     if let Some(facets) = facets {
         value["facets"] = json!(facets);
+        value["facetsNote"] = json!(FACETS_NOTE);
     }
     Ok(value)
 }
+
+/// 分面计数对自身维度排除当前筛选是标准做法；不写清会被当成 bug。
+/// 搜索与集合视图用命中集统计分面，标签分面因此只含命中集内的标签——这一句也要写进去，
+/// 否则 AI 会拿“标签分面应该自排除”去解释那边的数字。
+const FACETS_NOTE: &str = "标签分面不应用 tagIds、tagPresence 与 excludeTagIds：选中一个标签后仍能看到其它标签的计数。文件夹、扩展名、评分分面各自排除自身维度，其余筛选照常生效。搜索与集合视图的分面按命中集统计，标签分面只含命中集内的标签。分面只给 tagId 与计数，标签名用 tags_list 取。";
 
 pub fn find_similar(
     context: &ReadContext,
@@ -867,6 +923,7 @@ mod tests {
             &FoldersListInput {
                 parent_path: None,
                 limit: None,
+                cursor: None,
             },
         )
         .unwrap();
@@ -879,6 +936,7 @@ mod tests {
             &FoldersListInput {
                 parent_path: Some("作品".into()),
                 limit: None,
+                cursor: None,
             },
         )
         .unwrap();
@@ -890,6 +948,7 @@ mod tests {
             &TagsListInput {
                 query: Some("人".into()),
                 limit: None,
+                cursor: None,
             },
         )
         .unwrap();
@@ -900,6 +959,7 @@ mod tests {
             &TagsListInput {
                 query: None,
                 limit: None,
+                cursor: None,
             },
         )
         .unwrap();
@@ -1315,14 +1375,74 @@ mod tests {
     #[test]
     fn library_info_reports_mode_and_limits() {
         let fixture = fixture();
-        let value = library_info(&fixture.context, 21).unwrap();
+        let value = library_info(&fixture.context, 24).unwrap();
         assert_eq!(value["counts"]["images"], 3);
         assert_eq!(value["mcp"]["mode"], "ask");
         assert_eq!(value["mcp"]["writeTools"], true);
-        assert_eq!(value["mcp"]["approvalThreshold"], 100);
+        assert_eq!(value["mcp"]["writeAllowed"], true);
+        assert_eq!(value["mcp"]["approval"]["requiredInMode"], "ask");
+        assert_eq!(value["mcp"]["approval"]["appliesToCurrentMode"], true);
+        assert_eq!(value["mcp"]["approval"]["threshold"], 100);
+        assert_eq!(value["mcp"]["approval"]["queueClearedOnFull"], true);
         assert_eq!(value["mcp"]["limits"]["maxSheetCells"], 25);
         assert_eq!(value["mcp"]["limits"]["maxReferenceImages"], 100);
         assert_eq!(value["mcp"]["limits"]["maxImportPaths"], 10_000);
         assert_eq!(value["mcp"]["limits"]["importCompresses"], false);
+    }
+
+    #[test]
+    fn library_info_hides_threshold_outside_ask_mode() {
+        let mut fixture = fixture();
+        for (mode, write_allowed, applies, threshold) in [
+            (McpMode::Full, true, false, Value::Null),
+            (McpMode::ReadOnly, false, false, Value::Null),
+        ] {
+            fixture.context.settings.mcp.mode = mode;
+            let value = library_info(&fixture.context, 24).unwrap();
+            assert_eq!(value["mcp"]["writeAllowed"], write_allowed);
+            assert_eq!(value["mcp"]["approval"]["appliesToCurrentMode"], applies);
+            assert_eq!(value["mcp"]["approval"]["threshold"], threshold);
+            assert_eq!(value["mcp"]["writeTools"], true);
+        }
+    }
+
+    #[test]
+    fn tags_list_pages_through_every_tag() {
+        let fixture = fixture();
+        let mut cursor: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = tags_list(
+                &fixture.context,
+                &TagsListInput {
+                    query: None,
+                    limit: Some(1),
+                    cursor: cursor.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(page["total"], 2);
+            for tag in page["tags"].as_array().unwrap() {
+                seen.push(tag["id"].as_i64().unwrap());
+            }
+            match page["nextCursor"].as_str() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 2);
+
+        let error = tags_list(
+            &fixture.context,
+            &TagsListInput {
+                query: None,
+                limit: Some(1),
+                cursor: Some("第二页".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("游标无效"));
     }
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Pencil, Tags, Trash2, X } from "lucide-react";
+import { Merge, Pencil, Tags, Trash2, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Modal } from "../../shared/components/Modal";
 import { Spinner } from "../../shared/components/Spinner";
@@ -11,7 +11,14 @@ import { errorMessage } from "../../shared/errors";
 interface TagManagerDialogProps {
   open: boolean;
   onClose: () => void;
-  onChanged: (change: { tagId: number; action: "rename" | "delete" }) => void;
+  onChanged: (change: TagChange) => void;
+}
+
+export interface TagChange {
+  tagId: number;
+  action: "rename" | "delete" | "merge";
+  /** action=merge 时保留的目标标签。 */
+  targetTagId?: number;
 }
 
 /** 与 Rust `query::MAX_TAGS` 一致：管理器一次只取图片最多的这些标签，搜索在当前列表内进行。 */
@@ -25,6 +32,8 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [mergingId, setMergingId] = useState<number | null>(null);
+  const [mergeQuery, setMergeQuery] = useState("");
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -48,15 +57,13 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     if (!open) {
       setQuery("");
       setEditingId(null);
+      setMergingId(null);
+      setMergeQuery("");
       setBusy(false);
     }
   }, [open]);
 
-  const run = async (
-    operation: () => Promise<string>,
-    success: string,
-    change: { tagId: number; action: "rename" | "delete" },
-  ) => {
+  const run = async (operation: () => Promise<string>, success: string, change: TagChange) => {
     if (busy) return;
     setBusy(true);
     try {
@@ -94,16 +101,42 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     }, "标签已删除", { tagId: tag.id, action: "delete" });
   };
 
+  const merge = async (source: TagInfo, target: TagInfo) => {
+    setMergingId(null);
+    setMergeQuery("");
+    const accepted = await confirm({
+      title: `把「${source.name}」合并到「${target.name}」？`,
+      message: `${source.imageCount.toLocaleString()} 张图片会改挂到「${target.name}」，然后删除「${source.name}」这个标签。图片本身不会删除，可以在操作记录里撤销。`,
+      confirmLabel: "合并标签",
+      danger: true,
+    });
+    if (!accepted) return;
+    void run(
+      async () => {
+        const report = await libraryApi.mergeTags(source.id, target.id);
+        return `改挂 ${report.moved.toLocaleString()} 张，去重 ${report.duplicate.toLocaleString()} 张`;
+      },
+      "标签已合并",
+      { tagId: source.id, action: "merge", targetTagId: target.id },
+    );
+  };
+
   const needle = query.trim().toLowerCase();
   const visible = tags.filter((tag) =>
     needle ? tag.name.toLowerCase().includes(needle) : true,
+  );
+  const mergeNeedle = mergeQuery.trim().toLowerCase();
+  const mergeCandidates = tags.filter(
+    (tag) =>
+      tag.id !== mergingId &&
+      (mergeNeedle ? tag.name.toLowerCase().includes(mergeNeedle) : true),
   );
 
   return (
     <Modal
       open={open}
       title="标签管理"
-      subtitle="重命名与删除会立即影响所有引用该标签的图片。"
+      subtitle="重命名、删除与合并会立即影响所有引用该标签的图片。"
       width={560}
       onClose={onClose}
       footer={
@@ -178,6 +211,16 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
                         <Pencil size={13} />
                       </IconButton>
                       <IconButton
+                        label="合并到其它标签"
+                        disabled={busy}
+                        onClick={() => {
+                          setMergingId(tag.id);
+                          setMergeQuery("");
+                        }}
+                      >
+                        <Merge size={13} />
+                      </IconButton>
+                      <IconButton
                         label="删除标签"
                         variant="danger"
                         disabled={busy}
@@ -188,6 +231,41 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
                     </div>
                   </>
                 )}
+                {mergingId === tag.id ? (
+                  <div className="tag-manager-merge">
+                    <input
+                      className="input"
+                      value={mergeQuery}
+                      autoFocus
+                      placeholder="合并到哪个标签"
+                      onChange={(event) => setMergeQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") {
+                          setMergingId(null);
+                          setMergeQuery("");
+                        }
+                      }}
+                    />
+                    <div className="tag-manager-merge-list">
+                      {mergeCandidates.length === 0 ? (
+                        <p className="dialog-empty">没有可合并的标签</p>
+                      ) : (
+                        mergeCandidates.map((candidate) => (
+                          <button
+                            key={candidate.id}
+                            type="button"
+                            className="tag-manager-merge-option"
+                            disabled={busy}
+                            onClick={() => void merge(tag, candidate)}
+                          >
+                            <span>{candidate.name}</span>
+                            <em>{candidate.imageCount.toLocaleString()} 张</em>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

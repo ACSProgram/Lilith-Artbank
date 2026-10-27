@@ -911,6 +911,13 @@ impl AppState {
         self.mutate(|| metadata::delete_tag(&database, tag_id))
     }
 
+    pub fn merge_tags(&self, source_id: i64, target_id: i64) -> AppResult<metadata::MergeReport> {
+        let (database, _) = self.query_source()?;
+        self.mutate(|| {
+            metadata::merge_tags_with_id(&database, source_id, target_id).map(|(r, _)| r)
+        })
+    }
+
     pub fn move_images(
         &self,
         image_ids: &[i64],

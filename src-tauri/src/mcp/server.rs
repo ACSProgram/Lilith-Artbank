@@ -27,6 +27,7 @@ use super::{
             self, FindSimilarInput, FoldersListInput, ImageSheetInput, ImagesGetInput,
             SearchImagesInput, TagsListInput,
         },
+        tag::{self as tag_tool, TagsModifyInput},
         task::{self, TasksCancelInput, TasksGetInput},
         write::{
             self, CollectionsCreateInput, CollectionsMembershipInput, CollectionsModifyInput,
@@ -36,7 +37,7 @@ use super::{
 };
 
 /// 已注册的工具数，由 `library_info` 报给客户端；测试保证它与路由一致。
-const TOOL_COUNT: usize = 23;
+const TOOL_COUNT: usize = 24;
 
 /// 工具适配器只负责取当前 AppState、调用领域函数并把结果编码成 MCP 内容。
 #[derive(Clone)]
@@ -155,7 +156,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "列文件夹及其直接/子树图片数。parentPath 省略时列根目录；给相对路径时列它的直接子文件夹。新建、重命名、移动、删除文件夹用 folders_modify。"
+        description = "列文件夹及其直接/子树图片数。parentPath 省略时列根目录；给相对路径时列它的直接子文件夹。同级超过 limit 条时返回 nextCursor，原样传给 cursor 取下一页；total 是这一层的总数。新建、重命名、移动、删除文件夹用 folders_modify。"
     )]
     async fn folders_list(
         &self,
@@ -183,7 +184,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "列标签及图片数；query 按名称模糊匹配，limit 默认 100。没有图片的标签不会返回。"
+        description = "列标签及图片数；query 按名称模糊匹配，limit 默认 100、最多 500。total 是命中总数，超过 limit 时返回 nextCursor，原样传给 cursor 取下一页。没有图片的标签不会返回。要重命名、删除或合并标签用 tags_modify。"
     )]
     async fn tags_list(
         &self,
@@ -195,6 +196,19 @@ impl McpServer {
             })
             .await?;
         Ok(tool_value(result))
+    }
+
+    #[tool(
+        description = "管理标签：action=rename 用 tagId+name 改名（撞同名直接报错）；action=delete 删除标签并从所有图片上移除它；action=merge 把 tagId 的图片全部并到 targetId，然后删掉 tagId 这个标签。图片本身不会被删除，三种动作都写操作记录、可以撤销。先 dryRun 看数量；delete/merge 可传 expectedImages 核对源标签当前图片数，不一致直接拒绝。询问档下 rename 直接执行，delete 与 merge 需要用户确认。"
+    )]
+    async fn tags_modify(
+        &self,
+        Parameters(input): Parameters<TagsModifyInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_state("tags_modify", move |state| {
+            tag_tool::tags_modify(state, &input)
+        })
+        .await
     }
 
     #[tool(description = "列集合及图片数，按用户排序。")]
@@ -470,7 +484,14 @@ impl ServerHandler for McpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。写入受应用内权限档限制：只读档拒绝全部写入，询问档会把危险或超量操作放入待确认队列；没有永久删除、清空回收站、压缩、像素编辑工具。临时区可以生成 embedding 或姿势特征，但必须先在 library_info 确认库内已有对应特征；普通图库不开放批量 AI 生成。",
+                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合与标签、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。\
+\n\n当前权限档以 library_info 的 mcp.writeAllowed 与 mcp.approval 为准，三档区别只有一处：\
+\n- readOnly：writeAllowed=false，全部写入、导入与撤销/重做都返回“当前是只读模式”。写工具仍然出现在 tools/list 里，这是正常的。\
+\n- ask：写入会执行，但 import_start（target=library）、images_trash、history_undo、history_redo、folders_modify 的 move/delete、tags_modify 的 delete/merge，以及任何超过 100 张的批量写入会先进入应用内待确认队列，返回 status=pendingApproval 与 approvalId；用 tasks_get(approvalId) 等用户决定。\
+\n- full：不弹确认，直接执行；confirmedCount、confirmedSteps 等数量核对照常保留。approval.threshold 在完全档是 null，意思是这里没有张数阈值，不是“阈值消失后不受限制”。\
+\n100 张阈值只在询问档生效，不是设置项；询问档之外的档位不受它约束。\
+\n没有永久删除、清空回收站、压缩、像素编辑工具。临时区可以生成 embedding 或姿势特征，但必须先在 library_info 确认库内已有对应特征；普通图库不开放批量 AI 生成。\
+\n列表工具的 nextCursor 请原样回传，不要自己拼。",
             )
     }
 }
@@ -518,6 +539,7 @@ mod tests {
             "import_start",
             "temp_features_generate",
             "folders_modify",
+            "tags_modify",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

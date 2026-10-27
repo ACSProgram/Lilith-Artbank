@@ -20,6 +20,7 @@ import {
   mockImageDetail,
   mockImageStates,
   mockLibraryCounts,
+  mockMergeTags,
   mockMoveFolder,
   mockMoveImages,
   mockPlaceFolders,
@@ -63,6 +64,7 @@ import type {
   MoveReport,
   SelectionTags,
   TagInfo,
+  TagMergeReport,
   TagRef,
 } from "./types";
 
@@ -228,6 +230,11 @@ export const libraryApi = {
   async deleteTag(tagId: number): Promise<number> {
     if (!isTauri()) return mockDeleteTag(tagId);
     return invoke<number>("delete_tag", { tagId });
+  },
+
+  async mergeTags(sourceId: number, targetId: number): Promise<TagMergeReport> {
+    if (!isTauri()) return mockMergeTags(sourceId, targetId);
+    return invoke<TagMergeReport>("merge_tags", { sourceId, targetId });
   },
 
   async moveImagesToFolder(imageIds: number[], folderPath: string): Promise<MoveReport> {

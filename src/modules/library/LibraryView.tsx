@@ -55,7 +55,7 @@ import { InspectorPanel } from "./Inspector";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
 import { OperationHistoryPanel } from "./OperationHistoryPanel";
 import { SortMenu } from "./SortMenu";
-import { TagManagerDialog } from "./TagManagerDialog";
+import { TagManagerDialog, type TagChange } from "./TagManagerDialog";
 import { ViewBar } from "./ViewBar";
 import { breadcrumbsFor, buildFolderTree } from "./folderTreeModel";
 import {
@@ -1686,13 +1686,14 @@ export function LibraryView({
   );
 
   const handleTagChanged = useCallback(
-    (info?: { tagId: number; action: "rename" | "delete" }) => {
+    (info?: TagChange) => {
       applyChange({
         kind: "tagCatalog",
         source: "local",
         reason: info?.action ?? "tagCatalog",
         tagId: info?.tagId,
         tagAction: info?.action ?? "rename",
+        targetTagId: info?.targetTagId,
         similarity: "keep",
       });
     },

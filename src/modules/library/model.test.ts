@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import {
   COLLECTION_SORT_LEVELS,
   DEFAULT_SORT_LEVELS,
+  activeFilterCount,
   defaultBrowseState,
   effectiveSort,
+  emptyFilters,
+  normalizeFilters,
   rowInTagScope,
   sortForViewChange,
   sortSummary,
@@ -140,6 +143,23 @@ test("append toggles the tag while remove drops it", () => {
     collectionId: null,
   });
   assert.deepEqual(removed?.filters.tagIds, [9]);
+});
+
+test("tag presence and exclusions count as filters", () => {
+  assert.equal(activeFilterCount(emptyFilters()), 0);
+
+  const missing = normalizeFilters({
+    ...emptyFilters(),
+    tagIds: [7],
+    tagPresence: "missing",
+  });
+  // “一个标签都没有”与“含某些标签”互斥，前者赢。
+  assert.deepEqual(missing.tagIds, []);
+  assert.equal(activeFilterCount(missing), 1);
+
+  const excluded = normalizeFilters({ ...emptyFilters(), excludeTagIds: [9, 3, 9] });
+  assert.deepEqual(excluded.excludeTagIds, [3, 9]);
+  assert.equal(activeFilterCount(excluded), 1);
 });
 
 test("global sort applies to every library view", () => {

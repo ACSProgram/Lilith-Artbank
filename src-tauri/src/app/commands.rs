@@ -27,7 +27,9 @@ use crate::{
         folders::FolderSortKey,
         history::HistoryPage,
         manifest::LibraryInspection,
-        metadata::{DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef},
+        metadata::{
+            DeleteReport, ImageDetails, ImageState, MergeReport, MoveReport, SelectionTags, TagRef,
+        },
         optimize_estimate::OptimizeEstimate,
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::LibraryInfo,
@@ -477,6 +479,15 @@ pub fn rename_tag(state: State<'_, AppState>, tag_id: i64, name: String) -> Resu
 #[tauri::command]
 pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<u64, String> {
     AppError::command(state.delete_tag(tag_id))
+}
+
+#[tauri::command]
+pub fn merge_tags(
+    state: State<'_, AppState>,
+    source_id: i64,
+    target_id: i64,
+) -> Result<MergeReport, String> {
+    AppError::command(state.merge_tags(source_id, target_id))
 }
 
 /// 在 write lane 上跑一个有进度的批量操作：占用、排队、进度、终态都交给任务总线。
@@ -935,6 +946,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         remove_tags_from_images,
         rename_tag,
         delete_tag,
+        merge_tags,
         move_images_to_folder,
         trash_images,
         restore_images,

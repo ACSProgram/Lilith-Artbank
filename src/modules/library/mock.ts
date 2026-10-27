@@ -26,6 +26,7 @@ import type {
   SortKey,
   TagCount,
   TagInfo,
+  TagMergeReport,
   TagRef,
   ValueCount,
 } from "./types";
@@ -639,6 +640,34 @@ export function mockDeleteTag(tagId: number): number {
     affected += before - image.tags.length;
   }
   return affected;
+}
+
+export function mockMergeTags(sourceId: number, targetId: number): TagMergeReport {
+  const source = tagState.find((item) => item.id === sourceId);
+  const target = tagState.find((item) => item.id === targetId);
+  if (!source) throw new Error("源标签不存在");
+  if (!target) throw new Error("目标标签不存在");
+  if (sourceId === targetId) throw new Error("不能把标签合并到自己");
+  let moved = 0;
+  let duplicate = 0;
+  for (const image of mockImages) {
+    if (!image.tags.includes(source.name)) continue;
+    image.tags = image.tags.filter((name) => name !== source.name);
+    if (image.tags.includes(target.name)) {
+      duplicate += 1;
+    } else {
+      image.tags.push(target.name);
+      moved += 1;
+    }
+  }
+  tagState.splice(tagState.indexOf(source), 1);
+  return {
+    sourceImages: moved + duplicate,
+    moved,
+    duplicate,
+    sourceName: source.name,
+    targetName: target.name,
+  };
 }
 
 function normalizeMockFolder(value: string): string {

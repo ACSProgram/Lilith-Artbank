@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 use serde::Serialize;
 
 use crate::{
@@ -893,11 +895,15 @@ pub fn remove_tags_with_id(
 }
 
 pub fn rename_tag(database: &LibraryDb, tag_id: i64, name: &str) -> AppResult<()> {
+    rename_tag_with_id(database, tag_id, name).map(|_| ())
+}
+
+pub fn rename_tag_with_id(database: &LibraryDb, tag_id: i64, name: &str) -> AppResult<Option<i64>> {
     if tag_id <= 0 {
         return Err(AppError::message("标签 id 无效"));
     }
     let name = validate_tag_name(name)?;
-    history::write(
+    let (_, operation_id) = history::write_with_id(
         database,
         NewOperation::new(HistoryKind::TagRename, format!("重命名标签「{name}」")),
         |transaction, draft| {
@@ -930,10 +936,15 @@ pub fn rename_tag(database: &LibraryDb, tag_id: i64, name: &str) -> AppResult<()
             draft.affected(1);
             Ok(())
         },
-    )
+    )?;
+    Ok(operation_id)
 }
 
 pub fn delete_tag(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
+    delete_tag_with_id(database, tag_id).map(|(affected, _)| affected)
+}
+
+pub fn delete_tag_with_id(database: &LibraryDb, tag_id: i64) -> AppResult<(u64, Option<i64>)> {
     if tag_id <= 0 {
         return Err(AppError::message("标签 id 无效"));
     }
@@ -947,7 +958,7 @@ pub fn delete_tag(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
         })?
         .map(|name| format!("删除标签「{name}」"))
         .unwrap_or_else(|| "删除标签".to_owned());
-    history::write(
+    history::write_with_id(
         database,
         NewOperation::new(HistoryKind::TagDelete, label),
         |transaction, draft| {
@@ -981,6 +992,170 @@ pub fn delete_tag(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
             Ok(image_ids.len() as u64)
         },
     )
+}
+
+/// 合并两个标签：把源标签的全部图片关系迁到目标标签，然后删掉源标签行。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    /// 源标签原本挂了多少张图片。
+    pub source_images: u64,
+    /// 其中目标标签原本没有、这次新加上的关系数。
+    pub moved: u64,
+    /// 其中目标标签本来就有、只做了去重的关系数。
+    pub duplicate: u64,
+    pub source_name: String,
+    pub target_name: String,
+}
+
+pub fn merge_tags_with_id(
+    database: &LibraryDb,
+    source_id: i64,
+    target_id: i64,
+) -> AppResult<(MergeReport, Option<i64>)> {
+    if source_id <= 0 || target_id <= 0 {
+        return Err(AppError::message("标签 id 无效"));
+    }
+    if source_id == target_id {
+        return Err(AppError::message("不能把标签合并到自己"));
+    }
+    // 标题在事务里才知道两个名称，先写占位再就地改写。
+    let (report, operation_id) = history::write_with_id(
+        database,
+        NewOperation::new(HistoryKind::TagMerge, "合并标签".to_owned()),
+        |transaction, draft| merge_in_transaction(transaction, draft, source_id, target_id),
+    )?;
+    if let Some(operation_id) = operation_id {
+        let label = format!(
+            "合并标签「{}」→「{}」",
+            report.source_name, report.target_name
+        );
+        history::update_label(database, operation_id, &label)?;
+    }
+    Ok((report, operation_id))
+}
+
+/// 供 MCP 预先统计“会变动多少”，不写库。
+pub fn merge_preview(
+    database: &LibraryDb,
+    source_id: i64,
+    target_id: i64,
+) -> AppResult<MergeReport> {
+    if source_id <= 0 || target_id <= 0 {
+        return Err(AppError::message("标签 id 无效"));
+    }
+    if source_id == target_id {
+        return Err(AppError::message("不能把标签合并到自己"));
+    }
+    database.with_reader(|connection| {
+        let source_name =
+            tag_name_in(connection, source_id)?.ok_or_else(|| AppError::message("源标签不存在"))?;
+        let target_name = tag_name_in(connection, target_id)?
+            .ok_or_else(|| AppError::message("目标标签不存在"))?;
+        let source_images: i64 = connection.query_row(
+            "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
+            [source_id],
+            |row| row.get(0),
+        )?;
+        let duplicate: i64 = connection.query_row(
+            "SELECT count(*) FROM image_tags source
+             WHERE source.tag_id = ?1
+               AND EXISTS (SELECT 1 FROM image_tags target
+                           WHERE target.tag_id = ?2 AND target.image_id = source.image_id)",
+            params![source_id, target_id],
+            |row| row.get(0),
+        )?;
+        Ok(MergeReport {
+            source_images: source_images.max(0) as u64,
+            moved: (source_images - duplicate).max(0) as u64,
+            duplicate: duplicate.max(0) as u64,
+            source_name,
+            target_name,
+        })
+    })
+}
+
+pub fn tag_name(database: &LibraryDb, tag_id: i64) -> AppResult<Option<String>> {
+    database.with_reader(|connection| tag_name_in(connection, tag_id))
+}
+
+fn tag_name_in(connection: &Connection, tag_id: i64) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row("SELECT name FROM tags WHERE id = ?1", [tag_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?)
+}
+
+pub fn tag_image_count(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
+    database.with_reader(|connection| {
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
+            [tag_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    })
+}
+
+fn merge_in_transaction(
+    transaction: &Transaction<'_>,
+    draft: &mut history::OperationDraft,
+    source_id: i64,
+    target_id: i64,
+) -> AppResult<MergeReport> {
+    let source_name =
+        tag_name_in(transaction, source_id)?.ok_or_else(|| AppError::message("源标签不存在"))?;
+    let target_name =
+        tag_name_in(transaction, target_id)?.ok_or_else(|| AppError::message("目标标签不存在"))?;
+    let images: Vec<i64> = {
+        let mut statement = transaction
+            .prepare("SELECT image_id FROM image_tags WHERE tag_id = ?1 ORDER BY image_id")?;
+        statement
+            .query_map([source_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut added = Vec::new();
+    for image_id in &images {
+        let changed = transaction.execute(
+            "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)
+             ON CONFLICT(image_id, tag_id) DO NOTHING",
+            params![image_id, target_id],
+        )?;
+        if changed > 0 {
+            added.push(*image_id);
+        }
+    }
+    transaction.execute("DELETE FROM tags WHERE id = ?1", [source_id])?;
+    let source_images = images.len() as u64;
+    let report = MergeReport {
+        source_images,
+        moved: added.len() as u64,
+        duplicate: source_images - added.len() as u64,
+        source_name: source_name.clone(),
+        target_name,
+    };
+    draft.json(&TagRecord::Merge {
+        source_id,
+        source_name,
+        target_id,
+    })?;
+    // 关系清单按 1000 条一个 chunk，与标签删除的记录分块口径一致。
+    for chunk in images.chunks(1_000) {
+        draft.json(&TagRecord::Pairs {
+            pairs: chunk
+                .iter()
+                .map(|image_id| (*image_id, source_id))
+                .collect(),
+        })?;
+    }
+    for chunk in added.chunks(1_000) {
+        draft.json(&TagRecord::MergeAdded {
+            image_ids: chunk.to_vec(),
+        })?;
+    }
+    draft.affected(source_images);
+    Ok(report)
 }
 
 fn tag_summary(names: &[String]) -> String {
@@ -2075,6 +2250,90 @@ mod tests {
         .unwrap();
         assert!(!trashed_path.exists());
         assert!(image_details(&fixture.session.db, &fixture.root, trashed).is_err());
+    }
+
+    fn tag_pair_count(fixture: &Fixture, tag_id: i64) -> u64 {
+        fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
+                    [tag_id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap() as u64
+    }
+
+    fn undo_task() -> std::sync::Arc<crate::app::tasks::TaskHandle> {
+        crate::app::tasks::TaskHandle::new("merge-test", crate::app::tasks::TaskKind::Undo, "测试")
+    }
+
+    #[test]
+    fn merge_moves_relations_and_can_be_undone() {
+        let fixture = fixture();
+        let a = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
+        let b = insert_image(&fixture, "b", "jpg", 1, fixture.folder);
+        let c = insert_image(&fixture, "c", "jpg", 1, fixture.folder);
+        add_tags(&fixture.session.db, &[a, b], &["源".into()]).unwrap();
+        add_tags(&fixture.session.db, &[b, c], &["目标".into()]).unwrap();
+        let (source_id, target_id) = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                Ok((
+                    connection.query_row("SELECT id FROM tags WHERE name = '源'", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    connection.query_row(
+                        "SELECT id FROM tags WHERE name = '目标'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+
+        let preview = merge_preview(&fixture.session.db, source_id, target_id).unwrap();
+        assert_eq!(preview.source_images, 2);
+        assert_eq!(preview.moved, 1);
+        assert_eq!(preview.duplicate, 1);
+
+        let (report, operation_id) =
+            merge_tags_with_id(&fixture.session.db, source_id, target_id).unwrap();
+        assert_eq!(report.moved, 1);
+        assert_eq!(report.duplicate, 1);
+        assert!(operation_id.is_some());
+        assert_eq!(tag_pair_count(&fixture, target_id), 3);
+        assert!(tag_name(&fixture.session.db, source_id).unwrap().is_none());
+
+        let operation_id = operation_id.unwrap();
+        history::run_undo(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            operation_id,
+            undo_task(),
+        )
+        .unwrap();
+        assert_eq!(
+            tag_name(&fixture.session.db, source_id).unwrap().as_deref(),
+            Some("源")
+        );
+        assert_eq!(tag_pair_count(&fixture, source_id), 2);
+        assert_eq!(tag_pair_count(&fixture, target_id), 2);
+
+        history::run_redo(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            operation_id,
+            undo_task(),
+        )
+        .unwrap();
+        assert!(tag_name(&fixture.session.db, source_id).unwrap().is_none());
+        assert_eq!(tag_pair_count(&fixture, target_id), 3);
     }
 
     #[test]

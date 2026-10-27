@@ -21,6 +21,10 @@ export interface LibraryFilters {
   scores: number[];
   tagIds: number[];
   tagMode: TagMode;
+  /** 标签存在性；missing 表示“一个标签都没有”，此时 tagIds 必须为空。 */
+  tagPresence: PresenceFilter;
+  /** 排除拥有其中任一标签的图片。 */
+  excludeTagIds: number[];
   importedFrom: number | null;
   importedTo: number | null;
   sizeMin: number | null;
@@ -132,6 +136,15 @@ export interface TagInfo {
   imageCount: number;
 }
 
+/** 合并两个标签的结果：源标签的图片全部并到目标标签后，源标签被删除。 */
+export interface TagMergeReport {
+  sourceImages: number;
+  moved: number;
+  duplicate: number;
+  sourceName: string;
+  targetName: string;
+}
+
 export interface TagRef {
   id: number;
   name: string;
@@ -230,6 +243,7 @@ export type HistoryKind =
   | "tagRemove"
   | "tagRename"
   | "tagDelete"
+  | "tagMerge"
   | "collectionCreate"
   | "collectionRename"
   | "collectionDelete"

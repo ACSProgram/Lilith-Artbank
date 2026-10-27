@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -119,6 +119,10 @@ pub struct LibraryFilters {
     pub scores: Vec<i64>,
     pub tag_ids: Vec<i64>,
     pub tag_mode: TagMode,
+    /// 标签的存在性：any 不限、has 至少一个标签、missing 一个标签都没有。
+    pub tag_presence: PresenceFilter,
+    /// 排除拥有其中任一标签的图片；与 `tag_ids` 独立叠加。
+    pub exclude_tag_ids: Vec<i64>,
     pub imported_from: Option<i64>,
     pub imported_to: Option<i64>,
     pub size_min: Option<i64>,
@@ -654,21 +658,67 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
 }
 
 pub fn list_tags(database: &LibraryDb, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
-    let limit = limit.unwrap_or(MAX_TAGS).clamp(1, MAX_TAGS);
+    list_tags_page(database, None, limit.unwrap_or(MAX_TAGS), 0)
+}
+
+pub fn search_tags(
+    database: &LibraryDb,
+    query: &str,
+    limit: Option<u32>,
+) -> AppResult<Vec<TagInfo>> {
+    search_tags_page(database, query, limit.unwrap_or(50), 0)
+}
+
+/// 按名称模糊匹配标签；`limit` 最高 200，供界面自动补全使用。
+pub fn search_tags_page(
+    database: &LibraryDb,
+    query: &str,
+    limit: u32,
+    offset: u32,
+) -> AppResult<Vec<TagInfo>> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return list_tags_page(database, None, limit.min(MAX_TAGS), offset);
+    }
+    list_tags_page(database, Some(needle), limit.clamp(1, 200), offset)
+}
+
+/// 分页取标签；`search` 为空时按图片数降序，否则按名称 `LIKE` 过滤。
+///
+/// 临时图片不计入标签；标签本身仍保留，标签清空临时区后自然消失。
+pub fn list_tags_page(
+    database: &LibraryDb,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> AppResult<Vec<TagInfo>> {
+    let limit = limit.clamp(1, MAX_TAGS);
+    let search = search.map(str::trim).filter(|text| !text.is_empty());
     database.with_reader(|connection| {
-        // 临时图片不计入标签；标签本身仍保留，标签清空临时区后自然消失。
         let mut statement = connection.prepare(&format!(
             "SELECT tags.id, tags.name, count(images.id)
              FROM tags
              JOIN image_tags ON image_tags.tag_id = tags.id
              JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
-             WHERE {}
+             WHERE {exclude}{name_filter}
              GROUP BY tags.id
              ORDER BY count(images.id) DESC, tags.name
-             LIMIT ?1",
-            temp::EXCLUDE_SQL
+             LIMIT ?1 OFFSET ?2",
+            exclude = temp::EXCLUDE_SQL,
+            name_filter = if search.is_some() {
+                " AND tags.name LIKE ?3 ESCAPE '\\'"
+            } else {
+                ""
+            },
         ))?;
-        let rows = statement.query_map([limit], |row| {
+        let mut params = vec![
+            Value::Integer(i64::from(limit)),
+            Value::Integer(i64::from(offset)),
+        ];
+        if let Some(needle) = search {
+            params.push(Value::Text(format!("%{}%", escape_like(needle))));
+        }
+        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
             Ok(TagInfo {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -680,39 +730,32 @@ pub fn list_tags(database: &LibraryDb, limit: Option<u32>) -> AppResult<Vec<TagI
     })
 }
 
-pub fn search_tags(
-    database: &LibraryDb,
-    query: &str,
-    limit: Option<u32>,
-) -> AppResult<Vec<TagInfo>> {
-    let needle = query.trim();
-    if needle.is_empty() {
-        return list_tags(database, limit);
-    }
-    let limit = limit.unwrap_or(50).clamp(1, 200);
-    let pattern = format!("%{}%", escape_like(needle));
+/// 与 [`list_tags_page`] 同口径的命中总数，用于判断还有没有下一页。
+pub fn count_tags(database: &LibraryDb, search: Option<&str>) -> AppResult<u64> {
+    let search = search.map(str::trim).filter(|text| !text.is_empty());
     database.with_reader(|connection| {
         let mut statement = connection.prepare(&format!(
-            "SELECT tags.id, tags.name, count(images.id)
-             FROM tags
-             LEFT JOIN image_tags ON image_tags.tag_id = tags.id
-             LEFT JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
-                 AND {exclude}
-             WHERE tags.name LIKE ?1 ESCAPE '\\'
-             GROUP BY tags.id
-             ORDER BY count(images.id) DESC, tags.name
-             LIMIT ?2",
-            exclude = temp::EXCLUDE_SQL
+            "SELECT count(*) FROM tags
+             WHERE EXISTS (
+                 SELECT 1 FROM image_tags
+                 JOIN images ON images.id = image_tags.image_id
+                 WHERE image_tags.tag_id = tags.id
+                   AND images.deleted_at IS NULL
+                   AND {exclude}
+             ){name_filter}",
+            exclude = temp::EXCLUDE_SQL,
+            name_filter = if search.is_some() {
+                " AND tags.name LIKE ?1 ESCAPE '\\'"
+            } else {
+                ""
+            },
         ))?;
-        let rows = statement.query_map(params![pattern, limit], |row| {
-            Ok(TagInfo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                image_count: row.get::<_, i64>(2)?.max(0) as u64,
-            })
-        })?;
-        let tags = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(tags)
+        let mut params = Vec::new();
+        if let Some(needle) = search {
+            params.push(Value::Text(format!("%{}%", escape_like(needle))));
+        }
+        let total: i64 = statement.query_row(params_from_iter(params.iter()), |row| row.get(0))?;
+        Ok(total.max(0) as u64)
     })
 }
 
@@ -782,6 +825,13 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
 
     query.filters.folder_ids = dedupe_ids(query.filters.folder_ids, 256, "文件夹")?;
     query.filters.tag_ids = dedupe_ids(query.filters.tag_ids, 64, "标签")?;
+    query.filters.exclude_tag_ids = dedupe_ids(query.filters.exclude_tag_ids, 64, "标签")?;
+    // “一个标签都没有”与“含有这些标签”互斥；同时给出时按错误处理，不静默丢弃一边。
+    if query.filters.tag_presence == PresenceFilter::Missing && !query.filters.tag_ids.is_empty() {
+        return Err(AppError::message(
+            "筛选“没有任何标签”时不能再指定要包含的标签",
+        ));
+    }
 
     let mut extensions = Vec::new();
     let mut seen = HashSet::new();
@@ -1140,29 +1190,8 @@ impl FilterSet {
                 .extend(filters.scores.iter().map(|score| Value::Integer(*score)));
         }
 
-        if exclude != Some(Facet::Tags) && !filters.tag_ids.is_empty() {
-            match filters.tag_mode {
-                TagMode::Any => {
-                    let marks = placeholders(filters.tag_ids.len());
-                    self.clauses.push(format!(
-                        "EXISTS (SELECT 1 FROM image_tags
-                         WHERE image_tags.image_id = images.id
-                           AND image_tags.tag_id IN ({marks}))"
-                    ));
-                    self.params
-                        .extend(filters.tag_ids.iter().map(|tag_id| Value::Integer(*tag_id)));
-                }
-                TagMode::All => {
-                    for tag_id in &filters.tag_ids {
-                        self.clauses.push(
-                            "EXISTS (SELECT 1 FROM image_tags
-                             WHERE image_tags.image_id = images.id AND image_tags.tag_id = ?)"
-                                .to_owned(),
-                        );
-                        self.params.push(Value::Integer(*tag_id));
-                    }
-                }
-            }
+        if exclude != Some(Facet::Tags) {
+            self.push_tag_clauses(filters);
         }
 
         if let Some(from) = filters.imported_from {
@@ -1189,6 +1218,63 @@ impl FilterSet {
         }
         push_feature_presence(&mut self.clauses, "embedding", filters.embedding);
         push_feature_presence(&mut self.clauses, "pose", filters.pose);
+    }
+
+    /// 标签维度的三段条件：包含（any/all）、存在性、排除。
+    ///
+    /// 三段都算标签维度，做标签分面时一起跳过——选中一个标签后仍要能看到其它标签的计数。
+    fn push_tag_clauses(&mut self, filters: &LibraryFilters) {
+        if !filters.tag_ids.is_empty() {
+            match filters.tag_mode {
+                TagMode::Any => {
+                    let marks = placeholders(filters.tag_ids.len());
+                    self.clauses.push(format!(
+                        "EXISTS (SELECT 1 FROM image_tags
+                         WHERE image_tags.image_id = images.id
+                           AND image_tags.tag_id IN ({marks}))"
+                    ));
+                    self.params
+                        .extend(filters.tag_ids.iter().map(|tag_id| Value::Integer(*tag_id)));
+                }
+                TagMode::All => {
+                    for tag_id in &filters.tag_ids {
+                        self.clauses.push(
+                            "EXISTS (SELECT 1 FROM image_tags
+                             WHERE image_tags.image_id = images.id AND image_tags.tag_id = ?)"
+                                .to_owned(),
+                        );
+                        self.params.push(Value::Integer(*tag_id));
+                    }
+                }
+            }
+        }
+
+        match filters.tag_presence {
+            PresenceFilter::Any => {}
+            PresenceFilter::Has => self.clauses.push(
+                "EXISTS (SELECT 1 FROM image_tags WHERE image_tags.image_id = images.id)"
+                    .to_owned(),
+            ),
+            PresenceFilter::Missing => self.clauses.push(
+                "NOT EXISTS (SELECT 1 FROM image_tags WHERE image_tags.image_id = images.id)"
+                    .to_owned(),
+            ),
+        }
+
+        if !filters.exclude_tag_ids.is_empty() {
+            let marks = placeholders(filters.exclude_tag_ids.len());
+            self.clauses.push(format!(
+                "NOT EXISTS (SELECT 1 FROM image_tags
+                 WHERE image_tags.image_id = images.id
+                   AND image_tags.tag_id IN ({marks}))"
+            ));
+            self.params.extend(
+                filters
+                    .exclude_tag_ids
+                    .iter()
+                    .map(|tag_id| Value::Integer(*tag_id)),
+            );
+        }
     }
 }
 
@@ -1947,6 +2033,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids(&all), vec![1]);
+    }
+
+    #[test]
+    fn filters_by_tag_presence_and_exclusions() {
+        let fixture = fixture();
+
+        let has = all_ids(
+            LibraryQuery {
+                filters: LibraryFilters {
+                    tag_presence: PresenceFilter::Has,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &fixture,
+        );
+        assert_eq!(has, vec![4, 1, 2]);
+
+        let missing = all_ids(
+            LibraryQuery {
+                filters: LibraryFilters {
+                    tag_presence: PresenceFilter::Missing,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &fixture,
+        );
+        assert_eq!(missing, vec![3]);
+
+        // 排除标签：剩下“没有速写”的图片。
+        let excluded = all_ids(
+            LibraryQuery {
+                filters: LibraryFilters {
+                    exclude_tag_ids: vec![fixture.tag_sketch],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &fixture,
+        );
+        assert_eq!(excluded, vec![4, 3]);
+
+        // 包含与排除叠加：有速写、但没有参考 → 只剩 2。
+        let combined = all_ids(
+            LibraryQuery {
+                filters: LibraryFilters {
+                    tag_ids: vec![fixture.tag_sketch],
+                    exclude_tag_ids: vec![fixture.tag_reference],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &fixture,
+        );
+        assert_eq!(combined, vec![2]);
+
+        // “没有任何标签”与“包含某些标签”互斥。
+        let conflict = query_page(
+            &fixture.session.db,
+            &fixture.root,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    tag_presence: PresenceFilter::Missing,
+                    tag_ids: vec![fixture.tag_sketch],
+                    ..Default::default()
+                },
+                ..base_query()
+            },
+        );
+        assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn lists_tags_with_offset_and_total() {
+        let fixture = fixture();
+        let total = count_tags(&fixture.session.db, None).unwrap();
+        assert_eq!(total, 2);
+
+        let first = list_tags_page(&fixture.session.db, None, 1, 0).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = list_tags_page(&fixture.session.db, None, 1, 1).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].id, second[0].id);
+        assert!(
+            list_tags_page(&fixture.session.db, None, 1, 2)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 搜索路径与全量路径口径一致，也按 offset 切片。
+        let searched = count_tags(&fixture.session.db, Some("速")).unwrap();
+        assert_eq!(searched, 1);
+        let page = list_tags_page(&fixture.session.db, Some("速"), 10, 0).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, fixture.tag_sketch);
     }
 
     #[test]

@@ -235,6 +235,18 @@ test("标签改名保留选择；删除正在筛选的标签清空选择", () =>
   assert.deepEqual([...selectionAfterChange(new Set([1]), remove, current, [])], []);
 });
 
+test("合并掉正在筛选的源标签也清空选择", () => {
+  const current = query({ filters: { tagIds: [7] } });
+  const merge = change({
+    kind: "tagCatalog",
+    tagId: 7,
+    tagAction: "merge",
+    targetTagId: 9,
+  });
+  assert.deepEqual([...selectionAfterChange(new Set([1]), merge, current, [])], []);
+  assert.equal(planDataChange(merge, current, context).tagOptions, true);
+});
+
 test("任务与 MCP 变化映射到对应的变化类型", () => {
   assert.equal(dataChangeForTaskKind("thumbnail").kind, "thumbnails");
   assert.equal(dataChangeForTaskKind("aiPose").similarity, "clear");

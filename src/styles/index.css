@@ -3239,6 +3239,56 @@ textarea:focus-visible {
   background: var(--bg-soft);
 }
 
+/* 合并目标选择要占满整行，所以只有标签行允许换行。 */
+.tag-manager-row {
+  flex-wrap: wrap;
+}
+
+/* 合并目标选择：占满整行，跟在被合并的标签下面。 */
+.tag-manager-merge {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-basis: 100%;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.tag-manager-merge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.tag-manager-merge-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tag-manager-merge-option:hover {
+  border-color: var(--border);
+  background: var(--panel-hover);
+}
+
+.tag-manager-merge-option em {
+  color: var(--text-faint);
+  font-style: normal;
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
 .collection-manager-name,
 .tag-manager-name {
   flex: 1;
