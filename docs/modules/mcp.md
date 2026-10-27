@@ -1,6 +1,6 @@
 # MCP 图库控制
 
-支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库。批次 1（只读）、批次 2（写工具、撤销/重做、询问档、任务工具）、批次 3（导入、导入回执、`logs/mcp.log` 审计）、批次 4（找相似范围与平均参考）、批次 5（临时文件夹）与批次 6（导入归因、临时区特征生成）已实现；使用反馈批次 5 补了列表分页、规则自描述、标签缺失/排除筛选与标签管理写入。
+支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库：24 个工具覆盖浏览、搜索、拼图、写入、撤销/重做、任务、导入、临时区特征与文件夹/标签管理，写入走操作记录并受三档权限约束。本文件只写当前契约；真实客户端验收步骤见[验证策略](../guides/validation.md)，未完成项见[待办](../planning/todo.md)。
 
 传输与进程：
 
@@ -269,32 +269,4 @@ Rust：
 
 ## 验证
 
-自动检查：设置 v5→v6 迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector 全量解析、搜索总数与分页与 `pageSize` 上限、拼图布局/缺图/缓存/来源标签、相似 token 失效与命中总数/分数、`find_similar` 的 scope 收窄与多参考图平均/拒绝、全库扫描排除临时图而显式范围可命中、`phash_groups` 跳过临时行、0 张标签过滤、切档保留端口与口令、`write_with_id`、描述写入的改动数与空操作、撤销/重做预览步数与影响数、压缩记录阻断、确认数量与三档判定、`library_info` 三档的 `writeAllowed`/`approval.threshold`、`tags_list` 游标遍历与非法游标、`folders_list` 分页、标签缺失/排除筛选、`tags_modify` 的权限划分与 `expectedImages` 核对、标签合并的迁移与撤销重做、工具注册数量（24）、临时图库只读工具、导入输入与路径校验、`optimize` / `workerThreads` 不进入 MCP 导入、导入预览路径截断、导入回执字段与隐藏压缩字段、精确重复/批内重复/合并目标/源文件映射与 `includePairs` 默认省略、失败计数取精确值、审计单行截断、导入缩略图预览上限 25、临时导入 target 校验（清空文件夹、拒绝 merge/preserve）、临时视图查询与元数据不写历史、`library_info` 临时计数/路径/临时特征计数、`temp_features_generate` 的临时 id 校验与 100 张上限、similarity 选择器写入按 offset/limit 切片、`willChange` 只算真实改动并在全无变化时 noop、集合存在性与成员预检、移动的 `alreadyInTarget` 与任务 skipped/failed 对齐、临时图在移动/移入回收站/加入集合前被同步拒绝、导入路径预检、临时区同内容行在图库导入时被丢弃、`find_by_hash_state` 的临时区口径、`history_list` 顶层 canRun 推导、拼图 `status` 与 `excludedCells`、文件夹 create/rename/move/delete 的领域变体与删除前置检查。
-
-真实客户端验收需要用户执行：
-
-1. 启动应用并打开图库，在设置 → MCP 开启服务，确认状态为“服务运行中”。
-2. 在设置 → MCP 点“复制客户端配置”，粘贴到支持 stdio 的客户端（命令是当前进程路径，参数 `--mcp-stdio`），调用 `library_info`，确认档位与限制。
-3. 只读档调用 `images_update`，确认得到“当前是只读模式”。
-4. 询问档 `dryRun` 一个搜索/拼图 selector，拿到 `selected` 后带 `confirmedCount` 执行评分或加标签，确认设置页“最近 AI 操作”出现 `AI ·` 记录且网格刷新。
-5. 询问档移入回收站，确认右下角出现确认卡片；批准后图片进入回收站、查看器关闭；拒绝或等待 10 分钟确认操作取消。
-6. 对一条记录 `history_list` → `history_undo` dryRun → 带 steps/affected 执行，确认任务中心进度与撤销结果；再重做。压缩记录应返回“压缩操作不可撤销”。
-7. 启动一次导入/优化后调用短写工具，确认得到明确冲突错误且没有被排队；再启动第二个长任务，确认它进入 `queued` 并可用 `tasks_cancel` 取消。
-8. 关闭 MCP 服务，确认客户端收到明确连接错误；重启应用后确认 `mcp-runtime.json` 已更新。
-9. 询问档调用 `import_start` 导入几张图片，确认右下角与设置页出现确认卡，卡片列出来源路径、目标文件夹、标签/评分与重复策略；批准后任务开始，拒绝或超时则不导入。
-10. `tasks_get(taskId)` 等到导入完成，确认附带回执的 `imported` / `duplicates` / `merged` / `previewIds` 与失败清单；用 `image_sheet(selector.ids=previewIds)` 看到刚入库的图。
-11. 对这次导入 `history_list` → `history_undo`，确认整次导入被撤销；确认 `logs/mcp.log` 有工具调用与导入来源行，且没有压缩字段或压缩行为。
-12. 从便携目录启动 exe（含 `server/`，不含安装器），重复第 2 步，确认 `--mcp-stdio` 指向当前 exe 且能正常调用 `library_info` 和 `import_start`。
-13. `find_similar` 分别传 `scope: {"type":"folder","folderId":…,"includeSubfolders":false}` 与 `targetIds`（两张图，`kind: color8`），确认结果只来自范围、参考图全部被排除，`detail.referenceCount=2`、`scope` 文案与界面一致。
-14. `import_start` 传 `target: "temp"` 导入几张图：询问档应直接开始、不出现确认卡；`tasks_get` 回执 `target=temp`、`operationId=null`；`search_images` 用 `view: "temp"` 能看到图片，普通 `view: "all"` 看不到。
-15. 对 `view: "temp"` 的图片调用 `images_update` 改评分，`history_list` 不应新增记录；调用 `images_trash` 或被移出临时视图范围应得到明确拒绝。
-16. 把 3 张已在库内的图（其中 1 张在回收站）重新导入一次，`tasks_get(includePairs=true)` 返回 3 条 `duplicatePairs`，`imageId` 指向首次入库的图，回收站那张 `trashed=true`；不传 `includePairs` 时回执里没有这几组数组。
-17. 对同样 3 张改用 `duplicatePolicy=merge` 重跑，`mergedImageIds` 与上一步的 3 个 id 一致，`images_get` 能看到标签并集与较高评分。
-18. 同一目录放 2 份完全相同的图导入，`batchDuplicatePairs` 给出一对 `keptPath` / `sourcePath`，`duplicates=1`；`target=temp` 导入同样返回重复对且不写操作记录。
-19. 临时区导入 5 张图后调用 `temp_features_generate(kind=embedding)`：询问档出现确认卡，批准后任务用 write lane 运行；完成后 `library_info.features.embeddings` 不变、`tempEmbeddings=5`。
-20. 以临时图为参考、`scope=temp` 搜语义能命中临时区内的图；改成 `scope=library` 后结果里不出现任何临时图。清空临时区后再搜语义不报错。
-21. `ids` 里混入一张普通库图片，`temp_features_generate` 整批拒绝并列出 `invalidIds`；生成中途取消后已完成张数保留、任务为 `cancelled`。
-22. `tags_list` 不带 `limit`：返回 100 条 + `total` + `nextCursor`；把 `nextCursor` 传给 `cursor` 再调一次，拿到剩余标签且没有重复 id；`nextCursor` 为 `null` 表示翻完。
-23. `search_images` 传 `filters.tagPresence: "missing"` 只能拿到没有标签的图片；再加 `excludeTagIds`，结果里不再出现带该标签的图片。
-24. 切到完全档调 `library_info`：`approval.threshold` 为 `null`、`appliesToCurrentMode` 为 false；问 AI「完全档批量写入需不需要确认」，应答不需要。
-25. `tags_modify` 合并两个近义标签：先 `dryRun` 看 `moved` / `duplicate`，正式执行后源标签消失、目标标签图片数为两者之和；`history_list(kind: "tagMerge")` 有 `AI ·` 记录，撤销后两个标签与关系都回来。
+自动检查：`cargo test --lib mcp`，覆盖范围见[验证策略](../guides/validation.md)。真实客户端、确认卡片、`--mcp-stdio` 小桥与便携目录的验收步骤同文件“MCP 真实客户端”；代理不启动应用。

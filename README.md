@@ -1,133 +1,74 @@
 # Lilith Artbank
 
-面向数十万张图片、数百 GB 素材的本地美术图库。Tauri 2 + Rust 负责元数据、文件与图像管线，React 只做视图与交互。
+Lilith Artbank 是用于管理大量图片参考图的个人工具。它为**上百万张图片、数百 GB 文件**这一数量级设计，导入、浏览、检索、编辑与语义搜索全部在本机完成，不依赖任何在线服务。
 
-本项目是内部工具，不做公开版本发布，因此没有版本节奏、CHANGELOG 与法律许可文件。所有实现以开发效率和运行性能为先。
+> 本软件仅为个人工具，不为部署、数据迁移和安全、软件服务支持提供任何便利和承诺
 
-## 当前状态
+![Lilith Artbank 主界面：左侧多级文件夹树，中间图片网格与筛选面板，右侧图片详情](.github/assets/demo.webp)
 
-**S0 已完成**：项目骨架、设置持久化、图库创建/打开/关闭、SQLite schema v1、应用外壳与图库入口。
+## 主要功能
 
-**S1 已完成（自动验收通过）**：512px WebP 缩略图编码（libwebp 静态链接）、追加式缩略图包、`thumb://` 自定义协议、应用内 150 张加载基准；导入管线（文件/目录/拖放、BLAKE3、EXIF 方向、pHash、主色、重复策略、进度/取消/失败清单）与导入界面。
+### 检索与理解
 
-**S2 已实现（自动验收通过）**：键集分页查询引擎（视图、文件夹/扩展名/评分/标签筛选、时间/评分/大小排序）、筛选分面计数、文件夹与标签列表、全部匹配 id、系统剪贴板文本；前端自适应虚拟网格与固定行高列表、缩略图占位与重试、选择/Ctrl+A/键盘导航/右键菜单、基础筛选面板。
+按内容而不是文件名找图是这套工具的重点。文本、语义、相似度与姿势四种方式都指向同一批图片，任何一次筛选或找相似的结果都可以就地收窄再继续，也可以直接存成集合。
 
-**S3 已实现（自动验收通过）**：描述/标签名/文件夹路径搜索（当前视图或全库）、导入时间与文件大小范围、描述/embedding/pose 存在性筛选、集合内手工顺序；详情与批量编辑（评分/描述/标签/文件夹移动）、标签重命名与删除、集合 CRUD/排序/并集交集差集、回收站软删除/恢复/永久删除/清空。普通视图的分面计数在预算内，搜索与超大集合的计数超 100 ms 时筛选面板显示加载态。
+- **排序与视图**：自适应列数的网格与固定行高列表；按导入时间、修改时间、评分、文件大小、像素尺寸、所在文件夹或集合内顺序排序，多级叠加后可存成排序方案。
+- **文本搜索**：在描述、标签名与文件夹路径里查找，可以只看当前视图，也可以搜全库。
+- **筛选**：按扩展名、评分、标签（任一/全部/无标签）、导入时间与大小范围、有无描述/向量/姿势筛选；打开面板时同时给出每个维度的命中数量。
+- **找相似**：任意图片可设为参考，按画面哈希、主色、语义向量或人物姿势检索，支持多张平均成一个参考，并在此基础上继续收窄范围。
+- **语义搜索**：直接用一句描述找图，不必先给图片写描述；与找相似共用同一套结果视图。
+- **全库相似分组**：按画面或语义把整个图库聚成若干组，用来发现重复构图与同一作者的习惯，结果可整批存成集合。
+- **向量与姿势生成**：为选中、当前视图或全库批量生成，有进度、取消与失败清单。
+- **集合**：手工集合支持排序、加入移出与并集/交集/差集，也能把当前筛选或相似分组直接存成集合。
 
-**S4 已实现（自动验收通过）**：全屏查看器（缩放/平移/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、`img://` 原图与预览协议、复制图片到剪贴板、可编辑详情侧栏。
+### 整理与编辑
 
-**S6 已实现（自动验收通过）**：本机 `/v1` AI 客户端与服务进程托管、feature pack（embedding fp16 / pose f32）、打开图库计算全库均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务（进度/取消/失败清单）、查看器姿势生成与叠加、详情侧栏 AI 描述入口。本轮服务端没有描述模型，描述功能置灰，见 [AI 服务](docs/modules/ai-service.md)。
+- **图库与文件夹**：一个图库就是一个普通文件夹，里面的文件夹就是真实磁盘目录，可多级嵌套并保留空目录。左侧树支持多选、拖放移动、右键新建/重命名/删除，以及按名称或图片数排序整层。
+- **导入**：文件选择、目录递归与窗口拖放三种输入，可平铺或保留源目录结构，落进指定文件夹并带上初始标签与评分。
+  - 原图按内容命名，同一张图不会存两份：完全重复默认跳过或只合并元数据，同一批内的重复只留一份。
+  - 可以先导进临时区看图、挑图，再决定是否入库；临时区在关闭、换库或退出时清空。
+  - 也可以导入时就按质量档位重新压缩，此时不保留原图。
+- **查看器**：全屏查看，支持适应窗口、1:1、滚轮缩放、拖拽平移、上下张与胶片带；大图与 TIFF/TGA 也能直接看。
+- **几何编辑**：翻转、旋转、裁剪、调尺寸可任意组合，按「翻转 → 旋转 → 裁剪 → 缩放」的固定顺序执行，裁剪框跟着旋转与翻转走。
+  - 保存不覆盖原文件，而是写入新文件并在一个事务里切换，旧图暂存以便撤销；标签、评分、描述与集合关系全部保留。
+  - 输出前给出预计体积与“重新编码会损失画质”的提示，编辑过程有会话内撤销栈。
+- **详情与批量编辑**：评分、标签、描述与所属文件夹；描述区分手工、导入与 AI 三种来源，批量编辑会区分“全部都有”和“部分图片有”的标签。
+- **操作记录与撤销**：只有会改变图库内容的写操作才记录，批量操作只记一条。撤销是线性回退，撤销后可重做，新写入会开启新时间线；永久删除与清空回收站只做标记，等记录过期或清空后才真正删文件。
+- **空间优化**：先只读估算能省多少空间、要跑多久，再决定是否执行；估算按源图类型抽样并给出误差区间，执行前复核候选与原图是否还在。压缩不可撤销。
 
-S5 图像处理（色彩/LUT/DFT/卷积）已按用户决定取消。真实 WebView2 的 150 张门槛已由用户确认；真实窗口中的导入、浏览、编辑、集合、回收站、查看器、AI 服务与语义搜索待手工验收。尚未实现：S7 的颜色/pHash/向量/pose 相似度与高级集合。路线见 [docs/planning/roadmap.md](docs/planning/roadmap.md)。
+### 可选能力
 
-## 功能边界
+- **神经网络模型服务**：语义、向量与姿势能力由本机的模型服务提供，应用负责启动、探活与退出；不装模型时其余功能照常可用，相关按钮置灰。
+- **MCP 图库控制**：把图库开放给支持 MCP 的 LLM 客户端，共 24 个工具，覆盖浏览、搜索、拼图、导入、写入、撤销/重做与任务查询。
+  - 两种接法：应用内的本机 HTTP 服务（仅本机可达，带口令），或同一个 exe 的 `--mcp-stdio` 小桥。
+  - 三档权限：只读、询问、完全。询问档会拦下导入、回收站、撤销/重做、文件夹移动删除、标签删除合并与超过 100 张的批量写入。
 
-保留原 Lilith 图库本体的能力：导入与去重、标签/评分/描述、文件夹、筛选排序、集合、回收站、查看器、裁剪/旋转/调尺寸、批量维护。图像处理（色彩/LUT/滤波/卷积）已按用户决定取消，不再实现。
+## 运行环境
 
-明确不做：
+- **操作系统**：Windows 10/11，WebView2 使用系统自带运行时。
+- **模型能力可选**：需要语义、向量或姿势时才要 `python_embeded/` 与 `resources/models/`。
+- **便携使用**：`npm run pack:portable` 产出 exe 与 `server/` 的文件夹，把 Python 环境与模型放进去即可直接运行，不生成安装器。
 
-- PinBoard 画板、ImagePaste 贴图、PasteBoard 截屏附件；
-- OKLCH 调色盘、色彩测试等绘画小工具；
-- 旧图库格式的读取与数据迁移（后续单独做一次性脚本，不在应用内）；
-- 公开版本号、CHANGELOG、LICENSE 等发布材料。
+## 开发与构建
 
-AI 能力（description / embedding / pose）统一走本地 HTTP 服务，应用负责托管 Python 进程；服务端在 `server/`，Python 环境与模型文件不随包，由用户放进程序目录。描述本轮未实现。
-
-## 程序目录与便携包
-
-release 下设置、日志与 AI 服务日志都写在 exe 旁，不读取旧 AppData 设置。完整目录：
-
-```text
-Lilith Artbank\
-  lilith-artbank.exe
-  server\                   随包分发
-  python_embeded\           用户提供，不打包
-  resources\models\         用户提供，不打包
-  settings.json             首次运行生成
-  logs\
-```
-
-`npm run pack:portable` 生成 exe + `server/` 的便携文件夹，不生成 NSIS 安装器；把 `python_embeded/` 与 `resources/models/` 放进去即可运行。
-
-## 技术栈
-
-| 层 | 选择 |
-| --- | --- |
-| 桌面壳 | Tauri 2（Windows，WebView2 系统运行时，不随包附带 DLL） |
-| 前端 | React 19 + TypeScript + Vite 6，手写 CSS，无 UI 框架 |
-| 元数据 | SQLite（`rusqlite` bundled，静态编译），WAL + FTS5 |
-| 图像 | `image` crate + 静态 libwebp；缩略图为追加式 `.pack`，浏览器负责解码 |
-| 并发 | 单写连接 + 多读连接；`rayon` 处理导入与图像计算 |
-| AI | 本地 HTTP `/v1` 接口；应用托管进程，接口见 [docs/modules/ai-service.md](docs/modules/ai-service.md) |
-
-## 数据布局
-
-```text
-<library>/
-  .artbank/
-    library.json         图库清单
-    library.db           SQLite 元数据（WAL）
-    thumbs/0001.pack     追加式缩略图包
-    features/            embedding（fp16）/ pose（f32）追加式包
-    temp/                原子写入与导入临时目录；启动时清理
-  <folder>/<content-hash>.<ext>
-  recycle/
-  output/
-```
-
-原图按 BLAKE3 内容哈希命名，内容不变就不动文件；编辑产生新哈希文件，数据库用稳定的图片 id 引用标签与集合。
-
-## 性能基线（本机实测）
-
-原始 C++ 版本的目标是“一页 150 张缩略图 1 秒内加载并渲染”。本机（Windows 11，开发档，Chromium 150）初步实测：
-
-| 项目 | 结果 |
-| --- | --- |
-| SQLite 20 万行首屏 150 条（按评分） | p50 0.12 ms |
-| 深分页 150 条（键集游标） | p50 0.53 ms |
-| 按文件夹取 150 条 | p50 0.07 ms |
-| 按标签取 150 条 | p50 1.95 ms |
-| 查询引擎首屏 150 条（含 JOIN 与标签摘要） | p50 0.62 ms |
-| 查询引擎筛选分面计数（文件夹/扩展名/评分/标签） | p50 27.36 ms |
-| 筛选分面计数（FTS 搜索，20 万行） | p50 132.56 ms |
-| 筛选分面计数（20 万条集合） | p50 778.83 ms |
-| 全选 20 万条 id | 17.61 ms |
-| FTS 三字中文查询 | p50 0.48 ms |
-| 200k 元数据 + 600k 标签关系写入 | 7.01 s |
-| 150×20KB 随机读：缩略图包 vs 逐文件 | 0.60 ms vs 9.69 ms |
-| 150 张 512px WebP 生成 + 写入 pack | 3.97 s，9.00 MB（开发档） |
-| 同一 pack 内 150 张（约 9 MB）定位读 | p50 2.27 ms / p95 2.80 ms |
-| 150 张 512px JPEG：冷加载 / 热缓存 | 456 ms / 236 ms |
-| 150 张 512px WebP：冷加载 | 437 ms，体积约为 JPEG 一半 |
-| 1000 张 768×512 混合格式导入（开发档，4 线程） | 约 20 s，50.0 张/秒 |
-
-结论：SQLite 不是瓶颈；缩略图包明显优于逐文件；浏览器解码满足 1/3 效率门槛；导入吞吐高于 20 张/秒下限；S2/S3 的翻页查询（含搜索与集合）仍在毫秒级，分面计数在搜索与超大集合下超过 100 ms 预算，筛选面板以加载态呈现。完整方法与结论见 [docs/guides/performance.md](docs/guides/performance.md)。
-
-## 开发
+需要 Windows + Node.js 24 + 稳定版 Rust 工具链 + Microsoft C++ 生成工具 + WebView2。
 
 ```bash
 npm install
-npm run tauri dev       # 真实 Tauri 窗口
-npm run dev             # 浏览器预览（mock 数据，不写磁盘）
+npm run tauri dev        # 真实窗口
+npm run dev              # 浏览器预览（mock 数据，不写磁盘）
 npm run typecheck
 npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
+npm run test:web
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-性能基准默认忽略，按需运行：
-
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_bench_build
-```
-
-真实 WebView2 的缩略图基准在开发构建中打开任意图库，点击工作区右上角“缩略图基准”。
-
-`G:\Lilith Image Library` 下的真实仓库只允许只读查看；任何测试、基准与开发流程都不得修改它。
+技术栈是 Tauri 2 + React 19 + TypeScript，元数据存 SQLite，图像管线在 Rust 侧完成。开发约定与目录边界见 [AGENTS.md](AGENTS.md)，性能基准与门槛见[性能基准](docs/guides/performance.md)。
 
 ## 文档
 
-从 [docs/README.md](docs/README.md) 进入；代码任务先读 [docs/architecture/ai-reading-guide.md](docs/architecture/ai-reading-guide.md)。
+文档按读者分层，完整索引见 [docs/README.md](docs/README.md)。
+
+- 想了解怎么用：本文件的功能介绍 + [当前阶段状态](docs/planning/current-handoff.md)（现在有哪些能力、规模基线）。
+- 要改代码：先看 [AI 阅读引导](docs/architecture/ai-reading-guide.md) 选路由，再进[系统架构](docs/architecture/overview.md)或对应[模块文档](docs/README.md)。
+- 要知道还差什么：[待办与待决策](docs/planning/todo.md) 是唯一的未完成清单，[路线图](docs/planning/roadmap.md) 写剩余阶段。

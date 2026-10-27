@@ -1,36 +1,49 @@
 # Lilith Artbank 文档
 
-本项目是内部工具，文档只分两层层级：`architecture/` 与 `modules/` 记录当前有效的实现约束；`planning/` 记录当前阶段、未完成事项与路线。没有面向公众的发布、法务或版本材料。
+文档只写两类内容：**当前有效的契约**（架构、模块、规范）与**还没做完的事**（待办、路线）。历史批次、被替代的计划与实现记录都在 `planning/archive/`，不作为执行依据。
 
-## 入口
+## 按目标进入
 
-- [系统架构](architecture/overview.md)：分层、数据布局、并发、性能原则、AI 服务边界。
-- [AI 阅读引导](architecture/ai-reading-guide.md)：代码任务的第一步，按问题选路由。
-- [当前阶段状态](planning/current-handoff.md)：现在做到哪里、验证过什么。
-- [待办与待决策](planning/todo.md)：唯一未完成清单。
-- [分阶段路线图](planning/roadmap.md)：阶段目标、代码预算与验收门槛。
-- [规划归档](planning/archive/README.md)：全部已完成批次的计划与实现记录（S0–S7 各批、单库重构、体验整改 P0–P4、MCP、压缩与撤销、使用反馈整改批次 1–7）。
+| 你的问题 | 去哪 |
+| --- | --- |
+| 这个软件能做什么 | [README](../README.md) |
+| 现在有哪些能力、规模与版本基线 | [当前阶段状态](planning/current-handoff.md) |
+| 还差什么、哪些要验收、哪些待决策 | [待办与待决策](planning/todo.md) |
+| 后面怎么排 | [路线图](planning/roadmap.md)（剩余 S8/S9 与门槛） |
+| 我要改代码，从哪读起 | [AI 阅读引导](architecture/ai-reading-guide.md) |
+| 整体分层、生命周期、并发、取舍 | [系统架构](architecture/overview.md) |
+| 某个领域的契约 | 下面的模块文档 |
+| 怎么检查、怎么验收、性能门槛 | [验证策略](guides/validation.md)、[性能基准](guides/performance.md) |
+| 以前怎么做的 | [规划归档](planning/archive/README.md) |
 
 ## 领域模块
 
-- [图库与元数据](modules/library.md)：设置、图库生命周期、SQLite schema、命令契约。
-- [导入与缩略图](modules/import.md)：解码、BLAKE3、pHash、主色、缩略图包。
-- [浏览与检索](modules/browse-and-query.md)：网格/列表、键集分页、筛选排序、集合、回收站。
-- [查看器与图像处理](modules/viewer-and-editor.md)：查看、裁剪/旋转/调尺寸、色彩/LUT/DFT/卷积。
-- [AI 服务](modules/ai-service.md)：进程托管与 `/v1` HTTP 接口。
-- [维护与批量工作流](modules/maintenance.md)：清理、缩略图重建、描述导入导出。
+- [图库与元数据](modules/library.md)：单库生命周期、设置、schema 与迁移、文件夹、临时文件夹、操作记录与撤销、命令契约。
+- [导入与缩略图](modules/import.md)：输入与校验、BLAKE3、pHash、主色、重复策略、导入即压缩、缩略图包与 `thumb://`。
+- [浏览与检索](modules/browse-and-query.md)：查询 DTO、搜索、筛选与分面计数、排序与游标、视图与选择、详情与批量编辑、找相似、失效规则。
+- [查看器与几何编辑](modules/viewer-and-editor.md)：查看与导航、几何组合、保存语义、体积预估、`img://`。
+- [AI 服务](modules/ai-service.md)：进程托管、`/v1` 接口、feature pack、批量任务、本地检索与相似度算法。
+- [维护与批量工作流](modules/maintenance.md)：缩略图重建、待释放与清理、图片空间优化（估算与执行）、后续维护项。
+- [MCP 图库控制](modules/mcp.md)：传输与进程、24 个工具、selector、数量核对、三档权限与确认队列、审计。
 
 ## 规范
 
-- [验证策略](guides/validation.md)：允许的检查、界面验收边界、真实仓库只读。
-- [性能基准](guides/performance.md)：原始基线、实测结果、运行方法、门槛。
+- [验证策略](guides/validation.md)：允许与禁止的检查、按改动选检查、真实窗口验收步骤、AI 服务端一次性检查。
+- [性能基准](guides/performance.md)：方法、实测记录、结论、预算与仍需复测项。
 
 ## 目录分工
 
-- `architecture/`：跨模块的长期约束。
+- `architecture/`：跨模块的长期约束与取舍。
 - `modules/`：领域契约、数据模型、行为与边界。
-- `guides/`：验证、性能与工程规范。
-- `planning/current-handoff.md`：当前批次状态与基线，只写“现在”。
-- `planning/todo.md`：未完成、未验证或待决策事项。
-- `planning/roadmap.md`：阶段划分与验收标准。
-- `planning/archive/`：已归档的分析、批次记录与被替代的计划；不再作为执行依据。
+- `guides/`：验证与性能。
+- `planning/current-handoff.md`：只写“现在”，不写流水。
+- `planning/todo.md`：唯一未完成清单。
+- `planning/roadmap.md`：只写还没做的阶段。
+- `planning/archive/`：已完成批次与被替代的计划，索引见[归档说明](planning/archive/README.md)。
+
+## 维护规则
+
+- 契约变化时同步改 `architecture/` 或 `modules/` 的对应段落，并在 `todo.md` 记下未完成或未验收的部分。
+- 新功能落地后写“已实现”只写到 `current-handoff.md` 的能力现状与模块契约里，不写逐批流水；批次记录、与计划的差异、实测证据放 `planning/archive/`。
+- 一个数字只在一处维护：性能数字在 `guides/performance.md`，预算在 `roadmap.md`，版本与规模基线在 `current-handoff.md`。
+- 不写版本小节、CHANGELOG、法律文本；不写“计划实现”当成“已验收”。

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import brandMark from "../assets/brand-mark.png";
 import { useAppRuntime } from "./runtimeContext";
 import { LibraryDialog } from "./LibraryDialog";
 import { LibraryWorkspace } from "./LibraryWorkspace";
@@ -45,7 +46,7 @@ export function AppShell() {
       <div className="app-frame">
         <WindowTitleBar />
         <div className="splash">
-          <div className="splash-mark">A</div>
+          <img className="splash-mark" src={brandMark} alt="" draggable={false} />
           <Spinner size={22} />
           <p>正在读取设置与图库状态…</p>
         </div>

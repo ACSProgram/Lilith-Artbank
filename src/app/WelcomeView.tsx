@@ -1,4 +1,5 @@
 import { FolderPlus, Gauge, Images, ShieldCheck } from "lucide-react";
+import brandMark from "../assets/brand-mark.png";
 import { Button } from "../shared/components/Button";
 import { browserPreview } from "./api";
 
@@ -6,7 +7,7 @@ export function WelcomeView({ onAddLibrary }: { onAddLibrary: () => void }) {
   return (
     <div className="welcome">
       <div className="welcome-hero">
-        <div className="welcome-mark">A</div>
+        <img className="welcome-mark" src={brandMark} alt="" draggable={false} />
         <span className="welcome-eyebrow">LOCAL ART ASSET LIBRARY</span>
         <h1>
           把几十万张素材

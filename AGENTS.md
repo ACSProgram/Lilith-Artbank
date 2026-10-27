@@ -28,7 +28,7 @@
 - 缩略图写追加式 `.pack`，数据库只记录 segment/offset/length；不要改成 20 万个独立小文件。
 - 浏览器只解码当前页缩略图；Rust 不做 DDS/BC 缩略图管线。
 - AI 能力统一走本机 HTTP 服务；应用负责进程生命周期。接口以 `docs/modules/ai-service.md` 为准。
-- MCP 服务在应用进程内运行，直接调用 `AppState`，只绑定 `127.0.0.1` 并要求 Bearer 口令；不另起 headless 图库写进程。MCP 写入必须走操作记录、进程内串行并受三档权限约束；询问档只拦回收站、撤销/重做与超过 100 张的批量写入，不开放永久删除、清空回收站与压缩。
+- MCP 服务在应用进程内运行，直接调用 `AppState`，只绑定 `127.0.0.1` 并要求 Bearer 口令；不另起 headless 图库写进程。MCP 写入必须走操作记录、进程内串行并受三档权限约束；询问档拦导入、回收站、撤销/重做、文件夹移动与删除、标签删除与合并，以及超过 100 张的批量写入（阈值固定，不是设置项），不开放永久删除、清空回收站、空间优化与像素编辑。
 - 设置、日志与相对资源路径都以程序根目录为准（`src-tauri/src/app/paths.rs`）；不读旧 AppData 设置，也不做迁移。
 - Python 环境与模型文件不打包、不下载；只产出便携文件夹（`npm run pack:portable`），不生成 NSIS 安装器。
 - 姿势相似度按旧程序 `MediaPipePoseData::similarity` 1:1 移植：权重、landmark 索引与“镜像取较大值”都不许自行改动，`ai/pose_similarity.rs` 的 golden 值测试必须保持通过。
@@ -62,9 +62,11 @@
 
 ## 文档
 
+- 外层 `README.md` 只介绍项目（定位、主要功能、运行环境、开发、文档入口）；状态、基线、性能数字与历史都不写在这里。
 - 当前有效事实写 `docs/architecture/`、`docs/modules/`、`docs/guides/`。
-- `docs/planning/current-handoff.md` 只写当前批次状态与基线；`docs/planning/todo.md` 只写未完成、未验证与待决策。
+- `docs/planning/current-handoff.md` 只写当前能力、基线与约束；`docs/planning/todo.md` 只写未完成、未验证与待决策；`docs/planning/roadmap.md` 只写还没做的阶段。
 - 已完成批次与已被替代的计划搬入 `docs/planning/archive/`，同步更新 `docs/planning/archive/README.md`，并从表层删除。
+- 一个数字只维护一处：性能数字在 `docs/guides/performance.md`，预算是 `roadmap.md`，版本与规模基线是 `current-handoff.md`。
 - 代码入口或契约变化时同步更新模块文档。不要把“计划实现”写成“已经验收”。
 - 不写版本小节、不写 CHANGELOG、不写法律文本。
 
@@ -79,7 +81,7 @@
 ## 验证
 
 - 默认跑与改动匹配的检查：`npm run typecheck`、`npm run build`、`cargo fmt --check`、`cargo check`、`cargo test`、`git diff --check`。
-- 前端改动必须跑 `npx tsc --noEmit`；Rust 改动必须跑 `cargo test`。
+- 前端改动必须跑 `npx tsc --noEmit`；前端纯函数改动（几何换算、标签筛选、文件夹树、失效计划）跑 `npm run test:web`；Rust 改动必须跑 `cargo test`。
 - **不编译 release**：不跑 `cargo build --release`、`tauri build`，也不为了“确认能打包”而全量编译。需要 release 产物时由用户自己执行。
 - **不做 UI 调试**：不启动 `npm run dev` / `npm run tauri dev`，不打开浏览器预览或无头浏览器，不截图、不抓 DOM、不注入输入、不模拟鼠标键盘、不驱动真实窗口。
 - 界面、布局、交互、观感一律由用户手工验收；代理只负责代码与自动检查，并把“怎么验”写清楚交给用户。

@@ -24,7 +24,7 @@ src/styles/                  tokens.css（浅/深语义颜色变量）与 index.
 src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 与 img:// 协议
 src-tauri/src/library/       schema、SQLite 连接池、图库生命周期、文件夹服务、缩略图 pack、导入仓储、键集查询、查看器源与编辑保存、操作记录与撤销、pHash/主色相似索引与分组
 src-tauri/src/import/        BLAKE3、解码/EXIF、扫描、pHash/主色调度、导入后台任务
-src-tauri/src/imageops/      缩略图编码、pHash、主色（含 OKLab 预转换）、几何编辑；色彩/LUT/DFT/卷积已取消（见 S5 取消记录）
+src-tauri/src/imageops/      只做像素：缩略图编码、pHash、主色（含 OKLab 预转换）、几何编辑、压缩编码、拼图
 src-tauri/src/platform/      剪贴板等平台差异（文本与图片写入）
 src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管、feature pack、embedding 检索、姿势相似度
 ```
@@ -41,6 +41,24 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 - 文件夹的创建/重命名/移动/删除与物理目录同步，和导入、图像保存、回收站操作共用 `maintenance` 守卫。
 - 应用内没有“移除图库”条目；更换图库即打开另一个目录并替换当前会话。原图文件只在永久删除/清空回收站的记录过期、或用户清空操作记录之后才真正删除。
 - AI 服务默认随应用启动（可配置），启动失败不阻塞图库本体；退出时先请求服务优雅关闭。
+
+## 程序目录与运行环境
+
+- 运行环境：Windows + WebView2（系统自带运行时，不随包附带 DLL）。Node 24 与稳定版 Rust 工具链只在开发时需要。
+- 设置、日志与相对资源路径都以程序根目录为准（release 为 exe 所在目录，debug 为仓库根目录，可用 `LILITH_ARTBANK_ROOT` 覆盖）；不读旧 AppData 设置，程序目录不可写时启动失败并提示。
+
+```text
+Lilith Artbank\
+  lilith-artbank.exe
+  server\                   随包分发（/v1 服务端）
+  python_embeded\           用户提供，不打包
+  resources\models\         用户提供，不打包
+  settings.json             首次运行生成
+  logs\                     lilith-artbank.log / ai-server.log / mcp.log
+  mcp-runtime.json          MCP 端口与口令，本地凭据（已 gitignore）
+```
+
+`npm run pack:portable` 只产出 exe + `server/` 的便携文件夹，不生成 NSIS 安装器；把 `python_embeded/` 与 `resources/models/` 放进去即可运行。
 
 ## 存储布局
 
@@ -120,44 +138,4 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 | 文件夹 | 真实磁盘目录 + `folders` 路径行（NOCASE 唯一） | 用户可在资源管理器直接查看/整理；空文件夹可保留；路径本身就是身份，移动时更新子树 |
 | 文件夹筛选 | 选中即包含全部后代 | 与资源管理器树的直觉一致；用路径边界避免 `人物` 误匹配 `人物速写` |
 | 主题 | 单套语义变量 + `html[data-theme]`，浅/深共用组件样式 | 避免两套样式表漂移；查看器不再单独维护深色配色，深色下画布比面板再暗一档 |
-| 设置字段 | 先入库、后接消费者 | `thumbFit` / `thumbCacheCount` / `viewerFilmstrip` 已分别在 P1、P3 接上消费者；`sort` / `sortProfiles` 与 P4 一起落地，避免中途再改一次设置版本；只有一种实现的字段（如已删掉的 `detailPanelMode`）不入库 |
-
-## 当前实现状态
-
-S0 已实现：设置、图库清单、SQLite schema（当时为 v1，现为 v5）、连接池、图库创建/打开/关闭、窗口命令、应用外壳与图库入口。
-
-S1 前半已实现：WebP 缩略图编码、追加式缩略图包、`thumb://` 协议、应用内 150 张加载基准（用户已确认满足门槛）。
-
-S1 后半已实现：文件/目录/拖放导入、流式 BLAKE3、原子发布、EXIF 方向、pHash、4/8 主色、精确重复与合并、感知重复提示、rayon 工作池、单写批量入库、进度/取消/失败清单、导入界面。1000 张合成图实测 47.7–50.0 张/秒；真实窗口导入界面待用户手工验收。
-
-S2 已实现：键集查询引擎、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本、虚拟网格/列表、缩略图占位与重试、选择/键盘/右键菜单、基础筛选面板、导入后刷新。20 万行查询预算全部达标；真实窗口滚动与复制路径待手工验收。拖出到资源管理器与复制图片未在 S2 实现。
-
-S3 已实现：描述/标签/文件夹搜索（当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签重命名/删除、文件夹移动（失败回滚）、集合 CRUD/排序/运算、回收站软删除/恢复/永久删除/清空。普通视图分面计数在预算内；搜索与超大集合计数超 100ms 时筛选面板显示加载态。
-
-S4 已实现：查看器（缩放/平移/全屏/上下张/键盘）、大图与 EXIF 方向图的 Rust WebP 预览、旋转/翻转/裁剪/调尺寸、JPEG/PNG/WebP 输出、新内容发布式保存、复制图片与新命令、可编辑详情侧栏。`img://` 协议按内容哈希提供原图与预览；姿势叠加 UI 在 S6 接入真实 landmark 后可用。OLE 拖出暂缓。真实 Tauri 窗口的 S1–S4 交互待用户手工验收。
-
-S6 已实现：AI 服务进程托管（启动/探活/启动失败退避重试/退出）、`/v1` 客户端与重试、feature pack（embedding fp16 / pose f32）、打开图库计算均值、mmap 中心化余弦语义搜索、embedding/pose/description 批量任务与取消/失败清单、查看器姿势生成与叠加、详情侧栏 AI 描述。真实 AI 服务与 WebView2 界面待手工验收。
-
-2026-10-24 单库与多级文件夹已实现：设置 v2（单一 `libraryPath`）与 v1 迁移、schema v2（`folders.path` NOCASE 唯一索引）、单库生命周期与命令清理、文件夹创建/重命名/移动/删除空文件夹、子树筛选与树计数、导入“平铺/保留源目录”、前端单库外壳与文件夹树/面包屑/选择器/拖放。自动测试覆盖迁移、路径校验、文件夹 CRUD、子树查询与导入层级；真实窗口交互待手工验收。
-
-S7 已实现：目标图找相似（pHash / 4 色 / 8 色 / embedding / pose）、全库 pHash 相似组与 embedding 复核组、结果按 token 分页与全选、右键“找相似”与“相似分组”对话框、从当前结果创建集合。姿势相似度按原程序 1:1 移植并有 golden 值测试；20 万级数字待实测。2026-10-26 起入口改为右键“设为相似参考”（多选为平均参考）+ 工具栏“相似”面板，并支持范围收窄，见 [浏览与查询](../modules/browse-and-query.md)。
-
-2026-10-24 体验整改 P0（基础层）已实现：`tokens.css` 语义变量与 `html[data-theme]` 主题切换（`settings.ui.theme` 支持 `light`/`dark`/`system` 并真正生效）、查看器与主界面统一配色、设置 v3（删掉 `thumbnailCacheMb`，新增缩略图填充/缓存张数/排序/排序方案/胶片带字段）、schema v3（`folders.sort_index`）、`ConfirmDialog` 的 `detail`/`checkbox`、`Modal` 焦点陷阱与滚动锁、`Popover`/`MenuSection`、移入回收站统一确认。
-
-2026-10-24 体验整改 P1（浏览主界面）已实现：侧栏与标题栏去重（关库/换库只留设置入口）、主区头部整块删除、工具栏改两行并把 AI 任务/相似分组收进“任务”菜单、缩略图纯图方格 + `ui.thumbFit` 裁剪/适应切换、网格列数变化按活动项锚定滚动、右键菜单分组与键盘导航、新建集合独立对话框、筛选分面隐藏零值、调试文案清理、缩略图 LRU 缓存、设置改左侧分类导航且固定高度。缩略图基准已在 P2 删除。
-
-2026-10-24 体验整改 P2（任务总线）已实现：`app/tasks.rs` 统一任务总线（write / ai / scan 三条 lane、冲突返回与排队/取消现有）、导入与三种 AI 任务迁移、相似分组改异步扫描任务（pHash 与语义两个独立指标，各自开关与阈值，同时开启为 AND）、缩略图重建、批量文件操作（移动/永久删除/清空回收站）进度与取消、`get_image_capabilities` / `get_feature_summary` 能力置灰；前端新增任务中心胶囊/面板、批量任务对话框，相似分组从批量任务中拆出为独立入口。P2 已通过用户手工验收；提交前删掉了 AI 任务自带的 `AiJob` 状态与 `ai-job-*` 兼容事件（进度只走 `task-progress` / `task-finished`），设置对话框改为 700×560 固定尺寸。
-
-2026-10-24 体验整改 P3（查看器与编辑）已实现：几何操作可组合（旋转/翻转带走裁剪矩形、尺寸按新基底等比换算）、编辑撤销栈（50 步、可读标签、`Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y`）、保存体积预估（`estimate_edit_size`，500ms 防抖）、查看器胶片带（虚拟横向）、全屏状态提升与标题栏隐藏（F11、系统快捷键同步、Esc 先退全屏）、姿势骨架按屏幕像素恒定粗细且可调不透明度、详情标签点击按范围筛选、保存后就地更新列表行而不重置查询。自动检查全绿，真实窗口观感待用户验收。
-
-2026-10-25 体验整改 P4（文件夹与排序）已实现：内部拖放改为 `shared/useDragSort.ts` 指针事件（图片拖入文件夹、文件夹换父级/同级排序、悬停展开、Esc 取消、边缘自动滚动），`reorder_folders` 与 `folders.sort_index` 持久化文件夹手动顺序；查询排序扩到 7 个指标、支持最多 7 级，单级走键集、多级/文件夹走 id 列表游标（token + offset，最多缓存 2 份），新增 `anchor_id` 与 `nextPageToken`；排序全局一套并写入设置，集合内顺序离开集合时暂存；新增排序弹层与最多 50 个排序方案、列表列头排序与文件夹树排序菜单；schema v4 补修改时间与像素表达式索引。用户已手工验收；20 万行基准实测单级首页 0.66-0.76 ms、6 级首次建 id 列表 213 ms、后续翻页与深页 0.83 ms。详见 [体验整改 P1–P4 实现记录](../planning/archive/2026-10-25-体验整改P1-P4记录.md) 与 [当前阶段状态](../planning/current-handoff.md)。
-
-2026-10-25 图库操作撤销批次 1–3 已实现：schema v5（`operations` / `operation_chunks` / `undo_runs`、`images.purge_operation_id` / `origin_operation_id`）与设置 v5（`history.maxSteps`）、`library/history.rs`（同事务记录、线性撤销、裁剪、启动恢复、释放）、永久删除与清空回收站改为延迟释放标记、`TaskKind::Undo` / `ReleaseGarbage`、工具栏“记录”面板；导入/编辑/移动/文件夹、评分/描述/AI 描述/标签/集合与相似分组记录均已接入。撤销后的记录以灰色 `undone` 保留，可重做（`TaskKind::Redo` / `redo_to_operation`），新的图库写入清空重做分支；编辑与导入使用 `.artbank/undo/<op>/` 暂存原图。详见 [操作撤销实现记录](../planning/archive/2026-10-25-操作撤销实现记录.md) 与 [图库与元数据](../modules/library.md#操作记录与撤销)。
-
-2026-10-25 图片空间优化（智能压缩）两批已实现：`imageops/optimize.rs` 的三档判据、阶梯编码与 EXIF/ICC 搬运；`library/optimize_estimate.rs` 的分层估算与只读报告；schema v6 的 `images.optimized_at`；`library/optimize.rs` 的候选收集、分批编码发布与旧图清理；`HistoryKind::Optimize` 不可撤销记录与 `update_label`；`start_batch_task(kind = "optimize")` 的估算凭证校验；`OptimizeDialog` 的估算 → 确认执行两阶段界面。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化) 与 [当前阶段状态](../planning/current-handoff.md)。
-
-2026-10-25 图片空间优化第三阶段已实现：长边改 64–65535 自由输入，抽样改 50–2000 离散滑块；估算取结果改为依赖任务原始值并带 5 秒超时重试，进度按阶段推进（统计候选只报百分比，编码样本按张显示，百分比加权不回退）；执行在并行编码内部按张上报，编码与提交前分别显示文案；导入管线新增可选的 `optimize` 参数，在解码后、发布前复用同一套压缩内核，去重语义改为压缩后内容哈希，`optimized_at` 标记导入即压缩的行。详见 [维护与批量工作流](../modules/maintenance.md#图片空间优化)、[导入与缩略图](../modules/import.md) 与 [当前阶段状态](../planning/current-handoff.md)。
-
-MCP 图库控制（2026-10-26 完成，不在 S 序列内）：设置 v6 的 `mcp` 配置与 schema v7 的临时文件夹；应用内 stateless Streamable HTTP 服务（`127.0.0.1` + 随机 Bearer 口令 + `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；24 个工具（8 只读 + 9 写 + 3 记录 + 2 任务 + `import_start` + `temp_features_generate`）、query/ids/sheet/similarity selector、拼图编号与 128 份/2 小时映射缓存、`dryRun` / `confirmedCount`、三档权限与 10 分钟确认队列、`library-changed` 刷新、`logs/mcp.log` 审计。临时文件夹是与回收站同级的会话级暂存区，只能经导入进入，打开/关闭/换库/退出时清空，元数据改动不写操作记录；全库相似扫描与相似分组排除临时图。界面侧新增“设为相似参考” + 相似面板与共享范围选择器。永久删除、清空回收站、压缩与像素编辑仍不开放。详见 [MCP 图库控制](../modules/mcp.md)、[图库与元数据](../modules/library.md#临时文件夹) 与 [导入与缩略图](../modules/import.md)。
-
-尚未实现：S8 的维护与批量工作流（描述导出/回填、孤儿清理、缩略图包压缩、库检查、导出、快捷键）；图像处理已按用户决定取消。具体见 [路线图](../planning/roadmap.md)。
+| 设置字段 | 先入库、后接消费者 | 新增字段与消费它的界面同批落地，避免为同一件事改两次设置版本；只有一种实现的字段（如已删掉的 `detailPanelMode`）不入库 |

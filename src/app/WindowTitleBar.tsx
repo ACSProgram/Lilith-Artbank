@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Copy, Minus, Square, X } from "lucide-react";
+import brandMark from "../assets/brand-mark.png";
 import { IconButton } from "../shared/components/Button";
 import { appApi, browserPreview } from "./api";
 import { useAppRuntime } from "./runtimeContext";
@@ -26,7 +27,7 @@ export function WindowTitleBar() {
   return (
     <header className="titlebar">
       <div className="titlebar-brand" data-tauri-drag-region onDoubleClick={toggleMaximize}>
-        <span className="brand-mark">A</span>
+        <img className="brand-mark" src={brandMark} alt="" draggable={false} />
         <span className="brand-name">Lilith Artbank</span>
         {browserPreview ? <span className="titlebar-badge">浏览器预览</span> : null}
         {busy ? <span className="titlebar-busy">{busy}…</span> : null}

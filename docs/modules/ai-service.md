@@ -6,7 +6,7 @@ description、image/text embedding、pose 都通过本机 HTTP 服务完成。�
 
 ## 进程托管
 
-设置项（设置 v4）：
+设置项（当前设置 v7 的 `ai` 段）：
 
 ```text
 ai.baseUrl         默认 http://127.0.0.1:18766；探活与所有请求都走这里
@@ -16,6 +16,7 @@ ai.pythonPath      默认 python_embeded\python.exe；为空时只连接外部�
 ai.serverScript    默认 server\main.py
 ai.modelPath       模型根目录，默认 resources\models
 ai.clipModelPath   CLIP 模型目录，默认 siglip2-giant-opt-patch16-384；相对 modelPath，也可填绝对路径
+ai.prewarmImports  默认 true；启动托管服务时加 --prewarm-imports，在后台导入 torch/transformers
 ```
 
 - 相对路径以程序根目录解析：release 为 exe 所在目录，debug 为仓库根目录；两种模式都可用 `LILITH_ARTBANK_ROOT` 覆盖。
@@ -255,9 +256,9 @@ Content-Type: application/octet-stream
 - 模型不兼容：语义搜索提示“需要重算 embedding”，不混用不同模型向量。
 - 日志不得写入图片内容、完整描述或向量；只记录 id、耗时、状态与错误摘要。
 
-## 当前实现（S6 客户端 + S7 本地相似度 + 本机服务端）
+## 应用侧命令与实现位置
 
-客户端、本机 Python 服务端与便携打包脚本都在本仓库；Python 环境与模型文件不随包。
+客户端、本机 Python 服务端与便携打包脚本都在本仓库；Python 环境与模型文件不随包，由用户放进程序目录。
 
 命令：
 
@@ -314,17 +315,4 @@ Content-Type: application/octet-stream
 - 描述能力本轮未实现；批量任务中的描述项按缺少能力置灰。
 - 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。
 - 便携包只包含 exe、`server/` 与资源清单，不包含 `python_embeded/`、`resources/models/`；不生成 NSIS 安装器。
-- 真实服务、真实模型与 WebView2 界面待用户手工验收。
-
-## 验收
-
-- 用 mock HTTP 服务覆盖成功、400、422、503、超时与重试；任务可取消。
-- 真实服务接入后：health、ensure、单张 embedding、单张 pose 成功；批量任务进度可见；断网/关服务时 UI 正确降级。
-- 服务端：图片塔与文本塔切换后只驻留一个；空闲后卸载；health 在未加载时仍返回模型名与维度。
-- 便携目录：exe、`server/`、`python_embeded/`、`resources/models/` 放齐后直接运行；设置与日志生成在 exe 旁；无 NSIS 安装器。
-- 描述本轮未实现：health 不返回 `description`，批量任务中描述置灰，`/v1/describe` 返回 404。
-- 语义搜索只用同一 model/dim 的向量，并且 image/text 两侧都减去同一均值；结果 id 能正确分页。
-- 找相似：`phash`/`color4`/`color8`/`embedding`/`pose` 都能排除目标图并按分数排序；目标图缺数据时给出可行动的提示，而不是返回空列表。范围过滤后 `total` 与分页只在范围内；多张参考图的主色/embedding 平均与阈值有单元测试。
-- 全库相似组：20 万条库上不 O(n²) 卡死；`truncated` 与 `missing` 计数正确；embedding 复核能把 pHash 命中但语义不一致的图片拆开。
-- 姿势相似度与原程序同输入的分数在浮点误差内一致（golden 值测试覆盖）。
-- 旧模型（如 1024 维 CLIP）的向量不参与检索；维护页可重算或清理。
+- 真实服务、真实模型与 WebView2 界面待用户手工验收，清单见[待办](../planning/todo.md)。

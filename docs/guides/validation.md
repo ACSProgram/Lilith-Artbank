@@ -4,8 +4,8 @@
 
 允许：
 
-- `npm run typecheck`、`npm run build`；
-- `cargo fmt --check`、`cargo check`、`cargo test`；
+- `npm run typecheck`、`npm run build`、`npm run test:web`；
+- `cargo fmt --check`、`cargo check`、`cargo test`、`cargo clippy --all-targets`；
 - `git diff --check`；
 - 对真实图库目录做**只读**清点（`ls`、文件数、尺寸），不写入。
 
@@ -17,31 +17,32 @@
 - 修改 `G:\Lilith Image Library` 下的任何文件（包括“测试性改名/删除/写入”）；
 - 把真实图库路径写进测试或基准；测试一律用 `tempfile` 临时目录。
 
-界面视觉、手感与真实窗口行为全部由用户在阶段验收时手工检查。代理只报告构建、类型、单测与基准的结论，并把验收步骤写清楚交给用户。
+界面视觉、手感与真实窗口行为全部由用户手工检查。代理只报告构建、类型、单测与基准的结论，并把验收步骤写清楚交给用户；未完成与待验收清单在[待办](../planning/todo.md)。
 
 ## 日常检查
 
 ```bash
 npm run typecheck        # tsc --noEmit
 npm run build            # tsc + vite build
-npm run test:web         # node --test：viewer 几何换算 + library 标签筛选换算
+npm run test:web         # node --test：几何换算、标签筛选、文件夹树、失效计划、范围、标签名
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
 ```
 
-- 前端改动至少跑 typecheck；涉及构建配置时跑 build。
-- 前端纯函数改动（几何换算、标签筛选范围、排序换算）跑 `npm run test:web`；它用 Node 的类型擦除直接跑 `src/**/model.test.ts`，不引入测试框架依赖。
-- Rust 改动至少跑 cargo check 与 cargo test。
-- 导入改动跑 `cargo test`：包含混合格式入库、精确重复、合并策略、取消一致性与 pack 缺失；性能门槛单独跑 `perf_import_1000`。
-- 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。批次 6 之后另有三类断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
-- 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
-- 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同时跑 `npm run test:web`（旋转/翻转对裁剪的映射、尺寸按新基底换算）与 typecheck/build，查看器布局、缩放、裁剪拖拽映射、撤销栈、胶片带与上下张由用户手工验收。
-- MCP 改动跑 `cargo test --lib mcp`：设置迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector（分页/全量/相似结果切片/排除格）、搜索总数与 `pageSize` 上限、0 张标签过滤、临时图库只读工具、拼图布局/格子状态/来源标签/缓存、相似 token 失效与命中总数、切档保留端口与口令、24 个工具注册、三档阈值判定与确认过期、`library_info` 三档的 `writeAllowed` / `approval.threshold`、列表游标（`tags_list` 遍历与非法游标、`folders_list` 分页）、标签缺失/排除筛选、`tags_modify` 的权限划分与 `expectedImages` 核对、标签合并的迁移与撤销重做、`dryRun` 的 `willChange` 只算真实改动且全无变化时返回 noop、撤销/重做预览与压缩记录阻断、导入输入与路径预检、`optimize`/`workerThreads` 不透传、导入回执与 `includePairs` 归因数组与截断标记、临时区口径与 `temp_features_generate` 的临时 id 校验、`folders_modify` 四种动作与「AI · 」前缀、审计单行截断与导入来源行总数在前；真实 MCP 客户端、确认卡片、`--mcp-stdio` 小桥、导入与便携目录由用户手工验收，代理不启动应用。
-- AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。行指针不再 `JOIN images` 之后，`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。
-- `server/` 只做一次性检查，不加入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。一次性检查命令见下方“AI 服务端”。
-- 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。
+按改动选检查：
+
+- 前端改动至少跑 typecheck；涉及构建配置时跑 build。前端纯函数改动（几何换算、标签筛选范围、排序换算、文件夹树、失效计划）跑 `test:web`；它用 Node 的类型擦除直接跑 `src/**/*.test.ts`，不引入测试框架依赖。
+- Rust 改动至少跑 `cargo check` 与 `cargo test`；提交前跑一次 `cargo clippy --all-targets`。
+- **导入**：`cargo test` 覆盖混合格式入库、精确/批内重复、合并策略、取消一致性、pack 缺失；吞吐跑 `perf_import_1000`。
+- **浏览/查询**：`cargo test` 覆盖键集分页、多级排序、筛选、搜索、计数、全选 id、集合、子树筛选与直属筛选；性能跑 `perf_metadata_200k`。另有三类结构断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
+- **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件操作测试只用临时图库。
+- **查看器/编辑**：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同跑 `test:web` 与 typecheck/build。
+- **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。
+- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作、审计单行截断。
+- **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录。
+- `server/` 只做一次性检查，不加入常驻测试：它依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 
 ## 数据库与文件
@@ -51,44 +52,19 @@ git diff --check
 - 不读取旧 `.data`；迁移脚本独立于应用。
 - 200k 行基准会写入临时目录并在结束时删除；不要指向真实图库。
 
-## 性能基准
+## 手工验收（真实窗口）
 
-默认被 `#[ignore]` 标记，按需运行：
+以下都由用户执行，代理不启动应用。逐条的验收清单在[待办](../planning/todo.md)对应条目里。
 
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
-cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
-cargo test --manifest-path src-tauri/Cargo.toml --lib ai::embedding::perf_tests -- --ignored --nocapture
-```
-
-最后一项会生成约 614 MB 的临时 fp16 向量包，结束后删除；只用于 20 万条 × 1536 维扫描基准。
-
-`perf_metadata_200k` 现在同时输出原始 SQL 与 S2 查询引擎（`query_page`、`filter_counts`、`query_ids`）的 p50/p95。
-
-浏览器缩略图基准：
-
-```bash
-python tools/perf/thumb_bench/generate.py
-node tools/perf/thumb_bench/server.mjs
-# 打开 http://127.0.0.1:18767/?format=jpg 与 ?format=webp，看页面右下角结果
-```
-
-真实 WebView2 的缩略图观感与加载速度直接在主界面验收（缩略图基准已在 P2 删除）：
+缩略图、浏览与导入：
 
 ```bash
 npm run tauri dev
-# 打开图库 → 网格/列表滚动，观察缩略图出现速度与缓存命中
+# 打开图库 → 导入图片/拖入图片 → 网格/列表滚动 → 筛选 → 选择 → 复制路径
+# 观察 150 张缩略图从请求到可见的耗时、缓存命中与列布局
 ```
 
-浏览界面与导入界面同样只在真实 Tauri 窗口中做最终验收：
-
-```bash
-npm run tauri dev
-# 打开图库 → 导入图片/拖入图片 → 关闭导入弹窗 → 网格/列表 → 筛选 → 选择 → 复制路径
-```
-
-S4 查看器（含 P3 的撤销栈、体积预估、胶片带、全屏）的真实窗口验收：
+查看器与编辑：
 
 ```bash
 npm run tauri dev
@@ -99,20 +75,91 @@ npm run tauri dev
 # 右键“复制图片” → 粘贴到画图/聊天工具；大图与 EXIF 方向图确认显示与裁剪一致
 ```
 
-S6 AI 的真实窗口验收：
+AI 服务与语义检索：
 
 ```bash
 npm run tauri dev
 # 设置 → AI 服务 → 检测/启动 → 确认状态行显示图像塔/文本塔/姿势的“已加载 / 未加载”
 # 确认设置页没有手动加载模型的按钮；模型由首次使用自动加载
 # 选中图片或当前视图 → AI 任务 → embedding/pose 批量任务（确认“开始任务时自动加载”）
-# 确认进度、取消、失败清单；搜索框切到“语义”输入文本并 Enter，首次搜索应提示正在加载文本模型
+# 确认进度、取消、失败清单；搜索框切到“语义”输入英文短语并 Enter，首次搜索应提示正在加载文本模型
 # 查看器无 pose 时点击“生成姿势骨架”
-# 右键图片“设为相似参考” → 工具栏“相似”打开面板 → 查找相似 → 点击结果条里的比较图文件名打开查看器 → 绿色“退出相似结果”
+# 右键图片“设为相似参考” → 工具栏“相似”打开面板 → 查找相似 → 点击结果条里的比较图文件名打开查看器
 # 描述本轮未实现：批量任务里的描述项应置灰
 ```
 
-AI 服务端（一次性检查，不进入常驻测试）：
+MCP 真实客户端：
+
+1. 启动应用并打开图库，在设置 → MCP 开启服务，确认状态为“服务运行中”。
+2. 在设置 → MCP 点“复制客户端配置”，粘贴到支持 stdio 的客户端（命令是当前进程路径，参数 `--mcp-stdio`），调用 `library_info`，确认档位与限制。
+3. 只读档调用 `images_update`，确认得到“当前是只读模式”。
+4. 询问档 `dryRun` 一个搜索/拼图 selector，拿到 `selected` 后带 `confirmedCount` 执行评分或加标签，确认设置页“最近 AI 操作”出现 `AI ·` 记录且网格刷新。
+5. 询问档移入回收站，确认右下角出现确认卡片；批准后图片进入回收站、查看器关闭；拒绝或等待 10 分钟确认操作取消。
+6. 对一条记录 `history_list` → `history_undo` dryRun → 带 steps/affected 执行，确认任务中心进度与撤销结果；再重做。压缩记录应返回“压缩操作不可撤销”。
+7. 启动一次导入/优化后调用短写工具，确认得到明确冲突错误且没有被排队；再启动第二个长任务，确认它进入 `queued` 并可用 `tasks_cancel` 取消。
+8. 关闭 MCP 服务，确认客户端收到明确连接错误；重启应用后确认 `mcp-runtime.json` 已更新。
+9. 询问档调用 `import_start` 导入几张图片，确认右下角与设置页出现确认卡，卡片列出来源路径、目标文件夹、标签/评分与重复策略；批准后任务开始，拒绝或超时则不导入。
+10. `tasks_get(taskId)` 等到导入完成，确认附带回执的 `imported` / `duplicates` / `merged` / `previewIds` 与失败清单；用 `image_sheet(selector.ids=previewIds)` 看到刚入库的图。
+11. 对这次导入 `history_list` → `history_undo`，确认整次导入被撤销；确认 `logs/mcp.log` 有工具调用与导入来源行，且没有压缩字段或压缩行为。
+12. 从便携目录启动 exe（含 `server/`，不含安装器），重复第 2 步，确认 `--mcp-stdio` 指向当前 exe 且能正常调用 `library_info` 和 `import_start`。
+13. `find_similar` 分别传 `scope: {"type":"folder","folderId":…,"includeSubfolders":false}` 与 `targetIds`（两张图，`kind: color8`），确认结果只来自范围、参考图全部被排除。
+14. `import_start` 传 `target: "temp"` 导入几张图：询问档应直接开始、不出现确认卡；`tasks_get` 回执 `target=temp`、`operationId=null`；`search_images` 用 `view: "temp"` 能看到图片，普通 `view: "all"` 看不到。
+15. 对 `view: "temp"` 的图片调用 `images_update` 改评分，`history_list` 不应新增记录；调用 `images_trash` 应得到明确拒绝。
+16. 把 3 张已在库内的图（其中 1 张在回收站）重新导入一次，`tasks_get(includePairs=true)` 返回 3 条 `duplicatePairs`，`imageId` 指向首次入库的图，回收站那张 `trashed=true`。
+17. 对同样 3 张改用 `duplicatePolicy=merge` 重跑，`mergedImageIds` 与上一步的 3 个 id 一致，`images_get` 能看到标签并集与较高评分。
+18. 同一目录放 2 份完全相同的图导入，`batchDuplicatePairs` 给出一对 `keptPath` / `sourcePath`，`duplicates=1`。
+19. 临时区导入 5 张图后调用 `temp_features_generate(kind=embedding)`：询问档出现确认卡，批准后任务用 write lane 运行；完成后 `library_info.features.embeddings` 不变、`tempEmbeddings=5`。
+20. 以临时图为参考、`scope=temp` 搜语义能命中临时区内的图；改成 `scope=library` 后结果里不出现任何临时图。清空临时区后再搜语义不报错。
+21. `ids` 里混入一张普通库图片，`temp_features_generate` 整批拒绝并列出 `invalidIds`；生成中途取消后已完成张数保留、任务为 `cancelled`。
+22. `tags_list` 不带 `limit`：返回 100 条 + `total` + `nextCursor`；把 `nextCursor` 传给 `cursor` 再调一次，拿到剩余标签且没有重复 id。
+23. `search_images` 传 `filters.tagPresence: "missing"` 只能拿到没有标签的图片；再加 `excludeTagIds`，结果里不再出现带该标签的图片。
+24. 切到完全档调 `library_info`：`approval.threshold` 为 `null`、`appliesToCurrentMode` 为 false；问 AI「完全档批量写入需不需要确认」，应答不需要。
+25. `tags_modify` 合并两个近义标签：先 `dryRun` 看 `moved` / `duplicate`，正式执行后源标签消失、目标标签图片数为两者之和；`history_list(kind: "tagMerge")` 有 `AI ·` 记录，撤销后两个标签与关系都回来。
+
+便携包：
+
+```bash
+npm run pack:portable
+# 把 python_embeded\ 与 resources\models\ 放进 release\Lilith Artbank\ 后直接运行 lilith-artbank.exe
+# 确认 settings.json 与 logs\ 生成在 exe 旁，不出现 NSIS 安装器
+```
+
+## 性能基准
+
+默认被 `#[ignore]` 标记，按需运行：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_thumb_pack_read
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_import_1000
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_history_200k
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_encode_threads
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_optimize_batch_size
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_estimate_vs_actual
+cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_estimate_sampling_spread
+cargo test --manifest-path src-tauri/Cargo.toml --lib ai::embedding::perf_tests -- --ignored --nocapture
+```
+
+最后一项会生成约 614 MB 的临时 fp16 向量包，结束后删除；只用于 20 万条 × 1536 维扫描基准。
+
+浏览器缩略图基准：
+
+```bash
+python tools/perf/thumb_bench/generate.py
+node tools/perf/thumb_bench/server.mjs
+# 打开 http://127.0.0.1:18767/?format=jpg 与 ?format=webp，看页面右下角结果
+```
+
+规则：
+
+- 同一台机器、同一构建档、同一浏览器才有可比性；不要用跨机器墙钟下结论。
+- 结果写入[性能基准](performance.md)的实测记录，注明日期、机器、构建档与浏览器版本。
+- 新增热点路径必须补对应基准或说明为什么不影响门槛。
+- 代理不跑 `npm run dev` 做浏览器预览检查；布局与观感由用户验收。
+
+## AI 服务端一次性检查
+
+不进入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 
 ```bash
 python_embeded\python.exe -m py_compile server\main.py server\clip_cache.py server\pose_engine.py server\image_io.py
@@ -125,40 +172,19 @@ curl.exe -X POST http://127.0.0.1:18766/v1/shutdown
 
 - 图片塔与文本塔应分别加载；加载另一塔时旧塔让位。
 - 空闲 300 秒后 health 的两个塔都变回 `ready=false`；可用 `--idle-unload-seconds` 调短验证。
-- Python 服务与模型路径必须由用户环境提供；不要把它写成 CI 或常驻测试。
+- Python 服务与模型路径必须由用户环境提供，不要写成 CI 或常驻测试。
 
-便携包：
-
-```bash
-npm run pack:portable
-# 把 python_embeded\ 与 resources\models\ 放进 release\Lilith Artbank\ 后直接运行 lilith-artbank.exe
-# 确认 settings.json 与 logs\ 生成在 exe 旁，不出现 NSIS 安装器
-```
-
-浏览器预览的检查方式（不驱动真实窗口）：
-
-```bash
-npm run dev
-# 打开 http://127.0.0.1:1420 → 创建演示图库 → 网格/列表/筛选/滚动
-```
-
-预览使用 4,000 行内存 mock 与 SVG data URL 缩略图，只用于检查布局、DOM 数量、筛选/排序重置、选择与右键菜单；不代表真实缩略图协议或性能。检查完关闭 dev server，不留下浏览器页面或后台进程。
-
-代理不得用输入注入驱动该窗口；界面最终由用户手工确认。
-
-发布产物依赖检查：
+## 发布产物依赖检查
 
 ```bash
 cargo build --manifest-path src-tauri/Cargo.toml
 python tools/perf/pe_imports.py src-tauri/target/debug/lilith-artbank.exe
 ```
 
-- 同一台机器、同一构建档、同一浏览器才有可比性；不要用跨机器墙钟下结论。
-- 结果写入 [性能基准](performance.md) 的“实测记录”，注明日期、机器、构建档与浏览器版本。
-- 新增热点路径必须补对应基准或说明为什么不影响门槛。
+脚本列出 PE 的 import 与 delay-import DLL。当前只包含系统 DLL，没有 `WebView2Loader.dll`、`vcruntime140.dll` 或 `webp.dll`；release 产物的最终核对留在 S9。
 
-## 阶段验收
+## 收尾
 
-未完成与待验收事项写 `docs/planning/todo.md`；当前状态与基线写 `docs/planning/current-handoff.md`；批次流水账与通过验收的计划移入 `docs/planning/archive/`。不要把“计划实现”写成“已验收”。
-
-性能阶段的硬门槛以 [性能基准](performance.md) 为准；未达门槛先解决，再继续堆功能。
+- 未完成与待验收事项写 `docs/planning/todo.md`；当前能力与基线写 `docs/planning/current-handoff.md`；后续阶段写 `docs/planning/roadmap.md`。
+- 批次记录与通过验收的计划移入 `docs/planning/archive/`。不要把“计划实现”写成“已验收”。
+- 性能门槛以[性能基准](performance.md)为准；未达门槛先解决，再继续堆功能。
