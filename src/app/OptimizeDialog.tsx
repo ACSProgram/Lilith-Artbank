@@ -17,13 +17,11 @@ import {
   isTaskActive,
   taskPercent,
   type BatchTaskRequest,
-  type ConflictPolicy,
   type OptimizeEstimate,
   type OptimizeOptions,
   type OptimizeTier,
   type TaskScope,
   type TaskSnapshot,
-  type TaskSummary,
 } from "./taskTypes";
 import { ScopePicker } from "../shared/components/ScopePicker";
 import {
@@ -215,14 +213,12 @@ export function OptimizeDialog({
   );
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<TaskSummary[] | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [estimate, setEstimate] = useState<OptimizeEstimate | null>(null);
   const [loadingEstimate, setLoadingEstimate] = useState(false);
   const [estimateRetry, setEstimateRetry] = useState(0);
   const [canRetryEstimate, setCanRetryEstimate] = useState(false);
   const [executeTaskId, setExecuteTaskId] = useState<string | null>(null);
-  const [pendingKind, setPendingKind] = useState<"estimate" | "execute">("estimate");
   const [runConfig, setRunConfig] = useState<RunConfig | null>(null);
   /** 当前展示的结果对应的设置签名；与表单签名不一致时结果作废。 */
   const [resultSignature, setResultSignature] = useState<string | null>(null);
@@ -285,10 +281,8 @@ export function OptimizeDialog({
     if (!open) return;
     setStarting(false);
     setError(null);
-    setConflict(null);
     setCanRetryEstimate(false);
     setEstimateRetry(0);
-    setPendingKind("estimate");
 
     const list = tasksRef.current;
     const newest = (predicate: (task: TaskSnapshot) => boolean) =>
@@ -525,10 +519,7 @@ export function OptimizeDialog({
     };
   }
 
-  const launchTask = async (
-    kind: "optimizeEstimate" | "optimize",
-    policy: ConflictPolicy,
-  ) => {
+  const launchTask = async (kind: "optimizeEstimate" | "optimize") => {
     if (!context) return;
     if (kind === "optimize" && !estimate) return;
     if (kind === "optimizeEstimate" && edge.invalid) {
@@ -541,8 +532,6 @@ export function OptimizeDialog({
 
     setStarting(true);
     setError(null);
-    setConflict(null);
-    setPendingKind(kind === "optimize" ? "execute" : "estimate");
     try {
       const request: BatchTaskRequest = {
         kind,
@@ -554,11 +543,11 @@ export function OptimizeDialog({
         optimize: config.options,
         estimateId: kind === "optimize" ? (estimate?.taskId ?? null) : null,
         estimateSampleSize: kind === "optimizeEstimate" ? config.sampleSize : null,
-        conflict: policy,
+        conflict: "queue",
       };
       const result = await start(request);
       if (result.status === "conflict") {
-        setConflict(result.active);
+        setError("任务暂时无法开始，请稍后再试");
         return;
       }
       if (kind === "optimize") {
@@ -586,10 +575,8 @@ export function OptimizeDialog({
       estimate.processCount,
       estimate.savingsBytes,
     );
-    if (accepted) await launchTask("optimize", "fail");
+    if (accepted) await launchTask("optimize");
   };
-
-  const retryKind = pendingKind === "execute" ? "optimize" : "optimizeEstimate";
 
   const resetToConfig = () => {
     setTaskId(null);
@@ -597,7 +584,6 @@ export function OptimizeDialog({
     setEstimate(null);
     setRunConfig(null);
     setError(null);
-    setConflict(null);
     fetchedEstimate.current = null;
   };
 
@@ -625,26 +611,6 @@ export function OptimizeDialog({
         onClick={() => void cancel(activeTask.taskId)}
       >
         取消任务
-      </Button>
-    </>
-  ) : conflict ? (
-    <>
-      <Button variant="ghost" onClick={() => setConflict(null)}>
-        返回
-      </Button>
-      <Button
-        variant="secondary"
-        onClick={() => void launchTask(retryKind, "cancelActive")}
-        loading={starting}
-      >
-        取消现有任务并开始
-      </Button>
-      <Button
-        variant="primary"
-        onClick={() => void launchTask(retryKind, "queue")}
-        loading={starting}
-      >
-        排队等待
       </Button>
     </>
   ) : execution ? (
@@ -689,7 +655,7 @@ export function OptimizeDialog({
         icon={<Play size={13} />}
         loading={starting || loadingEstimate}
         disabled={!scopeOptions[scope].enabled || edge.invalid}
-        onClick={() => void launchTask("optimizeEstimate", "fail")}
+        onClick={() => void launchTask("optimizeEstimate")}
       >
         开始估算
       </Button>
@@ -939,25 +905,6 @@ export function OptimizeDialog({
           <AlertTriangle size={14} />
           <span>执行压缩不可撤销，原图会被压缩后的版本替换。</span>
         </div>
-
-        {conflict ? (
-          <div className="batch-task-conflict">
-            <span>
-              <AlertTriangle size={14} /> 现在有任务正在运行：
-            </span>
-            <ul>
-              {conflict.map((item) => (
-                <li key={item.taskId}>
-                  {item.label} · {item.scope}
-                </li>
-              ))}
-            </ul>
-            <p>
-              可以等它结束后自动开始，或者取消它、马上开始
-              {pendingKind === "execute" ? "压缩" : "新的估算"}。
-            </p>
-          </div>
-        ) : null}
 
         {task && (isTaskActive(task) || (!estimate && !execution)) ? (
           <ProgressPanel task={task} percent={percent} />

@@ -894,12 +894,6 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
         );
     }
 
-    // 任务是后台的 write lane 占用者；这里先确认当前没有别的任务，避免被静默排队。
-    if state.tasks.any_busy() {
-        return Err(AppError::message(
-            "有任务正在进行，请等待完成或取消后再移动",
-        ));
-    }
     let inspection = inspect(state, &input.selector, true)?;
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())

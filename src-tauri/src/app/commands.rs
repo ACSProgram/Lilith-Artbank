@@ -14,8 +14,8 @@ use crate::{
         settings::Settings,
         state::AppState,
         tasks::{
-            BatchTaskRequest, LaneGuard, TaskKind, TaskPhase, TaskScope, TaskSnapshot,
-            TaskStartResult,
+            self, BatchTaskRequest, LaneGuard, TaskHandle, TaskKind, TaskPhase, TaskScope,
+            TaskSnapshot, TaskStartResult,
         },
     },
     import::{ImportRequest, job::ImportSnapshot},
@@ -479,7 +479,7 @@ pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<u64, String
     AppError::command(state.delete_tag(tag_id))
 }
 
-/// 在 write lane 上跑一个有进度的批量操作：占用、进度、终态都交给任务总线。
+/// 在 write lane 上跑一个有进度的批量操作：占用、排队、进度、终态都交给任务总线。
 async fn run_write_task<T, F>(
     app: AppHandle,
     kind: TaskKind,
@@ -490,19 +490,29 @@ where
     T: Send + 'static,
     F: FnOnce(&AppState, &dyn BatchReporter) -> AppResult<T> + Send + 'static,
 {
-    let (handle, guard) = {
-        let state = app.state::<AppState>();
-        state
-            .begin_write_task(&app, kind, scope)
-            .map_err(|error| error.to_string())?
-    };
+    let handle = TaskHandle::new(uuid::Uuid::new_v4().to_string(), kind, scope);
     tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let guard = state
+            .tasks
+            .begin_queued(&app, handle.clone())
+            .map_err(|error| error.to_string())?;
         let _guard: LaneGuard = guard;
         handle.set_phase(TaskPhase::Running);
-        let state = app.state::<AppState>();
-        let result = work(&state, &*handle);
-        handle.finish_from(&result);
-        result.map_err(|error| error.to_string())
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&state, &*handle)));
+        match outcome {
+            Ok(result) => {
+                handle.finish_from(&result);
+                result.map_err(|error| error.to_string())
+            }
+            // 与任务总线的线程兜底同一套文案与终态，避免两处不一致。
+            Err(payload) => Err(tasks::fail_from_panic(
+                &handle,
+                "write-task",
+                payload.as_ref(),
+            )),
+        }
     })
     .await
     .map_err(|error| error.to_string())?

@@ -28,7 +28,7 @@ export type TaskPhase =
   | "cancelled"
   | "failed";
 
-export type ConflictPolicy = "fail" | "queue" | "cancelActive";
+export type ConflictPolicy = "fail" | "queue";
 export type BatchTaskKind = "thumbnail" | "aiEmbedding" | "aiPose" | "aiDescription";
 export type TaskRequestKind =
   | BatchTaskKind

@@ -136,9 +136,9 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
     }
 
     // 描述任务会产生用户可见的内容修改：先建 live 记录，逐张追加旧描述；
-    // 取消或失败时已经写入的描述仍然可以撤销。
-    let operation_id = if request.kind == AiJobKind::Description {
-        Some(history::begin_live(
+    // 取消、失败或 panic 时已经写入的描述仍然可以撤销。
+    let operation = if request.kind == AiJobKind::Description {
+        Some(history::LiveOperation::begin(
             &context.database,
             NewOperation::new(
                 HistoryKind::AiDescription,
@@ -148,6 +148,7 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
     } else {
         None
     };
+    let operation_id = operation.as_ref().map(history::LiveOperation::id);
 
     let outcome = run_job(
         context,
@@ -158,13 +159,13 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
         ids,
         operation_id,
     );
-    if let Some(operation_id) = operation_id {
+    if let Some(operation) = operation {
         let error = outcome
             .as_ref()
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default();
-        if let Err(error) = history::finish_live(&context.database, operation_id, &error) {
+        if let Err(error) = operation.finish(&error) {
             log::warn!("收尾 AI 描述记录失败：{error}");
         }
     }

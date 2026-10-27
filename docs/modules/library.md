@@ -235,7 +235,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 - 元数据写入都走单写连接；批量操作按 400 个 id 分块。
 - 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除与清空回收站只标记 `purge_operation_id`，真正删行删文件由 `ReleaseGarbage` 任务按 400 张一块执行。
-- 文件操作（图片移动、永久删除、清空回收站、撤销、释放）挂任务总线的 write lane，有进度与取消；导入、创建/打开图库要求任务总线空闲，关闭图库只拒绝 write lane（ai/scan 任务会被取消并等待退出）。单条记录的撤销与释放任务不可中途取消；多条记录的撤销只在记录之间检查取消，单条记录必须撤完。释放任务按队列等待。
+- 文件操作（图片移动、永久删除、清空回收站、释放）与导入等长任务挂任务总线的 write lane，冲突时自动排队；同 lane 先来先得，队列里出现 write 等待者后不再放行新的 ai/scan，避免写任务被持续插队。短写（评分、标签、描述、集合/文件夹元数据、编辑保存、回收站）仍立即占 lane，冲突直接失败。撤销/重做/清空记录依赖当前操作时间线，不进入队列；任务忙时直接拒绝或按钮禁用。
+- 创建/打开图库要求任务总线完全空闲（含排队任务）；关闭图库拒绝运行或排队的 write 任务，ai/scan 任务会被取消并等待退出。单条记录的撤销与释放任务不可中途取消；多条记录的撤销只在记录之间检查取消。任务线程 panic 由框架捕获、写日志并标为失败，lane 随 guard 释放；正常返回但没有写终态同样标为失败。运行中/排队任务不会被 50 条任务历史裁剪。
 - 集合只引用图片 id；集合运算新建集合，不修改源集合。
 
 ## 文件夹
@@ -274,7 +275,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 - 已接入：移入回收站、恢复、永久删除、清空回收站（批次 1）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序（批次 2）；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述（批次 3）；图片空间优化（`kind='optimize'`，只记结果，不可撤销）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
 - 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，既不留下空记录，也不清空重做分支（没有实际改动的操作不算新时间线）。`write` 在同一个事务里删除 `undone` / `redoing` 记录：确实写入的新操作开启新时间线，灰色记录与其暂存文件不再可重做。
-- 长任务用 `begin_live` 建 `pending` 记录、每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据、结束时 `finish_live`；导入、批量 AI 描述与图片空间优化使用。`begin_live` 不结束重做分支：导入可能因 write lane 冲突根本没启动，或整批都是重复跳过；只有确实写入内容的批次（导入批次、AI 描述写入与压缩批次）才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。
+- 长任务用 `history::LiveOperation` 包住 `begin_live`：每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据，正常结束、取消、失败与 panic 都通过 `finish_live` 收尾；导入、批量 AI 描述与图片空间优化使用。排队取消或线程起不来时 guard 随闭包丢弃，空记录删除；进程被强杀时 Drop 不执行，仍由下次打开恢复。
+- `begin_live` 不结束重做分支：导入可能整批都是重复跳过，或排队未启动；只有确实写入内容的批次（导入批次、AI 描述写入与压缩批次）才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。撤销/重做运行中 panic 会把 `undo_runs` 标为失败；`undoing` / `redoing` 记录保留给下次打开续做，本次不自动重试。
 - 图片空间优化不写任何逆数据：每批事务内更新 `images` 并累加 `affected`，完成后用 `history::update_label` 把「N 张 · 省 X」写进标题。`run_undo` 在标记 `undoing` 之前预检链中含 `optimize` 就返回“压缩操作不可撤销，原图已删除”，不会留下假的 `undoFailed`；记录面板同样禁用撤销。
 - 撤销是线性回退：选中第 N 条 = 依次撤回当前仍为 `applied` 的记录，直到 N。成功的记录不再删除，而是标为 `undone`（列表里变灰）；`undone` 记录保持原 chunks，并通过 `redo` chunks 保存撤销前的状态。多条记录的撤销只在记录之间检查取消。
 - 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
@@ -282,7 +284,9 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
 - `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；可重复执行，不可取消。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件。
 - 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有任务占用 write lane 且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有任务占用 write lane 且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryStorage`：`{ recordCount, chunkCount, chunkBytes, undoFiles, undoBytes, totalBytes }`。逆数据用 `sum(length(data))` 统计，不读 BLOB 内容；`undo*` 递归统计 `.artbank/undo/` 的普通文件并跳过符号链接。操作记录面板显示记录数与占用；清空只删除记录与暂存，不对 SQLite 执行 `VACUUM`，数据库文件不会立即缩小。
+- `recoveryNeeded` 为真表示存在 `undoing` / `redoing` 记录且没有对应撤销/重做任务在跑；此时 `blockedReason` 提示重新打开图库恢复。
 - 待释放行对查询不可见：回收站视图与“全库搜索”显式加 `images.purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
 - 界面入口在浏览工具栏“记录”按钮：灰色 `undone` 记录可选中重做，“当前状态”分隔线标出撤销位置；新操作后灰色记录消失。见 [浏览与检索](browse-and-query.md#操作记录)。
 
@@ -313,7 +317,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）；使用反馈批次 3（文件夹一次性排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、窗口状态与展开集合持久化）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）；使用反馈批次 3（文件夹一次性排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、窗口状态与展开集合持久化）；使用反馈批次 4（任务 panic 兜底与 release unwind、`LiveOperation` / `HistoryRunGuard` 收尾、长任务默认排队与 FIFO/写优先、`HistoryPage.storage` 占用统计与中断恢复提示）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 

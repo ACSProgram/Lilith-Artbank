@@ -2255,6 +2255,22 @@ textarea:focus-visible {
   font-size: 10.5px;
 }
 
+.operation-history-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--danger);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.operation-history-warning > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
 .operation-history-list {
   flex: 1;
   min-height: 120px;

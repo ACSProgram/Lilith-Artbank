@@ -253,11 +253,23 @@ export interface HistoryEntry {
   error: string;
 }
 
+export interface HistoryStorage {
+  recordCount: number;
+  chunkCount: number;
+  chunkBytes: number;
+  undoFiles: number;
+  undoBytes: number;
+  totalBytes: number;
+}
+
 export interface HistoryPage {
   entries: HistoryEntry[];
   maxSteps: number;
   pendingPurgeCount: number;
   pendingPurgeBytes: number;
+  storage: HistoryStorage;
+  /** 上次撤销/重做异常中断，且此刻没有对应任务在跑。 */
+  recoveryNeeded: boolean;
   /** 此刻能否开始撤销或重做。 */
   canRun: boolean;
   blockedReason: string | null;

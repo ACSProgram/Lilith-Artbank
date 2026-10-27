@@ -68,7 +68,8 @@ pub struct AppState {
     pub mcp: McpRuntime,
     app: AppHandle,
     library: Mutex<Option<LibrarySession>>,
-    import_job: Mutex<Option<Arc<ImportJob>>>,
+    /// 最近发起的导入；允许排队后可能同时存在多个未结束的导入。
+    import_jobs: Mutex<VecDeque<Arc<ImportJob>>>,
     /// 已结束的导入回执；MCP 任务列表在导入结束后仍要能读到统计与预览。
     import_receipts: Mutex<VecDeque<ImportSnapshot>>,
     managed: AtomicBool,
@@ -82,7 +83,7 @@ pub struct AppState {
 
 /// MCP 能取消的任务只保留最近这些条，足够覆盖一次确认后的等待窗口。
 const MAX_MCP_TASKS: usize = 100;
-/// 导入回执与任务列表保留同样量级，旧的滚动淘汰。
+/// 导入回执与未结束导入的句柄保留同样量级，旧的滚动淘汰；运行中的导入永不淘汰。
 const MAX_IMPORT_RECEIPTS: usize = 20;
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
@@ -98,7 +99,7 @@ impl AppState {
             mcp: McpRuntime::new(),
             app,
             library: Mutex::new(None),
-            import_job: Mutex::new(None),
+            import_jobs: Mutex::new(VecDeque::new()),
             import_receipts: Mutex::new(VecDeque::new()),
             managed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryPlan::default()),
@@ -172,7 +173,6 @@ impl AppState {
         request: ImportRequest,
         from_mcp: bool,
     ) -> AppResult<(ImportSnapshot, Option<i64>)> {
-        self.ensure_no_activity()?;
         let mut request = request.normalized()?;
         request.worker_threads = self.settings.snapshot().performance.worker_threads;
 
@@ -211,14 +211,15 @@ impl AppState {
             label
         };
         // 临时导入是生命周期数据：不写操作记录，也不影响撤销/重做时间线。
-        let operation_id = if temp_target {
+        let operation = if temp_target {
             None
         } else {
-            Some(history::begin_live(
+            Some(history::LiveOperation::begin(
                 &database,
                 NewOperation::new(HistoryKind::Import, label),
             )?)
         };
+        let operation_id = operation.as_ref().map(history::LiveOperation::id);
         handle.set_operation_id(operation_id);
         let source = ImportSource {
             database: database.clone(),
@@ -226,27 +227,24 @@ impl AppState {
             root,
             operation_id,
         };
-        let started = match self
+        let started = self
             .tasks
-            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
-                crate::import::start(runner_app, source, runner_job, request, guard);
-            }) {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(operation_id) = operation_id {
-                    let _ = history::finish_live(&database, operation_id, &error.to_string());
-                }
-                return Err(error);
-            }
-        };
+            .launch(app, handle, ConflictPolicy::Queue, move |guard| {
+                crate::import::start(runner_app, source, runner_job, request, guard, operation);
+            })?;
         if let TaskStartResult::Conflict { active } = started {
-            // 冲突时导入线程没有启动；空记录在这里收掉。
-            if let Some(operation_id) = operation_id {
-                let _ = history::finish_live(&database, operation_id, "");
-            }
             return Err(conflict_error(&active));
         }
-        *self.import_job.lock() = Some(job.clone());
+        {
+            let mut jobs = self.import_jobs.lock();
+            jobs.push_back(job.clone());
+            while jobs.len() > MAX_IMPORT_RECEIPTS {
+                let Some(index) = jobs.iter().position(|job| !job.is_running()) else {
+                    break;
+                };
+                jobs.remove(index);
+            }
+        }
         if from_mcp {
             self.remember_mcp_task(job.id());
         }
@@ -273,30 +271,42 @@ impl AppState {
     }
 
     pub fn cancel_import(&self, job_id: &str) -> AppResult<()> {
-        let slot = self.import_job.lock();
-        let job = slot
-            .as_ref()
-            .filter(|job| job.id() == job_id)
-            .ok_or_else(|| AppError::message("导入任务不存在或已被替换"))?;
+        let job = self
+            .import_jobs
+            .lock()
+            .iter()
+            .find(|job| job.id() == job_id)
+            .cloned()
+            .ok_or_else(|| AppError::message("导入任务不存在或已结束"))?;
+        if !job.is_running() {
+            return Err(AppError::message("导入任务已经结束"));
+        }
         job.request_cancel();
+        // 排队中的导入不会自己看到取消标记，还要从任务总线的等待队列里醒来。
+        let _ = self.tasks.cancel(job.id());
         Ok(())
     }
 
     pub fn import_status(&self, job_id: &str) -> Option<ImportSnapshot> {
-        self.import_job
+        self.import_jobs
             .lock()
-            .as_ref()
-            .filter(|job| job.id() == job_id)
+            .iter()
+            .find(|job| job.id() == job_id)
             .map(|job| job.snapshot())
     }
 
     fn ensure_no_activity(&self) -> AppResult<()> {
-        if !self.tasks.any_busy() {
+        if self.tasks.is_idle() {
             return Ok(());
         }
         if let Some(task) = self.tasks.active().into_iter().next() {
+            let state = if task.phase == TaskPhase::Queued {
+                "正在排队"
+            } else {
+                "正在进行"
+            };
             return Err(AppError::message(format!(
-                "「{}」正在进行，请等待完成或取消",
+                "「{}」{state}，请等待完成或取消",
                 task.label
             )));
         }
@@ -502,7 +512,7 @@ impl AppState {
         let launched = self.tasks.launch(
             self.app.clone(),
             handle,
-            ConflictPolicy::Fail,
+            ConflictPolicy::Queue,
             move |guard| {
                 let database = database.clone();
                 let root = root.clone();
@@ -585,6 +595,7 @@ impl AppState {
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
         self.import_receipts.lock().clear();
+        self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
@@ -620,6 +631,7 @@ impl AppState {
         *self.recovery.lock() = plan;
         self.optimize_estimates.lock().clear();
         self.import_receipts.lock().clear();
+        self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
@@ -652,17 +664,18 @@ impl AppState {
     }
 
     pub fn close_library(&self) -> AppResult<()> {
-        // 写任务不能中途关库；AI/扫描任务先取消，等它们真正退出后再释放句柄。
-        if self.tasks.lane_busy(TaskLane::Write) {
-            let label = self
-                .tasks
-                .active()
-                .into_iter()
-                .find(|task| task.lane == TaskLane::Write)
+        // 写任务不能中途关库；排队中的写任务也算，不能等关库时再启动。
+        let write_task = self
+            .tasks
+            .active()
+            .into_iter()
+            .find(|task| task.lane == TaskLane::Write);
+        if self.tasks.lane_busy(TaskLane::Write) || write_task.is_some() {
+            let label = write_task
                 .map(|task| task.label)
                 .unwrap_or_else(|| "文件任务".to_owned());
             return Err(AppError::message(format!(
-                "「{label}」正在进行，请等待完成或取消后再关闭图库"
+                "「{label}」正在进行或排队，请等待完成或取消后再关闭图库"
             )));
         }
         self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
@@ -679,6 +692,7 @@ impl AppState {
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
         self.import_receipts.lock().clear();
+        self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
@@ -692,6 +706,8 @@ impl AppState {
             log::warn!("退出时仍有写任务，临时文件夹留到下次打开图库时清空");
             return;
         }
+        // 排队任务还没占 lane，退出前直接取消，避免关闭过程中突然启动。
+        self.tasks.cancel_queued();
         self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
         if !self.tasks.wait_idle(Duration::from_secs(2)) {
             log::warn!("退出时任务未停止，临时文件夹留到下次打开图库时清空");
@@ -1000,20 +1016,34 @@ impl AppState {
     }
 
     pub fn history_page(&self) -> AppResult<HistoryPage> {
-        let (database, _) = self.query_source()?;
+        let (database, root) = self.query_source()?;
         let entries = history::list(&database)?;
         let (pending_purge_count, pending_purge_bytes) = history::pending_summary(&database)?;
+        let storage = history::storage_usage(&database, &root)?;
+        let history_task_active = self
+            .tasks
+            .active()
+            .iter()
+            .any(|task| matches!(task.kind, TaskKind::Undo | TaskKind::Redo));
+        // 有中断标记但撤销/重做任务正在跑，说明是本次运行中的中间态，不算遗留。
+        let recovery_needed = !history_task_active && history::has_interrupted_run(&database)?;
         // 撤销与重做都要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
-        let blocked_reason = match self.tasks.active().first() {
-            Some(task) => Some(format!("「{}」正在进行，完成后才能撤销或重做", task.label)),
-            None if entries.is_empty() => Some("还没有操作记录".to_owned()),
-            None => None,
+        let blocked_reason = if recovery_needed {
+            Some("上次撤销或重做异常中断，请重新打开图库恢复".to_owned())
+        } else {
+            match self.tasks.active().first() {
+                Some(task) => Some(format!("「{}」正在进行，完成后才能撤销或重做", task.label)),
+                None if entries.is_empty() => Some("还没有操作记录".to_owned()),
+                None => None,
+            }
         };
         Ok(HistoryPage {
             entries,
             max_steps: self.settings.snapshot().history.max_steps,
             pending_purge_count,
             pending_purge_bytes,
+            storage,
+            recovery_needed,
             can_run: blocked_reason.is_none(),
             blocked_reason,
         })
@@ -1388,18 +1418,6 @@ impl AppState {
         content::original_path(&database, &root, image_id)
     }
 
-    /// 启动一个会修改文件/缩略图的后台任务（写入 lane，独占）。
-    pub fn begin_write_task(
-        &self,
-        app: &AppHandle,
-        kind: TaskKind,
-        scope: String,
-    ) -> AppResult<(Arc<TaskHandle>, LaneGuard)> {
-        let handle = TaskHandle::new(uuid::Uuid::new_v4().to_string(), kind, scope);
-        let guard = self.tasks.begin_now(app, handle.clone())?;
-        Ok((handle, guard))
-    }
-
     pub fn cancel_task(&self, task_id: &str) -> AppResult<()> {
         self.tasks.cancel(task_id)
     }
@@ -1427,7 +1445,7 @@ impl AppState {
             &settings,
             kind,
             image_ids,
-            ConflictPolicy::Fail,
+            ConflictPolicy::Queue,
         )
     }
 
@@ -1646,38 +1664,57 @@ impl AppState {
 
         let (database, thumbs, root) = self.edit_handles()?;
         let fingerprint = optimize_fingerprint(&request.scope, &options);
-        let ids = request.scope.resolve(&database)?;
-        if ids.is_empty() {
+        let scope = request.scope.clone();
+        let scope_label = scope.label();
+        if scope.resolve(&database)?.is_empty() {
             return Err(AppError::message("当前范围没有图片"));
         }
-        let candidates = crate::library::optimize::collect_candidates(&database, &ids)?;
-        let (count, bytes) = crate::library::optimize::eligible_summary(&candidates, &options);
-        // 指纹与候选漂移都在这里一次判定；没有候选时 `verify_grant` 自己会报错。
-        crate::library::optimize::verify_grant(&estimate, &fingerprint, count, bytes)?;
-
-        let operation_id = history::begin_live(
-            &database,
-            NewOperation::new(
-                HistoryKind::Optimize,
-                format!("优化图片空间 · {}", request.scope.label()),
-            ),
-        )?;
 
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             TaskKind::Optimize,
-            request.scope.label(),
+            scope_label,
         );
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
-        let cleanup_database = database.clone();
-        let launched = self
-            .tasks
+        self.tasks
             .launch(app, handle, request.conflict, move |guard| {
                 let _ = tasks.spawn_worker("optimize".to_owned(), worker.clone(), move || {
                     let _guard: LaneGuard = guard;
                     worker.set_phase(TaskPhase::Running);
+
+                    let prepared = recheck_optimize_scope(
+                        &database,
+                        &scope,
+                        &options,
+                        &estimate,
+                        &fingerprint,
+                    );
+                    let (candidates, count) = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                            return;
+                        }
+                    };
+                    let operation = match history::LiveOperation::begin(
+                        &database,
+                        NewOperation::new(
+                            HistoryKind::Optimize,
+                            format!("优化图片空间 · {}", scope.label()),
+                        ),
+                    ) {
+                        Ok(operation) => operation,
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                            return;
+                        }
+                    };
+                    let operation_id = operation.id();
+                    worker.set_operation_id(Some(operation_id));
                     worker.set_total(count as usize);
                     let result = crate::library::optimize::optimize(
                         &database,
@@ -1704,7 +1741,9 @@ impl AppState {
                             };
                             let _ = history::update_label(&database, operation_id, &label);
                             let error = report.stop_reason.clone().unwrap_or_default();
-                            let _ = history::finish_live(&database, operation_id, &error);
+                            if let Err(error) = operation.finish(&error) {
+                                log::warn!("收尾空间优化记录失败：{error}");
+                            }
                             let mut summary = format!(
                                 "处理 {} 张，省 {}",
                                 report.processed,
@@ -1732,20 +1771,15 @@ impl AppState {
                             }
                         }
                         Err(error) => {
-                            let _ =
-                                history::finish_live(&database, operation_id, &error.to_string());
+                            if let Err(error) = operation.finish(&error.to_string()) {
+                                log::warn!("收尾空间优化记录失败：{error}");
+                            }
                             worker.set_message(error.to_string());
                             worker.finish(TaskPhase::Failed);
                         }
                     }
                 });
-            });
-
-        // 任务没能启动（冲突或线程失败）时不能留下一条永远不会结束的记录。
-        if matches!(launched, Ok(TaskStartResult::Conflict { .. }) | Err(_)) {
-            let _ = history::finish_live(&cleanup_database, operation_id, "");
-        }
-        launched
+            })
     }
 
     pub fn optimize_estimate(&self, task_id: &str) -> Option<OptimizeEstimate> {
@@ -1787,6 +1821,25 @@ fn optimize_fingerprint(scope: &crate::app::tasks::TaskScope, options: &Optimize
     blake3::hash(format!("{scope:?}|{options}").as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// 排队期间范围、文件与估算凭证都可能变化，真正开始执行前重新收集与核对。
+/// 任一环节与提交估算时不一致就返回错误，由调用方把任务标成失败，不使用过期候选。
+fn recheck_optimize_scope(
+    database: &LibraryDb,
+    scope: &TaskScope,
+    options: &OptimizeOptions,
+    estimate: &OptimizeEstimate,
+    fingerprint: &str,
+) -> AppResult<(Vec<crate::library::optimize::CandidateRow>, u64)> {
+    let ids = scope.resolve(database)?;
+    if ids.is_empty() {
+        return Err(AppError::message("当前范围没有图片"));
+    }
+    let candidates = crate::library::optimize::collect_candidates(database, &ids)?;
+    let (count, bytes) = crate::library::optimize::eligible_summary(&candidates, options);
+    crate::library::optimize::verify_grant(estimate, fingerprint, count, bytes)?;
+    Ok((candidates, count))
 }
 
 fn format_savings(bytes: u64) -> String {

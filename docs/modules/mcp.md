@@ -143,7 +143,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `temp_features_generate` | `ids`（≤100）、`kind: embedding/pose` | `taskId`；完成后在 `tasks_get` 看逐张结果与失败清单 |
 
 - 只接受临时文件夹里的图片 id；混入不存在、已删除或普通图库图片时整批拒绝（`status: "rejected"` + `invalidIds`），不做部分执行。
-- 只做 `embedding` 与 `pose`，不生成描述；不写操作记录，不需要 `confirmedCount`。钉住 write lane：期间其它写入与导入按现有冲突规则拒绝。
+- 只做 `embedding` 与 `pose`，不生成描述；不写操作记录，不需要 `confirmedCount`。任务占 `ai` lane：正在排队的其它 AI/扫描任务会按 FIFO 等待，短写操作优先通过。
 - 询问档每次确认；完全档直接执行；只读档拒绝。
 - 临时区导入时已经算好 pHash 与主色，粗筛不需要生成；这个工具只补语义与姿势。库内没有对应特征时，生成临时特征也搜不出结果，工具描述要求先看 `library_info.features`。
 - 特征写进 `feature_blobs`，临时区清空时随 `images` 行级联删除；feature pack 里的字节不会立刻回收，留待维护任务处理。
@@ -174,7 +174,8 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 正式写入必须带 `confirmedCount`，等于 selector 解析出的 id 数；缺失或不一致返回 `status: "rejected"` 与最新数量。
 - selector 解析为空返回 `status: "noop"`，不产生历史记录。`collections_create` 只在带 selector 时套用这条；不带 selector 时按用户意图创建空集合。`collections_membership` 会先核对集合是否存在，不存在直接报错，不进确认队列。
 - 部分 id 不存在、已在回收站或状态不符时返回 `status: "rejected"` 与失败清单，不执行任何一行。
-- MCP 写入在本进程内串行；短写入立即占用 write lane，导入、移动、编辑、优化、撤销/重做或 AI/扫描任务占用时直接拒绝。移动任务在启动前检查任务总线。
+- MCP 写入在本进程内串行；短写入立即占用 write lane，导入、移动、编辑、优化、撤销/重做或 AI/扫描任务占用时直接拒绝，不排队。
+- 长任务（`library_import`、`library_move`、`temp_features_generate`）默认排队：调用立即返回 `taskId`，任务可能处于 `queued` 阶段；`tasks_cancel` 可取消排队中的任务。撤销/重做与清空记录不排队，被占用时直接失败。
 - 一次工具调用对应一条历史记录；标签操作的历史 `affected` 是关系条数，工具结果同时给出 `selected`。
 
 ## 询问档确认队列
@@ -271,7 +272,7 @@ Rust：
 4. 询问档 `dryRun` 一个搜索/拼图 selector，拿到 `selected` 后带 `confirmedCount` 执行评分或加标签，确认设置页“最近 AI 操作”出现 `AI ·` 记录且网格刷新。
 5. 询问档移入回收站，确认右下角出现确认卡片；批准后图片进入回收站、查看器关闭；拒绝或等待 10 分钟确认操作取消。
 6. 对一条记录 `history_list` → `history_undo` dryRun → 带 steps/affected 执行，确认任务中心进度与撤销结果；再重做。压缩记录应返回“压缩操作不可撤销”。
-7. 启动一次导入/优化后调用写工具，确认得到明确冲突错误；用 `tasks_get` 查看活动任务。
+7. 启动一次导入/优化后调用短写工具，确认得到明确冲突错误且没有被排队；再启动第二个长任务，确认它进入 `queued` 并可用 `tasks_cancel` 取消。
 8. 关闭 MCP 服务，确认客户端收到明确连接错误；重启应用后确认 `mcp-runtime.json` 已更新。
 9. 询问档调用 `import_start` 导入几张图片，确认右下角与设置页出现确认卡，卡片列出来源路径、目标文件夹、标签/评分与重复策略；批准后任务开始，拒绝或超时则不导入。
 10. `tasks_get(taskId)` 等到导入完成，确认附带回执的 `imported` / `duplicates` / `merged` / `previewIds` 与失败清单；用 `image_sheet(selector.ids=previewIds)` 看到刚入库的图。

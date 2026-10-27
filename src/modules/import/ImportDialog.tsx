@@ -55,6 +55,8 @@ function basename(path: string): string {
 
 function phaseLabel(phase: ImportPhase): string {
   switch (phase) {
+    case "queued":
+      return "排队中";
     case "scanning":
       return "正在扫描输入目录";
     case "processing":

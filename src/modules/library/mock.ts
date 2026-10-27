@@ -1200,6 +1200,15 @@ export function mockOperationHistory(): HistoryPage {
     maxSteps: 100,
     pendingPurgeCount: 0,
     pendingPurgeBytes: 0,
+    storage: {
+      recordCount: entries.length,
+      chunkCount: 0,
+      chunkBytes: 0,
+      undoFiles: 0,
+      undoBytes: 0,
+      totalBytes: 0,
+    },
+    recoveryNeeded: false,
     canRun: entries.length > 0,
     blockedReason: entries.length > 0 ? null : "还没有操作记录",
   };

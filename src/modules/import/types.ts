@@ -15,6 +15,7 @@ export interface ImportFolder {
 }
 
 export type ImportPhase =
+  | "queued"
   | "scanning"
   | "processing"
   | "finishing"

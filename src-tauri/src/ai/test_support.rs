@@ -53,20 +53,32 @@ impl MockServer {
         let requests_for_thread = requests.clone();
         let stop_for_thread = stop.clone();
         let handler = Arc::new(handler);
-        let handle = std::thread::spawn(move || {
-            while !stop_for_thread.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let index = requests_for_thread.lock().len();
-                        handle_connection(stream, &requests_for_thread, handler.as_ref(), index);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("mock-ai-server".to_owned())
+            .spawn(move || {
+                ready_tx.send(()).ok();
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let index = requests_for_thread.lock().len();
+                            handle_connection(
+                                stream,
+                                &requests_for_thread,
+                                handler.as_ref(),
+                                index,
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(3));
+                        }
+                        Err(_) => break,
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(3));
-                    }
-                    Err(_) => break,
                 }
-            }
-        });
+            })
+            .expect("无法启动 mock 服务线程");
+        // 监听端口在起线程前已经绑定；这里再等线程进入 accept 循环，避免高并发测试下的启动时序抖动。
+        let _ = ready_rx.recv();
         Self {
             address,
             stop,

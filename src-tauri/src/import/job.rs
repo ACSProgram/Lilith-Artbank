@@ -31,6 +31,7 @@ pub enum DuplicatePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImportPhase {
+    Queued,
     Scanning,
     Processing,
     Finishing,
@@ -187,6 +188,7 @@ pub struct ImportJob {
 
 fn task_phase(phase: ImportPhase) -> TaskPhase {
     match phase {
+        ImportPhase::Queued => TaskPhase::Queued,
         ImportPhase::Scanning | ImportPhase::Processing | ImportPhase::Finishing => {
             TaskPhase::Running
         }
@@ -203,7 +205,7 @@ impl ImportJob {
         Self {
             handle,
             target,
-            phase: Mutex::new(ImportPhase::Scanning),
+            phase: Mutex::new(ImportPhase::Queued),
             total: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
             imported: AtomicUsize::new(0),
@@ -377,10 +379,23 @@ impl ImportJob {
         self.handle.finish(task_phase(phase));
     }
 
+    /// 排队中被取消或线程没起来时，导入阶段还停在 Queued；以任务总线的终态为准。
+    fn effective_phase(&self) -> ImportPhase {
+        let phase = self.phase();
+        if phase != ImportPhase::Queued {
+            return phase;
+        }
+        match self.handle.phase() {
+            TaskPhase::Cancelled => ImportPhase::Cancelled,
+            TaskPhase::Failed => ImportPhase::Failed,
+            _ => ImportPhase::Queued,
+        }
+    }
+
     pub fn progress(&self) -> ImportProgress {
         ImportProgress {
             job_id: self.handle.id().to_owned(),
-            phase: self.phase(),
+            phase: self.effective_phase(),
             target: self.target,
             total: self.total.load(Ordering::Relaxed),
             processed: self.processed.load(Ordering::Relaxed),
@@ -438,7 +453,7 @@ mod tests {
 
         let value = serde_json::to_value(job.snapshot()).unwrap();
         assert_eq!(value["jobId"], "job-1");
-        assert_eq!(value["phase"], "scanning");
+        assert_eq!(value["phase"], "queued");
         assert_eq!(value["total"], 10);
         assert_eq!(value["imported"], 3);
         assert_eq!(value["failures"][0]["path"], "a.png");
@@ -446,6 +461,14 @@ mod tests {
         assert!(value.get("finishedAt").is_some());
         assert!(value.get("previewIds").unwrap().is_array());
         assert!(value.get("progress").is_none());
+    }
+
+    #[test]
+    fn queued_cancel_uses_task_terminal_phase() {
+        let job = ImportJob::new("job-queued", "1 个路径", ImportTarget::Library);
+        assert_eq!(job.progress().phase, ImportPhase::Queued);
+        job.handle().finish(TaskPhase::Cancelled);
+        assert_eq!(job.progress().phase, ImportPhase::Cancelled);
     }
 
     #[test]

@@ -41,7 +41,12 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
         index >= 0
           ? previous.map((task) => (task.taskId === snapshot.taskId ? snapshot : task))
           : [snapshot, ...previous];
-      return next.slice(0, MAX_TASKS);
+      // 活跃任务（含排队）永不裁掉；已结束的只保留最近 MAX_TASKS 条。
+      const active = next.filter(isTaskActive);
+      const finished = next
+        .filter((task) => !isTaskActive(task))
+        .slice(0, Math.max(0, MAX_TASKS - active.length));
+      return [...active, ...finished];
     });
   }, []);
 

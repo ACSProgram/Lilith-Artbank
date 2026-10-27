@@ -12,7 +12,7 @@ use crate::{
     app::{
         error::{AppError, AppResult},
         state::AppState,
-        tasks::LaneGuard,
+        tasks::{self, LaneGuard},
     },
     imageops::optimize::{OptimizeFormat, OptimizeOptions, QualityTier},
     library::{db::LibraryDb, history, paths::normalize_folder, thumbs::ThumbPack},
@@ -166,82 +166,106 @@ pub struct ImportSource {
 }
 
 /// 启动后台导入；立即返回，进度与最终结果通过事件推送。
-/// `guard` 是任务总线上的 write lane 占用权，随导入线程一起释放。
+/// `guard` 是任务总线上的 write lane 占用权，随导入线程一起释放；
+/// `live` 是本次导入的操作记录守卫，线程结束（含 panic）时由它收尾。
 pub fn start(
     app: AppHandle,
     source: ImportSource,
     job: Arc<ImportJob>,
     request: ImportRequest,
     guard: LaneGuard,
+    live: Option<history::LiveOperation>,
 ) {
     spawn_progress(app.clone(), job.clone());
 
-    let operation_id = source.operation_id;
-    let history_database = source.database.clone();
-    let history_database_fallback = history_database.clone();
-    let history_app = app.clone();
-    let fallback_app = app.clone();
-    let fallback_job = job.clone();
+    let thread_app = app.clone();
+    let thread_job = job.clone();
     let spawn = std::thread::Builder::new()
         .name(format!("import-{}", job.id()))
         .spawn(move || {
-            let _guard = guard;
+            // 外层再兜一次：收尾与事件推送自身 panic 时，任务也不能停在运行中。
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pipeline::run(source, job.clone(), request)
+                let _guard = guard;
+                let phase = run_pipeline(source, &thread_job, request);
+                finish(&thread_app, &thread_job, phase, live);
             }));
-
-            let phase = if job.should_cancel() {
-                ImportPhase::Cancelled
-            } else {
-                match outcome {
-                    Ok(Ok(())) => ImportPhase::Completed,
-                    Ok(Err(error)) => {
-                        job.add_failure("", error.to_string());
-                        job.inc_failed();
-                        ImportPhase::Failed
-                    }
-                    Err(_) => {
-                        log::error!("导入任务异常终止");
-                        job.add_failure("", "导入任务异常终止");
-                        job.inc_failed();
-                        ImportPhase::Failed
-                    }
+            if let Err(payload) = outcome {
+                log::error!(
+                    "导入任务在收尾阶段异常终止：{}",
+                    tasks::panic_message(payload.as_ref())
+                );
+                if thread_job.is_running() {
+                    thread_job.add_failure("", "导入任务异常终止");
+                    thread_job.inc_failed();
                 }
-            };
-
-            job.finish(phase);
-            if let Some(op_id) = operation_id {
-                let error = if phase == ImportPhase::Failed {
-                    "导入未完成"
-                } else {
-                    ""
-                };
-                if let Err(error) = history::finish_live(&history_database, op_id, error) {
-                    log::warn!("收尾导入操作记录失败：{error}");
-                }
+                // `live` 已随栈展开丢弃并在 Drop 里收尾，这里只需补终态与回执。
+                finish(&thread_app, &thread_job, ImportPhase::Failed, None);
             }
-            if let Some(state) = history_app.try_state::<AppState>() {
-                state.remember_import_receipt(job.snapshot());
-                state.after_history_write();
-            }
-            let _ = app.emit("import-progress", job.progress());
-            let _ = app.emit("import-finished", job.snapshot());
         });
 
     if let Err(error) = spawn {
         log::error!("无法启动导入线程：{error}");
-        if let Some(op_id) = operation_id {
-            // 还没有任何批次提交，finish_live 会删掉空记录。
-            let _ = history::finish_live(&history_database_fallback, op_id, "导入线程启动失败");
-        }
-        fallback_job.add_failure("", format!("无法启动导入任务：{error}"));
-        fallback_job.inc_failed();
-        fallback_job.finish(ImportPhase::Failed);
-        if let Some(state) = fallback_app.try_state::<AppState>() {
-            state.remember_import_receipt(fallback_job.snapshot());
-        }
-        let _ = fallback_app.emit("import-finished", fallback_job.snapshot());
+        job.add_failure("", format!("无法启动导入任务：{error}"));
+        job.inc_failed();
+        // `live` 已随闭包一起丢弃并在 Drop 里收尾，这里只补终态与回执。
+        finish(&app, &job, ImportPhase::Failed, None);
     }
+}
+
+/// 跑完管线并把结果折算成导入终态；只处理 panic 与业务错误，不写事件。
+fn run_pipeline(source: ImportSource, job: &Arc<ImportJob>, request: ImportRequest) -> ImportPhase {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipeline::run(source, job.clone(), request)
+    }));
+    if job.should_cancel() {
+        return ImportPhase::Cancelled;
+    }
+    match outcome {
+        Ok(Ok(())) => ImportPhase::Completed,
+        Ok(Err(error)) => {
+            job.add_failure("", error.to_string());
+            job.inc_failed();
+            ImportPhase::Failed
+        }
+        Err(payload) => {
+            log::error!(
+                "导入任务异常终止：{}",
+                tasks::panic_message(payload.as_ref())
+            );
+            job.add_failure("", "导入任务异常终止");
+            job.inc_failed();
+            ImportPhase::Failed
+        }
+    }
+}
+
+/// 统一收尾：终态、操作记录、导入回执与两个事件。
+/// 已经结束的任务不会覆盖终态，只补一次回执与事件。
+fn finish(
+    app: &AppHandle,
+    job: &Arc<ImportJob>,
+    phase: ImportPhase,
+    live: Option<history::LiveOperation>,
+) {
+    if job.is_running() {
+        job.finish(phase);
+    }
+    if let Some(live) = live {
+        let error = if phase == ImportPhase::Failed {
+            "导入未完成"
+        } else {
+            ""
+        };
+        if let Err(error) = live.finish(error) {
+            log::warn!("收尾导入操作记录失败：{error}");
+        }
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        state.remember_import_receipt(job.snapshot());
+        state.after_history_write();
+    }
+    let _ = app.emit("import-progress", job.progress());
+    let _ = app.emit("import-finished", job.snapshot());
 }
 
 fn spawn_progress(app: AppHandle, job: Arc<ImportJob>) {

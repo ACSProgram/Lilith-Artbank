@@ -59,6 +59,12 @@ pub fn run() {
 
     let application = builder
         .setup(|application| {
+            // 保留默认输出，同时把位置与消息写进程序日志；release 不再 abort，任务线程可以兜底。
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                log::error!("panic: {info}");
+                default_hook(info);
+            }));
             let root = app::paths::app_root();
             let settings_path = app::paths::settings_path();
             if let Some(parent) = settings_path.parent() {

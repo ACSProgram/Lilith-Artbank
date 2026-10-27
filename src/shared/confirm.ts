@@ -78,14 +78,20 @@ export function confirmClearHistory(
   confirm: ConfirmFn,
   pendingCount: number,
   pendingBytes: number,
+  storageBytes: number,
 ): Promise<boolean> {
+  const storage =
+    storageBytes > 0
+      ? `会删除约 ${formatBytes(storageBytes)} 撤销数据；数据库文件不会立即缩小。`
+      : "";
+  const pending =
+    pendingCount > 0
+      ? `已从回收站移除的 ${count(pendingCount)} 张图片会立即释放磁盘（约 ${formatBytes(pendingBytes)}）。`
+      : "";
   return confirm({
     title: "清空操作记录？",
     message: "所有记录都会被删除，图库不能再撤销到这些操作之前。",
-    detail:
-      pendingCount > 0
-        ? `已从回收站移除的 ${count(pendingCount)} 张图片会立即释放磁盘（约 ${formatBytes(pendingBytes)}）。`
-        : "当前没有待释放的文件。",
+    detail: [storage, pending].filter(Boolean).join(" "),
     confirmLabel: "清空记录",
     danger: true,
   });

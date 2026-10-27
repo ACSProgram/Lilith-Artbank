@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Play, Square } from "lucide-react";
+import { Play, Square } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
@@ -18,8 +18,6 @@ import {
   isTaskActive,
   type BatchTaskKind,
   type BatchTaskRequest,
-  type ConflictPolicy,
-  type TaskSummary,
 } from "./taskTypes";
 import { ScopePicker } from "../shared/components/ScopePicker";
 import {
@@ -73,7 +71,6 @@ export function BatchTaskDialog({
   const [maxTokens, setMaxTokens] = useState(160);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<TaskSummary[] | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const wasOpenRef = useRef(open);
 
@@ -89,7 +86,6 @@ export function BatchTaskDialog({
     setMaxTokens(160);
     setStarting(false);
     setError(null);
-    setConflict(null);
     setTaskId(null);
     // 只在打开时重置；任务状态变化不应打断用户输入。
   }, [open]);
@@ -125,13 +121,12 @@ export function BatchTaskDialog({
   const capabilityInfo = capability ? status?.health?.capabilities[capability] : undefined;
   const capabilityReady = capabilityInfo?.ready === true;
 
-  const launch = async (policy: ConflictPolicy) => {
+  const launch = async () => {
     if (!context) return;
     const builtScope = buildScope(scope, context);
     if (!builtScope) return;
     setStarting(true);
     setError(null);
-    setConflict(null);
     try {
       const request: BatchTaskRequest = {
         kind,
@@ -140,11 +135,11 @@ export function BatchTaskDialog({
         recalcVisuals,
         prompt: kind === "aiDescription" ? prompt : null,
         maxTokens: kind === "aiDescription" ? maxTokens : null,
-        conflict: policy,
+        conflict: "queue",
       };
       const result = await start(request);
       if (result.status === "conflict") {
-        setConflict(result.active);
+        setError("任务暂时无法开始，请稍后再试");
         return;
       }
       setTaskId(result.task.taskId);
@@ -172,22 +167,6 @@ export function BatchTaskDialog({
         取消任务
       </Button>
     </>
-  ) : conflict ? (
-    <>
-      <Button variant="ghost" onClick={() => setConflict(null)}>
-        返回
-      </Button>
-      <Button
-        variant="secondary"
-        onClick={() => void launch("cancelActive")}
-        loading={starting}
-      >
-        取消现有任务并开始
-      </Button>
-      <Button variant="primary" onClick={() => void launch("queue")} loading={starting}>
-        排队等待
-      </Button>
-    </>
   ) : (
     <>
       <Button variant="ghost" onClick={onClose}>
@@ -198,7 +177,7 @@ export function BatchTaskDialog({
         icon={<Play size={13} />}
         loading={starting}
         disabled={!kindAvailability[kind].enabled || !scopeOptions[scope].enabled}
-        onClick={() => void launch("fail")}
+        onClick={() => void launch()}
       >
         开始任务
       </Button>
@@ -338,22 +317,6 @@ export function BatchTaskDialog({
                 <small>不勾选时只处理缺失项。</small>
               </span>
             </label>
-          </div>
-        ) : null}
-
-        {conflict ? (
-          <div className="batch-task-conflict">
-            <span>
-              <AlertTriangle size={14} /> 现在有任务正在运行：
-            </span>
-            <ul>
-              {conflict.map((taskItem) => (
-                <li key={taskItem.taskId}>
-                  {taskItem.label} · {taskItem.scope}
-                </li>
-              ))}
-            </ul>
-            <p>可以等它结束后自动开始，或者取消它、马上开始新任务。</p>
           </div>
         ) : null}
 

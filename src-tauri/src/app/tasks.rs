@@ -2,9 +2,12 @@
 //!
 //! 所有会长时间占用磁盘、写连接或 AI 服务的操作都注册到这里：
 //! 同一时刻只允许一个 `write` 任务；`ai` 与 `scan` 可以并行；同 lane 串行。
+//! 长任务冲突时默认排队（同 lane FIFO，write 优先），短操作仍立即失败。
+//! 任务体 panic、线程起不来或提前返回都在这里落到失败终态，并释放 lane。
 //! 进度通过 `task-progress` / `task-finished` 事件推给前端任务中心。
 
 use std::{
+    any::Any,
     collections::VecDeque,
     sync::{
         Arc,
@@ -28,7 +31,7 @@ use crate::{
     },
 };
 
-/// 任务历史保留条数（含已结束），只存在内存里。
+/// 任务历史保留条数（含已结束），只存在内存里；运行中与排队中的任务不会被裁掉。
 pub const MAX_TASKS: usize = 50;
 const MAX_FAILURES: usize = 200;
 const EMIT_INTERVAL: Duration = Duration::from_millis(150);
@@ -385,6 +388,43 @@ impl TaskHandle {
     }
 }
 
+/// 任务体退栈时的最后一道兜底：正常返回但没写终态，或 panic 逃过 `catch_unwind` 时标为失败。
+struct TaskRunGuard {
+    handle: Arc<TaskHandle>,
+}
+
+impl Drop for TaskRunGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.set_message("任务异常终止");
+            self.handle.finish(TaskPhase::Failed);
+        }
+    }
+}
+
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "未知 panic".to_owned()
+    }
+}
+
+/// 把任务体 panic 转成失败终态，返回给调用方的错误文案（与任务消息一致）。
+pub(crate) fn fail_from_panic(
+    handle: &TaskHandle,
+    name: &str,
+    payload: &(dyn Any + Send),
+) -> String {
+    let message = format!("任务异常终止：{}", panic_message(payload));
+    log::error!("任务线程 {name} 异常终止：{message}");
+    handle.set_message(message.clone());
+    handle.finish(TaskPhase::Failed);
+    message
+}
+
 impl BatchReporter for TaskHandle {
     fn report(&self, completed: usize, total: usize) {
         self.set_total(total);
@@ -404,11 +444,19 @@ impl BatchReporter for TaskHandle {
     }
 }
 
+/// 排队中的任务：只在等待 lane 时存在，拿到 lane 或取消后即移除。
+#[derive(Debug)]
+struct WaitEntry {
+    task_id: String,
+    lane: TaskLane,
+}
+
 #[derive(Default)]
 struct LaneState {
     write: usize,
     ai: usize,
     scan: usize,
+    waiters: VecDeque<WaitEntry>,
 }
 
 impl LaneState {
@@ -439,7 +487,56 @@ impl LaneState {
     }
 
     fn idle_unchecked(&self) -> bool {
-        self.write == 0 && self.ai == 0 && self.scan == 0
+        self.write == 0 && self.ai == 0 && self.scan == 0 && self.waiters.is_empty()
+    }
+
+    fn enqueue(&mut self, handle: &TaskHandle) {
+        if self
+            .waiters
+            .iter()
+            .any(|waiter| waiter.task_id == handle.id())
+        {
+            return;
+        }
+        self.waiters.push_back(WaitEntry {
+            task_id: handle.id().to_owned(),
+            lane: handle.lane(),
+        });
+    }
+
+    fn remove_waiter(&mut self, task_id: &str) {
+        self.waiters.retain(|waiter| waiter.task_id != task_id);
+    }
+
+    /// 等待者能否开始：同 lane 先来先得；write 只在全空闲且排在最前时开始；
+    /// 任何 write 等待者都会阻止它后面的 ai/scan 启动，避免写任务被持续插队饿死。
+    fn waiter_can_start(&self, task_id: &str, lane: TaskLane) -> bool {
+        let Some(position) = self
+            .waiters
+            .iter()
+            .position(|waiter| waiter.task_id == task_id)
+        else {
+            return false;
+        };
+        let ahead: Vec<&WaitEntry> = self.waiters.iter().take(position).collect();
+        let write_ahead = ahead.iter().any(|waiter| waiter.lane == TaskLane::Write);
+        match lane {
+            TaskLane::Write => self.can_start(TaskLane::Write) && ahead.is_empty(),
+            TaskLane::Ai => {
+                self.can_start(TaskLane::Ai)
+                    && !write_ahead
+                    && !ahead.iter().any(|waiter| waiter.lane == TaskLane::Ai)
+            }
+            TaskLane::Scan => {
+                self.can_start(TaskLane::Scan)
+                    && !write_ahead
+                    && !ahead.iter().any(|waiter| waiter.lane == TaskLane::Scan)
+            }
+        }
+    }
+
+    fn has_waiters(&self) -> bool {
+        !self.waiters.is_empty()
     }
 }
 
@@ -504,8 +601,20 @@ impl TaskBus {
         }
     }
 
+    /// 没有运行中任务、排队任务，也没有短操作占着 lane。
+    pub fn is_idle(&self) -> bool {
+        if !self.inner.lanes.lock().idle_unchecked() {
+            return false;
+        }
+        self.inner
+            .entries
+            .lock()
+            .iter()
+            .all(|handle| handle.is_finished())
+    }
+
     pub fn any_busy(&self) -> bool {
-        !self.inner.lanes.lock().idle_unchecked()
+        !self.is_idle()
     }
 
     pub fn conflicting(&self, lane: TaskLane) -> Vec<TaskSummary> {
@@ -519,19 +628,23 @@ impl TaskBus {
     }
 
     pub fn cancel(&self, task_id: &str) -> AppResult<()> {
-        let entries = self.inner.entries.lock();
-        let handle = entries
-            .iter()
-            .find(|handle| handle.id() == task_id)
-            .ok_or_else(|| AppError::message("任务不存在或已结束"))?;
-        if handle.is_finished() {
-            return Err(AppError::message("任务已经结束"));
-        }
-        if !handle.is_cancellable() {
-            return Err(AppError::message("该任务不能中途取消"));
-        }
+        let handle = {
+            let entries = self.inner.entries.lock();
+            let handle = entries
+                .iter()
+                .find(|handle| handle.id() == task_id)
+                .ok_or_else(|| AppError::message("任务不存在或已结束"))?;
+            if handle.is_finished() {
+                return Err(AppError::message("任务已经结束"));
+            }
+            if !handle.is_cancellable() {
+                return Err(AppError::message("该任务不能中途取消"));
+            }
+            handle.clone()
+        };
         handle.request_cancel();
         // 排队中的任务也要立刻醒来，看到取消标记后结束。
+        self.inner.lanes.lock().remove_waiter(handle.id());
         self.inner.ready.notify_all();
         Ok(())
     }
@@ -545,6 +658,27 @@ impl TaskBus {
                 }
             }
         }
+        {
+            let mut state = self.inner.lanes.lock();
+            state.waiters.retain(|waiter| !lanes.contains(&waiter.lane));
+        }
+        self.inner.ready.notify_all();
+    }
+
+    /// 退出/换库前取消所有还在排队的任务，避免关闭过程中队列突然启动。
+    pub fn cancel_queued(&self) {
+        let cancelled: Vec<Arc<TaskHandle>> = self
+            .inner
+            .entries
+            .lock()
+            .iter()
+            .filter(|handle| handle.is_running() && handle.phase() == TaskPhase::Queued)
+            .cloned()
+            .collect();
+        for handle in &cancelled {
+            handle.request_cancel();
+        }
+        self.inner.lanes.lock().waiters.clear();
         self.inner.ready.notify_all();
     }
 
@@ -552,13 +686,7 @@ impl TaskBus {
     pub fn wait_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let busy = self
-                .inner
-                .entries
-                .lock()
-                .iter()
-                .any(|handle| handle.is_running());
-            if !busy {
+            if self.is_idle() {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -589,14 +717,18 @@ impl TaskBus {
         })
     }
 
-    /// 排队等待时每 200ms 检查一次取消标记；被取消的排队任务不会继续占用 lane。
+    /// 阻塞等待 lane：先幂等入队（调用方可能已经入队保序），每 200ms 醒一次检查取消标记；
+    /// 被取消时返回 `None`，不留下等待项，也不占用 lane。
     fn acquire_blocking(&self, lane: TaskLane, handle: &TaskHandle) -> Option<LaneGuard> {
         let mut state = self.inner.lanes.lock();
+        state.enqueue(handle);
         loop {
             if handle.should_cancel() {
+                state.remove_waiter(handle.id());
                 return None;
             }
-            if state.can_start(lane) {
+            if state.waiter_can_start(handle.id(), lane) {
+                state.remove_waiter(handle.id());
                 state.enter(lane);
                 return Some(LaneGuard {
                     inner: self.inner.clone(),
@@ -609,32 +741,57 @@ impl TaskBus {
         }
     }
 
+    fn can_start_now(&self, lane: TaskLane) -> bool {
+        let state = self.inner.lanes.lock();
+        !state.has_waiters() && state.can_start(lane)
+    }
+
+    fn has_waiters(&self) -> bool {
+        self.inner.lanes.lock().has_waiters()
+    }
+
     fn register(&self, handle: Arc<TaskHandle>) {
         let mut entries = self.inner.entries.lock();
         entries.push_back(handle);
         while entries.len() > MAX_TASKS {
-            entries.pop_front();
+            let Some(index) = entries.iter().position(|handle| handle.is_finished()) else {
+                break;
+            };
+            entries.remove(index);
         }
     }
 
-    /// 同步占用一个 lane 并开始记录任务（用于命令内部自己跑完的批量操作）。
-    pub fn begin_now(&self, app: &AppHandle, handle: Arc<TaskHandle>) -> AppResult<LaneGuard> {
-        let guard = self.acquire_immediate(handle.lane())?;
-        self.register(handle.clone());
-        handle.set_phase(TaskPhase::Preparing);
-        spawn_pump(app.clone(), handle);
-        Ok(guard)
-    }
-
-    /// 在独立线程里执行任务体。线程起不来时把任务标成失败并返回错误，
-    /// 否则任务会永远停在“准备中”，还会一直占着 `active()`。
-    pub fn spawn_worker<F>(&self, name: String, handle: Arc<TaskHandle>, run: F) -> AppResult<()>
+    fn spawn_guarded<F>(
+        &self,
+        name: String,
+        handle: Arc<TaskHandle>,
+        run: F,
+        finish_on_return: bool,
+    ) -> AppResult<()>
     where
         F: FnOnce() + Send + 'static,
     {
+        let worker = handle.clone();
+        let thread_name = name.clone();
         std::thread::Builder::new()
             .name(name)
-            .spawn(run)
+            .spawn(move || {
+                // 排队线程只负责启动任务体，正常返回不代表任务结束，所以不挂这个 guard。
+                let _guard = finish_on_return.then(|| TaskRunGuard {
+                    handle: worker.clone(),
+                });
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    Ok(()) => {
+                        if finish_on_return && !worker.is_finished() {
+                            worker.set_message("任务结束但未报告终态");
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                    Err(payload) => {
+                        fail_from_panic(&worker, &thread_name, payload.as_ref());
+                    }
+                }
+            })
             .map(|_| ())
             .map_err(|error| {
                 log::error!("无法启动任务线程：{error}");
@@ -644,7 +801,73 @@ impl TaskBus {
             })
     }
 
-    /// 启动任务：lane 空闲时立即运行；冲突时按 policy 失败、排队或取消现有任务。
+    /// 在独立线程里执行任务体。线程起不来或 panic 时把任务标成失败并返回错误，
+    /// 否则任务会永远停在“准备中”，还会一直占着 `active()`。
+    pub fn spawn_worker<F>(&self, name: String, handle: Arc<TaskHandle>, run: F) -> AppResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.spawn_guarded(name, handle, run, true)
+    }
+
+    /// 排队线程只负责等 lane 后调用启动闭包；闭包返回时任务体可能还在另一个线程里跑，
+    /// 所以正常返回不能当成任务结束。
+    fn spawn_launcher<F>(&self, name: String, handle: Arc<TaskHandle>, run: F) -> AppResult<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.spawn_guarded(name, handle, run, false)
+    }
+
+    fn run_immediate<F>(&self, handle: Arc<TaskHandle>, name: &str, guard: LaneGuard, run: F)
+    where
+        F: FnOnce(LaneGuard),
+    {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(guard)));
+        if let Err(payload) = outcome {
+            fail_from_panic(&handle, name, payload.as_ref());
+        }
+    }
+
+    /// 记为排队并进入等待队列。入队必须由调用线程同步完成：交给排队线程自己入队的话，
+    /// 后提交的任务可能先进队列，FIFO 就失效了。
+    fn mark_queued(&self, handle: &TaskHandle) {
+        handle.set_phase(TaskPhase::Queued);
+        handle.set_message("排队等待前一个任务结束");
+        self.inner.lanes.lock().enqueue(handle);
+    }
+
+    /// 给 `run_write_task` 使用：注册任务与进度推送，必要时排队，返回时已经拿到 lane。
+    /// 调用方应在阻塞线程里调用，不能占着异步运行时工作线程等 lane。
+    pub fn begin_queued(&self, app: &AppHandle, handle: Arc<TaskHandle>) -> AppResult<LaneGuard> {
+        let lane = handle.lane();
+        self.register(handle.clone());
+        spawn_pump(app.clone(), handle.clone());
+
+        if self.can_start_now(lane)
+            && let Ok(guard) = self.acquire_immediate(lane)
+        {
+            handle.set_phase(TaskPhase::Preparing);
+            return Ok(guard);
+        }
+
+        self.mark_queued(&handle);
+        let Some(guard) = self.acquire_blocking(lane, &handle) else {
+            self.inner.lanes.lock().remove_waiter(handle.id());
+            handle.finish(TaskPhase::Cancelled);
+            return Err(AppError::message("任务已取消"));
+        };
+        if handle.should_cancel() {
+            drop(guard);
+            handle.finish(TaskPhase::Cancelled);
+            return Err(AppError::message("任务已取消"));
+        }
+        handle.set_message("");
+        handle.set_phase(TaskPhase::Preparing);
+        Ok(guard)
+    }
+
+    /// 启动任务：lane 空闲且没有等待者时立即运行；冲突时按 policy 失败或排队。
     pub fn launch<F>(
         &self,
         app: AppHandle,
@@ -655,51 +878,69 @@ impl TaskBus {
     where
         F: FnOnce(LaneGuard) + Send + 'static,
     {
-        let active = self.conflicting(handle.lane());
-        if !active.is_empty() {
-            match policy {
-                ConflictPolicy::Fail => return Ok(TaskStartResult::Conflict { active }),
-                ConflictPolicy::CancelActive => {
-                    for task in &active {
-                        let _ = self.cancel(&task.task_id);
-                    }
-                }
-                ConflictPolicy::Queue => {}
+        let lane = handle.lane();
+        let name = format!("task-{}", handle.id());
+
+        if policy == ConflictPolicy::Fail {
+            let active = self.conflicting(lane);
+            if !active.is_empty() || self.lane_busy(lane) || self.has_waiters() {
+                return Ok(TaskStartResult::Conflict { active });
             }
-        }
-
-        self.register(handle.clone());
-        spawn_pump(app, handle.clone());
-
-        if active.is_empty()
-            && let Ok(guard) = self.acquire_immediate(handle.lane())
-        {
+            let Ok(guard) = self.acquire_immediate(lane) else {
+                return Ok(TaskStartResult::Conflict {
+                    active: self.conflicting(lane),
+                });
+            };
+            self.register(handle.clone());
+            spawn_pump(app, handle.clone());
             handle.set_phase(TaskPhase::Preparing);
-            run(guard);
+            self.run_immediate(handle.clone(), &name, guard, run);
             return Ok(TaskStartResult::Started {
                 task: handle.snapshot(),
             });
         }
 
-        handle.set_phase(TaskPhase::Queued);
-        handle.set_message("排队等待前一个任务结束");
+        self.register(handle.clone());
+        spawn_pump(app.clone(), handle.clone());
+
+        if self.can_start_now(lane)
+            && let Ok(guard) = self.acquire_immediate(lane)
+        {
+            handle.set_phase(TaskPhase::Preparing);
+            self.run_immediate(handle.clone(), &name, guard, run);
+            return Ok(TaskStartResult::Started {
+                task: handle.snapshot(),
+            });
+        }
+
+        self.mark_queued(&handle);
         let snapshot = handle.snapshot();
         let bus = self.clone();
         let queued = handle.clone();
-        self.spawn_worker(format!("task-queue-{}", queued.id()), handle, move || {
-            let Some(guard) = bus.acquire_blocking(queued.lane(), &queued) else {
-                queued.finish(TaskPhase::Cancelled);
-                return;
-            };
-            if queued.should_cancel() {
-                drop(guard);
-                queued.finish(TaskPhase::Cancelled);
-                return;
-            }
-            queued.set_message("");
-            queued.set_phase(TaskPhase::Preparing);
-            run(guard);
-        })?;
+        let launched = self.spawn_launcher(
+            format!("task-queue-{}", queued.id()),
+            queued.clone(),
+            move || {
+                let Some(guard) = bus.acquire_blocking(queued.lane(), &queued) else {
+                    bus.inner.lanes.lock().remove_waiter(queued.id());
+                    queued.finish(TaskPhase::Cancelled);
+                    return;
+                };
+                if queued.should_cancel() {
+                    drop(guard);
+                    bus.inner.lanes.lock().remove_waiter(queued.id());
+                    queued.finish(TaskPhase::Cancelled);
+                    return;
+                }
+                queued.set_message("");
+                queued.set_phase(TaskPhase::Preparing);
+                run(guard);
+            },
+        );
+        if let Err(error) = launched {
+            self.inner.lanes.lock().remove_waiter(handle.id());
+            return Err(error);
+        }
 
         Ok(TaskStartResult::Started { task: snapshot })
     }
@@ -726,7 +967,7 @@ pub enum TaskStartResult {
     Started {
         task: TaskSnapshot,
     },
-    /// lane 被占用时返回正在运行的任务，由前端决定排队还是取消现有任务。
+    /// 只有 `Fail` 策略会返回：lane 被占用或已有等待者，调用方据此提示稍后重试。
     Conflict {
         active: Vec<TaskSummary>,
     },
@@ -735,10 +976,9 @@ pub enum TaskStartResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ConflictPolicy {
-    #[default]
     Fail,
+    #[default]
     Queue,
-    CancelActive,
 }
 
 /// 前端只传语义范围，id 集合在 Rust 侧解析，避免几十万 id 过 IPC。
@@ -1005,5 +1245,140 @@ mod tests {
         assert_eq!(TaskKind::ReleaseGarbage.lane(), TaskLane::Write);
         assert_eq!(TaskKind::Undo.label(), "撤销操作");
         assert_eq!(TaskKind::ReleaseGarbage.label(), "释放删除文件");
+    }
+
+    fn wait_terminal(handle: &TaskHandle) {
+        for _ in 0..200 {
+            if handle.is_finished() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("任务没有在预期时间内结束");
+    }
+
+    #[test]
+    fn panicking_worker_finishes_failed_and_releases_lane() {
+        let bus = TaskBus::new();
+        let guard = bus.acquire_immediate(TaskLane::Write).unwrap();
+        let handle = TaskHandle::new("panic", TaskKind::Thumbnail, "选中 1 张");
+        let worker = handle.clone();
+        bus.spawn_worker("panic-test".to_owned(), handle.clone(), move || {
+            let _guard = guard;
+            panic!("boom");
+        })
+        .unwrap();
+        wait_terminal(&handle);
+        assert_eq!(worker.phase(), TaskPhase::Failed);
+        assert!(worker.snapshot().message.contains("boom"));
+        assert!(!bus.lane_busy(TaskLane::Write));
+        assert!(bus.is_idle());
+    }
+
+    #[test]
+    fn worker_returning_without_terminal_is_marked_failed() {
+        let bus = TaskBus::new();
+        let handle = TaskHandle::new("early", TaskKind::Thumbnail, "选中 1 张");
+        bus.spawn_worker("early-return".to_owned(), handle.clone(), || {})
+            .unwrap();
+        wait_terminal(&handle);
+        assert_eq!(handle.phase(), TaskPhase::Failed);
+        assert!(handle.snapshot().message.contains("未报告终态"));
+    }
+
+    #[test]
+    fn history_trim_keeps_running_tasks() {
+        let bus = TaskBus::new();
+        let running = TaskHandle::new("running", TaskKind::Import, "运行中");
+        running.set_phase(TaskPhase::Running);
+        bus.register(running.clone());
+        for index in 0..60 {
+            let handle = TaskHandle::new(format!("done-{index}"), TaskKind::Import, "已完成");
+            handle.finish(TaskPhase::Completed);
+            bus.register(handle);
+        }
+        let tasks = bus.list();
+        assert!(tasks.iter().any(|task| task.task_id == "running"));
+        assert_eq!(tasks.len(), MAX_TASKS);
+    }
+
+    #[test]
+    fn queued_tasks_are_fifo_and_write_has_priority() {
+        let mut state = LaneState::default();
+        state.waiters.push_back(WaitEntry {
+            task_id: "ai-1".into(),
+            lane: TaskLane::Ai,
+        });
+        state.waiters.push_back(WaitEntry {
+            task_id: "write-1".into(),
+            lane: TaskLane::Write,
+        });
+        state.waiters.push_back(WaitEntry {
+            task_id: "scan-1".into(),
+            lane: TaskLane::Scan,
+        });
+        assert!(state.waiter_can_start("ai-1", TaskLane::Ai));
+        assert!(!state.waiter_can_start("write-1", TaskLane::Write));
+        assert!(!state.waiter_can_start("scan-1", TaskLane::Scan));
+
+        state.remove_waiter("ai-1");
+        assert!(state.waiter_can_start("write-1", TaskLane::Write));
+
+        state.enter(TaskLane::Ai);
+        assert!(!state.waiter_can_start("scan-1", TaskLane::Scan));
+    }
+
+    #[test]
+    fn ai_and_scan_can_start_together() {
+        let mut state = LaneState::default();
+        state.waiters.push_back(WaitEntry {
+            task_id: "ai-1".into(),
+            lane: TaskLane::Ai,
+        });
+        state.waiters.push_back(WaitEntry {
+            task_id: "scan-1".into(),
+            lane: TaskLane::Scan,
+        });
+        assert!(state.waiter_can_start("ai-1", TaskLane::Ai));
+        state.enter(TaskLane::Ai);
+        assert!(state.waiter_can_start("scan-1", TaskLane::Scan));
+        state.enter(TaskLane::Scan);
+        state.leave(TaskLane::Ai);
+        state.leave(TaskLane::Scan);
+        state.waiters.clear();
+        assert!(state.idle_unchecked());
+    }
+
+    #[test]
+    fn blocking_acquire_waits_for_lane_and_cancel() {
+        let bus = TaskBus::new();
+        let guard = bus.acquire_immediate(TaskLane::Write).unwrap();
+        let handle = TaskHandle::new("queued", TaskKind::Import, "排队");
+        let worker = handle.clone();
+        let bus_worker = bus.clone();
+        let thread = std::thread::spawn(move || {
+            bus_worker
+                .acquire_blocking(TaskLane::Write, &worker)
+                .is_some()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+        assert!(thread.join().unwrap());
+        assert!(handle.is_finished() || !bus.lane_busy(TaskLane::Write));
+
+        let guard = bus.acquire_immediate(TaskLane::Write).unwrap();
+        let handle = TaskHandle::new("cancel-queued", TaskKind::Import, "排队");
+        let worker = handle.clone();
+        let bus_worker = bus.clone();
+        let thread = std::thread::spawn(move || {
+            bus_worker
+                .acquire_blocking(TaskLane::Write, &worker)
+                .is_some()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        handle.request_cancel();
+        bus.inner.ready.notify_all();
+        assert!(!thread.join().unwrap());
+        drop(guard);
     }
 }

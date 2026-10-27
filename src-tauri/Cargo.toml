@@ -52,7 +52,6 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 tempfile = "3"
 
 [profile.release]
-panic = "abort"
 codegen-units = 1
 lto = "thin"
 strip = true

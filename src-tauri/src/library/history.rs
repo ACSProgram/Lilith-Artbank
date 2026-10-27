@@ -848,6 +848,45 @@ pub fn finish_live(database: &LibraryDb, op_id: i64, error: &str) -> AppResult<(
     })
 }
 
+/// 长任务的 live 记录守卫：正常结束、取消、失败与 panic 都必须收尾。
+/// 强杀进程时 Drop 不执行，仍由下次打开图库的 `recover_on_open` 兜底。
+pub struct LiveOperation {
+    database: Arc<LibraryDb>,
+    id: i64,
+    finished: bool,
+}
+
+impl LiveOperation {
+    pub fn begin(database: &Arc<LibraryDb>, op: NewOperation<'_>) -> AppResult<Self> {
+        let id = begin_live(database, op)?;
+        Ok(Self {
+            database: database.clone(),
+            id,
+            finished: false,
+        })
+    }
+
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn finish(mut self, error: &str) -> AppResult<()> {
+        self.finished = true;
+        finish_live(&self.database, self.id, error)
+    }
+}
+
+impl Drop for LiveOperation {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Err(error) = finish_live(&self.database, self.id, "任务异常终止") {
+            log::warn!("收尾操作记录 {} 失败：{error}", self.id);
+        }
+    }
+}
+
 /// 长任务完成后把结果写进记录标题（例如“省 12 GB”）；不改表结构。
 pub fn update_label(database: &LibraryDb, operation_id: i64, label: &str) -> AppResult<()> {
     database.with_writer(|connection| {
@@ -884,11 +923,26 @@ pub struct HistoryEntry {
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HistoryStorage {
+    /// 全部操作行数，包含当前任务刚建但还没收尾的 pending 记录。
+    pub record_count: u64,
+    pub chunk_count: u64,
+    pub chunk_bytes: u64,
+    pub undo_files: u64,
+    pub undo_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
     pub max_steps: u32,
     pub pending_purge_count: u64,
     pub pending_purge_bytes: u64,
+    pub storage: HistoryStorage,
+    /// 上次撤销/重做异常中断，且此刻没有对应任务在跑。
+    pub recovery_needed: bool,
     /// 此刻能否开始撤销或重做；不能时的原因在 `blocked_reason`。
     pub can_run: bool,
     pub blocked_reason: Option<String>,
@@ -1115,6 +1169,80 @@ pub fn pending_summary(database: &LibraryDb) -> AppResult<(u64, u64)> {
     })
 }
 
+/// 是否有上次异常中断、还没收尾的撤销/重做：`undoing` / `redoing` 由 `recover_on_open` 处理。
+pub fn has_interrupted_run(database: &LibraryDb) -> AppResult<bool> {
+    database.with_reader(|connection| {
+        Ok(connection.query_row(
+            "SELECT count(*) FROM operations WHERE status IN ('undoing', 'redoing')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    })
+}
+
+/// 操作记录与撤销暂存的占用。逆数据只读 SQLite 的 BLOB 头长度，不读内容。
+pub fn storage_usage(database: &LibraryDb, root: &Path) -> AppResult<HistoryStorage> {
+    let (record_count, chunk_count, chunk_bytes) = database.with_reader(|connection| {
+        let record_count: i64 =
+            connection.query_row("SELECT count(*) FROM operations", [], |row| row.get(0))?;
+        let (chunk_count, chunk_bytes): (i64, i64) = connection.query_row(
+            "SELECT count(*), coalesce(sum(length(data)), 0) FROM operation_chunks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            record_count.max(0) as u64,
+            chunk_count.max(0) as u64,
+            chunk_bytes.max(0) as u64,
+        ))
+    })?;
+    let (undo_files, undo_bytes) = undo_usage(&LibraryPaths::new(root).undo);
+    Ok(HistoryStorage {
+        record_count,
+        chunk_count,
+        chunk_bytes,
+        undo_files,
+        undo_bytes,
+        total_bytes: chunk_bytes.saturating_add(undo_bytes),
+    })
+}
+
+fn undo_usage(path: &Path) -> (u64, u64) {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("读取撤销暂存目录失败 {}：{error}", path.display());
+            }
+            return (0, 0);
+        }
+    };
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let (child_files, child_bytes) = undo_usage(&entry.path());
+            files = files.saturating_add(child_files);
+            bytes = bytes.saturating_add(child_bytes);
+        } else if file_type.is_file()
+            && let Ok(metadata) = entry.metadata()
+        {
+            files = files.saturating_add(1);
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    (files, bytes)
+}
+
 /// 只裁剪 `applied` / `undo_failed`；`pending` / `undoing` 交给启动恢复。
 pub fn trim(database: &LibraryDb, max_steps: u32) -> AppResult<Vec<EvictedOperation>> {
     database.with_writer(|connection| {
@@ -1338,6 +1466,7 @@ pub fn run_undo(
     task: Arc<TaskHandle>,
 ) -> AppResult<()> {
     let run_id = start_run(database, target_id)?;
+    let run = HistoryRunGuard::new(database, run_id);
 
     let operations = database.with_reader(|connection| {
         let mut statement = connection.prepare(
@@ -1360,7 +1489,7 @@ pub fn run_undo(
     })?;
 
     if operations.is_empty() {
-        finish_run(database, run_id, "completed")?;
+        run.finish("completed")?;
         return Err(AppError::message("没有可撤销的记录"));
     }
 
@@ -1369,7 +1498,7 @@ pub fn run_undo(
         .iter()
         .any(|(_, kind, _)| *kind == HistoryKind::Optimize)
     {
-        finish_run(database, run_id, "failed")?;
+        run.finish("failed")?;
         return Err(AppError::message("压缩操作不可撤销，原图已删除"));
     }
 
@@ -1422,16 +1551,12 @@ pub fn run_undo(
                     )?;
                     Ok(())
                 })?;
-                finish_run(database, run_id, "failed")?;
+                run.finish("failed")?;
                 return Err(AppError::message(format!("撤销「{label}」失败：{error}")));
             }
         }
     }
-    finish_run(
-        database,
-        run_id,
-        if cancelled { "cancelled" } else { "completed" },
-    )?;
+    run.finish(if cancelled { "cancelled" } else { "completed" })?;
     task.set_message("");
     Ok(())
 }
@@ -1446,6 +1571,7 @@ pub fn run_redo(
     task: Arc<TaskHandle>,
 ) -> AppResult<()> {
     let run_id = start_run(database, target_id)?;
+    let run = HistoryRunGuard::new(database, run_id);
 
     let operations = database.with_reader(|connection| {
         let mut statement = connection.prepare(
@@ -1479,7 +1605,7 @@ pub fn run_redo(
     })?;
 
     if operations.is_empty() {
-        finish_run(database, run_id, "completed")?;
+        run.finish("completed")?;
         return Err(AppError::message("没有可重做的记录"));
     }
 
@@ -1528,16 +1654,12 @@ pub fn run_redo(
                     Ok(())
                 })?;
                 reset_redoing(database, &ids[index + 1..])?;
-                finish_run(database, run_id, "failed")?;
+                run.finish("failed")?;
                 return Err(AppError::message(format!("重做「{label}」失败：{error}")));
             }
         }
     }
-    finish_run(
-        database,
-        run_id,
-        if cancelled { "cancelled" } else { "completed" },
-    )?;
+    run.finish(if cancelled { "cancelled" } else { "completed" })?;
     task.set_message("");
     Ok(())
 }
@@ -1578,6 +1700,39 @@ fn finish_run(database: &LibraryDb, run_id: i64, state: &str) -> AppResult<()> {
         )?;
         Ok(())
     })
+}
+
+/// 撤销/重做运行的兜底：panic 时不能让 `undo_runs` 永远停在 running。
+struct HistoryRunGuard<'a> {
+    database: &'a LibraryDb,
+    run_id: i64,
+    finished: bool,
+}
+
+impl<'a> HistoryRunGuard<'a> {
+    fn new(database: &'a LibraryDb, run_id: i64) -> Self {
+        Self {
+            database,
+            run_id,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, state: &str) -> AppResult<()> {
+        self.finished = true;
+        finish_run(self.database, self.run_id, state)
+    }
+}
+
+impl Drop for HistoryRunGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Err(error) = finish_run(self.database, self.run_id, "failed") {
+            log::warn!("收尾撤销运行 {} 失败：{error}", self.run_id);
+        }
+    }
 }
 
 fn undo_operation(
@@ -5778,5 +5933,134 @@ mod tests {
             metadata::update_description_with_id(fixture.db(), image, "新描述").unwrap();
         assert_eq!(changed, 0);
         assert_eq!(operation, None);
+    }
+
+    #[test]
+    fn interrupted_run_is_detected_from_operation_status() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("interrupted");
+        let (_, operation) = metadata::set_scores_with_id(fixture.db(), &[image], 1).unwrap();
+        let id = operation.unwrap();
+        assert!(!has_interrupted_run(fixture.db()).unwrap());
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE operations SET status = 'undoing' WHERE id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(has_interrupted_run(fixture.db()).unwrap());
+    }
+
+    #[test]
+    fn live_operation_drop_cleans_empty_record() {
+        let fixture = Fixture::new();
+        let operation = LiveOperation::begin(
+            &fixture.session.db,
+            NewOperation::new(HistoryKind::Score, "空任务"),
+        )
+        .unwrap();
+        let id = operation.id();
+        drop(operation);
+        let count: i64 = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM operations WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn live_operation_finish_keeps_written_content() {
+        let fixture = Fixture::new();
+        let operation = LiveOperation::begin(
+            &fixture.session.db,
+            NewOperation::new(HistoryKind::Score, "有内容"),
+        )
+        .unwrap();
+        let id = operation.id();
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute("UPDATE operations SET affected = 2 WHERE id = ?1", [id])?;
+                Ok(())
+            })
+            .unwrap();
+        operation.finish("中途失败").unwrap();
+        let (status, error): (String, String) = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT status, error FROM operations WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(status, "applied");
+        assert_eq!(error, "中途失败");
+    }
+
+    #[test]
+    fn history_storage_counts_chunk_and_undo_files() {
+        let fixture = Fixture::new();
+        let operation = LiveOperation::begin(
+            &fixture.session.db,
+            NewOperation::new(HistoryKind::Score, "占用"),
+        )
+        .unwrap();
+        let id = operation.id();
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                add_live_affected_in_tx(&transaction, id, 1)?;
+                append_live_in_tx(&transaction, id, ChunkFormat::Json, b"hello")?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        operation.finish("").unwrap();
+
+        let undo = LibraryPaths::new(&fixture.root).undo.join("1");
+        fs::create_dir_all(&undo).unwrap();
+        fs::write(undo.join("payload"), b"abc").unwrap();
+
+        let storage = storage_usage(fixture.db(), &fixture.root).unwrap();
+        assert_eq!(storage.record_count, 1);
+        assert_eq!(storage.chunk_count, 1);
+        assert_eq!(storage.chunk_bytes, 5);
+        assert_eq!(storage.undo_files, 1);
+        assert_eq!(storage.undo_bytes, 3);
+        assert_eq!(storage.total_bytes, 8);
+    }
+
+    #[test]
+    fn history_run_guard_marks_interrupted_run_failed() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("run-guard");
+        let (_, operation) = metadata::set_scores_with_id(fixture.db(), &[image], 1).unwrap();
+        let run_id = start_run(fixture.db(), operation.unwrap()).unwrap();
+        drop(HistoryRunGuard::new(fixture.db(), run_id));
+        let state: String = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT state FROM undo_runs WHERE id = ?1",
+                    [run_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(state, "failed");
     }
 }

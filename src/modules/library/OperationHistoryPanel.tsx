@@ -6,7 +6,7 @@ import {
   useState,
   type RefObject,
 } from "react";
-import { History, Trash2, X } from "lucide-react";
+import { AlertTriangle, History, Trash2, X } from "lucide-react";
 import { useNotices } from "../../app/noticeContext";
 import { useTaskCenter } from "../../app/taskContext";
 import type { TaskStartResult } from "../../app/taskTypes";
@@ -220,6 +220,7 @@ export function OperationHistoryPanel({
       confirm,
       page.pendingPurgeCount,
       page.pendingPurgeBytes,
+      page.storage.totalBytes,
     );
     if (!accepted) return;
     setBusy(true);
@@ -260,6 +261,16 @@ export function OperationHistoryPanel({
               {historyTask.message ||
                 (historyTask.kind === "redo" ? "正在重做" : "正在撤销")}{" "}
               {historyTask.completed}/{historyTask.total}
+            </span>
+          </div>
+        ) : null}
+
+        {page?.recoveryNeeded ? (
+          <div className="operation-history-warning">
+            <AlertTriangle size={13} />
+            <span>
+              {page.blockedReason ??
+                "上次撤销或重做异常中断，请重新打开图库恢复"}
             </span>
           </div>
         ) : null}
@@ -346,16 +357,22 @@ export function OperationHistoryPanel({
 
         <footer className="operation-history-footer">
           <span>
+            {page
+              ? `记录 ${page.storage.recordCount.toLocaleString()} 条 · 撤销数据 ${formatBytes(page.storage.totalBytes)}`
+              : "正在读取占用…"}
             {page && page.pendingPurgeCount > 0
-              ? `待释放 ${page.pendingPurgeCount.toLocaleString()} 张 · ${formatBytes(page.pendingPurgeBytes)}`
-              : "没有待释放的文件"}
+              ? ` · 待释放 ${page.pendingPurgeCount.toLocaleString()} 张 · ${formatBytes(page.pendingPurgeBytes)}`
+              : ""}
             {page ? ` · 保留最近 ${page.maxSteps} 步` : ""}
           </span>
           <Button
             size="sm"
             variant="danger"
             icon={<Trash2 size={13} />}
-            disabled={busy || historyTask != null || !page || page.entries.length === 0}
+            disabled={
+              busy || active.length > 0 || !page || page.entries.length === 0
+            }
+            title={active.length > 0 ? page?.blockedReason ?? undefined : undefined}
             onClick={() => void clear()}
           >
             清空记录

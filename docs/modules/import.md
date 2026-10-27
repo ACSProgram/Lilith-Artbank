@@ -108,8 +108,9 @@
 - 结果通过有界通道送入唯一写线程；每 64 张或 250ms 批量提交；重复项最多攒 128 条。
 - 每张图的阶段：读取/哈希 → 解码/特征 → 发布 → 入库。界面显示当前文件名与总进度。
 - `import-progress` 事件每 150ms 推送一次；`import-finished` 在结束时推送完整快照。导入同时挂在任务总线上，右下角任务中心也能看到它与取消入口。
+- 默认排队：`start_import` 立即返回快照，`phase` 为 `queued`（排队等待）或 `scanning`（write lane 空闲时紧跟其后开始）；排队中的导入要等 lane 空闲且前面的等待者都启动后才进入 `scanning`。可以同时排队多个导入，但运行中的导入仍只有一个。
 - 取消：工作线程在文件边界检查标记；已入库图片保留，未完成临时文件清理；写线程继续把已准备好的批次落库。
-- 同一时间只允许一个导入任务；导入运行期间禁止关闭、创建或切换图库。
+- 运行中的导入只允许一个，后续导入排队；有其他排队/运行任务时禁止关闭、创建或切换图库。
 - 写线程按文件夹路径缓存 `folder_id`，同一批次重复进入同一目录时只解析/插入一次。
 - 失败清单最多保留 200 条；每条包含路径与原因。
 - 结果快照保留最近 24 个新增图片 id，用于导入完成后的缩略图预览。
@@ -117,10 +118,10 @@
 
 ### 操作记录与导入撤销
 
-- 导入开始前建一条 `pending` 操作记录（`HistoryKind::Import`）；记录 id 随 `ImportSource` / `WriterOptions` 进入写线程。冲突或线程启动失败时删掉空记录，已有的灰色撤销记录不受影响。
+- 导入开始前建一条 `pending` 操作记录（`HistoryKind::Import`）；记录 id 随 `ImportSource` / `WriterOptions` 进入写线程。记录由 `history::LiveOperation` 守卫：线程启动失败、panic 或提前返回时在 Drop 里删除空记录；已有内容则保留为可撤销。已有的灰色撤销记录不受影响。
 - 只有确实写入内容的批次才清空灰色（可重做）记录：导入被 write lane 冲突拒绝、或整批都是重复跳过时，重做分支必须保留。
 - 每批事务里：新增行写 `origin_operation_id`；`affected` 累加新增与合并数量；新建文件夹/标签与合并快照按批追加 JSON chunk。不在内存里累积整次导入。
-- 任务结束（完成、取消或失败）调用 `history::finish_live`；有任一已提交内容就转为可撤销，否则删除空记录。取消后已完成部分仍可撤销。
+- 任务结束（完成、取消、失败或 panic）由 `LiveOperation` 收尾；有任一已提交内容就转为可撤销，否则删除空记录。取消后已完成部分仍可撤销。
 - 崩溃留下的 `pending` 导入记录在下次打开图库时按 `origin_operation_id` 或已有 chunk 判断转 `applied`，没有内容则删除。
 - 撤销导入：按 `origin_operation_id` 分块把原图移入 `.artbank/undo/<op>/`，捕获完整图片行（含标签、集合位置、缩略图指针）后删行；恢复合并项的评分、`modified_at` 与标签关系；本次新建的文件夹与标签若已为空/无引用则删除，并捕获它们的完整行供重做。中断后重试是幂等的，记录保留为 `undone`。
 - 重做导入：按原 id 插回行、把暂存原图移回文件夹、补标签与集合位置，恢复合并后的评分/时间；用撤销时捕获的行重建本次新建的文件夹与标签。导入暂存目录在重做后清空，下一次撤销会重新暂存。
@@ -135,7 +136,7 @@
 
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
-| `start_import` | `{ request }` | `ImportSnapshot`（立即返回，任务在后台执行） |
+| `start_import` | `{ request }` | `ImportSnapshot`（立即返回；`phase` 可能为 `queued`，任务在后台执行） |
 | `cancel_import` | `{ jobId }` | `null` |
 | `get_import_status` | `{ jobId }` | `ImportSnapshot \| null` |
 
@@ -156,7 +157,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 `workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
 
 `tempReplaced` 只统计图库导入时被丢弃的临时区同内容行（见上面的“重复策略”），临时导入恒为 0。
 

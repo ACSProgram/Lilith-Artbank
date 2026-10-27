@@ -29,7 +29,7 @@ ai.clipModelPath   CLIP 模型目录，默认 siglip2-giant-opt-patch16-384；�
 1. 启动后先 `GET /v1/health` 探活。成功则标记在线，不重复拉起。
 2. `autoStart`、本机 `baseUrl`、Python 与脚本都配置好且探活失败时启动进程；等待健康检查最多 60 秒。
 3. 端口被其他程序占用且健康检查不是本服务格式 → 标记不可用，提示端口冲突；不尝试杀进程。
-4. 启动失败按 2s、4s 退避重试，最多 3 次；仍失败则记录状态与错误并保持离线，由用户在设置页或 AI 任务里手动重启。运行中被托管的进程退出时标记为失败，不自动重启。
+4. 启动失败按 2s、4s 退避重试，最多 3 次；仍失败则记录状态与错误并保持离线，由用户在设置页或 AI 任务里手动重启。运行中被托管的进程退出时标记为失败，不自动重启；正在执行的任务按单张失败处理，不会因为服务退出而无限重试。
 5. 退出时优先调用 `POST /v1/shutdown`（返回 2xx 即视为已关闭），超时后终止子进程。
 6. 服务只绑定 `127.0.0.1`。v1 不做鉴权；`baseUrl` 不是本机地址时只连接外部服务。
 
@@ -190,12 +190,14 @@ Content-Type: application/octet-stream
 
 - 批量任务挂在 `app/tasks.rs` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
 - 范围由 `TaskScope` 在 Rust 侧解析成 id 集合（选中 / 文件夹 / 集合 / 当前视图 / 临时文件夹 / 全库）；`AiJobRequest` 只接收已解析的 id，不再有“id 与 query 都为空就退回全库”的隐式分支。
-- 冲突：AI 任务占 `ai` lane，同 lane 串行，与 `write` lane 互斥；`start_batch_task` 返回 `{ status: "conflict", active }`，由前端选排队或取消现有任务。
+- 冲突：AI 任务占 `ai` lane，同 lane 串行，与 `write` lane 互斥。默认自动排队：`start_batch_task` 直接返回 `queued` 快照，任务在 `queued` 阶段等待，不需要前端选择排队或取消现有任务。排队中的任务在任务中心可取消；取消排队任务只把它从等待队列移除，不触碰正在运行的任务。
+- 先到先得：同一 lane 的等待者按入队顺序启动；短写任务优先于排队的长任务，避免一次大批量任务把后续小操作堵死。
 - 取消：停止调度新请求；在途请求允许完成并保存结果；已保存结果不回滚。
 - 熔断：连续 5 张失败视为服务不可用，任务以失败结束，避免把整库都记成失败。
 - 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。
 - 已完成的 embedding/pose 写入 feature pack 与 `feature_blobs`；描述写入 `images.description`，并设置 `description_source='ai'`、`description_model`。用户手工编辑后 `description_source='user'`。
-- 描述任务会产生用户可见的内容修改，因此使用 live 操作记录：任务开始建 `pending` 记录，每张写入时在同一事务里追加旧描述并计入 `affected`，结束（含取消/失败）调用 `finish_live`；已经写入的描述在任务取消后仍可撤销。单张 `ai_describe_image` 走普通 `history::write`。embedding/pose 是派生数据，不进入操作记录。
+- 描述任务会产生用户可见的内容修改，因此使用 live 操作记录：任务开始建 `pending` 记录，每张写入时在同一事务里追加旧描述并计入 `affected`，结束（含取消/失败）调用 `finish_live`；已经写入的描述在任务取消后仍可撤销。该记录由 `history::LiveOperation` 守卫，任务 panic、线程启动失败或提前返回时在 Drop 里收尾，不会留下永远 pending 的记录。单张 `ai_describe_image` 走普通 `history::write`。embedding/pose 是派生数据，不进入操作记录。
+- 任务 panic 按失败处理：任务边界用 `catch_unwind` 捕获，标记失败、写失败清单并释放 lane；不会再出现“界面显示运行中、lane 永不释放”的状态。release 构建使用 unwind，panic 信息写入日志。
 - 任务状态不持久化；崩溃后已保存结果保留，重跑时默认只处理缺失项。
 
 ## 存储
@@ -263,7 +265,7 @@ Content-Type: application/octet-stream
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
 | `find_similar_images` | 参考图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，`targetIds` 支持单张或最多 100 张平均（多张只允许 color4/color8/embedding）；可选 `threshold`、`limit`（默认 2000，上限 10000）与 `scope` |
-| `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、全库相似分组；返回 `{ status: "started", task }` 或 `{ status: "conflict", active }` |
+| `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、全库相似分组；立即返回 `{ status: "started", task }`，`task.phase` 为 `queued`（已排队）或 `preparing`（已拿到 lane） |
 | `list_tasks` / `cancel_task` | 任务列表与取消；进度通过 `task-progress` / `task-finished` 推送 |
 | `get_similarity_groups_result` | 按 taskId 取回相似分组结果 |
 | `get_similarity_page` / `get_similarity_ids` | 相似结果分页与全选（语义搜索与找相似共用） |
@@ -280,7 +282,7 @@ Content-Type: application/octet-stream
 - `server/clip_cache.py`：SigLIP2 图片塔/文本塔独立加载、单塔驻留、空闲卸载。
 - `server/pose_engine.py`：MediaPipe Pose 33 点。
 - `server/image_io.py`：图片字节解码与 EXIF 方向。
-- `src-tauri/src/app/tasks.rs`：任务总线、lane 规则、冲突/排队/取消与统一事件。
+- `src-tauri/src/app/tasks.rs`：任务总线、lane 规则、默认排队（FIFO + 写优先）、panic 兜底与统一事件。
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。

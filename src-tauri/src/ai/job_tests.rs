@@ -160,7 +160,8 @@ fn runs_embedding_pose_and_description_jobs() {
     let context = context(&session, &root, store, server.url());
 
     let job = task("embed", AiJobKind::Embedding, "选中 1 张");
-    execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
+    execute(&context, &job, &request(AiJobKind::Embedding))
+        .unwrap_or_else(|error| panic!("{error}; requests={:?}", server.requests()));
     assert_eq!(job.snapshot().completed, 1);
     let embedding = session
         .db
@@ -175,7 +176,8 @@ fn runs_embedding_pose_and_description_jobs() {
     assert_eq!(embedding, ("siglip2-test".into(), 4));
 
     let job = task("pose", AiJobKind::Pose, "选中 1 张");
-    execute(&context, &job, &request(AiJobKind::Pose)).unwrap();
+    execute(&context, &job, &request(AiJobKind::Pose))
+        .unwrap_or_else(|error| panic!("{error}; requests={:?}", server.requests()));
     assert_eq!(job.snapshot().completed, 1);
     let pose_dim: u32 = session
         .db
@@ -190,7 +192,8 @@ fn runs_embedding_pose_and_description_jobs() {
     assert_eq!(pose_dim, 33);
 
     let job = task("desc", AiJobKind::Description, "选中 1 张");
-    execute(&context, &job, &request(AiJobKind::Description)).unwrap();
+    execute(&context, &job, &request(AiJobKind::Description))
+        .unwrap_or_else(|error| panic!("{error}; requests={:?}", server.requests()));
     assert_eq!(job.snapshot().completed, 1);
     let description = session
         .db
