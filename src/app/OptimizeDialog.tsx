@@ -41,6 +41,8 @@ interface OptimizeDialogProps {
   context: BatchTaskContextInfo | null;
   /** 当前图库标识；换库后不接管上一个图库的任务。 */
   libraryId: string;
+  /** 打开后图库数据有变化；估算保留，但执行前会重新复核。 */
+  dataChanged?: boolean;
 }
 
 const TIERS: Array<{ value: OptimizeTier; label: string; detail: string }> = [
@@ -189,7 +191,13 @@ function scopeChoiceOf(scope: TaskScope | null | undefined): ScopeChoice | null 
   }
 }
 
-export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDialogProps) {
+export function OptimizeDialog({
+  open,
+  onClose,
+  context,
+  libraryId,
+  dataChanged = false,
+}: OptimizeDialogProps) {
   const { tasks, start, cancel, find } = useTaskCenter();
   const { confirm } = useNotices();
   const [scope, setScope] = useState<ScopeChoice>("library");
@@ -227,6 +235,7 @@ export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDi
   /** 本会话发起过的估算任务；只有它们才做“设置已改”的校验。 */
   const launched = useRef<Set<string>>(new Set());
   const signatureRef = useRef("");
+  const wasOpenRef = useRef(open);
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
   const runConfigRef = useRef<RunConfig | null>(null);
@@ -488,6 +497,15 @@ export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDi
     options.temp = { enabled: false, reason: "临时图片不参与空间优化" };
     return options;
   }, [context]);
+
+  // 数据变化后范围失效时退回仍可用的范围；估算结果保留并提示执行前复核。
+  useEffect(() => {
+    const wasOpen = wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!open || !context || !wasOpen) return;
+    if (scopeOptions[scope]?.enabled) return;
+    setScope(scopeOptions.view.enabled ? "view" : "library");
+  }, [context, open, scope, scopeOptions]);
 
   useEffect(() => {
     if (estimate) resultRef.current?.scrollIntoView({ block: "start" });
@@ -963,6 +981,10 @@ export function OptimizeDialog({ open, onClose, context, libraryId }: OptimizeDi
                 {(estimate.coverage * 100).toFixed(1)}% 的候选体积
               </span>
             </div>
+
+            {dataChanged ? (
+              <p className="dialog-hint">图库数据已变化，执行前会重新复核候选数量与体积。</p>
+            ) : null}
 
             <div className="optimize-funnel">
               <span>

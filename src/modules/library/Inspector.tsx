@@ -33,6 +33,7 @@ import {
   folderLabel,
 } from "./model";
 import type { ColorEntry, FolderInfo, ImageDetails } from "./types";
+import type { DataChange } from "./dataChange";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import { errorMessage } from "../../shared/errors";
 
@@ -44,7 +45,7 @@ interface InspectorPanelProps {
   /** 当前在临时视图：隐藏移动、集合与回收站操作。 */
   inTemp: boolean;
   onClose: () => void;
-  onChanged: () => void;
+  onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: (ids: number[]) => void;
   onTrash: (ids: number[]) => void;
@@ -154,7 +155,7 @@ interface ImageInspectorProps {
   folders: FolderInfo[];
   currentCollectionId: number | null;
   inTemp: boolean;
-  onChanged: () => void;
+  onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
   onTrash: () => void;
@@ -258,14 +259,15 @@ function ImageInspector({
     };
   }, [tagDraft, detail?.tags]);
 
+  /** 单张写入：操作成功后返回它引起的变化，由图库统一决定谁失效。 */
   const run = useCallback(
-    async (operation: () => Promise<void>, success?: string) => {
+    async (operation: () => Promise<DataChange | null>, success?: string) => {
       if (busy) return;
       setBusy(true);
       try {
-        await operation();
+        const change = await operation();
         if (success) notify(success, "success");
-        onChanged();
+        if (change) onChanged(change);
       } catch (cause) {
         notify("操作失败", "error", errorMessage(cause));
       } finally {
@@ -279,6 +281,15 @@ function ImageInspector({
     if (!detail || descriptionDraft.trim() === detail.description.trim()) return;
     void run(async () => {
       await libraryApi.updateImageDescription(detail.id, descriptionDraft);
+      return {
+        kind: "metadata",
+        source: "local",
+        reason: "description",
+        ids: [detail.id],
+        fields: ["description"],
+        descriptionEmpty: descriptionDraft.trim() === "",
+        similarity: "keep",
+      };
     }, "描述已保存");
   };
 
@@ -299,7 +310,15 @@ function ImageInspector({
           : previous,
       );
       notify("AI 描述已生成", "success");
-      onChanged();
+      onChanged({
+        kind: "metadata",
+        source: "local",
+        reason: "aiDescription",
+        ids: [detail.id],
+        fields: ["description"],
+        descriptionEmpty: result.text.trim() === "",
+        similarity: "keep",
+      });
     } catch (cause) {
       notify("AI 描述失败", "error", errorMessage(cause));
     } finally {
@@ -312,6 +331,15 @@ function ImageInspector({
     void run(async () => {
       await libraryApi.updateImageScore(detail.id, score);
       setDetail((previous) => (previous ? { ...previous, score } : previous));
+      return {
+        kind: "metadata",
+        source: "local",
+        reason: "score",
+        ids: [detail.id],
+        fields: ["score"],
+        score,
+        similarity: "keep",
+      };
     });
   };
 
@@ -323,24 +351,44 @@ function ImageInspector({
       return;
     }
     void run(async () => {
-      const tags = await libraryApi.setImageTags(detail.id, [
+      const applied = await libraryApi.setImageTags(detail.id, [
         ...detail.tags.map((tag) => tag.name),
         trimmed,
       ]);
-      setDetail((previous) => (previous ? { ...previous, tags } : previous));
+      setDetail((previous) => (previous ? { ...previous, tags: applied } : previous));
       setTagDraft("");
       setTagSuggestions([]);
+      return {
+        kind: "metadata",
+        source: "local",
+        reason: "tagAdd",
+        ids: [detail.id],
+        fields: ["tags"],
+        tagAction: "add",
+        rowPatches: [{ id: detail.id, update: { tags: applied.map((tag) => tag.name) } }],
+        similarity: "keep",
+      };
     });
   };
 
   const removeTag = (name: string) => {
     if (!detail) return;
     void run(async () => {
-      const tags = await libraryApi.setImageTags(
+      const applied = await libraryApi.setImageTags(
         detail.id,
         detail.tags.map((tag) => tag.name).filter((value) => value !== name),
       );
-      setDetail((previous) => (previous ? { ...previous, tags } : previous));
+      setDetail((previous) => (previous ? { ...previous, tags: applied } : previous));
+      return {
+        kind: "metadata",
+        source: "local",
+        reason: "tagRemove",
+        ids: [detail.id],
+        fields: ["tags"],
+        tagAction: "remove",
+        rowPatches: [{ id: detail.id, update: { tags: applied.map((tag) => tag.name) } }],
+        similarity: "keep",
+      };
     });
   };
 
@@ -362,9 +410,18 @@ function ImageInspector({
       setFolderDraft(target);
       if (report.moved === 0) {
         notify("图片已在该文件夹", "info");
-      } else {
-        notify("文件夹已更新", "success");
+        return null;
       }
+      notify("文件夹已更新", "success");
+      return {
+        kind: "folder",
+        source: "local",
+        reason: "moveImage",
+        ids: [detail.id],
+        fields: ["folder"],
+        targetFolderPath: target,
+        similarity: "keep",
+      };
     });
   };
 
@@ -788,7 +845,7 @@ interface BatchInspectorProps {
   folders: FolderInfo[];
   currentCollectionId: number | null;
   inTemp: boolean;
-  onChanged: () => void;
+  onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
   onTrash: () => void;
@@ -817,13 +874,17 @@ function BatchInspector({
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
   const count = imageIds.length;
-  const run = async (operation: () => Promise<string>, fallback: string) => {
+  const run = async (
+    operation: () => Promise<string>,
+    fallback: string,
+    change: () => DataChange,
+  ) => {
     if (busy) return;
     setBusy(true);
     try {
       const detail = await operation();
       notify(fallback, "success", detail);
-      onChanged();
+      onChanged(change());
     } catch (cause) {
       notify("批量操作失败", "error", errorMessage(cause));
     } finally {
@@ -834,10 +895,23 @@ function BatchInspector({
   const applyScore = () => {
     if (score === "unset") return;
     const value = Number(score);
-    void run(async () => {
-      const changed = await libraryApi.setImagesScore(imageIds, value);
-      return `${changed.toLocaleString()} 张已更新`;
-    }, "评分已更新");
+    void run(
+      async () => {
+        const changed = await libraryApi.setImagesScore(imageIds, value);
+        return `${changed.toLocaleString()} 张已更新`;
+      },
+      "评分已更新",
+      // 批量写入只返回数量；按新评分就地更新已加载行由图库侧完成。
+      () => ({
+        kind: "metadata",
+        source: "local",
+        reason: "batchScore",
+        ids: imageIds,
+        fields: ["score"],
+        score: value,
+        similarity: "keep",
+      }),
+    );
   };
 
   const splitTags = (value: string) =>
@@ -849,21 +923,45 @@ function BatchInspector({
   const applyAddTags = () => {
     const names = splitTags(tagAdd);
     if (names.length === 0) return;
-    void run(async () => {
-      const added = await libraryApi.addTagsToImages(imageIds, names);
-      setTagAdd("");
-      return `新增 ${added.toLocaleString()} 个标签关联`;
-    }, "标签已添加");
+    void run(
+      async () => {
+        const added = await libraryApi.addTagsToImages(imageIds, names);
+        setTagAdd("");
+        return `新增 ${added.toLocaleString()} 个标签关联`;
+      },
+      "标签已添加",
+      () => ({
+        kind: "metadata",
+        source: "local",
+        reason: "batchTagAdd",
+        ids: imageIds,
+        fields: ["tags"],
+        tagAction: "add",
+        similarity: "keep",
+      }),
+    );
   };
 
   const applyRemoveTags = () => {
     const names = splitTags(tagRemove);
     if (names.length === 0) return;
-    void run(async () => {
-      const removed = await libraryApi.removeTagsFromImages(imageIds, names);
-      setTagRemove("");
-      return `移除 ${removed.toLocaleString()} 个标签关联`;
-    }, "标签已移除");
+    void run(
+      async () => {
+        const removed = await libraryApi.removeTagsFromImages(imageIds, names);
+        setTagRemove("");
+        return `移除 ${removed.toLocaleString()} 个标签关联`;
+      },
+      "标签已移除",
+      () => ({
+        kind: "metadata",
+        source: "local",
+        reason: "batchTagRemove",
+        ids: imageIds,
+        fields: ["tags"],
+        tagAction: "remove",
+        similarity: "keep",
+      }),
+    );
   };
 
   const applyMove = (targetPath?: string) => {
@@ -875,28 +973,52 @@ function BatchInspector({
       notify("请输入目标文件夹", "info", "要移动到根目录，请用下方的「移动到根目录」。");
       return;
     }
-    void run(async () => {
-      const report = await libraryApi.moveImagesToFolder(imageIds, target);
-      if (report.failures.length > 0) {
-        throw new Error(
-          `${report.failures.length} 张移动失败：${report.failures[0].reason}`,
-        );
-      }
-      setFolderDraft(target);
-      return `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`;
-    }, "文件夹已更新");
+    void run(
+      async () => {
+        const report = await libraryApi.moveImagesToFolder(imageIds, target);
+        if (report.failures.length > 0) {
+          throw new Error(
+            `${report.failures.length} 张移动失败：${report.failures[0].reason}`,
+          );
+        }
+        setFolderDraft(target);
+        return `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`;
+      },
+      "文件夹已更新",
+      () => ({
+        kind: "folder",
+        source: "local",
+        reason: "batchMove",
+        ids: imageIds,
+        fields: ["folder"],
+        targetFolderPath: target,
+        similarity: "keep",
+      }),
+    );
   };
 
   const moveToRoot = () => {
-    void run(async () => {
-      const report = await libraryApi.moveImagesToFolder(imageIds, "");
-      if (report.failures.length > 0) {
-        throw new Error(
-          `${report.failures.length} 张移动失败：${report.failures[0].reason}`,
-        );
-      }
-      return `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`;
-    }, "文件夹已更新");
+    void run(
+      async () => {
+        const report = await libraryApi.moveImagesToFolder(imageIds, "");
+        if (report.failures.length > 0) {
+          throw new Error(
+            `${report.failures.length} 张移动失败：${report.failures[0].reason}`,
+          );
+        }
+        return `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`;
+      },
+      "文件夹已更新",
+      () => ({
+        kind: "folder",
+        source: "local",
+        reason: "batchMove",
+        ids: imageIds,
+        fields: ["folder"],
+        targetFolderPath: "",
+        similarity: "keep",
+      }),
+    );
   };
 
   return (

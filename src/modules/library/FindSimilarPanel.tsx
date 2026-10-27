@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Palette,
@@ -150,6 +150,9 @@ export function FindSimilarPanel({
   const [scope, setScope] = useState<ScopeChoice>("view");
   const [includeSubfolders, setIncludeSubfolders] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const contextRef = useRef(context);
+  contextRef.current = context;
+  const wasOpenRef = useRef(open);
 
   const idsKey = reference?.ids.join(",") ?? "";
   const average = (reference?.ids.length ?? 0) > 1;
@@ -171,12 +174,13 @@ export function FindSimilarPanel({
     return () => {
       disposed = true;
     };
-  }, [open, idsKey]);
+  }, [open, idsKey, context]);
 
   useEffect(() => {
-    if (!open || !context) return;
-    const availability = scopeAvailability(context);
-    const preferred = initial?.scope.type ?? defaultScopeChoice(context, "view");
+    const current = contextRef.current;
+    if (!open || !current) return;
+    const availability = scopeAvailability(current);
+    const preferred = initial?.scope.type ?? defaultScopeChoice(current, "view");
     setScope(
       availability[preferred as ScopeChoice]?.enabled
         ? (preferred as ScopeChoice)
@@ -210,8 +214,19 @@ export function FindSimilarPanel({
     setThresholds(nextThresholds);
     setLimitText(String(initial?.limit ?? DEFAULT_RESULTS));
     setError(null);
-    // 只在打开时重置；范围变化由下面的可用性检查处理。
-  }, [open, context, initial]);
+    // 只在打开或参考图变化时重置；计数刷新不打断用户草稿。
+  }, [open, idsKey, initial]);
+
+  // 数据变化后某个范围不再可用：退回当前视图或整个图库，草稿保持不动。
+  useEffect(() => {
+    const wasOpen = wasOpenRef.current;
+    wasOpenRef.current = open;
+    // 刚打开的那次由重置逻辑决定范围，避免用上一轮的旧 scope 覆盖。
+    if (!open || !context || !wasOpen) return;
+    const availability = scopeAvailability(context);
+    if (availability[scope]?.enabled) return;
+    setScope(availability.view.enabled ? "view" : "library");
+  }, [context, open, scope]);
 
   const capabilityMap = useMemo(() => {
     const map = new Map<number, ImageCapabilities>();

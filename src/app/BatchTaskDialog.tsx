@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Play, Square } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
@@ -75,6 +75,7 @@ export function BatchTaskDialog({
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<TaskSummary[] | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
+  const wasOpenRef = useRef(open);
 
   const online = status?.online === true;
 
@@ -110,6 +111,15 @@ export function BatchTaskDialog({
   }, [online, descriptionConfigured]);
 
   const scopeOptions = useMemo(() => scopeAvailability(context), [context]);
+
+  // 数据变化可能让当前范围失效（选择被清空、文件夹/集合消失）；只换范围，不动其它草稿。
+  useEffect(() => {
+    const wasOpen = wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!open || !context || !wasOpen) return;
+    if (scopeOptions[scope]?.enabled) return;
+    setScope(scopeOptions.view.enabled ? "view" : "library");
+  }, [context, open, scope, scopeOptions]);
 
   const capability = AI_CAPABILITY[kind];
   const capabilityInfo = capability ? status?.health?.capabilities[capability] : undefined;

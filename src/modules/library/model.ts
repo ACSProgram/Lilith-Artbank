@@ -174,8 +174,8 @@ export function queryKey(query: LibraryQuery): string {
   });
 }
 
-/** 只反映筛选与视图；排序变化不应清空图片选择。 */
-export function filterKey(query: LibraryQuery): string {
+/** 结果集身份：视图/集合/搜索/筛选。排序与数据刷新不改变身份，因此不进历史记录、不清空选择。 */
+export function queryIdentityKey(query: LibraryQuery): string {
   return JSON.stringify({
     view: query.view,
     collectionId: query.collectionId ?? null,
@@ -183,6 +183,10 @@ export function filterKey(query: LibraryQuery): string {
     searchScope: query.searchScope,
     filters: normalizeFilters(query.filters),
   });
+}
+
+export function querySortKey(query: LibraryQuery): string {
+  return JSON.stringify(query.sort);
 }
 
 export function activeFilterCount(filters: LibraryFilters): number {

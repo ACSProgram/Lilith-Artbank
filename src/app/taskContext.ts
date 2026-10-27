@@ -1,5 +1,12 @@
 import { createContext, useContext } from "react";
+import type { DataChange } from "../modules/library/dataChange";
 import type { BatchTaskRequest, TaskSnapshot, TaskStartResult } from "./taskTypes";
+
+export interface TaskChangeInfo {
+  revision: number;
+  change: DataChange;
+  closeViewer: boolean;
+}
 
 export interface TaskCenter {
   tasks: TaskSnapshot[];
@@ -42,11 +49,14 @@ export function useTaskActive(): TaskActiveInfo {
 export interface TaskDataInfo {
   dataVersion: number;
   lastFinished: TaskSnapshot | null;
+  /** 最近一次可分类的数据变化；同一时刻多次写入时可能只有最新一条。 */
+  lastChange: TaskChangeInfo | null;
 }
 
 export const TaskDataContext = createContext<TaskDataInfo>({
   dataVersion: 0,
   lastFinished: null,
+  lastChange: null,
 });
 
 export function useTaskData(): TaskDataInfo {

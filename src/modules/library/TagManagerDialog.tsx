@@ -11,7 +11,7 @@ import { errorMessage } from "../../shared/errors";
 interface TagManagerDialogProps {
   open: boolean;
   onClose: () => void;
-  onChanged: () => void;
+  onChanged: (change: { tagId: number; action: "rename" | "delete" }) => void;
 }
 
 /** 与 Rust `query::MAX_TAGS` 一致：管理器一次只取图片最多的这些标签，搜索在当前列表内进行。 */
@@ -52,14 +52,18 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     }
   }, [open]);
 
-  const run = async (operation: () => Promise<string>, success: string) => {
+  const run = async (
+    operation: () => Promise<string>,
+    success: string,
+    change: { tagId: number; action: "rename" | "delete" },
+  ) => {
     if (busy) return;
     setBusy(true);
     try {
       const detail = await operation();
       notify(success, "success", detail);
       await load();
-      onChanged();
+      onChanged(change);
     } catch (cause) {
       notify("标签操作失败", "error", errorMessage(cause));
     } finally {
@@ -73,7 +77,7 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
       await libraryApi.renameTag(tag.id, editingName);
       setEditingId(null);
       return `「${tag.name}」→「${editingName.trim()}」`;
-    }, "标签已重命名");
+    }, "标签已重命名", { tagId: tag.id, action: "rename" });
   };
 
   const remove = async (tag: TagInfo) => {
@@ -87,7 +91,7 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     void run(async () => {
       const affected = await libraryApi.deleteTag(tag.id);
       return `已从 ${affected.toLocaleString()} 张图片移除`;
-    }, "标签已删除");
+    }, "标签已删除", { tagId: tag.id, action: "delete" });
   };
 
   const needle = query.trim().toLowerCase();

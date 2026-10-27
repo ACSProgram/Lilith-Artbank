@@ -6,6 +6,7 @@ import {
   TaskDataContext,
   type TaskActiveInfo,
   type TaskCenter,
+  type TaskChangeInfo,
   type TaskDataInfo,
 } from "./taskContext";
 import { TaskCapsule } from "./TaskCapsule";
@@ -14,6 +15,11 @@ import { errorMessage } from "../shared/errors";
 import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { McpApprovalHost } from "./McpApprovalCard";
+import {
+  dataChangeForMcp,
+  dataChangeForTaskKind,
+  type McpChangePayload,
+} from "../modules/library/dataChange";
 
 const MAX_TASKS = 50;
 
@@ -23,6 +29,8 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
   const [tasks, setTasks] = useState<TaskSnapshot[]>([]);
   const [dataVersion, setDataVersion] = useState(0);
   const [lastFinished, setLastFinished] = useState<TaskSnapshot | null>(null);
+  const [lastChange, setLastChange] = useState<TaskChangeInfo | null>(null);
+  const changeRevision = useRef(0);
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
 
@@ -63,14 +71,35 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
           event.payload.kind !== "optimizeEstimate"
         ) {
           setDataVersion((value) => value + 1);
+          const change = dataChangeForTaskKind(event.payload.kind);
+          if (change.kind !== "none") {
+            changeRevision.current += 1;
+            setLastChange({
+              revision: changeRevision.current,
+              change,
+              closeViewer: false,
+            });
+          }
         }
       });
       // MCP 同步写入不产生任务，后端单独发 library-changed；同样推进数据版本，
       // 让网格、文件夹、计数与打开着的操作记录面板一起刷新。
-      const changed = await listen<{ closeViewer?: boolean }>("library-changed", () => {
-        if (disposed) return;
-        setDataVersion((value) => value + 1);
-      });
+      const changed = await listen<McpChangePayload & { closeViewer?: boolean }>(
+        "library-changed",
+        (event) => {
+          if (disposed) return;
+          setDataVersion((value) => value + 1);
+          const change = dataChangeForMcp(event.payload);
+          if (change.kind !== "none") {
+            changeRevision.current += 1;
+            setLastChange({
+              revision: changeRevision.current,
+              change,
+              closeViewer: event.payload.closeViewer === true,
+            });
+          }
+        },
+      );
       unlisteners.push(progress, finished, changed);
     })();
 
@@ -119,8 +148,8 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
     [active],
   );
   const dataInfo = useMemo<TaskDataInfo>(
-    () => ({ dataVersion, lastFinished }),
-    [dataVersion, lastFinished],
+    () => ({ dataVersion, lastFinished, lastChange }),
+    [dataVersion, lastFinished, lastChange],
   );
 
   return (

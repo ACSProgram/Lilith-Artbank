@@ -17,7 +17,7 @@
 - 姿势叠加：33 点 MediaPipe 骨架与可见点过滤；`get_image_pose` 从 S6 的 feature pack 读取 landmark。没有可见姿势时按钮调用 `ai_generate_pose`（512px 缩略图输入），保存后立即叠加；服务返回空点集时提示未检测到人体。骨架线宽与关节点半径按屏幕像素换算（`2 / zoom`、`5 / zoom` 与 `3.5 / zoom`），缩放时粗细不变；主线外加深色描边保证在明暗画面上都能看清，置信度低于 0.5 的连线与关节点半透明，头部与躯干节点比四肢大。画布右上的姿势面板显示可见点数（N/33）与不透明度滑块，不透明度存在 `localStorage`。
 - 复制图片：`copy_image` 解码原图、应用 EXIF 方向后以 RGBA 写入系统剪贴板；超过 5000 万像素给出可行动错误。
 - 拖出到资源管理器（Windows OLE）：评估后暂缓到后续阶段；S4 保留“复制图片”和已有的“复制文件路径”。
-- 元数据侧栏：由 `src/app/ViewerHost.tsx` 复用图库详情侧栏，评分、标签、描述、文件夹可直接编辑；回收站/恢复/永久删除成功后关闭查看器，刷新由图库侧统一完成。侧栏里的标签可以点击按范围筛选（见[浏览与检索](browse-and-query.md)的“按标签筛选”），点击后查看器关闭并把控制权交回网格。
+- 元数据侧栏：由 `src/app/ViewerHost.tsx` 复用图库详情侧栏，评分、标签、描述、文件夹可直接编辑；每次写入携带 `DataChange` 交给图库统一刷新，回收站/恢复/永久删除成功后关闭查看器。侧栏里的标签可以点击按范围筛选（见[浏览与检索](browse-and-query.md)的“按标签筛选”），点击后查看器关闭并把控制权交回网格。
 - 大图内存：查看器原图由 WebView2 解码；Rust 侧编辑/预览都受 512 MiB 分配、单边 65535、1 亿像素的解码上限约束，并对 >5000 万像素的图片禁用编辑。
 - 配色跟随全局主题：查看器不再固定深色，顶栏/工具面板/状态栏/输入框/裁剪框都用 `src/styles/tokens.css` 的语义变量；画布用 `--canvas`（浅色下中性灰、深色下比面板再暗一档），透明区域显示 `--checker` 棋盘格。
 - 胶片带：画布底部一条 68px 的横向缩略图带，当前项高亮并自动居中，点击切换，滚轮转横向滚动，滚到末尾沿用 `session.loadMore()` 继续加载。只渲染视口附近的条目（`OVERSCAN` 8 条），20 万条也不会一次挂满 DOM。开关写在 `settings.ui.viewerFilmstrip`，状态栏左侧按钮切换。
@@ -76,12 +76,12 @@
 前端结构：
 
 - `src/modules/viewer/`：types、api、model、ImageViewer、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）、model.test。
-- `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。两个前端模块不互相导入。
-- `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步、保存后就地更新行（`ViewerSessionUpdate`）、标签筛选与元数据操作的桥接契约。
+- `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。详情侧栏的写入经 `session.refresh(change)` 交给图库，生成姿势后同样发特征变化；外部变化后按活动图复核存在与回收站状态，离开当前范围时关闭。两个前端模块不互相导入。
+- `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步、保存后就地更新行（`ViewerSessionUpdate`）、`refresh(change)`、`expectTrashed`、标签筛选与元数据操作的桥接契约。
 - `src/shared/tagFilter.ts`：标签筛选的范围与动作类型，图库与查看器共用的最小契约。
 - `src/shared/imgUrl.ts`：`img://` URL 生成。
 
-保存后前端不重新查询：查看器把 `EditResult` 里的内容哈希、扩展名、体积、宽高、格式、alpha 与 `thumbVersion` 经 `session.onSaved(imageId, update)` 交给图库，网格/相似结果只就地替换这一行的字段（`patchItem`），排序、滚动位置与深分页上下文都保留。
+保存后前端不重新查询首屏：查看器把 `EditResult` 里的内容哈希、扩展名、体积、宽高、格式、alpha 与 `thumbVersion` 经 `session.onSaved(imageId, update)` 交给图库，网格/相似结果只就地替换这一行的字段（`patchItem`），并追加一条 `content` 变化刷新特征/分面、退出相似结果；排序、滚动位置与深分页上下文都保留。当前排序依赖修改时间/大小/像素或 id 游标还有下一页时，后台重取已加载范围而不清空列表。
 
 ## 图像处理（S5）
 

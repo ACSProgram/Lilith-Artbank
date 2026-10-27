@@ -5,8 +5,9 @@ import { ImportDialog } from "../modules/import/ImportDialog";
 import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type { FolderInfo } from "../modules/library/types";
+import type { CollectionInfo, FolderInfo } from "../modules/library/types";
 import { sortForViewChange } from "../modules/library/model";
+import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
 import { aiApi } from "../modules/ai/api";
 import { useAiStatus } from "../modules/ai/useAiStatus";
@@ -32,13 +33,64 @@ interface LibraryWorkspaceProps {
   onChangeLibrary: () => void;
 }
 
+/** 重算对话框范围计数时用到的当前库数据。 */
+interface ContextSources {
+  folders: FolderInfo[];
+  /** 为空表示这次没有重新读取集合，集合相关字段沿用旧值。 */
+  collections: CollectionInfo[] | null;
+  selectedIds: number[];
+  libraryTotal: number | null;
+  tempTotal: number | null;
+}
+
+/**
+ * 按打开时的范围重取数量。范围对象已经消失时把对应字段置空，界面据此禁用该范围，
+ * 不静默使用旧数字。
+ */
+async function refreshTaskContext(
+  previous: BatchTaskContextInfo,
+  sources: ContextSources,
+): Promise<BatchTaskContextInfo> {
+  const folder =
+    previous.folderId != null
+      ? sources.folders.find((item) => item.id === previous.folderId)
+      : undefined;
+  const collections = sources.collections;
+  const collection =
+    previous.collectionId != null && collections
+      ? collections.find((item) => item.id === previous.collectionId)
+      : undefined;
+  let viewTotal = previous.viewTotal;
+  if (previous.query) {
+    try {
+      viewTotal = await libraryApi.getQueryTotal(previous.query);
+    } catch {
+      viewTotal = null;
+    }
+  }
+  return {
+    ...previous,
+    selectedIds: sources.selectedIds,
+    viewTotal,
+    folderId: folder?.id ?? null,
+    folderName: folder?.path ?? null,
+    folderDirectTotal: folder?.directImageCount ?? null,
+    folderTotal: folder?.totalImageCount ?? null,
+    collectionId: collection?.id ?? (collections ? null : previous.collectionId),
+    collectionName: collection?.name ?? (collections ? null : previous.collectionName),
+    collectionTotal: collection?.imageCount ?? (collections ? null : previous.collectionTotal),
+    libraryTotal: sources.libraryTotal ?? previous.libraryTotal,
+    tempTotal: sources.tempTotal ?? previous.tempTotal,
+  };
+}
+
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
-  const { current, refreshStatus, settings } = useAppRuntime();
+  const { current, settings } = useAppRuntime();
   const { notify } = useNotices();
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [refreshToken, setRefreshToken] = useState(0);
+  const [changeSignal, setChangeSignal] = useState<DataChangeSignal | null>(null);
   const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null);
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
@@ -47,6 +99,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
   const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
+  const [contextsRevision, setContextsRevision] = useState(0);
+  const [optimizeStale, setOptimizeStale] = useState(false);
+  const contextsRevisionRef = useRef(0);
   const browse = useLibraryBrowse(settings?.ui.sort);
   const importTarget: ImportTarget =
     browse.browse.view === "temp" ? "temp" : "library";
@@ -57,11 +112,55 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return folders.find((folder) => folder.id === selected[0])?.path ?? "";
   }, [browse.browse.filters.folderIds, folders, importTarget]);
   const similarity = useSimilarityBrowse();
-  const { dataVersion: taskDataVersion, lastFinished } = useTaskData();
+  const { lastFinished, lastChange } = useTaskData();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const optimizeQueryRef = useRef(0);
   const importOpenRef = useRef(false);
   importOpenRef.current = importOpen;
+  const changeQueue = useRef<DataChange[]>([]);
+  const changeScheduled = useRef(false);
+  const lastEmittedChange = useRef<{ key: string; at: number } | null>(null);
+
+  /**
+   * 把变化排队后一次交给图库。任务结束与导入完成会各发一次同一条变化，短窗口内按内容去重；
+   * 去重键只用 id 数量与首尾，不拼接可能上万条的 id 列表。
+   */
+  const emitChange = useCallback((change: DataChange) => {
+    const ids = change.ids ?? [];
+    const idKey = ids.length > 0 ? `${ids.length}:${ids[0]}:${ids[ids.length - 1]}` : "";
+    const key = [
+      change.kind,
+      change.source,
+      change.reason ?? "",
+      idKey,
+      change.fields?.join(",") ?? "",
+      change.tagAction ?? "",
+      change.tagId ?? "",
+      change.score ?? "",
+      change.targetFolderPath ?? "",
+      change.similarity,
+    ].join("|");
+    const now = performance.now();
+    if (
+      lastEmittedChange.current?.key === key &&
+      now - lastEmittedChange.current.at < 400
+    ) {
+      return;
+    }
+    lastEmittedChange.current = { key, at: now };
+    changeQueue.current.push(change);
+    if (changeScheduled.current) return;
+    changeScheduled.current = true;
+    queueMicrotask(() => {
+      changeScheduled.current = false;
+      const changes = changeQueue.current.splice(0);
+      if (changes.length === 0) return;
+      setChangeSignal((previous) => ({
+        revision: (previous?.revision ?? 0) + 1,
+        changes,
+      }));
+    });
+  }, []);
 
   useEffect(() => {
     similarity.clear();
@@ -85,7 +184,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
 
   useEffect(() => {
     void reloadFolders();
-  }, [reloadFolders, refreshToken]);
+  }, [reloadFolders, current?.id]);
 
   useEffect(() => {
     if (!foldersLoaded) return;
@@ -132,16 +231,27 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     };
   }, []);
 
-  /** 任务改变图库数据后刷新网格、文件夹计数与图库状态。 */
+  /** 任务改变图库数据后把变化交给浏览界面；文件夹/计数/特征由变化计划决定。 */
+  const lastChangeRevision = useRef<number | null>(null);
   useEffect(() => {
-    if (taskDataVersion === 0) return;
-    setRefreshToken((value) => value + 1);
-    void reloadFolders();
-    void refreshStatus().catch((error: unknown) => {
-      notify("刷新图库状态失败", "error", errorMessage(error));
-    });
-    void refreshAi();
-  }, [taskDataVersion, notify, refreshAi, refreshStatus, reloadFolders]);
+    if (!lastChange) return;
+    const previous = lastChangeRevision.current;
+    lastChangeRevision.current = lastChange.revision;
+    if (previous === lastChange.revision) return;
+    if (lastChange.closeViewer) setViewerSession(null);
+    // 同一时刻多个任务结束：只拿到最后一条时退化为保守的完整刷新。
+    if (previous != null && lastChange.revision - previous > 1) {
+      emitChange({
+        kind: "unknown",
+        source: "task",
+        reason: "batched",
+        clearSelection: true,
+        similarity: "clear",
+      });
+      return;
+    }
+    emitChange(lastChange.change);
+  }, [lastChange, emitChange]);
 
   // 撤销/重做可能删除或恢复当前查看的图片，完成后退出查看器，避免停在过期内容上。
   useEffect(() => {
@@ -149,24 +259,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       setViewerSession(null);
     }
   }, [lastFinished]);
-
-  // MCP 同步写入的刷新由 TaskCenterProvider 推进数据版本；这里只处理查看器关闭。
-  useEffect(() => {
-    if (browserPreview) return;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      if (disposed) return;
-      unlisten = await listen<{ closeViewer?: boolean }>("library-changed", (event) => {
-        if (event.payload?.closeViewer) setViewerSession(null);
-      });
-    })();
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
 
   const generateDescription = useCallback(async (imageId: number) => {
     const result = await aiApi.describeImage(imageId);
@@ -192,8 +284,15 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             report.failures.length > 0 ? "error" : "success",
             report.failures[0]?.reason,
           );
-          await reloadFolders();
-          setRefreshToken((value) => value + 1);
+          emitChange({
+            kind: "folder",
+            source: "local",
+            reason: "moveImages",
+            ids: item.imageIds,
+            fields: ["folder"],
+            targetFolderPath: path,
+            similarity: "keep",
+          });
         } catch (cause) {
           notify("移动图片失败", "error", errorMessage(cause));
         }
@@ -236,13 +335,18 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
           const index = target.position === "before" ? position : position + 1;
           await libraryApi.reorderFolders([dragged.id], parent.id, index);
         }
-        await reloadFolders();
-        setRefreshToken((value) => value + 1);
+        emitChange({
+          kind: "folder",
+          source: "local",
+          reason: "moveFolder",
+          fields: ["folder"],
+          similarity: "keep",
+        });
       } catch (cause) {
         notify("移动文件夹失败", "error", errorMessage(cause));
       }
     },
-    [folders, notify, reloadFolders],
+    [folders, notify, emitChange],
   );
 
   const { beginDrag } = useDragSort({
@@ -285,6 +389,51 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     };
   }, [optimizeContext]);
 
+  const handleContextsChanged = useCallback(() => {
+    setContextsRevision((value) => value + 1);
+  }, []);
+
+  // 对话框打开期间数据变化：重取范围数量与选择；估算保留，只标记“执行前会复核”。
+  useEffect(() => {
+    if (contextsRevision === 0) return;
+    const previousBatch = batchContext;
+    const previousOptimize = optimizeContext;
+    if (!previousBatch && !previousOptimize) return;
+    const generation = contextsRevisionRef.current + 1;
+    contextsRevisionRef.current = generation;
+    const needsCollections = [previousBatch, previousOptimize].some(
+      (context) => context?.collectionId != null,
+    );
+    void (async () => {
+      let nextCollections: CollectionInfo[] | null = null;
+      if (needsCollections) {
+        try {
+          nextCollections = await libraryApi.getCollections();
+        } catch {
+          nextCollections = null;
+        }
+      }
+      const sources: ContextSources = {
+        folders,
+        collections: nextCollections,
+        selectedIds: selectedImageIds,
+        libraryTotal: current?.imageCount ?? null,
+        tempTotal: current?.tempCount ?? null,
+      };
+      const [nextBatch, nextOptimize] = await Promise.all([
+        previousBatch ? refreshTaskContext(previousBatch, sources) : null,
+        previousOptimize ? refreshTaskContext(previousOptimize, sources) : null,
+      ]);
+      if (generation !== contextsRevisionRef.current) return;
+      if (nextBatch) setBatchContext((current) => (current ? nextBatch : current));
+      if (nextOptimize) {
+        setOptimizeContext((current) => (current ? nextOptimize : current));
+        setOptimizeStale(true);
+      }
+    })();
+    // 只在计数版本推进时按打开时的上下文重取，不随上下文对象本身重跑。
+  }, [contextsRevision]);
+
   if (!current) return null;
 
   const hasImages =
@@ -296,15 +445,26 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       : null;
 
   const handleImportFinished = () => {
-    setRefreshToken((value) => value + 1);
-    void reloadFolders();
-    void refreshStatus().catch((error: unknown) => {
-      notify("刷新图库状态失败", "error", errorMessage(error));
+    // 任务结束路径通常也会发同一条变化；emitChange 在短窗口内去重。
+    emitChange({
+      kind: "membership",
+      source: "import",
+      reason: "import",
+      clearSelection: true,
+      similarity: "clear",
     });
   };
 
   const handleDataChanged = () => {
-    setRefreshToken((value) => value + 1);
+    // FolderTree 已经通过 onFoldersChanged 送回新的计数，只需刷新图片路径相关结果。
+    emitChange({
+      kind: "folder",
+      source: "local",
+      reason: "folderCatalog",
+      fields: ["folder"],
+      foldersAlreadyLoaded: true,
+      similarity: "keep",
+    });
   };
 
   const selectFolders = (folderIds: number[]) => {
@@ -366,10 +526,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               folders={folders}
               onApplyBrowse={browse.applyBrowse}
               onGoBack={browse.goBack}
-              onFoldersChanged={() => void reloadFolders()}
+              onFoldersChanged={() => reloadFolders()}
               onImageSelectionChange={setSelectedImageIds}
-              refreshToken={refreshToken}
+              changeSignal={changeSignal}
               onOpenViewer={setViewerSession}
+              onCloseViewer={() => setViewerSession(null)}
+              onContextsChanged={handleContextsChanged}
               onCopyImage={(imageId) => void handleCopyImage(imageId)}
               onOpenImport={() => openImport()}
               onBeginImageDrag={(imageIds, label, event) =>
@@ -380,7 +542,10 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 setSimilarityGroupsOpen(true);
               }}
               onOpenBatchTasks={setBatchContext}
-              onOpenOptimize={setOptimizeContext}
+              onOpenOptimize={(context) => {
+                setOptimizeContext(context);
+                setOptimizeStale(false);
+              }}
               onGenerateDescription={generateDescription}
               semanticBlockedReason={semanticBlockedReason}
             />
@@ -439,6 +604,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               key={`${current.id}-${viewerSession.initialId}`}
               session={viewerSession}
               onClose={() => setViewerSession(null)}
+              revalidateRevision={changeSignal?.revision ?? 0}
               onGenerateDescription={generateDescription}
               onGeneratePose={generatePose}
             />
@@ -455,6 +621,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             onClose={() => setOptimizeContext(null)}
             context={optimizeContext}
             libraryId={current.id}
+            dataChanged={optimizeStale}
           />
           <ImportDialog
             open={importOpen}
@@ -470,7 +637,14 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             onClose={() => {
               setSimilarityGroupsOpen(false);
             }}
-            onChanged={() => setRefreshToken((value) => value + 1)}
+            onChanged={() =>
+              emitChange({
+                kind: "collection",
+                source: "local",
+                reason: "similarityGroups",
+                similarity: "keep",
+              })
+            }
             initialTaskId={similarityGroupsTaskId}
             onTaskStarted={setSimilarityGroupsTaskId}
           />

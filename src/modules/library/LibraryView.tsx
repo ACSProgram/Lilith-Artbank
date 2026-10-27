@@ -64,11 +64,11 @@ import {
   buildQuery,
   effectiveViewOf,
   emptyFilters,
-  filterKey,
   folderLabel,
   hasActiveFilters,
   hasActiveQuery,
   isFormTarget,
+  queryIdentityKey,
   queryKey,
   rowInTagScope,
   selectionRange,
@@ -92,6 +92,13 @@ import { useImageQuery } from "./useImageQuery";
 import { VirtualGrid } from "./VirtualGrid";
 import { VirtualList } from "./VirtualList";
 import type { VirtualViewHandle } from "./virtual";
+import {
+  combinePlans,
+  planDataChange,
+  selectionAfterChange,
+  type DataChange,
+  type DataChangeSignal,
+} from "./dataChange";
 import type {
   ViewerSession,
   ViewerSessionItem,
@@ -109,10 +116,15 @@ interface LibraryViewProps {
   folders: FolderInfo[];
   onApplyBrowse: (next: BrowseState, pushHistory?: boolean) => void;
   onGoBack: () => void;
-  onFoldersChanged?: () => void;
+  onFoldersChanged?: () => void | Promise<void>;
   onImageSelectionChange?: (imageIds: number[]) => void;
-  refreshToken: number;
+  /** 工作区、任务与 MCP 送来的数据变化；本地变化由 LibraryView 直接应用。 */
+  changeSignal: DataChangeSignal | null;
   onOpenViewer: (session: ViewerSession) => void;
+  /** 结果集或相似来源变化时关闭查看器，避免停在旧数据源上。 */
+  onCloseViewer?: () => void;
+  /** 计数类状态变化：打开着的任务/找相似对话框需要重取范围数量。 */
+  onContextsChanged?: () => void;
   onCopyImage: (imageId: number) => void;
   onOpenImport?: () => void;
   /** 开始把网格/列表中的图片拖到文件夹。 */
@@ -159,6 +171,30 @@ function fileNameOf(path: string): string {
   return index >= 0 ? path.slice(index + 1) : path;
 }
 
+/**
+ * 活动图是否已离开结果集：已选中的按选择裁剪结果判断，未选中的只认明确移出图库的成员变化。
+ * 评分/标签/描述这类不改变范围的变化不会移动活动图。
+ */
+function activeLeftResult(
+  active: number,
+  previousSelected: Set<number>,
+  nextSelected: Set<number>,
+  changes: DataChange[],
+): boolean {
+  if (previousSelected.has(active)) return !nextSelected.has(active);
+  return changes.some(
+    (change) =>
+      change.kind === "membership" &&
+      !isRestoreReason(change.reason) &&
+      change.ids?.includes(active) === true,
+  );
+}
+
+/** 恢复类变化让图片重新出现，不按“移出图库”处理。 */
+function isRestoreReason(reason: string | undefined): boolean {
+  return reason === "restore" || reason === "images_restore";
+}
+
 export function LibraryView({
   browse,
   canGoBack,
@@ -167,8 +203,10 @@ export function LibraryView({
   onGoBack,
   onFoldersChanged,
   onImageSelectionChange,
-  refreshToken,
+  changeSignal,
   onOpenViewer,
+  onCloseViewer,
+  onContextsChanged,
   onCopyImage,
   onOpenImport,
   onBeginImageDrag,
@@ -197,7 +235,10 @@ export function LibraryView({
   const [gridColumns, setGridColumns] = useState(1);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [selectingAll, setSelectingAll] = useState(false);
-  const [dataVersion, setDataVersion] = useState(0);
+  const [detailVersion, setDetailVersion] = useState(0);
+  const [facetVersion, setFacetVersion] = useState(0);
+  const [tagOptionsVersion, setTagOptionsVersion] = useState(0);
+  const [featureVersion, setFeatureVersion] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [collectionsLoaded, setCollectionsLoaded] = useState(false);
   const [collectionManagerOpen, setCollectionManagerOpen] = useState(false);
@@ -235,6 +276,11 @@ export function LibraryView({
   browseRef.current = browse;
   const activeIdRef = useRef<number | null>(activeId);
   activeIdRef.current = activeId;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const appliedChangeRevision = useRef(0);
+  const contextRevision = useRef(0);
+  const [findSimilarContextVersion, setFindSimilarContextVersion] = useState(0);
   // 标签筛选后保留原图选择；若不在第一页，用锚点游标跳到它所在位置。
   const preserveTagSelectionRef = useRef(false);
   const pendingTagFocusRef = useRef<{
@@ -271,24 +317,26 @@ export function LibraryView({
   }, [collections, effectiveCollectionId]);
 
   const query = useMemo(() => buildQuery(browse), [browse]);
-  const imageQuery = useImageQuery(query, refreshToken + dataVersion);
+  const imageQuery = useImageQuery(query);
   const similarityActive = similarity?.active === true;
   // 结果来自“找相似”而不是文本语义搜索；状态文案按它分支。
   const similarMode = similarity?.mode === "similar";
   // 相似模式下网格换成结果数据源；两者共享 items/status/error/hasMore 契约。
   const listSource = similarityActive && similarity ? similarity : imageQuery;
   const { items, status, error, moreStatus, moreError, hasMore } = listSource;
+  const refreshError = imageQuery.refreshError;
+  const clearRefreshError = imageQuery.clearRefreshError;
+  // 取稳定回调而不是整个控制器对象，避免每次渲染都让变化应用函数换新引用。
+  const { patchItems, removeItems, refreshKeepingRows } = imageQuery;
   const loadMore = listSource.loadMore;
   const retry = listSource.retry;
   const retryMore = similarityActive && similarity ? similarity.loadMore : imageQuery.retryMore;
   const similarityKey = similarityActive ? `similarity:${similarity?.token ?? ""}` : "";
+  const similarityClear = similarity?.clear;
+  // 排序与数据刷新不再改变 resetKey；只有换结果集或换相似来源才回到顶部。
   const resetSignature = useMemo(
-    () => `${queryKey(query)}|${refreshToken}|${similarityKey}`,
-    [query, refreshToken, similarityKey],
-  );
-  const selectionResetSignature = useMemo(
-    () => `${filterKey(query)}|${refreshToken}|${similarityKey}`,
-    [query, refreshToken, similarityKey],
+    () => `${queryIdentityKey(query)}|${similarityKey}`,
+    [query, similarityKey],
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
   const thumbFit: ThumbFit = settings?.ui.thumbFit ?? "cover";
@@ -316,15 +364,33 @@ export function LibraryView({
     void libraryApi
       .getImageDetail(similarityTargetId)
       .then((details) => {
-        if (!disposed) setSimilarityTarget(details);
+        if (disposed) return;
+        if (details.deletedAt != null) {
+          setSimilarityTarget(null);
+          similarityClear?.();
+          notify(
+            "比较图已失效",
+            "info",
+            "目标图片已被移出图库，请重新查找相似图片。",
+          );
+          return;
+        }
+        setSimilarityTarget(details);
       })
       .catch(() => {
-        if (!disposed) setSimilarityTarget(null);
+        if (disposed) return;
+        setSimilarityTarget(null);
+        similarityClear?.();
+        notify(
+          "比较图已失效",
+          "info",
+          "目标图片已被删除，请重新查找相似图片。",
+        );
       });
     return () => {
       disposed = true;
     };
-  }, [similarityTargetId]);
+  }, [similarityTargetId, detailVersion, similarityClear, notify]);
 
   /** 界面偏好（填充方式、详情面板）改了就存，不弹“设置已保存”。 */
   const persistUi = useCallback(
@@ -347,18 +413,6 @@ export function LibraryView({
     setContextMenu(null);
   }, []);
 
-  const refreshData = useCallback(
-    (options?: { clearSelection?: boolean }) => {
-      if (options?.clearSelection) clearSelection();
-      setDataVersion((value) => value + 1);
-      onFoldersChanged?.();
-      void refreshStatus().catch((cause: unknown) => {
-        notify("刷新图库状态失败", "error", errorMessage(cause));
-      });
-    },
-    [clearSelection, notify, onFoldersChanged, refreshStatus],
-  );
-
   const collectionsGeneration = useRef(0);
   const reloadCollections = useCallback(async () => {
     const generation = collectionsGeneration.current + 1;
@@ -374,9 +428,261 @@ export function LibraryView({
     }
   }, [notify]);
 
+  /** 成员变化后复核相似参考与比较图；本地已知 id 直接剔除，外部变化查一次状态。 */
+  const prunedInvalidSimilarityInputs = useCallback(
+    async (changes: DataChange[]) => {
+      const membership = changes.filter(
+        (change) => change.kind === "membership" || change.kind === "unknown",
+      );
+      if (membership.length === 0) return;
+
+      const removed = new Set<number>();
+      let needsQuery = false;
+      for (const change of membership) {
+        if (!change.ids?.length) {
+          needsQuery = true;
+          continue;
+        }
+        // 恢复是图片重新出现，不会让参考或比较图失效。
+        if (isRestoreReason(change.reason)) continue;
+        for (const id of change.ids) removed.add(id);
+      }
+
+      const referenceIds = similarityReference?.ids ?? [];
+      const targetIds = lastFindSimilar?.targetIds ?? similarity?.targetIds ?? [];
+      const checkIds = [...new Set([...referenceIds, ...targetIds])];
+      const states = new Map<number, number | null>();
+      if (needsQuery && checkIds.length > 0) {
+        try {
+          const rows = await libraryApi.getImageStates(checkIds);
+          for (const row of rows) states.set(row.id, row.deletedAt);
+        } catch {
+          return;
+        }
+      }
+      const isValid = (id: number) =>
+        !removed.has(id) &&
+        (!needsQuery || (states.has(id) && states.get(id) == null));
+      const remainingReferences = referenceIds.filter(isValid);
+      const remainingTargets = targetIds.filter(isValid);
+      let cleared = false;
+      const clearResults = () => {
+        if (cleared) return;
+        cleared = true;
+        similarityClear?.();
+        setSimilarityTarget(null);
+      };
+
+      if (referenceIds.length > 0 && remainingReferences.length !== referenceIds.length) {
+        if (remainingReferences.length === 0) {
+          setSimilarityReference(null);
+          setLastFindSimilar(null);
+          setFindSimilarOpen(false);
+          clearResults();
+          notify(
+            "相似参考已失效",
+            "info",
+            "参考图已被移出图库，请重新选择参考图。",
+          );
+        } else {
+          const remainingSet = new Set(remainingReferences);
+          setSimilarityReference({
+            ids: remainingReferences,
+            items:
+              similarityReference?.items.filter((item) => remainingSet.has(item.id)) ?? [],
+          });
+          if (lastFindSimilar?.targetIds.some((id) => !remainingSet.has(id))) {
+            setLastFindSimilar(null);
+            clearResults();
+            notify(
+              "相似参考已变化",
+              "info",
+              "有参考图被移出图库，当前相似结果已失效。",
+            );
+          }
+        }
+      }
+
+      if (targetIds.length > 0 && remainingTargets.length !== targetIds.length) {
+        if (lastFindSimilar?.targetIds.some((id) => !remainingTargets.includes(id))) {
+          setLastFindSimilar(null);
+        }
+        clearResults();
+        notify(
+          "比较图已失效",
+          "info",
+          "目标图片已被移出图库，请重新查找相似图片。",
+        );
+      }
+    },
+    [
+      lastFindSimilar,
+      notify,
+      similarity,
+      similarityClear,
+      similarityReference,
+    ],
+  );
+
+  /**
+   * 统一应用数据变化。列表刷新保留旧行；只有换结果集才清空。
+   * 文件夹/集合/状态/特征/分面按 plan 各自刷新，不再让所有面板订阅同一个版本号。
+   */
+  const applyChanges = useCallback(
+    async (changes: DataChange[]) => {
+      const meaningful = changes.filter((change) => change.kind !== "none");
+      if (meaningful.length === 0) return;
+
+      const plans = meaningful.map((change) =>
+        planDataChange(change, query, { hasMore: hasMoreRef.current }),
+      );
+      const plan = combinePlans(plans);
+
+      // 同一个 id 只留一份合并后的补丁；评分/文件夹这类批量写入按 id + 新值推导。
+      const patchById = new Map<number, Partial<ImageRow>>();
+      const addPatch = (id: number, update: Partial<ImageRow>) => {
+        patchById.set(id, { ...patchById.get(id), ...update });
+      };
+      for (const change of meaningful) {
+        for (const patch of change.rowPatches ?? []) addPatch(patch.id, patch.update);
+        if (change.ids?.length && (change.fields ?? []).includes("score")) {
+          for (const id of change.ids) addPatch(id, { score: change.score ?? 0 });
+        }
+        if (change.kind === "folder" && change.ids?.length && change.targetFolderPath != null) {
+          for (const id of change.ids) addPatch(id, { folderPath: change.targetFolderPath });
+        }
+        if (
+          change.kind === "membership" &&
+          change.source === "local" &&
+          change.ids?.length
+        ) {
+          removeItems(change.ids);
+        }
+      }
+      if (patchById.size > 0) {
+        const patches = [...patchById].map(([id, update]) => ({ id, update }));
+        patchItems(patches);
+        if (similarityActive && similarity) {
+          for (const patch of patches) similarity.patchItem(patch.id, patch.update);
+        }
+      }
+
+      if (plan.list === "refresh") {
+        await refreshKeepingRows();
+      }
+
+      const folderPaths = folders
+        .filter((folder) => query.filters.folderIds.includes(folder.id))
+        .map((folder) => folder.path);
+      const previousSelected = selectedRef.current;
+      let nextSelected = previousSelected;
+      for (const change of meaningful) {
+        nextSelected = selectionAfterChange(nextSelected, change, query, folderPaths);
+      }
+      if (
+        nextSelected.size !== previousSelected.size ||
+        [...nextSelected].some((id) => !previousSelected.has(id))
+      ) {
+        selectedRef.current = nextSelected;
+        setSelected(nextSelected);
+      }
+
+      const active = activeIdRef.current;
+      if (plan.selection === "clear") {
+        setActiveId(null);
+        setAnchorId(null);
+      } else if (
+        active != null &&
+        activeLeftResult(active, previousSelected, nextSelected, meaningful)
+      ) {
+        // 活动图离开结果时把焦点交给剩余选择，其次是已加载的第一张。
+        const fallback =
+          [...nextSelected][0] ??
+          itemsRef.current.find((item) => item.id !== active)?.id ??
+          null;
+        setActiveId(fallback);
+        setAnchorId(fallback);
+      }
+      setContextMenu(null);
+
+      if (plan.similarity === "clear") {
+        similarityClear?.();
+        setSimilarityTarget(null);
+      }
+      if (plan.folders) await onFoldersChanged?.();
+      if (plan.collections) void reloadCollections();
+      if (plan.status) {
+        await refreshStatus().catch((cause: unknown) => {
+          notify("刷新图库状态失败", "error", errorMessage(cause));
+        });
+      }
+      if (plan.features) setFeatureVersion((value) => value + 1);
+      if (plan.facets) setFacetVersion((value) => value + 1);
+      if (plan.tagOptions) setTagOptionsVersion((value) => value + 1);
+      if (plan.detail) setDetailVersion((value) => value + 1);
+      if (plan.folders || plan.collections || plan.status || plan.detail) {
+        setFindSimilarContextVersion((value) => value + 1);
+      }
+      if (plan.facets || plan.folders || plan.collections || plan.status) {
+        onContextsChanged?.();
+      }
+
+      if (
+        meaningful.some(
+          (change) =>
+            change.kind === "membership" ||
+            change.kind === "unknown" ||
+            change.kind === "content",
+        )
+      ) {
+        void prunedInvalidSimilarityInputs(meaningful);
+      }
+    },
+    [
+      folders,
+      notify,
+      onContextsChanged,
+      onFoldersChanged,
+      patchItems,
+      prunedInvalidSimilarityInputs,
+      query,
+      refreshKeepingRows,
+      refreshStatus,
+      reloadCollections,
+      removeItems,
+      similarity,
+      similarityActive,
+      similarityClear,
+    ],
+  );
+
+  const applyChange = useCallback(
+    (change: DataChange) => {
+      void applyChanges([change]);
+    },
+    [applyChanges],
+  );
+
+  useEffect(() => {
+    if (!changeSignal || changeSignal.revision === appliedChangeRevision.current) return;
+    appliedChangeRevision.current = changeSignal.revision;
+    void applyChanges(changeSignal.changes);
+  }, [changeSignal, applyChanges]);
+
+  // 保留旧行刷新失败时列表仍可用；只提示一次，不替换内容、不打断滚动。
+  useEffect(() => {
+    if (!refreshError) return;
+    notify(
+      "刷新图片列表失败",
+      "error",
+      "当前仍显示旧内容，可以稍后点工具栏的刷新重试。",
+    );
+    clearRefreshError();
+  }, [clearRefreshError, notify, refreshError]);
+
   useEffect(() => {
     void reloadCollections();
-  }, [reloadCollections, refreshToken, dataVersion]);
+  }, [reloadCollections]);
 
   // 全库特征覆盖情况只随数据变化重查；用于筛选面板与工具栏置灰。
   useEffect(() => {
@@ -392,7 +698,7 @@ export function LibraryView({
     return () => {
       disposed = true;
     };
-  }, [refreshToken, dataVersion]);
+  }, [featureVersion]);
 
   useEffect(() => {
     // 标签筛选是“从当前图片跳转”，保留选择；其它筛选/视图变化仍清空。
@@ -404,7 +710,19 @@ export function LibraryView({
     setActiveId(null);
     setAnchorId(null);
     setContextMenu(null);
-  }, [selectionResetSignature]);
+  }, [resetSignature]);
+
+  // 底层数据源换了（视图/筛选/相似 token）：查看器里的图片不再属于当前结果。
+  const viewerSourceRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (viewerSourceRef.current == null) {
+      viewerSourceRef.current = resetSignature;
+      return;
+    }
+    if (viewerSourceRef.current === resetSignature) return;
+    viewerSourceRef.current = resetSignature;
+    onCloseViewer?.();
+  }, [resetSignature, onCloseViewer]);
 
   // 标签筛选完成后：回到原图；第一页没有它时，用锚点游标取它所在的一页。
   useEffect(() => {
@@ -439,14 +757,8 @@ export function LibraryView({
     imageQuery.status,
   ]);
 
-  // 外部刷新（导入、批处理完成、元数据变化）会让相似结果过期，直接退出相似模式。
-  const similarityClear = similarity?.clear;
-  const similarityRefreshRef = useRef(refreshToken + dataVersion);
-  useEffect(() => {
-    if (similarityRefreshRef.current === refreshToken + dataVersion) return;
-    similarityRefreshRef.current = refreshToken + dataVersion;
-    similarityClear?.();
-  }, [refreshToken, dataVersion, similarityClear]);
+  // 外部刷新（导入、批处理完成、MCP 写入）统一走 changeSignal，由 applyChanges 决定
+  // 哪些结果过期；不再把所有变化都当成“相似结果失效”。
 
   useEffect(() => {
     try {
@@ -781,6 +1093,18 @@ export function LibraryView({
     [buildTaskContextBase],
   );
 
+  // 面板打开期间数据变化：只换计数与范围可用性，不清空用户已选的指标与阈值。
+  useEffect(() => {
+    if (!findSimilarOpen || findSimilarContextVersion === 0) return;
+    let disposed = false;
+    void buildTaskContext({ includeView: true }).then((context) => {
+      if (!disposed && context) setFindSimilarContext(context);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [buildTaskContext, findSimilarContextVersion, findSimilarOpen]);
+
   const openBatchTasks = useCallback(async () => {
     setTaskMenuOpen(false);
     if (!onOpenBatchTasks) return;
@@ -925,7 +1249,13 @@ export function LibraryView({
       try {
         const changed = await libraryApi.trashImages(ids);
         notify(`已移入回收站 ${changed.toLocaleString()} 张`, "success");
-        refreshData({ clearSelection: true });
+        applyChange({
+          kind: "membership",
+          source: "local",
+          reason: "trash",
+          ids,
+          similarity: "clear",
+        });
         return changed > 0;
       } catch (cause) {
         notify("移入回收站失败", "error", errorMessage(cause));
@@ -934,7 +1264,7 @@ export function LibraryView({
         setViewBusy(false);
       }
     },
-    [confirm, notify, refreshData, viewBusy],
+    [applyChange, confirm, notify, viewBusy],
   );
 
   const restoreSelected = useCallback(
@@ -944,7 +1274,13 @@ export function LibraryView({
       try {
         const changed = await libraryApi.restoreImages(ids);
         notify(`已恢复 ${changed.toLocaleString()} 张`, "success");
-        refreshData({ clearSelection: true });
+        applyChange({
+          kind: "membership",
+          source: "local",
+          reason: "restore",
+          ids,
+          similarity: "clear",
+        });
         return changed > 0;
       } catch (cause) {
         notify("恢复失败", "error", errorMessage(cause));
@@ -953,7 +1289,7 @@ export function LibraryView({
         setViewBusy(false);
       }
     },
-    [notify, refreshData, viewBusy],
+    [applyChange, notify, viewBusy],
   );
 
   const deleteSelected = useCallback(
@@ -982,7 +1318,13 @@ export function LibraryView({
               ? "文件会在操作记录清除后释放。"
               : undefined,
         );
-        refreshData({ clearSelection: true });
+        applyChange({
+          kind: "membership",
+          source: "local",
+          reason: "permanentDelete",
+          ids,
+          similarity: "clear",
+        });
         return report.deleted > 0;
       } catch (cause) {
         notify("永久删除失败", "error", errorMessage(cause));
@@ -991,7 +1333,7 @@ export function LibraryView({
         setViewBusy(false);
       }
     },
-    [confirm, notify, refreshData, viewBusy],
+    [applyChange, confirm, notify, viewBusy],
   );
 
   const emptyTrash = useCallback(async () => {
@@ -1012,14 +1354,20 @@ export function LibraryView({
             ? "文件会在操作记录清除后释放。"
             : undefined,
       );
-      refreshData({ clearSelection: true });
+      applyChange({
+        kind: "membership",
+        source: "local",
+        reason: "emptyTrash",
+        clearSelection: true,
+        similarity: "clear",
+      });
     } catch (cause) {
       notify("清空回收站失败", "error", errorMessage(cause));
     } finally {
       setEmptyingTrash(false);
       setViewBusy(false);
     }
-  }, [confirm, current?.trashCount, notify, refreshData, viewBusy]);
+  }, [applyChange, confirm, current?.trashCount, notify, viewBusy]);
 
   const removeFromCurrentCollection = useCallback(
     async (ids: number[]): Promise<boolean> => {
@@ -1034,8 +1382,13 @@ export function LibraryView({
           ids,
         );
         notify(`已从当前集合移出 ${removed.toLocaleString()} 张`, "success");
-        void reloadCollections();
-        refreshData({ clearSelection: true });
+        applyChange({
+          kind: "collection",
+          source: "local",
+          reason: "collectionRemove",
+          ids,
+          similarity: "keep",
+        });
         return removed > 0;
       } catch (cause) {
         notify("移出集合失败", "error", errorMessage(cause));
@@ -1044,7 +1397,7 @@ export function LibraryView({
         setViewBusy(false);
       }
     },
-    [effectiveCollectionId, effectiveView, notify, refreshData, reloadCollections, viewBusy],
+    [applyChange, effectiveCollectionId, effectiveView, notify, viewBusy],
   );
 
   /** 编辑保存后只替换已加载行的字段，不重置查询、排序与滚动位置。 */
@@ -1052,8 +1405,16 @@ export function LibraryView({
     (imageId: number, update: ViewerSessionUpdate) => {
       if (similarityActive && similarity) similarity.patchItem(imageId, update);
       else imageQuery.patchItem(imageId, update);
+      applyChange({
+        kind: "content",
+        source: "local",
+        reason: "edit",
+        ids: [imageId],
+        rowPatches: [{ id: imageId, update }],
+        similarity: "clear",
+      });
     },
-    [imageQuery.patchItem, similarity, similarityActive],
+    [applyChange, imageQuery.patchItem, similarity, similarityActive],
   );
 
   const filterByTag = useCallback(
@@ -1116,6 +1477,7 @@ export function LibraryView({
         folders,
         currentCollectionId: effectiveCollectionId,
         inTemp: effectiveView === "temp",
+        expectTrashed: effectiveView === "trash",
         getItems: () => itemsRef.current,
         hasMore: () => hasMoreRef.current,
         subscribe: (listener) => {
@@ -1133,7 +1495,7 @@ export function LibraryView({
           if (position >= 0) viewRef.current?.ensureIndex(position);
         },
         onSaved: (imageId, update) => patchSavedImage(imageId, update),
-        refresh: () => refreshData(),
+        refresh: (change) => applyChange(change),
         filterByTag,
         folderScopeLabel,
         collectionScopeLabel,
@@ -1159,7 +1521,7 @@ export function LibraryView({
       loadMore,
       onOpenViewer,
       patchSavedImage,
-      refreshData,
+      applyChange,
       removeFromCurrentCollection,
       restoreSelected,
       trashSelected,
@@ -1207,13 +1569,14 @@ export function LibraryView({
       folders,
       currentCollectionId: null,
       inTemp: false,
+      expectTrashed: false,
       getItems: () => targetViewerItems.current,
       hasMore: () => false,
       subscribe: () => () => {},
       loadMore: () => {},
       onActiveChange: () => {},
       onSaved: (imageId, update) => patchSavedImage(imageId, update),
-      refresh: () => refreshData(),
+      refresh: (change) => applyChange(change),
       filterByTag,
       folderScopeLabel,
       collectionScopeLabel,
@@ -1237,7 +1600,7 @@ export function LibraryView({
     notify,
     onOpenViewer,
     patchSavedImage,
-    refreshData,
+    applyChange,
     removeFromCurrentCollection,
     restoreSelected,
     similarity?.targetIds,
@@ -1246,9 +1609,13 @@ export function LibraryView({
   ]);
 
   const handleCollectionAdded = useCallback(() => {
-    void reloadCollections();
-    refreshData();
-  }, [refreshData, reloadCollections]);
+    applyChange({
+      kind: "collection",
+      source: "local",
+      reason: "collectionAdd",
+      similarity: "keep",
+    });
+  }, [applyChange]);
 
   const handleCollectionCreated = useCallback(
     (collection: CollectionInfo) => {
@@ -1312,9 +1679,19 @@ export function LibraryView({
     [collections, notify, reloadCollections],
   );
 
-  const handleTagChanged = useCallback(() => {
-    refreshData();
-  }, [refreshData]);
+  const handleTagChanged = useCallback(
+    (info?: { tagId: number; action: "rename" | "delete" }) => {
+      applyChange({
+        kind: "tagCatalog",
+        source: "local",
+        reason: info?.action ?? "tagCatalog",
+        tagId: info?.tagId,
+        tagAction: info?.action ?? "rename",
+        similarity: "keep",
+      });
+    },
+    [applyChange],
+  );
 
   const columnCount = viewMode === "grid" ? gridColumns : 1;
 
@@ -1583,7 +1960,6 @@ export function LibraryView({
             open={historyOpen}
             anchorRef={historyAnchorRef}
             onClose={() => setHistoryOpen(false)}
-            onChanged={() => refreshData()}
           />
           <Popover
             open={taskMenuOpen}
@@ -1814,7 +2190,8 @@ export function LibraryView({
               open={filterOpen}
               filters={browse.filters}
               query={query}
-              dataVersion={dataVersion}
+              countsVersion={facetVersion}
+              tagOptionsVersion={tagOptionsVersion}
               featureSummary={featureSummary}
               onFiltersChange={(filters) =>
                 applyBrowse({ ...browseRef.current, filters })
@@ -2030,6 +2407,7 @@ export function LibraryView({
               thumbPx={thumbPx}
               thumbFit={thumbFit}
               resetKey={resetSignature}
+              anchorRevision={imageQuery.replaceRevision}
               selected={selected}
               activeId={activeId}
               hasMore={hasMore}
@@ -2051,6 +2429,7 @@ export function LibraryView({
               ref={viewRef}
               items={items}
               resetKey={resetSignature}
+              anchorRevision={imageQuery.replaceRevision}
               selected={selected}
               activeId={activeId}
               sort={browse.sort}
@@ -2073,12 +2452,12 @@ export function LibraryView({
         {inspectorOpen ? (
           <InspectorPanel
             selectedIds={selectedIds}
-            version={dataVersion}
+            version={detailVersion}
             folders={folders}
             currentCollectionId={effectiveCollectionId}
             inTemp={effectiveView === "temp"}
             onClose={() => setInspectorOpen(false)}
-            onChanged={refreshData}
+            onChanged={(change) => applyChange(change)}
             onAddToCollection={() => setCollectionPickerOpen(true)}
             onRemoveFromCollection={(ids) => void removeFromCurrentCollection(ids)}
             onTrash={(ids) => void trashSelected(ids)}
@@ -2175,8 +2554,12 @@ export function LibraryView({
         open={combineOpen}
         collections={collections}
         onCombined={() => {
-          void reloadCollections();
-          refreshData();
+          applyChange({
+            kind: "collection",
+            source: "local",
+            reason: "collectionCombine",
+            similarity: "keep",
+          });
         }}
         onClose={() => setCombineOpen(false)}
       />

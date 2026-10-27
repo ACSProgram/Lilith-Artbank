@@ -28,8 +28,10 @@ interface FilterPanelProps {
   open: boolean;
   filters: LibraryFilters;
   query: LibraryQuery;
-  dataVersion: number;
-  /** 全库特征覆盖情况；为空时不做置灰。 */
+  /** 分面计数版本；只有可能改变计数的数据变化才递增。 */
+  countsVersion: number;
+  /** 标签选项版本；标签目录变化才递增。 */
+  tagOptionsVersion: number;
   featureSummary?: FeatureSummary | null;
   onFiltersChange: (filters: LibraryFilters) => void;
   onClose: () => void;
@@ -41,7 +43,8 @@ export function FilterPanel({
   open,
   filters,
   query,
-  dataVersion,
+  countsVersion,
+  tagOptionsVersion,
   featureSummary = null,
   onFiltersChange,
   onClose,
@@ -75,7 +78,7 @@ export function FilterPanel({
   useEffect(() => {
     if (!open) return;
     void loadOptions();
-  }, [open, loadOptions, dataVersion]);
+  }, [open, loadOptions, tagOptionsVersion]);
 
   useEffect(() => {
     setSizeMinDraft(bytesToMbInput(filters.sizeMin));
@@ -106,7 +109,7 @@ export function FilterPanel({
       })();
     }, 160);
     return () => window.clearTimeout(timer);
-  }, [open, countsKey, dataVersion]);
+  }, [open, countsKey, countsVersion]);
 
   useEffect(() => {
     if (!open) setTagQuery("");

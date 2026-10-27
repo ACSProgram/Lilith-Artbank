@@ -47,7 +47,6 @@ interface OperationHistoryPanelProps {
   open: boolean;
   anchorRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
-  onChanged: () => void;
 }
 
 function formatTime(value: number): string {
@@ -63,7 +62,6 @@ export function OperationHistoryPanel({
   open,
   anchorRef,
   onClose,
-  onChanged,
 }: OperationHistoryPanelProps) {
   const { notify, confirm } = useNotices();
   const { active, dataVersion } = useTaskCenter();
@@ -208,7 +206,6 @@ export function OperationHistoryPanel({
         )
       ) {
         setSelectedId(null);
-        onChanged();
       }
     } catch (cause) {
       notify(redo ? "重做失败" : "撤销失败", "error", errorMessage(cause));
@@ -228,7 +225,7 @@ export function OperationHistoryPanel({
     setBusy(true);
     try {
       const result = await libraryApi.clearOperationHistory();
-      if (handleResult(result, "已开始清空操作记录", "现在不能清空记录")) onChanged();
+      if (handleResult(result, "已开始清空操作记录", "现在不能清空记录")) setSelectedId(null);
     } catch (cause) {
       notify("清空操作记录失败", "error", errorMessage(cause));
     } finally {

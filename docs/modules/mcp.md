@@ -197,9 +197,9 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 ## 前端刷新
 
-- 同步写入成功后后端发 `library-changed`，载荷包含 `source`、`tool`、`operationId`、`closeViewer`。
-- `TaskCenterProvider` 监听它并递增数据版本，网格、文件夹、图库计数、AI 状态与打开着的操作记录面板随之刷新；`LibraryWorkspace` 只在 `closeViewer` 为真时关闭查看器（移入回收站）。
-- 异步任务继续用 `task-progress` / `task-finished`；`TaskCenterProvider` 在 `task-finished` 时递增数据版本。
+- 同步写入成功后后端发 `library-changed`，载荷包含 `source`、`tool`、`operationId`、`closeViewer` 与结构化 `change`（`kind`、`fields`、`tagAction`、`score`、`descriptionEmpty`）。
+- `TaskCenterProvider` 把载荷转成统一的 `DataChange`，由 `LibraryView` 的 `planDataChange` 决定列表、选择、文件夹、计数、特征、分面与相似结果是否失效；外部写入拿不到受影响 id，元数据变化重取可见行，范围变化清空选择。
+- 异步任务继续用 `task-progress` / `task-finished`；`task-finished` 同样转成 `DataChange`，同刻多个任务只拿到最后一条时退化为保守的完整刷新。
 - 设置 → MCP 面板监听 `mcp-approval-changed` 与 `library-changed`，刷新待确认与最近 AI 操作。
 
 ## 审计日志
@@ -255,8 +255,8 @@ Rust：
 - `src/app/types.ts`、`src/app/api.ts`：MCP 确认单类型与三个命令；`AppInfo.exePath` 供客户端配置使用。
 - `src/app/McpPanel.tsx`：设置 → MCP 的三档、待确认与最近 AI 操作。
 - `src/app/McpApprovalCard.tsx`：确认卡片（导入额外显示来源路径、标签/评分与重复策略）、全局非模态宿主、`useApprovalActions` 与 `mcp-approval-changed` 监听。
-- `src/app/TaskCenterProvider.tsx`：挂载确认卡片宿主，并在 `library-changed` 时推进数据版本。
-- `src/app/LibraryWorkspace.tsx`：监听 `library-changed`，在 `closeViewer` 为真时关闭查看器。
+- `src/app/TaskCenterProvider.tsx`：挂载确认卡片宿主，把 `library-changed` 与 `task-finished` 转成 `DataChange`。
+- `src/app/LibraryWorkspace.tsx`：接收任务/MCP 变化，交给自己发起的拖放与导入变化一起排队，再传给 `LibraryView`；`closeViewer` 为真时关闭查看器。
 - `src/app/taskTypes.ts`：任务快照的 `operationId` 与 `tempFeatures` 任务类型。
 
 ## 验证

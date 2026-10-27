@@ -131,6 +131,7 @@ tags: string[]
 | 命令 | 输入 | 输出 |
 | --- | --- | --- |
 | `get_image_detail` | `{ imageId }` | `ImageDetails` |
+| `get_image_states` | `{ imageIds }` | `ImageState[]`（最多 1000 个 id；不存在的 id 缺席） |
 | `update_image_score` | `{ imageId, score }` | `null` |
 | `set_images_score` | `{ imageIds, score }` | 更新行数 |
 | `update_image_description` | `{ imageId, description }` | `null` |
@@ -141,6 +142,7 @@ tags: string[]
 | `delete_tag` | `{ tagId }` | 删除关系数 |
 | `move_images_to_folder` | `{ imageIds, folderPath }` | `MoveReport` |
 
+- `get_image_states` 返回 `id` 与 `deletedAt`（回收站状态），供外部变化后复核选择、相似参考与查看器活动图；不复用详情查询，避免逐张读标签与主色。
 - 描述保存时 `description_source` 固定为 `user`、清空 `description_model`，并由 schema 触发器同步 FTS。
 - 评分、描述、标签设置/增删/改名/删除都写入一条操作记录；撤销恢复旧评分/描述/标签关系，删除标签的撤销用原 id 重建标签与关系。
 - 标签名忽略大小写去重；每张图最多 64 个标签，标签名最多 64 字符。
@@ -242,9 +244,10 @@ src/modules/library/
   types.ts                  边界 DTO（含 FolderInfo / SortSpec / QueryCursor）
   api.ts                    Tauri 命令入口 + 浏览器预览 mock
   mock.ts                   浏览器预览用的可变数据集与查询/编辑/文件夹实现
-  model.ts                  BrowseState、查询构造、全局排序与集合顺序暂存、筛选键、标签筛选换算
+  model.ts                  BrowseState、查询构造、全局排序与集合顺序暂存、结果集身份键、标签筛选换算
+  dataChange.ts             数据变化类型、失效计划（planDataChange）、选择裁剪、任务/MCP 变化映射
   useLibraryBrowse.ts       受控 BrowseState、初始排序、浏览历史与返回
-  useImageQuery.ts          首屏/下一页、代次、锚点跳转、pageToken 与就地替换行、错误重试
+  useImageQuery.ts          首屏/下一页、代次、锚点跳转、pageToken、保留旧行刷新与就地替换行
   LibraryView.tsx           视图：搜索/排序/选择/键盘/右键菜单/面包屑
   SortMenu.tsx              排序弹层：多级编辑、方向、排序方案
   LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
@@ -330,10 +333,13 @@ src/shared/
 
 - `useImageQuery` 为每次首屏请求递增代次；过期结果直接丢弃，不覆盖新视图。
 - 翻页请求与首屏共享代次；筛选/排序/刷新变化后旧页不会追加到新结果。
-- 首屏失败显示整页错误与重试；翻页失败保留已加载页，在列表底部提供重试。
-- 排序变化会重新从第一页加载并清空滚动位置，但保留图片选择；搜索/筛选变化会清空选择（按标签筛选除外，见上）。
-- 导入结束会递增 `refreshToken`，重新查询第一页并刷新图库计数；详情编辑递增本地 `dataVersion`。
-- 查看器保存编辑不重置查询：只按 `ViewerSessionUpdate` 就地替换已加载行的内容哈希/扩展名/体积/宽高/格式/alpha/`thumbVersion`（相似结果视图走 `SimilarityBrowseState.patchItem`），排序、滚动位置与深分页上下文都保留；分面计数与文件夹计数不随之刷新。
+- 首屏失败显示整页错误与重试；翻页失败保留已加载页，在列表底部提供重试；保留旧行刷新失败只提示一次，不清空列表。
+- 查询身份（视图/搜索/筛选/集合）变化才清空列表、回到顶部并清空选择；排序变化保留选择、活动图与滚动位置，在新结果返回后一次性替换行。
+- 数据变化统一走 `DataChange` 与 `planDataChange`，按变化类型分别推进列表、选择、文件夹、集合、图库计数、特征、分面、标签选项、详情与相似结果，不再让所有面板订阅同一个版本号。
+- 列表刷新保留旧行并重取已加载范围（最多 20 页），不显示整页 loading、不回到顶部；活动图按原视口偏移重新锚定。每次写入都会让后端 id 列表缓存整体失效，走 id 游标且还有下一页时必须刷新已加载范围。
+- 本地已知 id 的选择按变化精确剔除；外部任务/MCP 的范围变化（移动、删除、导入、撤销/重做）拿不到 id，清空选择。元数据变化不改变范围时不动选择。
+- 相似结果只随退出条件清空（导入、像素编辑、回收站/恢复/永久删除、撤销/重做、空间优化、AI 批量任务、MCP `invalidateSimilarity`）；评分/标签/描述/移动保留结果并就地更新已加载行。
+- 查看器保存编辑发 `content` 变化：就地替换行、刷新特征与分面，并按当前排序或 id 游标决定是否刷新已加载范围；不重置查询与滚动位置。
 - 切换图库时 `LibraryView` 以图库 id 为 key 重新挂载，避免复用上一库的筛选与选择。
 
 ## 性能

@@ -1,5 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { InspectorPanel } from "../modules/library/Inspector";
+import { libraryApi } from "../modules/library/api";
+import type { DataChange } from "../modules/library/dataChange";
+import type { ImageState } from "../modules/library/types";
 import { ImageViewer } from "../modules/viewer/ImageViewer";
 import type { PoseData } from "../modules/viewer/types";
 import type { ViewerSession } from "../shared/viewerSession";
@@ -10,14 +13,24 @@ import { errorMessage } from "../shared/errors";
 interface ViewerHostProps {
   session: ViewerSession;
   onClose: () => void;
+  /** 外部数据变化代次；变化后复核活动图是否仍在当前范围。 */
+  revalidateRevision?: number;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
   onGeneratePose?: (imageId: number) => Promise<PoseData>;
+}
+
+/** 当前图是否仍属于查看器的数据源：临时区不区分回收站，其余按打开时的来源判断。 */
+function stillVisible(state: ImageState | undefined, session: ViewerSession): boolean {
+  if (!state) return false;
+  if (session.inTemp) return true;
+  return session.expectTrashed ? state.deletedAt != null : state.deletedAt == null;
 }
 
 /** 查看器与图库详情侧栏的编排层；两个模块不互相导入。 */
 export function ViewerHost({
   session,
   onClose,
+  revalidateRevision = 0,
   onGenerateDescription,
   onGeneratePose,
 }: ViewerHostProps) {
@@ -29,9 +42,9 @@ export function ViewerHost({
   const [version, setVersion] = useState(0);
   const filmstripOpen = settings?.ui.viewerFilmstrip ?? true;
 
-  const refresh = () => {
+  const refresh = (change: DataChange) => {
     setVersion((value) => value + 1);
-    session.refresh();
+    session.refresh(change);
   };
 
   /** 关闭查看器时一并退出全屏，否则窗口会停在无标题栏状态。 */
@@ -39,6 +52,31 @@ export function ViewerHost({
     if (fullscreen) void setFullscreen(false);
     onClose();
   };
+  const closeRef = useRef(close);
+  closeRef.current = close;
+
+  // 外部变化后复核当前图；图片离开当前范围时直接退出，不停在过期内容上。
+  useEffect(() => {
+    let disposed = false;
+    void libraryApi
+      .getImageStates([activeId])
+      .then((rows) => {
+        if (disposed) return;
+        if (stillVisible(rows.find((item) => item.id === activeId), session)) return;
+        notify(
+          "当前图片已离开列表",
+          "info",
+          session.expectTrashed ? "图片已恢复，或已被删除。" : "图片可能已被移入回收站或删除。",
+        );
+        closeRef.current();
+      })
+      .catch(() => {
+        // 复核失败不阻断查看；下一次变化或关闭会再查。
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [activeId, version, revalidateRevision, session, notify]);
 
   const toggleFilmstrip = () => {
     if (!settings) return;
@@ -58,7 +96,22 @@ export function ViewerHost({
       onToggleSidebar={() => setSidebarOpen((value) => !value)}
       onActiveChange={setActiveId}
       onSaved={() => setVersion((value) => value + 1)}
-      onGeneratePose={onGeneratePose ? () => onGeneratePose(activeId) : undefined}
+      onGeneratePose={
+        onGeneratePose
+          ? async () => {
+              const pose = await onGeneratePose(activeId);
+              refresh({
+                kind: "features",
+                source: "local",
+                reason: "pose",
+                ids: [activeId],
+                feature: "pose",
+                similarity: "clear",
+              });
+              return pose;
+            }
+          : undefined
+      }
       filmstripOpen={filmstripOpen}
       onToggleFilmstrip={toggleFilmstrip}
       fullscreen={fullscreen}

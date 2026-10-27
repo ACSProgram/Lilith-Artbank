@@ -1,4 +1,5 @@
 import type { TagFilterAction, TagFilterScope } from "./tagFilter";
+import type { DataChange } from "../modules/library/dataChange";
 
 /** 查看器与图库浏览之间的最小契约；由 `src/app` 编排，模块之间不直接导入。 */
 export interface ViewerSessionItem {
@@ -40,6 +41,8 @@ export interface ViewerSession {
   currentCollectionId: number | null;
   /** 浏览的是临时文件夹：详情侧栏隐藏移动、集合与回收站操作。 */
   inTemp: boolean;
+  /** 浏览的是回收站：外部恢复后当前图会离开列表。 */
+  expectTrashed: boolean;
   /** 必须返回稳定引用，供 useSyncExternalStore 使用。 */
   getItems(): readonly ViewerSessionItem[];
   hasMore(): boolean;
@@ -47,7 +50,8 @@ export interface ViewerSession {
   loadMore(): void;
   onActiveChange(imageId: number): void;
   onSaved(imageId: number, update: ViewerSessionUpdate): void;
-  refresh(): void;
+  /** 详情侧栏或查看器产生的写入；交给图库统一刷新与失效。 */
+  refresh(change: DataChange): void;
   /** 在网格里按标签筛选；查看器会把控制权交回网格。 */
   filterByTag(tagId: number, action: TagFilterAction, scope: TagFilterScope): void;
   /** 侧栏当前选中的文件夹（用于标签筛选范围菜单）；为空表示不可用。 */

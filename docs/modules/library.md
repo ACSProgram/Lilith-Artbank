@@ -175,6 +175,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]` |
 | `get_image_detail` | `{ imageId }` | `ImageDetails` |
+| `get_image_states` | `{ imageIds }` | `ImageState[]`（最多 1000 个 id；不存在的 id 缺席） |
 | `update_image_score` | `{ imageId, score }` | `null` |
 | `set_images_score` | `{ imageIds, score }` | 更新行数 |
 | `update_image_description` | `{ imageId, description }` | `null` |

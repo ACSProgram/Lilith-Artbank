@@ -17,6 +17,7 @@ import {
   mockFilterCounts,
   mockFolders,
   mockImageDetail,
+  mockImageStates,
   mockLibraryCounts,
   mockMoveFolder,
   mockMoveImages,
@@ -52,6 +53,7 @@ import type {
   ImageCapabilities,
   ImageDetails,
   ImagePage,
+  ImageState,
   LibraryQuery,
   MoveReport,
   TagInfo,
@@ -129,6 +131,13 @@ export const libraryApi = {
   async getImageDetail(imageId: number): Promise<ImageDetails> {
     if (!isTauri()) return mockImageDetail(imageId);
     return invoke<ImageDetails>("get_image_detail", { imageId });
+  },
+
+  /** 批量取存在与回收站状态；用于外部变化后复核选择、相似参考与查看器。 */
+  async getImageStates(imageIds: number[]): Promise<ImageState[]> {
+    if (imageIds.length === 0) return [];
+    if (!isTauri()) return mockImageStates(imageIds);
+    return invoke<ImageState[]>("get_image_states", { imageIds });
   },
 
   async updateImageScore(imageId: number, score: number): Promise<void> {

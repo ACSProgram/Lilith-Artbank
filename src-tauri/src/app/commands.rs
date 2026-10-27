@@ -26,7 +26,7 @@ use crate::{
         edit::{self, EditRequest, EditResult, EditSizeEstimate},
         history::HistoryPage,
         manifest::LibraryInspection,
-        metadata::{DeleteReport, ImageDetails, MoveReport, TagRef},
+        metadata::{DeleteReport, ImageDetails, ImageState, MoveReport, TagRef},
         optimize_estimate::OptimizeEstimate,
         query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::LibraryInfo,
@@ -363,6 +363,14 @@ pub fn search_tags(
 #[tauri::command]
 pub fn get_image_detail(state: State<'_, AppState>, image_id: i64) -> Result<ImageDetails, String> {
     AppError::command(state.image_detail(image_id))
+}
+
+#[tauri::command]
+pub fn get_image_states(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+) -> Result<Vec<ImageState>, String> {
+    AppError::command(state.image_states(&image_ids))
 }
 
 #[tauri::command]
@@ -863,6 +871,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_tags,
         search_tags,
         get_image_detail,
+        get_image_states,
         update_image_score,
         set_images_score,
         update_image_description,

@@ -135,6 +135,12 @@ export interface ColorEntry {
   weight: number;
 }
 
+/** 外部变化后复核用；已删除的图片也会返回，找不到的 id 直接缺席。 */
+export interface ImageState {
+  id: number;
+  deletedAt: number | null;
+}
+
 export interface ImageDetails {
   id: number;
   contentHash: string;

@@ -2,6 +2,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
@@ -25,6 +26,8 @@ import type { VirtualViewHandle } from "./virtual";
 interface VirtualListProps {
   items: ImageRow[];
   resetKey: string;
+  /** 数据刷新成功一次递增；用于把活动图按原视口偏移重新锚定。 */
+  anchorRevision: number;
   selected: Set<number>;
   activeId: number | null;
   sort: SortSpec[];
@@ -51,6 +54,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
   {
     items,
     resetKey,
+    anchorRevision,
     selected,
     activeId,
     sort,
@@ -72,6 +76,8 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [scrollTop, setScrollTop] = useState(0);
+  const scrollTopRef = useRef(0);
+  const anchorRef = useRef({ revision: anchorRevision, items, scrollTop: 0 });
 
   useEffect(() => {
     const element = containerRef.current;
@@ -91,6 +97,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
+        scrollTopRef.current = element.scrollTop;
         setScrollTop(element.scrollTop);
       });
     };
@@ -105,6 +112,7 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
     const element = containerRef.current;
     if (!element) return;
     element.scrollTop = 0;
+    scrollTopRef.current = 0;
     setScrollTop(0);
   }, [resetKey]);
 
@@ -128,6 +136,29 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
     if (!hasMore || moreStatus !== "idle" || !nearEnd) return;
     onLoadMore();
   }, [hasMore, moreStatus, nearEnd, onLoadMore, items.length]);
+
+  /** 数据刷新替换 items 后，把活动行放回它原来的视口偏移。 */
+  useLayoutEffect(() => {
+    const element = containerRef.current;
+    const previous = anchorRef.current;
+    if (element && anchorRevision !== previous.revision && activeId != null) {
+      const oldIndex = previous.items.findIndex((item) => item.id === activeId);
+      const newIndex = items.findIndex((item) => item.id === activeId);
+      if (oldIndex >= 0 && newIndex >= 0) {
+        const oldTop = HEADER_HEIGHT + PADDING + oldIndex * ROW_HEIGHT;
+        const offset = oldTop - previous.scrollTop;
+        const newTop = HEADER_HEIGHT + PADDING + newIndex * ROW_HEIGHT;
+        element.scrollTop = Math.max(0, newTop - offset);
+        scrollTopRef.current = element.scrollTop;
+        setScrollTop(element.scrollTop);
+      }
+    }
+    anchorRef.current = {
+      revision: anchorRevision,
+      items,
+      scrollTop: scrollTopRef.current,
+    };
+  });
 
   const scrollToIndex = (index: number) => {
     const element = containerRef.current;

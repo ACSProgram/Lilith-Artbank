@@ -14,6 +14,7 @@ import type {
   ImageDetails,
   ImagePage,
   ImageRow,
+  ImageState,
   LibraryFilters,
   LibraryQuery,
   MoveReport,
@@ -492,6 +493,14 @@ export function mockImageDetail(id: number): ImageDetails {
     colors4: palette.colors4,
     colors8: palette.colors8,
   };
+}
+
+export function mockImageStates(ids: number[]): ImageState[] {
+  const wanted = new Set(ids);
+  return mockImages
+    .filter((image) => wanted.has(image.id))
+    .map((image) => ({ id: image.id, deletedAt: image.deletedAt }))
+    .sort((left, right) => left.id - right.id);
 }
 
 function findImage(id: number): ImageRow {

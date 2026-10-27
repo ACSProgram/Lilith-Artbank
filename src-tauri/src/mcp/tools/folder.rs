@@ -338,6 +338,7 @@ fn finish(
                 "operationId": operation_id,
                 // 文件夹改名/移动会换掉网格里的路径，让界面刷新一次。
                 "closeViewer": false,
+                "change": { "kind": "folder" },
             }),
             false,
         );

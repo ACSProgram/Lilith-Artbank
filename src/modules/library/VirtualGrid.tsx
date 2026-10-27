@@ -26,6 +26,8 @@ interface VirtualGridProps {
   thumbPx: number;
   thumbFit: ThumbFit;
   resetKey: string;
+  /** 数据刷新成功一次递增；用于把活动图按原视口偏移重新锚定。 */
+  anchorRevision: number;
   selected: Set<number>;
   activeId: number | null;
   hasMore: boolean;
@@ -51,6 +53,7 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
     thumbPx,
     thumbFit,
     resetKey,
+    anchorRevision,
     selected,
     activeId,
     hasMore,
@@ -147,6 +150,13 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
    * 不做这件事时，同一个 scrollTop 会落到不同行上，看起来就是“选中的图片跳走了”。
    */
   const layoutRef = useRef({ columns, rowHeight, scrollTop: 0 });
+  const anchorRef = useRef({
+    revision: anchorRevision,
+    items,
+    columns,
+    rowHeight,
+    scrollTop: 0,
+  });
 
   useLayoutEffect(() => {
     const element = containerRef.current;
@@ -163,6 +173,35 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
       }
     }
     layoutRef.current = { columns, rowHeight, scrollTop: scrollTopRef.current };
+  });
+
+  /**
+   * 数据刷新替换 items 后，把活动图放回它原来的视口偏移。
+   * 活动图被移除时保持当前滚动位置，由浏览器按新内容高度夹紧。
+   */
+  useLayoutEffect(() => {
+    const element = containerRef.current;
+    const previous = anchorRef.current;
+    if (element && anchorRevision !== previous.revision && activeId != null) {
+      const oldIndex = previous.items.findIndex((item) => item.id === activeId);
+      const newIndex = items.findIndex((item) => item.id === activeId);
+      if (oldIndex >= 0 && newIndex >= 0) {
+        const oldTop =
+          PADDING + Math.floor(oldIndex / previous.columns) * previous.rowHeight;
+        const offset = oldTop - previous.scrollTop;
+        const newTop = PADDING + Math.floor(newIndex / columns) * rowHeight;
+        element.scrollTop = Math.max(0, newTop - offset);
+        scrollTopRef.current = element.scrollTop;
+        setScrollTop(element.scrollTop);
+      }
+    }
+    anchorRef.current = {
+      revision: anchorRevision,
+      items,
+      columns,
+      rowHeight,
+      scrollTop: scrollTopRef.current,
+    };
   });
 
   const scrollToIndex = (index: number) => {

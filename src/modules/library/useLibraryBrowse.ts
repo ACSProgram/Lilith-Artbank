@@ -1,5 +1,10 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { buildQuery, defaultBrowseState, filterKey, type BrowseState } from "./model";
+import {
+  buildQuery,
+  defaultBrowseState,
+  queryIdentityKey,
+  type BrowseState,
+} from "./model";
 import type { SortSpec } from "./types";
 
 export interface LibraryBrowseController {
@@ -20,7 +25,7 @@ export function useLibraryBrowse(initialSort?: SortSpec[]): LibraryBrowseControl
 
   const applyBrowse = useCallback((next: BrowseState, pushHistory = true) => {
     const previous = browseRef.current;
-    if (pushHistory && filterKey(buildQuery(previous)) !== filterKey(buildQuery(next))) {
+    if (pushHistory && queryIdentityKey(buildQuery(previous)) !== queryIdentityKey(buildQuery(next))) {
       setHistory((value) => [...value.slice(-29), previous]);
     }
     browseRef.current = next;

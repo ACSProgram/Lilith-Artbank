@@ -365,6 +365,8 @@ struct WriteFinish<'a> {
     affected: u64,
     close_viewer: bool,
     invalidate_similarity: bool,
+    /// 前端据此判断列表、选择与详情是否需要失效；拿不到受影响 id。
+    change: Value,
     extra: Value,
 }
 
@@ -381,6 +383,7 @@ fn finish_write(state: &AppState, finish: WriteFinish<'_>) -> Value {
                 "tool": finish.tool,
                 "operationId": finish.operation_id,
                 "closeViewer": finish.close_viewer,
+                "change": finish.change,
             }),
             finish.invalidate_similarity,
         );
@@ -394,6 +397,24 @@ fn finish_write(state: &AppState, finish: WriteFinish<'_>) -> Value {
     });
     merge_object(&mut value, finish.extra);
     value
+}
+
+fn update_change(kind: &UpdateKind) -> Value {
+    match kind {
+        UpdateKind::Score(score) => {
+            json!({ "kind": "metadata", "fields": ["score"], "score": score })
+        }
+        UpdateKind::AddTags(_) => {
+            json!({ "kind": "metadata", "fields": ["tags"], "tagAction": "add" })
+        }
+        UpdateKind::RemoveTags(_) => {
+            json!({ "kind": "metadata", "fields": ["tags"], "tagAction": "remove" })
+        }
+        UpdateKind::Description(text) => {
+            // 只回传是否为空：前端据此判断“有/无描述”筛选下的成员变化，不必搬运整段文本。
+            json!({ "kind": "metadata", "fields": ["description"], "descriptionEmpty": text.trim().is_empty() })
+        }
+    }
 }
 
 fn classify(input: &ImagesUpdateInput) -> AppResult<UpdateKind> {
@@ -771,6 +792,7 @@ fn run_update(
         drop(lane);
         return Ok(no_change_outcome(inspection.selected));
     }
+    let change = update_change(&kind);
     let (affected, operation_id) = match kind {
         UpdateKind::Score(score) => {
             let (changed, operation_id) =
@@ -801,6 +823,7 @@ fn run_update(
             affected,
             close_viewer: false,
             invalidate_similarity: false,
+            change,
             extra: json!({ "willChange": will_change }),
         },
     )))
@@ -967,6 +990,7 @@ fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppR
             affected,
             close_viewer: true,
             invalidate_similarity: true,
+            change: json!({ "kind": "membership" }),
             extra: Value::Null,
         },
     )))
@@ -1043,6 +1067,7 @@ fn run_restore(
             affected,
             close_viewer: false,
             invalidate_similarity: true,
+            change: json!({ "kind": "membership" }),
             extra: Value::Null,
         },
     )))
@@ -1183,6 +1208,7 @@ fn run_collection_create(
             affected: 1 + added,
             close_viewer: false,
             invalidate_similarity: false,
+            change: json!({ "kind": "collection" }),
             extra: json!({ "collection": collection, "added": added }),
         },
     )))
@@ -1255,6 +1281,7 @@ pub fn collections_modify(
             affected: affected.max(1),
             close_viewer: false,
             invalidate_similarity: false,
+            change: json!({ "kind": "collection" }),
             extra,
         },
     )))
@@ -1371,6 +1398,7 @@ fn run_collection_membership(
             affected,
             close_viewer: false,
             invalidate_similarity: false,
+            change: json!({ "kind": "collection" }),
             extra: json!({ "action": operation }),
         },
     )))

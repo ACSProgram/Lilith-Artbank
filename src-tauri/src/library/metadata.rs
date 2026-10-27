@@ -26,9 +26,17 @@ use crate::{
 const SQL_CHUNK: usize = 400;
 const MAX_BATCH_IDS: usize = 1_000_000;
 const MAX_FILE_BATCH_IDS: usize = 10_000;
+const MAX_STATE_IDS: usize = 1_000;
 const MAX_TAGS_PER_IMAGE: usize = 64;
 const MAX_TAG_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 50_000;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageState {
+    pub id: i64,
+    pub deleted_at: Option<i64>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,6 +181,41 @@ pub fn image_details(database: &LibraryDb, root: &Path, image_id: i64) -> AppRes
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(details)
+    })
+}
+
+/// 按 id 批量取状态；已不存在的 id 不返回。外部变化后复核选择、相似参考与查看器。
+pub fn image_states(database: &LibraryDb, image_ids: &[i64]) -> AppResult<Vec<ImageState>> {
+    let mut unique: Vec<i64> = image_ids.iter().copied().filter(|id| *id > 0).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() > MAX_STATE_IDS {
+        return Err(AppError::message(format!(
+            "一次最多查询 {MAX_STATE_IDS} 张图片的状态"
+        )));
+    }
+    if unique.is_empty() {
+        return Ok(Vec::new());
+    }
+    database.with_reader(|connection| {
+        let mut states = Vec::with_capacity(unique.len());
+        for chunk in unique.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            let mut statement = connection.prepare(&format!(
+                "SELECT id, deleted_at FROM images WHERE id IN ({marks}) ORDER BY id"
+            ))?;
+            states.extend(
+                statement
+                    .query_map(params_from_iter(chunk.iter()), |row| {
+                        Ok(ImageState {
+                            id: row.get(0)?,
+                            deleted_at: row.get(1)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(states)
     })
 }
 
@@ -1492,6 +1535,35 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"content").unwrap();
         path
+    }
+
+    #[test]
+    fn image_states_report_existing_and_trashed_rows() {
+        let fixture = fixture();
+        let active = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
+        let trashed = insert_image(&fixture, "b", "jpg", 1, fixture.folder);
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET deleted_at = 123 WHERE id = ?1",
+                    [trashed],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let states =
+            image_states(&fixture.session.db, &[trashed, 999_999, active, active]).unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].id, active);
+        assert!(states[0].deleted_at.is_none());
+        assert_eq!(states[1].id, trashed);
+        assert_eq!(states[1].deleted_at, Some(123));
+
+        let too_many: Vec<i64> = (1..=1_001).collect();
+        assert!(image_states(&fixture.session.db, &too_many).is_err());
     }
 
     #[test]
