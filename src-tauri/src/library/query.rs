@@ -250,6 +250,15 @@ pub struct FolderInfo {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FolderChange {
+    /// 受影响文件夹的最新状态；前端按 id 就地合并。
+    pub folders: Vec<FolderInfo>,
+    /// 已经删除的文件夹 id。
+    pub removed_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TagInfo {
     pub id: i64,
     pub name: String,
@@ -623,13 +632,14 @@ pub fn query_total(database: &LibraryDb, query: LibraryQuery) -> AppResult<u64> 
     })
 }
 
+/// 每个文件夹的直属图片数。单独提出来是为了让测试能断言查询计划。
+const FOLDER_COUNTS_SQL: &str = "SELECT folder_id, count(*) FROM images
+     WHERE deleted_at IS NULL AND purge_operation_id IS NULL GROUP BY folder_id";
+
 pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
     database.with_reader(|connection| {
         let folders = all_folders(connection)?;
-        let mut statement = connection.prepare(
-            "SELECT folder_id, count(*) FROM images
-             WHERE deleted_at IS NULL AND purge_operation_id IS NULL GROUP BY folder_id",
-        )?;
+        let mut statement = connection.prepare(FOLDER_COUNTS_SQL)?;
         let direct = statement
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
@@ -655,6 +665,20 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
             })
             .collect())
     })
+}
+
+/// 只返回给定 id 的最新 `FolderInfo`；用于文件夹写命令的增量返回。
+///
+/// 计数仍走一次全库聚合（覆盖索引后是索引内扫描），但前端只收到受影响的行。
+pub fn folder_infos(database: &LibraryDb, ids: &[i64]) -> AppResult<Vec<FolderInfo>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: HashSet<i64> = ids.iter().copied().collect();
+    Ok(list_folders(database)?
+        .into_iter()
+        .filter(|folder| wanted.contains(&folder.id))
+        .collect())
 }
 
 pub fn list_tags(database: &LibraryDb, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
@@ -686,48 +710,182 @@ pub fn search_tags_page(
 /// 分页取标签；`search` 为空时按图片数降序，否则按名称 `LIKE` 过滤。
 ///
 /// 临时图片不计入标签；标签本身仍保留，标签清空临时区后自然消失。
+///
+/// 默认形状从 `image_tags` 覆盖扫描聚合计数，再回连 `tags`：`image_tags` 有外键级联，
+/// 不存在指向已删图片的孤儿关系行，所以按关系行计数与旧 SQL 的“回表过滤”等价。
+/// 回收站与临时区里的关系行用有界减法扣掉；这两类图片太多（例如刚清空回收站前）时
+/// 退回逐张回表的旧 SQL，避免为减法建一张几十万条 id 的临时集合。
 pub fn list_tags_page(
     database: &LibraryDb,
     search: Option<&str>,
     limit: u32,
     offset: u32,
 ) -> AppResult<Vec<TagInfo>> {
-    let limit = limit.clamp(1, MAX_TAGS);
     let search = search.map(str::trim).filter(|text| !text.is_empty());
     database.with_reader(|connection| {
-        let mut statement = connection.prepare(&format!(
-            "SELECT tags.id, tags.name, count(images.id)
-             FROM tags
-             JOIN image_tags ON image_tags.tag_id = tags.id
-             JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
-             WHERE {exclude}{name_filter}
-             GROUP BY tags.id
-             ORDER BY count(images.id) DESC, tags.name
-             LIMIT ?1 OFFSET ?2",
-            exclude = temp::EXCLUDE_SQL,
-            name_filter = if search.is_some() {
-                " AND tags.name LIKE ?3 ESCAPE '\\'"
-            } else {
-                ""
-            },
-        ))?;
-        let mut params = vec![
-            Value::Integer(i64::from(limit)),
-            Value::Integer(i64::from(offset)),
-        ];
-        if let Some(needle) = search {
-            params.push(Value::Text(format!("%{}%", escape_like(needle))));
-        }
-        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
-            Ok(TagInfo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                image_count: row.get::<_, i64>(2)?.max(0) as u64,
-            })
-        })?;
-        let tags = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(tags)
+        list_tags_page_in(connection, search, limit, offset, MAX_TAG_DEAD_IMAGES)
     })
+}
+
+/// 回收站与临时区的图片数超过这个量时，减法不再划算，改回旧形状。
+const MAX_TAG_DEAD_IMAGES: u64 = 50_000;
+
+fn list_tags_page_in(
+    connection: &Connection,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+    max_dead_images: u64,
+) -> AppResult<Vec<TagInfo>> {
+    let limit = limit.clamp(1, MAX_TAGS);
+    let dead = dead_tag_counts(connection, max_dead_images)?;
+    let Some(dead) = dead else {
+        return list_tags_page_legacy(connection, search, limit, offset);
+    };
+
+    let mut names = connection.prepare(match search {
+        Some(_) => "SELECT id, name FROM tags WHERE name LIKE ?1 ESCAPE '\\'",
+        None => "SELECT id, name FROM tags",
+    })?;
+    let mut params = Vec::new();
+    if let Some(needle) = search {
+        params.push(Value::Text(format!("%{}%", escape_like(needle))));
+    }
+    let names = names
+        .query_map(params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut counts: HashMap<i64, u64> = connection
+        .prepare("SELECT tag_id, count(*) FROM image_tags GROUP BY tag_id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    for (tag_id, count) in dead {
+        if let Some(total) = counts.get_mut(&tag_id) {
+            *total = total.saturating_sub(count);
+        }
+    }
+
+    let mut tags: Vec<TagInfo> = names
+        .into_iter()
+        .filter_map(|(id, name)| {
+            let image_count = counts.get(&id).copied().unwrap_or(0);
+            (image_count > 0).then_some(TagInfo {
+                id,
+                name,
+                image_count,
+            })
+        })
+        .collect();
+    tags.sort_by(|left, right| {
+        right
+            .image_count
+            .cmp(&left.image_count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(tags
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect())
+}
+
+/// 回收站与临时区里的关系行按标签计数；这两类图片数超过阈值时返回 `None`。
+///
+/// 阈值只看图片数，同一张图既在回收站又在临时区时会重复计数——那只是让回退更早
+/// 发生，减法本身仍按 id 集合去重，不影响结果。
+fn dead_tag_counts(
+    connection: &Connection,
+    max_dead_images: u64,
+) -> AppResult<Option<Vec<(i64, u64)>>> {
+    let trash: i64 = connection.query_row(
+        "SELECT count(*) FROM images WHERE deleted_at IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let temp: i64 = connection.query_row(
+        "SELECT count(*) FROM images WHERE folder_id = COALESCE(
+             (SELECT temp_folders.id FROM folders temp_folders WHERE temp_folders.kind = 'temp'), -1)",
+        [],
+        |row| row.get(0),
+    )?;
+    let dead_images = trash.max(0) as u64 + temp.max(0) as u64;
+    if dead_images == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if dead_images > max_dead_images {
+        return Ok(None);
+    }
+    let rows = connection
+        .prepare(
+            "SELECT tag_id, count(*) FROM image_tags
+             WHERE image_id IN (
+                 SELECT id FROM images
+                 WHERE deleted_at IS NOT NULL
+                    OR folder_id = COALESCE(
+                        (SELECT temp_folders.id FROM folders temp_folders
+                         WHERE temp_folders.kind = 'temp'), -1)
+             )
+             GROUP BY tag_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(rows))
+}
+
+/// 旧形状：`tags → image_tags → images` 逐张回表；死亡关系过多时使用。
+fn list_tags_page_legacy(
+    connection: &Connection,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> AppResult<Vec<TagInfo>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT tags.id, tags.name, count(images.id)
+         FROM tags
+         JOIN image_tags ON image_tags.tag_id = tags.id
+         JOIN images ON images.id = image_tags.image_id AND images.deleted_at IS NULL
+         WHERE {exclude}{name_filter}
+         GROUP BY tags.id
+         ORDER BY count(images.id) DESC, tags.name
+         LIMIT ?1 OFFSET ?2",
+        exclude = temp::EXCLUDE_SQL,
+        name_filter = if search.is_some() {
+            " AND tags.name LIKE ?3 ESCAPE '\\'"
+        } else {
+            ""
+        },
+    ))?;
+    let mut params = vec![
+        Value::Integer(i64::from(limit)),
+        Value::Integer(i64::from(offset)),
+    ];
+    if let Some(needle) = search {
+        params.push(Value::Text(format!("%{}%", escape_like(needle))));
+    }
+    let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+        Ok(TagInfo {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            image_count: row.get::<_, i64>(2)?.max(0) as u64,
+        })
+    })?;
+    let tags = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(tags)
+}
+
+/// 基准专用：在真实库规模上对比新旧形状（`perf_metadata_200k`）。
+#[cfg(test)]
+pub(crate) fn list_tags_page_legacy_bench(
+    database: &LibraryDb,
+    limit: u32,
+) -> AppResult<Vec<TagInfo>> {
+    database.with_reader(|connection| list_tags_page_legacy(connection, None, limit, 0))
 }
 
 /// 与 [`list_tags_page`] 同口径的命中总数，用于判断还有没有下一页。
@@ -3313,5 +3471,144 @@ mod tests {
 
         let (_, _, temp_count) = fixture.session.db.counts().unwrap();
         assert_eq!(temp_count, 1);
+    }
+
+    /// 标签分页换形状后必须与旧 SQL 逐行一致：回收站、临时区、两者都有、死亡关系超阈值。
+    #[test]
+    fn list_tags_page_matches_legacy_shape() {
+        let fixture = fixture();
+        let compare = |database: &LibraryDb| {
+            database
+                .with_reader(|connection| {
+                    let fast = list_tags_page_in(connection, None, 100, 0, MAX_TAG_DEAD_IMAGES)?;
+                    let legacy = list_tags_page_legacy(connection, None, 100, 0)?;
+                    assert_eq!(fast.len(), legacy.len());
+                    for (left, right) in fast.iter().zip(legacy.iter()) {
+                        assert_eq!(
+                            (left.id, left.name.as_str(), left.image_count),
+                            (right.id, right.name.as_str(), right.image_count)
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap()
+        };
+
+        // fixture 里 id=5 已在回收站，且它带着两个标签关系。
+        compare(&fixture.session.db);
+
+        // 再加一张临时图片与它的标签：临时图片不算标签计数。
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                let folder = temp::folder(connection)?.unwrap().id;
+                connection.execute("INSERT INTO tags(name) VALUES ('临时标签')", [])?;
+                let tag = connection.last_insert_rowid();
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    0,
+                    folder,
+                    600,
+                    6_000,
+                    700,
+                    700,
+                    None,
+                    &[tag],
+                );
+                Ok(())
+            })
+            .unwrap();
+        compare(&fixture.session.db);
+
+        // 死亡关系数超过阈值时回退旧形状，结果必须一致。
+        fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                let fast = list_tags_page_in(connection, None, 100, 0, MAX_TAG_DEAD_IMAGES)?;
+                let fallback = list_tags_page_in(connection, None, 100, 0, 0)?;
+                assert_eq!(
+                    fast.iter()
+                        .map(|tag| (tag.id, tag.image_count))
+                        .collect::<Vec<_>>(),
+                    fallback
+                        .iter()
+                        .map(|tag| (tag.id, tag.image_count))
+                        .collect::<Vec<_>>()
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 名称搜索与分页也必须与旧形状一致。
+    #[test]
+    fn list_tags_page_search_and_offset_match_legacy_shape() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                for (search, limit, offset) in [(None, 1, 0), (None, 1, 1), (Some("速写"), 100, 0)]
+                {
+                    let fast =
+                        list_tags_page_in(connection, search, limit, offset, MAX_TAG_DEAD_IMAGES)?;
+                    let legacy = list_tags_page_legacy(connection, search, limit, offset)?;
+                    assert_eq!(
+                        fast.iter()
+                            .map(|tag| (tag.id, tag.image_count))
+                            .collect::<Vec<_>>(),
+                        legacy
+                            .iter()
+                            .map(|tag| (tag.id, tag.image_count))
+                            .collect::<Vec<_>>(),
+                        "search={search:?} limit={limit} offset={offset}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 文件夹写命令只回传受影响的 id，计数口径必须与整树一致。
+    #[test]
+    fn folder_infos_returns_only_the_requested_ids() {
+        let fixture = fixture();
+        let all = list_folders(&fixture.session.db).unwrap();
+        let subset = folder_infos(&fixture.session.db, &[fixture.folder_people, -1]).unwrap();
+        assert_eq!(subset.len(), 1);
+        let expected = all
+            .iter()
+            .find(|folder| folder.id == fixture.folder_people)
+            .unwrap();
+        assert_eq!(subset[0].path, expected.path);
+        assert_eq!(subset[0].direct_image_count, expected.direct_image_count);
+        assert_eq!(subset[0].total_image_count, expected.total_image_count);
+        assert!(folder_infos(&fixture.session.db, &[]).unwrap().is_empty());
+    }
+
+    /// 文件夹计数聚合不能退回“按像素索引逐行回表”。
+    #[test]
+    fn folder_counts_plan_avoids_per_row_indexes() {
+        let fixture = fixture();
+        let plan = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                let mut statement =
+                    connection.prepare(&format!("EXPLAIN QUERY PLAN {FOLDER_COUNTS_SQL}"))?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.join("\n"))
+            })
+            .unwrap();
+        assert!(
+            !plan.contains("idx_images_active"),
+            "文件夹计数仍在逐行回表：{plan}"
+        );
     }
 }

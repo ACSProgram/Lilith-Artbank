@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v6、schema v7、多级文件夹、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v8、多级文件夹、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,13 +36,14 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 7；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 8；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
 - v4 → v5 新增 `operations` / `operation_chunks` / `undo_runs` 三张表、`images.purge_operation_id` / `origin_operation_id` 两列与 `idx_images_purge` 索引，不改现有行；v1–v3 库按链式迁移到 v5。
 - v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行。
 - v6 → v7 给 `folders` 增加 `kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','temp'))` 与唯一部分索引 `idx_folders_single_temp`，并插入唯一的临时文件夹行；内部路径固定为 `.artbank-temp`，已有同名文件夹时追加 `-1`、`-2` 后缀。v1–v6 库按链式迁移到 v7。
+- v7 → v8 只新增覆盖索引 `idx_images_visible_facets(deleted_at, purge_operation_id, folder_id, file_ext, score)`，不改数据与语义。真实库（39 万行）建索引 533 ms、库体积 +7 MB；计数与文件夹聚合从 620/683 ms 降到 20/27 ms。
 
 ### 表
 
@@ -112,10 +113,10 @@ origin_operation_id 导入批次；用于撤销导入时找回本次新增的行
 字段：
 
 ```text
-settingsVersion    当前为 6
+settingsVersion    当前为 7
 libraryPath        当前图库绝对路径；null 表示未打开。由后端维护
 ai                 { baseUrl, port, autoStart, pythonPath, serverScript,
-                     modelPath, clipModelPath }
+                     modelPath, clipModelPath, prewarmImports }
 performance        { readerConnections, workerThreads }
 history            { maxSteps }  每个图库保留的操作记录步数，默认 100
 mcp                { enabled, port, mode }  MCP 服务；默认关闭、18767、ask
@@ -130,6 +131,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
   - `serverScript` 默认 `server\main.py`；填了 Python 就必须填脚本。
   - `modelPath` 是模型根目录，默认 `resources\models`。
   - `clipModelPath` 是 CLIP 模型目录，默认 `siglip2-giant-opt-patch16-384`；相对 `modelPath`，也可填绝对路径。
+  - `prewarmImports` 默认 true：启动托管的服务时加 `--prewarm-imports`，让服务在后台导入 torch/transformers。代价是服务进程常驻约 420 MB，收益是首次 AI 请求少等 7–8 s。
   - 相对路径一律以程序根目录解析；本机 `baseUrl` 的端口必须与 `port` 一致。
 - 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。
 - 保存启动相关 AI 设置后，应用会按新配置重启托管的 Python 服务。
@@ -161,19 +163,20 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `create_library` | `{ name, path }` | `LibraryInfo`（创建并打开） |
 | `open_library_path` | `{ path }` | `LibraryInfo`（只打开已存在的图库） |
 | `close_library` | — | `null` |
-| `get_library_status` | — | `LibraryInfo \| null` |
+| `get_library_status` | — | `LibraryInfo \| null`（只返回缓存计数，不重算） |
+| `get_library_counts` | — | `{ imageCount, trashCount, tempCount }`（重算并写回缓存） |
 | `rename_library` | `{ name }` | `LibraryInfo`（只改名称，不改目录） |
 | `query_images` | `{ query }` | `{ items, nextCursor, nextPageToken }` |
 | `query_image_ids` | `{ query }` | `number[]` |
 | `get_filter_counts` | `{ query }` | `FilterCounts` |
 | `get_folders` | — | `FolderInfo[]` |
-| `create_folder` | `{ path }` | `FolderInfo[]`（完整列表） |
-| `rename_folder` | `{ folderId, name }` | `FolderInfo[]` |
-| `move_folder` | `{ folderId, parentId }` | `FolderInfo[]` |
-| `place_folders` | `{ folderIds, parentId, sortIndex? }` | `FolderInfo[]`（多文件夹一次移动/插入，一条记录） |
-| `reorder_folders` | `{ folderIds, parentId, sortIndex }` | `FolderInfo[]` |
-| `apply_folder_order` | `{ folderId, key, descending, recursive, orders }` | `FolderInfo[]`（一次性排序，一条记录） |
-| `delete_folder` | `{ folderId }` | `FolderInfo[]` |
+| `create_folder` | `{ path }` | `FolderChange`（新建的行，含自动补齐的缺失祖先） |
+| `rename_folder` | `{ folderId, name }` | `FolderChange`（整个子树，路径都变了） |
+| `move_folder` | `{ folderId, parentId }` | `FolderChange`（子树 + 两侧祖先） |
+| `place_folders` | `{ folderIds, parentId, sortIndex? }` | `FolderChange`（多文件夹一次移动/插入，一条记录） |
+| `reorder_folders` | `{ folderIds, parentId, sortIndex }` | `FolderChange`（同级受影响行） |
+| `apply_folder_order` | `{ folderId, key, descending, recursive, orders }` | `FolderChange`（一次性排序，一条记录） |
+| `delete_folder` | `{ folderId }` | `FolderChange`（`folders` 为空，`removedIds` 含该 id） |
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]` |
 | `get_image_detail` | `{ imageId }` | `ImageDetails` |
@@ -228,7 +231,9 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 { kind: "invalid", reason }
 ```
 
-`LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`tempCount`、`schemaVersion`、`openedAt`。计数分别对应普通图片、回收站与临时文件夹；临时图片不计入 `imageCount`。
+`LibraryInfo`：`id`、`name`、`path`、`imageCount`、`trashCount`、`tempCount`、`schemaVersion`、`openedAt`。计数分别对应普通图片、回收站与临时文件夹；临时图片不计入 `imageCount`。打开图库不再同步算计数（真实库 620 ms），`imageCount` 等字段先为 0，前端随后调用 `get_library_counts` 补齐；`get_library_status` 只返回缓存值，重算只发生在开库与数据变化之后。
+
+`FolderChange`：`{ folders: FolderInfo[], removedIds: number[] }`。文件夹写命令只回传受影响的行，前端按 id 就地合并（`applyFolderChange`），不再每次重取整棵树。
 
 `FolderInfo`：`{ id, path, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。`sortIndex` 只在同级内比较，决定文件夹树的显示顺序。
 
@@ -308,7 +313,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 ## 生命周期
 
 - `create_library`：校验名称/绝对路径/目录状态 → 建目录 → 写清单 → 建库与 schema → 打开 → 确保临时文件夹 → 把路径写入设置。
-- `open_library_path`：校验清单/库 → 建连接池 → 校验或迁移 schema → 清空上一个会话的临时图片（新建库则为 0）→ 确保临时文件夹 → 读计数 → 打开 → 把路径写入设置。空目录或无效目录直接拒绝，需先创建。
+- `open_library_path`：校验清单/库 → 建连接池 → 校验或迁移 schema → 清空上一个会话的临时图片（新建库则为 0）→ 确保临时文件夹 → 打开（计数为 0，由前端随后拉取）→ 把路径写入设置。空目录或无效目录直接拒绝，需先创建。
 - 打开或创建新库成功后才替换旧会话；失败保留旧会话与设置中的旧路径。
 - 启动：`open_configured_library` 按 `libraryPath` 自动打开；失败只记日志，前端随后再尝试一次并提示，最终退回欢迎页。
 - `close_library`：清空当前图库的临时文件夹，再释放连接、清空 AI 运行时状态与 `libraryPath`，不动其它文件。应用退出时同样尽力清空一次。
@@ -318,7 +323,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 ## 已实现与未实现
 
-已实现：上述单库生命周期、schema v7（含 v1→v2→v3→v4→v5→v6→v7 迁移与临时文件夹）、连接池、设置 v6（含 v1→v2→v3→v4→v5→v6 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）；使用反馈批次 3（文件夹一次性排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、窗口状态与展开集合持久化）；使用反馈批次 4（任务 panic 兜底与 release unwind、`LiveOperation` / `HistoryRunGuard` 收尾、长任务默认排队与 FIFO/写优先、`HistoryPage.storage` 占用统计与中断恢复提示）；使用反馈批次 5（`tags_list` / `folders_list` 分页、`library_info` 三档规则表达、`tagPresence` / `excludeTagIds` 标签筛选、`tags_modify` 与标签合并及 `tagMerge` 记录）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
+已实现：上述单库生命周期、schema v8（含 v1→…→v7 迁移与临时文件夹、v8 覆盖索引）、连接池、设置 v7（含 v1→…→v7 迁移；文件移到程序目录）、窗口命令、Stage 0 UI；文件夹创建/重命名/移动/删除空文件夹、路径校验与手动排序（`reorder_folders` / `sort_index`）；打开图库时初始化追加式缩略图包（只扫描段文件）；`thumb://` 按图片 id 读取缩略图指针与 pack 字节；导入批次写入 `images`、`folders`、`tags`、`image_tags`、缩略图指针与 `thumb_segments` 行；S2 键集查询、基础筛选/排序、筛选计数、文件夹/标签列表、全部匹配 id、系统剪贴板文本，以及虚拟网格/列表；S3 搜索（描述/标签/文件夹，当前视图/全库）、时间/大小与存在性筛选、详情与批量编辑、标签/文件夹管理、集合 CRUD/排序/加入移出/并集交集差集、回收站软删除/恢复/永久删除/清空；S4 查看器源与 `img://` 原图/降采样预览协议、几何编辑保存（新哈希发布、缩略图/pHash/主色重算、embedding/pose 清除、旧文件清理）、复制图片到剪贴板；S6 AI 进程托管、`/v1` 客户端、feature pack（embedding fp16 / pose f32）、均值中心化语义搜索、批量任务、查看器姿势生成；P2 任务总线与任务中心、缩略图重建、批量文件操作进度与取消、`get_image_capabilities` / `get_feature_summary`；P3 编辑体积预估（`estimate_edit_size`）、保存后行内就地更新、标签点击筛选与锚点跳转、`window_set_fullscreen` 设置语义；P4 多级排序与 id 列表游标、`anchor_id`、`nextPageToken`、排序方案设置、文件夹与排序索引；操作记录批次 1–3（schema/设置 v5、回收站与删除撤销、延迟释放、历史面板；导入/编辑/移动/文件夹撤销与中断续做；灰色重做分支、当前状态分隔线与撤销/重做续做；评分/描述/AI 描述/标签/集合/相似分组撤销与重做）；使用反馈批次 3（文件夹一次性排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、窗口状态与展开集合持久化）；使用反馈批次 4（任务 panic 兜底与 release unwind、`LiveOperation` / `HistoryRunGuard` 收尾、长任务默认排队与 FIFO/写优先、`HistoryPage.storage` 占用统计与中断恢复提示）；使用反馈批次 5（`tags_list` / `folders_list` 分页、`library_info` 三档规则表达、`tagPresence` / `excludeTagIds` 标签筛选、`tags_modify` 与标签合并及 `tagMerge` 记录）；使用反馈批次 6（schema v8 覆盖索引、`list_tags` 覆盖聚合、重读命令异步化、文件夹写命令增量返回、计数拆出 `get_library_counts`、设置 v7 的 `ai.prewarmImports`）。详见 [查看器与几何编辑](viewer-and-editor.md) 与 [AI 服务](ai-service.md)。
 
 未实现（后续阶段）：拖出到资源管理器（OLE）、维护类工作流（描述导出/回填、孤儿清理、包压缩、库检查、导出）。对应命令在实现时追加到 `src-tauri/src/app/commands.rs` 的注册表，并同步本文件。
 
@@ -326,8 +331,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 `cargo test` 覆盖：
 
-- 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、v6→v7 迁移（补 `ai.prewarmImports=true`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
+- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、v7→v8 迁移（只建覆盖索引、幂等、现有行不变）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝、临时文件夹不进入排序；

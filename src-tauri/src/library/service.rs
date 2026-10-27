@@ -33,6 +33,15 @@ pub struct LibrarySession {
     pub thumbs: Arc<ThumbPack>,
 }
 
+/// 图库三档计数；打开图库不再同步计算，前端按需单独拉取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCounts {
+    pub image_count: u64,
+    pub trash_count: u64,
+    pub temp_count: u64,
+}
+
 pub fn create(
     path: &Path,
     name: &str,
@@ -116,16 +125,15 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
     let database = LibraryDb::open(&paths.database, read_connections)?;
     database.with_writer(|connection| schema::ensure(connection, &manifest))?;
     temp::ensure(&database, path)?;
-    let (image_count, trash_count, temp_count) = database.counts()?;
 
     Ok(LibrarySession {
         info: LibraryInfo {
             id: manifest.library_id.clone(),
             name: manifest.name.clone(),
             path: path.to_string_lossy().into_owned(),
-            image_count,
-            trash_count,
-            temp_count,
+            image_count: 0,
+            trash_count: 0,
+            temp_count: 0,
             schema_version: SCHEMA_VERSION,
             opened_at: now_ms(),
         },

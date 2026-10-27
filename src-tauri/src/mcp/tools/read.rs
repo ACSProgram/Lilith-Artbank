@@ -499,6 +499,7 @@ pub fn find_similar(
                 Some(limit),
                 Some(&task_scope),
                 input.threshold,
+                None,
             )?;
             (
                 result.token,

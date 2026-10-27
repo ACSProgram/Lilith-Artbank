@@ -18,6 +18,13 @@ pub struct LibraryDb {
     cursor: AtomicUsize,
 }
 
+/// 活跃图片总数；`?1` 是临时文件夹 id（没有临时文件夹时传 -1）。
+///
+/// 单独提出来是为了让测试能断言查询计划：这条聚合必须走
+/// `idx_images_visible_facets` 或直接扫表，不能再按像素索引逐行回表。
+const ACTIVE_COUNT_SQL: &str =
+    "SELECT count(*) FROM images WHERE deleted_at IS NULL AND folder_id <> ?1";
+
 impl LibraryDb {
     pub fn open(path: &Path, read_connections: u32) -> AppResult<Self> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -103,11 +110,8 @@ impl LibraryDb {
                 })
                 .optional()?;
             let temp_id = temp_id.unwrap_or(-1);
-            let active: u64 = connection.query_row(
-                "SELECT count(*) FROM images WHERE deleted_at IS NULL AND folder_id <> ?1",
-                [temp_id],
-                |row| row.get(0),
-            )?;
+            let active: u64 =
+                connection.query_row(ACTIVE_COUNT_SQL, [temp_id], |row| row.get(0))?;
             let trash: u64 = connection.query_row(
                 "SELECT count(*) FROM images
                  WHERE deleted_at IS NOT NULL AND purge_operation_id IS NULL AND folder_id <> ?1",
@@ -157,5 +161,28 @@ mod tests {
             db.with_durable_writer(|_| Err(crate::app::error::AppError::message("模拟失败")));
         assert!(failed.is_err());
         assert_eq!(synchronous(&db), 1, "失败也要恢复原值");
+    }
+
+    /// 计数聚合不能退回“按像素索引逐行回表”的旧计划（真实库上那是 39 万次回表）。
+    #[test]
+    fn active_count_plan_avoids_per_row_indexes() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = crate::library::service::create(&root, "计划测试", 1).unwrap();
+        let plan = session
+            .db
+            .with_reader(|connection| {
+                let mut statement =
+                    connection.prepare(&format!("EXPLAIN QUERY PLAN {ACTIVE_COUNT_SQL}"))?;
+                let rows = statement
+                    .query_map([-1_i64], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.join("\n"))
+            })
+            .unwrap();
+        assert!(
+            !plan.contains("idx_images_active"),
+            "计数仍在逐行回表：{plan}"
+        );
     }
 }

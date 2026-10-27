@@ -5,7 +5,7 @@ import { ImportDialog } from "../modules/import/ImportDialog";
 import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type { CollectionInfo, FolderInfo } from "../modules/library/types";
+import type { CollectionInfo, FolderChange, FolderInfo } from "../modules/library/types";
 import { sortForViewChange } from "../modules/library/model";
 import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
@@ -27,6 +27,7 @@ import { errorMessage } from "../shared/errors";
 import type { ViewerSession } from "../shared/viewerSession";
 import { useDragSort, type DragPayload, type DropTarget } from "../shared/useDragSort";
 import {
+  applyFolderChange,
   foldersById,
   isSameOrDescendant,
   outermostFolders,
@@ -341,18 +342,19 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
           .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
 
       try {
+        let change: FolderChange;
         if (target.position === "inside") {
           const alreadyInside = dragged.every(
             (folder) => parentFolderPath(folder.path) === targetFolder.path,
           );
           if (alreadyInside) {
-            await libraryApi.reorderFolders(
+            change = await libraryApi.reorderFolders(
               draggedIds,
               targetFolder.id,
               siblingsOf(targetFolder.path).length,
             );
           } else {
-            await libraryApi.placeFolders(draggedIds, targetFolder.id, null);
+            change = await libraryApi.placeFolders(draggedIds, targetFolder.id, null);
           }
         } else {
           const parentPath = parentFolderPath(targetFolder.path);
@@ -366,16 +368,18 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             (folder) => parentFolderPath(folder.path) === parentPath,
           );
           if (sameParent) {
-            await libraryApi.reorderFolders(draggedIds, parent.id, index);
+            change = await libraryApi.reorderFolders(draggedIds, parent.id, index);
           } else {
-            await libraryApi.placeFolders(draggedIds, parent.id, index);
+            change = await libraryApi.placeFolders(draggedIds, parent.id, index);
           }
         }
+        setFolders((previous) => applyFolderChange(previous, change));
         emitChange({
           kind: "folder",
           source: "local",
           reason: "moveFolder",
           fields: ["folder"],
+          foldersAlreadyLoaded: true,
           similarity: "keep",
         });
       } catch (cause) {
@@ -477,11 +481,14 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
 
   const hasImages =
     current.imageCount > 0 || current.trashCount > 0 || current.tempCount > 0;
+  const mean = aiStatus?.mean;
   const semanticBlockedReason = !aiStatus?.online
     ? "AI 服务离线，语义搜索需要文本模型"
-    : aiStatus.mean.count === 0
-      ? "还没有图片 embedding，可在批量任务里生成"
-      : null;
+    : mean?.phase === "failed"
+      ? (mean.message ?? "embedding 均值计算失败，请重新打开图库")
+      : mean?.phase === "missing" && mean.count === 0
+        ? (mean.message ?? "还没有图片 embedding，可在批量任务里生成")
+        : null;
 
   const handleImportFinished = () => {
     // 任务结束路径通常也会发同一条变化；emitChange 在短窗口内去重。

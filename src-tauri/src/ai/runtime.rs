@@ -678,6 +678,7 @@ impl AiRuntime {
         limit: Option<usize>,
         scope: Option<&TaskScope>,
         min_score: Option<f64>,
+        stage: Option<&dyn Fn(&str)>,
     ) -> AppResult<SemanticSearchResult> {
         let text = text.trim();
         if text.is_empty() {
@@ -685,6 +686,11 @@ impl AiRuntime {
         }
         let handles = self.handles()?;
         let started = Instant::now();
+        let report = |label: &str| {
+            if let Some(stage) = stage {
+                stage(label);
+            }
+        };
         let client = AiClient::new(&settings.base_url);
         let health = client.health().map_err(|error| {
             if error.transport {
@@ -705,6 +711,7 @@ impl AiRuntime {
         let dim = image_capability
             .dim
             .ok_or_else(|| AppError::message("embedding 模型没有声明维度"))?;
+        report("加载文本模型");
         let text_capability = job::ensure_capability(&client, &health, "textEmbedding")
             .map_err(|error| AppError::message(format!("无法加载文本 embedding 模型：{error}")))?;
         if text_capability.model.trim().is_empty() {
@@ -723,6 +730,7 @@ impl AiRuntime {
                 "文本 embedding 维度 {text_dim} 与图片 embedding 维度 {dim} 不一致"
             )));
         }
+        report("生成查询向量");
         let query_embedding = client
             .embed_text(&text_capability.model, text)
             .map_err(|error| AppError::message(error.to_string()))?;
@@ -732,10 +740,12 @@ impl AiRuntime {
                 query_embedding.dim
             )));
         }
+        report("计算均值");
         let mean = self.ensure_mean(&handles, &image_model, dim)?;
         let limit = limit.unwrap_or(embedding::DEFAULT_SEARCH_LIMIT);
         let allowed = self.resolve_similarity_scope(&handles.database, scope)?;
         let min_score = parse_score_threshold(min_score, "语义相似度下限")?;
+        report("扫描向量");
         let (hits, total_hits) = embedding::search_with_total(
             &handles.database,
             &self.inner.store,
@@ -1138,17 +1148,36 @@ impl AiRuntime {
         model: &str,
         dim: u32,
     ) -> AppResult<embedding::MeanEmbedding> {
-        {
-            let slot = self.inner.mean.read();
-            if slot.phase == MeanPhase::Ready
-                && slot.model.as_deref() == Some(model)
-                && slot.dim == Some(dim)
-                && let Some(vector) = &slot.vector
+        let ready = |slot: &MeanSlot| -> Option<embedding::MeanEmbedding> {
+            if slot.phase != MeanPhase::Ready
+                || slot.model.as_deref() != Some(model)
+                || slot.dim != Some(dim)
             {
-                return Ok(embedding::MeanEmbedding {
-                    vector: vector.as_ref().clone(),
-                    count: slot.count,
-                });
+                return None;
+            }
+            slot.vector.as_ref().map(|vector| embedding::MeanEmbedding {
+                vector: vector.as_ref().clone(),
+                count: slot.count,
+            })
+        };
+        if let Some(mean) = ready(&self.inner.mean.read()) {
+            return Ok(mean);
+        }
+        // 打开图库后后台线程已经在算：等它，不要在这里覆盖槽位再算一遍。
+        if self.inner.mean.read().phase == MeanPhase::Computing {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                std::thread::sleep(Duration::from_millis(25));
+                let slot = self.inner.mean.read();
+                if slot.phase != MeanPhase::Computing {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if let Some(mean) = ready(&self.inner.mean.read()) {
+                return Ok(mean);
             }
         }
         *self.inner.mean.write() = MeanSlot::computing(Some(model.to_owned()), Some(dim));

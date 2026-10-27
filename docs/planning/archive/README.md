@@ -4,6 +4,7 @@
 
 | 日期 | 文档 | 说明 |
 | --- | --- | --- |
+| 2026-10-27 | [使用反馈整改 批次 6：性能专项](2026-10-27-批次6-性能专项.md) | 真实库全表聚合、索引 A/B、SigLIP 导入分段与均值测量；schema v8 覆盖索引、`list_tags` 覆盖聚合、重读命令异步化与文件夹写命令增量返回、`get_library_counts`、导入预热 + `ensure` warmup forward + 均值等待/rayon 并行、行指针去 `JOIN images`、刷新按已加载行数重取、`temp/viewer/` 2 GB 上限；实现完成，20 万行合成库基准已补（`list_folders` 3.3×、`list_tags` 13.5×、均值 9.8×），真实库复测与真实窗口验收未做。 |
 | 2026-10-27 | [使用反馈整改 批次 5：MCP 接口一致性与规则自描述](2026-10-27-批次5-MCP接口一致性与规则自描述.md) | `tags_list` / `folders_list` 的 offset 游标与 `total`、`library_info` 的 `writeAllowed` + 结构化 `approval`、instructions 三档口径、`tagPresence` / `excludeTagIds` 标签筛选与界面“无标签”、`includeFacets` 的 `facetsNote`、新工具 `tags_modify`（重命名/删除/合并）与 `tagMerge` 记录、标签管理器“合并到…”，以及真实库只读测量与查询计划对比；代码已实现，验收未完成。 |
 | 2026-10-27 | [使用反馈整改 批次 4：后台任务健壮性与并发](2026-10-27-批次4-后台任务健壮性与并发.md) | 任务终态兜底（panic / 线程起不来 / 提前返回）、release 移除 `panic = "abort"` 与全局 panic hook、`LiveOperation` 与 `HistoryRunGuard` RAII 收尾、长任务同 lane FIFO 排队与写优先、任务历史只裁剪已结束任务、`HistoryPage.storage` 占用统计与 `recoveryNeeded` 中断恢复提示；代码已实现，验收未完成。 |
 | 2026-10-27 | [使用反馈整改 批次 3：文件夹树与会话状态](2026-10-27-批次3-文件夹树与会话状态.md) | 移除常驻排序、一次性递归排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动与一条记录、批量移动排序位回滚、窗口状态插件与可见性回退、按图库保存展开集合；代码已实现，验收未完成。 |

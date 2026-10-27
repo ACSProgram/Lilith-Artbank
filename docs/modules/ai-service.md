@@ -97,6 +97,8 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
 
 响应 `{ "capabilities": { ... } }`，结构同 health。加载失败返回 422/503；失败的塔不会保留半加载状态。
 
+`ensure` 在把权重映射进内存之后会**先跑一次前向**（warmup）再返回：权重是按需分页的 mmap，只 mmap 时 RSS 约 499 MB，首次 forward 才把 2.83 GB 真正读进物理内存（CPU 实测 2.37 s，之后每条 163 ms）。所以“加载完成”等于“可以直接用”，这段时间算在 ensure 的耗时里而不是第一次搜索里。warmup 失败按加载失败处理。
+
 - 一次请求最多接受一个 CLIP 塔；同时请求 `imageEmbedding` 与 `textEmbedding` 返回 400。应用分别加载图片塔与文本塔。
 - 请求 `description` 返回 404；当前服务端没有描述模型。
 - 加载图片塔会让已驻留的文本塔让位，反之亦然。
@@ -214,11 +216,13 @@ Content-Type: application/octet-stream
 - `feature_blobs.dim` 对 embedding 是向量维度，对 pose 是 landmark 个数（33）；pose 包的 `dim` 是 f32 元素数 132（33 × 4），两者不要混用。
 - embedding 磁盘上每条 `dim × 2` 字节（仅存 fp16）；读入后立即转 fp32，均值、点积、范数与余弦全部用 f32 在 CPU 计算。pose 每条 33 × 4 × 4 字节（f32，x/y/z/visibility）。
 - 读取向量不整体载入：扫描按 `pack_offset` 排序后 mmap 顺序读，数据库只做一次批量查询；单条读取（查看器 pose）按偏移定位。
+- 行指针查询只读 `feature_blobs`，不再 `JOIN images` 判断可见性：回收站（以及全库范围下的临时区）的 id 先用两条小查询取成集合，再在内存里减掉。真实库上这省掉 34.5 万次回表，而这两个集合通常是空的。
 
 ## 服务端实现（server/）
 
 - 入口 `server/main.py`：标准库 `ThreadingHTTPServer`，只绑 `127.0.0.1`；路由 `/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/shutdown`；`/v1/describe` 返回 404。
-- `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。
+- `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。加载完成后立即 warmup 一次前向。
+- `--prewarm-imports`：启动后在后台线程导入 torch/transformers（实测 7.7–8.0 s、RSS 420 MB），把这段成本从“第一次 AI 请求”挪到“用户还在看图”。没有模型目录时不预热。应用按设置 `ai.prewarmImports`（默认开）决定是否传这个参数。
 - `pose_engine.py`：MediaPipe Pose（`model_complexity=2`、`static_image_mode=True`、`min_detection_confidence=0.3`）。模型随 `python_embeded` 携带，不读 `resources/models`；未检测到人体返回空数组。
 - `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；解码失败返回 422。
 - 运行环境为 Python 3.11 + torch 2.5.1+cu121 + transformers 4.57.6 + mediapipe 0.10.14，依赖已在 `python_embeded` 内，不做运行时下载。
@@ -232,8 +236,8 @@ Content-Type: application/octet-stream
 - **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行（临时区行带 `is_temp` 标记），pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。全库扫描与全库相似分组跳过临时行，显式范围仍可使用。
 - **pHash 相似**：参考图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。只支持单张参考图。
 - **主色相似**：参考主色（单张的 4/8 色，或多张等权合并后的代表色）与索引逐项做对称加权 OKLab 距离（每项匹配对方最近色、按自身权重平均，两个方向再取均值），距离升序。
-- **均值中心化**：打开图库后在后台扫描当前 model/dim 的普通图 embedding，求 fp32 均值并保存在内存；会话内不随新增/编辑更新，关闭并重新打开图库刷新。MCP 的临时区特征生成完成后会显式失效均值缓存。
-- **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
+- **均值中心化**：打开图库后在后台线程扫描当前 model/dim 的普通图 embedding，求 fp32 均值并保存在内存；不阻塞开库，也不随新增/编辑更新，关闭并重新打开图库刷新。MCP 的临时区特征生成完成后会显式失效均值缓存。均值按 4096 行分块用 rayon 并行累加再合并（真实库 364 056 行 × 1536 维）；语义搜索遇到 `Computing` 时等待后台结果（最多 15 s）而不是同步重算。
+- **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。慢阶段通过 `semantic-stage` 事件上报（加载文本模型 / 生成查询向量 / 计算均值 / 扫描向量），界面显示在搜索框下方。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
 - **相似 embedding**：参考图的 image embedding（单张，或多张平均后归一化）同样减均值后扫描。参考图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
 - **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做加权 k-means（初始质心按权重最高、随后每次取最远点，不用随机种子），保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
 - **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
@@ -304,7 +308,8 @@ Content-Type: application/octet-stream
 - 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。
 - 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。
-- 图片塔与文本塔同一时间只驻留一个；切换任务类型需要重新加载，最后一次使用后空闲 5 分钟自动卸载。塔未加载时 `/v1/embed/*` 返回 503，下一次任务开始前的 ensure 会重新加载。
+- 图片塔与文本塔同一时间只驻留一个；切换任务类型需要重新加载（tokenizer 0.9 s + 首次 forward 2.4 s），最后一次使用后空闲 5 分钟自动卸载。塔未加载时 `/v1/embed/*` 返回 503，下一次任务开始前的 ensure 会重新加载。
+- 依赖预热让被托管的服务进程常驻约 420 MB；只有整场会话完全不用 AI 时才是净浪费，可在设置里关掉。
 - 语义搜索依赖 health 在 `ready=false` 时仍返回图片模型名与维度；外部服务实现必须遵守这一点。
 - 描述能力本轮未实现；批量任务中的描述项按缺少能力置灰。
 - 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。

@@ -62,6 +62,9 @@ pub fn launch_spec(settings: &AiSettings) -> AppResult<AiLaunchSpec> {
         args.push(OsString::from("--model-dir"));
         args.push(model_dir.into_os_string());
     }
+    if settings.prewarm_imports {
+        args.push(OsString::from("--prewarm-imports"));
+    }
 
     Ok(AiLaunchSpec {
         program,
@@ -305,6 +308,17 @@ mod tests {
         assert_eq!(spec.args[2], OsString::from("19000"));
         assert_eq!(spec.args[3], OsString::from("--model-dir"));
         assert_eq!(spec.args[4], model_dir.into_os_string());
+        assert_eq!(spec.args[5], OsString::from("--prewarm-imports"));
+
+        let quiet = AiSettings {
+            prewarm_imports: false,
+            ..settings
+        };
+        let spec = launch_spec(&quiet).unwrap();
+        assert!(
+            !spec.args.contains(&OsString::from("--prewarm-imports")),
+            "关掉预热时不应传参"
+        );
     }
 
     #[test]

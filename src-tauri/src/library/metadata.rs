@@ -30,8 +30,9 @@ const SELECTION_TAG_CHUNK: usize = 4_000;
 /// 关系数超过“选中数 × 该系数”时，分块探测比全表扫描便宜。阈值校准见
 /// `docs/guides/performance.md` 的“选中标签聚合”。
 const SELECTION_TAG_SCAN_FACTOR: i64 = 16;
+/// 单次批量上限。涉及文件的操作（移动、永久删除）不再单独设更低的门槛：
+/// 它们的 SQL 与文件操作本来就按 400 张分块执行。
 const MAX_BATCH_IDS: usize = 1_000_000;
-const MAX_FILE_BATCH_IDS: usize = 10_000;
 const MAX_STATE_IDS: usize = 1_000;
 const MAX_TAGS_PER_IMAGE: usize = 64;
 const MAX_TAG_NAME_CHARS: usize = 64;
@@ -1184,7 +1185,7 @@ pub fn move_images_with_id(
     folder_path: &str,
     reporter: &dyn BatchReporter,
 ) -> AppResult<(MoveReport, Option<i64>)> {
-    let ids = validate_ids_for_files(image_ids)?;
+    let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
     // 临时路径在 normalize_folder 里就会被拒（保留目录名），不需要再查一次。
     let folder_path = normalize_folder(folder_path)?;
     database.with_reader(|connection| {
@@ -1398,7 +1399,7 @@ pub fn delete_images(
     image_ids: &[i64],
     reporter: &dyn BatchReporter,
 ) -> AppResult<DeleteReport> {
-    let ids = validate_ids_for_files(image_ids)?;
+    let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
     mark_for_purge(database, Some(&ids), reporter)
 }
 
@@ -1752,17 +1753,6 @@ fn validate_ids(values: &[i64], max: usize) -> AppResult<Vec<i64>> {
         return Err(AppError::message(format!("一次最多操作 {max} 张图片")));
     }
     Ok(result)
-}
-
-fn validate_ids_for_files(values: &[i64]) -> AppResult<Vec<i64>> {
-    validate_ids(values, MAX_FILE_BATCH_IDS).map_err(|error| match error {
-        AppError::Message(message) if message.starts_with("一次最多操作") => {
-            AppError::message(format!(
-                "涉及文件的批量操作一次最多 {MAX_FILE_BATCH_IDS} 张，请分批执行"
-            ))
-        }
-        other => other,
-    })
 }
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ import type {
   DeleteReport,
   FilterCounts,
   FeatureSummary,
+  FolderChange,
   FolderInfo,
   FolderOrder,
   FolderSortKey,
@@ -97,37 +98,37 @@ export const libraryApi = {
     return invoke<FolderInfo[]>("get_folders");
   },
 
-  async createFolder(path: string): Promise<FolderInfo[]> {
+  async createFolder(path: string): Promise<FolderChange> {
     if (!isTauri()) return mockCreateFolder(path);
-    return invoke<FolderInfo[]>("create_folder", { path });
+    return invoke<FolderChange>("create_folder", { path });
   },
 
-  async renameFolder(folderId: number, name: string): Promise<FolderInfo[]> {
+  async renameFolder(folderId: number, name: string): Promise<FolderChange> {
     if (!isTauri()) return mockRenameFolder(folderId, name);
-    return invoke<FolderInfo[]>("rename_folder", { folderId, name });
+    return invoke<FolderChange>("rename_folder", { folderId, name });
   },
 
-  async moveFolder(folderId: number, parentId: number): Promise<FolderInfo[]> {
+  async moveFolder(folderId: number, parentId: number): Promise<FolderChange> {
     if (!isTauri()) return mockMoveFolder(folderId, parentId);
-    return invoke<FolderInfo[]>("move_folder", { folderId, parentId });
+    return invoke<FolderChange>("move_folder", { folderId, parentId });
   },
 
   async reorderFolders(
     folderIds: number[],
     parentId: number,
     sortIndex: number,
-  ): Promise<FolderInfo[]> {
+  ): Promise<FolderChange> {
     if (!isTauri()) return mockReorderFolders(folderIds, parentId, sortIndex);
-    return invoke<FolderInfo[]>("reorder_folders", { folderIds, parentId, sortIndex });
+    return invoke<FolderChange>("reorder_folders", { folderIds, parentId, sortIndex });
   },
 
   async placeFolders(
     folderIds: number[],
     parentId: number,
     sortIndex: number | null,
-  ): Promise<FolderInfo[]> {
+  ): Promise<FolderChange> {
     if (!isTauri()) return mockPlaceFolders(folderIds, parentId, sortIndex);
-    return invoke<FolderInfo[]>("place_folders", { folderIds, parentId, sortIndex });
+    return invoke<FolderChange>("place_folders", { folderIds, parentId, sortIndex });
   },
 
   async applyFolderOrder(
@@ -136,11 +137,11 @@ export const libraryApi = {
     descending: boolean,
     recursive: boolean,
     orders: FolderOrder[],
-  ): Promise<FolderInfo[]> {
+  ): Promise<FolderChange> {
     if (!isTauri()) {
       return mockApplyFolderOrder(folderId, key, descending, recursive, orders);
     }
-    return invoke<FolderInfo[]>("apply_folder_order", {
+    return invoke<FolderChange>("apply_folder_order", {
       folderId,
       key,
       descending,
@@ -149,9 +150,9 @@ export const libraryApi = {
     });
   },
 
-  async deleteFolder(folderId: number): Promise<FolderInfo[]> {
+  async deleteFolder(folderId: number): Promise<FolderChange> {
     if (!isTauri()) return mockDeleteFolder(folderId);
-    return invoke<FolderInfo[]>("delete_folder", { folderId });
+    return invoke<FolderChange>("delete_folder", { folderId });
   },
 
   async getTags(limit = 500): Promise<TagInfo[]> {

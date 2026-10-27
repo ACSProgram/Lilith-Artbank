@@ -8,6 +8,7 @@ import type {
   DeleteReport,
   FilterCounts,
   FolderCount,
+  FolderChange,
   FolderInfo,
   FolderOrder,
   FolderSortKey,
@@ -745,7 +746,11 @@ function replaceFolderPrefix(oldPath: string, newPath: string) {
   }
 }
 
-export function mockCreateFolder(path: string): FolderInfo[] {
+function mockFolderChange(removedIds: number[] = []): FolderChange {
+  return { folders: mockFolders(), removedIds };
+}
+
+export function mockCreateFolder(path: string): FolderChange {
   const normalized = normalizeMockFolder(path);
   if (!normalized) throw new Error("根目录已经存在");
   const segments = normalized.split("/");
@@ -754,17 +759,17 @@ export function mockCreateFolder(path: string): FolderInfo[] {
     throw new Error("文件夹已存在");
   }
   ensureMockFolder(normalized);
-  return mockFolders();
+  return mockFolderChange();
 }
 
-export function mockRenameFolder(id: number, name: string): FolderInfo[] {
+export function mockRenameFolder(id: number, name: string): FolderChange {
   const folder = findFolder(id);
   if (!folder.path) throw new Error("不能重命名图库根目录");
   const nextName = validateFolderName(name);
   const index = folder.path.lastIndexOf("/");
   const parent = index < 0 ? "" : folder.path.slice(0, index);
   const nextPath = parent ? `${parent}/${nextName}` : nextName;
-  if (nextPath === folder.path) return mockFolders();
+  if (nextPath === folder.path) return mockFolderChange();
   if (
     folderState.some(
       (item) => item.id !== id && item.path.toLowerCase() === nextPath.toLowerCase(),
@@ -773,10 +778,10 @@ export function mockRenameFolder(id: number, name: string): FolderInfo[] {
     throw new Error("目标文件夹已存在");
   }
   replaceFolderPrefix(folder.path, nextPath);
-  return mockFolders();
+  return mockFolderChange();
 }
 
-export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
+export function mockMoveFolder(id: number, parentId: number): FolderChange {
   const folder = findFolder(id);
   const parent = findFolder(parentId);
   if (!folder.path) throw new Error("不能移动图库根目录");
@@ -785,7 +790,7 @@ export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
   }
   const leaf = folder.path.slice(folder.path.lastIndexOf("/") + 1);
   const nextPath = parent.path ? `${parent.path}/${leaf}` : leaf;
-  if (nextPath === folder.path) return mockFolders();
+  if (nextPath === folder.path) return mockFolderChange();
   if (
     folderState.some(
       (item) => item.id !== id && item.path.toLowerCase() === nextPath.toLowerCase(),
@@ -795,7 +800,7 @@ export function mockMoveFolder(id: number, parentId: number): FolderInfo[] {
   }
   replaceFolderPrefix(folder.path, nextPath);
   assignSortIndexAtEnd(id);
-  return mockFolders();
+  return mockFolderChange();
 }
 
 function assignSortIndexAtEnd(id: number) {
@@ -814,7 +819,7 @@ export function mockReorderFolders(
   ids: number[],
   parentId: number,
   sortIndex: number,
-): FolderInfo[] {
+): FolderChange {
   const parent = findFolder(parentId);
   const siblings = folderState
     .filter((folder) => folder.path !== "" && parentFolderPath(folder.path) === parent.path)
@@ -831,17 +836,17 @@ export function mockReorderFolders(
     const folder = byId.get(id);
     if (folder) folder.sortIndex = index;
   });
-  return mockFolders();
+  return mockFolderChange();
 }
 
 export function mockPlaceFolders(
   ids: number[],
   parentId: number,
   sortIndex: number | null,
-): FolderInfo[] {
+): FolderChange {
   const parent = findFolder(parentId);
   const dragged = outermostFolders([...new Set(ids)].map((id) => findFolder(id)));
-  if (dragged.length === 0) return mockFolders();
+  if (dragged.length === 0) return mockFolderChange();
   if (dragged.some((folder) => !folder.path)) throw new Error("不能移动图库根目录");
   if (dragged.some((folder) => isSameOrDescendant(parent.path, folder.path))) {
     throw new Error("不能把文件夹移动到自身或子文件夹");
@@ -891,7 +896,7 @@ export function mockPlaceFolders(
     const folder = byId.get(id);
     if (folder) folder.sortIndex = index;
   });
-  return mockFolders();
+  return mockFolderChange();
 }
 
 export function mockApplyFolderOrder(
@@ -900,7 +905,7 @@ export function mockApplyFolderOrder(
   _descending: boolean,
   _recursive: boolean,
   orders: FolderOrder[],
-): FolderInfo[] {
+): FolderChange {
   const root = findFolder(folderId);
   const byId = new Map(folderState.map((folder) => [folder.id, folder]));
   for (const order of orders) {
@@ -925,10 +930,10 @@ export function mockApplyFolderOrder(
       if (folder) folder.sortIndex = index;
     });
   }
-  return mockFolders();
+  return mockFolderChange();
 }
 
-export function mockDeleteFolder(id: number): FolderInfo[] {
+export function mockDeleteFolder(id: number): FolderChange {
   const folder = findFolder(id);
   if (!folder.path) throw new Error("不能删除图库根目录");
   if (folderState.some((item) => item.path.startsWith(`${folder.path}/`))) {
@@ -939,7 +944,7 @@ export function mockDeleteFolder(id: number): FolderInfo[] {
   }
   const index = folderState.findIndex((item) => item.id === id);
   folderState.splice(index, 1);
-  return mockFolders();
+  return mockFolderChange([id]);
 }
 
 export function mockMoveImages(ids: number[], folderPath: string): MoveReport {

@@ -9,8 +9,13 @@ export type QueryStatus = "loading" | "ready" | "error";
 /** 下一页状态；虚拟网格/列表底部据此显示载入中、失败重试或已到底。 */
 export type MoreStatus = "idle" | "loading" | "error";
 
-/** 一次刷新最多重取 20 页，避免深滚动后一次变化发起过多请求。 */
-const MAX_REFRESH_PAGES = 20;
+/**
+ * 刷新时按“已加载行数”重取同样多的行：截断会让深滚动后的列表突然变短、
+ * 滚动位置跟着跳。页预算按行数折算，多留一页用来判断还有没有更多。
+ */
+function refreshPageBudget(rows: number): number {
+  return Math.ceil(rows / PAGE_SIZE) + 1;
+}
 
 export interface ImageQueryState {
   items: ImageRow[];
@@ -129,7 +134,8 @@ export function useImageQuery(query: LibraryQuery): ImageQueryState {
     setMoreError(null);
     setRefreshError(null);
 
-    const target = Math.min(previousCount, PAGE_SIZE * MAX_REFRESH_PAGES);
+    const target = previousCount;
+    const pageBudget = refreshPageBudget(previousCount);
     const collected: ImageRow[] = [];
     const seen = new Set<number>();
     let cursor: QueryCursor | null = null;
@@ -137,8 +143,8 @@ export function useImageQuery(query: LibraryQuery): ImageQueryState {
     let pages = 0;
 
     try {
-      // 页数上限既限制深滚动的请求数，也避免后端返回空页但仍有游标时死循环。
-      while (collected.length < target && pages < MAX_REFRESH_PAGES) {
+      // 页预算既限制深滚动的请求数，也避免后端返回空页但仍有游标时死循环。
+      while (collected.length < target && pages < pageBudget) {
         pages += 1;
         const page = await libraryApi.queryImages({
           ...queryRef.current,

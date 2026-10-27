@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::{
     ai::runtime::{
@@ -31,8 +31,8 @@ use crate::{
             DeleteReport, ImageDetails, ImageState, MergeReport, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::OptimizeEstimate,
-        query::{FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
-        service::LibraryInfo,
+        query::{FilterCounts, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        service::{LibraryCounts, LibraryInfo},
         viewer::{self, PoseData, ViewerSource},
     },
 };
@@ -113,8 +113,13 @@ pub fn close_library(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_library_status(state: State<'_, AppState>) -> Result<Option<LibraryInfo>, String> {
-    AppError::command(state.status())
+pub async fn get_library_status(app: AppHandle) -> Result<Option<LibraryInfo>, String> {
+    run_blocking(app, |state| state.status()).await
+}
+
+#[tauri::command]
+pub async fn get_library_counts(app: AppHandle) -> Result<LibraryCounts, String> {
+    run_blocking(app, |state| state.counts()).await
 }
 
 #[tauri::command]
@@ -278,67 +283,67 @@ pub fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn query_images(state: State<'_, AppState>, query: LibraryQuery) -> Result<ImagePage, String> {
-    AppError::command(state.query_images(query))
+pub async fn query_images(app: AppHandle, query: LibraryQuery) -> Result<ImagePage, String> {
+    run_blocking(app, move |state| state.query_images(query)).await
 }
 
 #[tauri::command]
-pub fn query_image_ids(
-    state: State<'_, AppState>,
-    query: LibraryQuery,
-) -> Result<Vec<i64>, String> {
-    AppError::command(state.query_image_ids(query))
+pub async fn query_image_ids(app: AppHandle, query: LibraryQuery) -> Result<Vec<i64>, String> {
+    run_blocking(app, move |state| state.query_image_ids(query)).await
 }
 
 #[tauri::command]
-pub fn get_filter_counts(
-    state: State<'_, AppState>,
+pub async fn get_filter_counts(
+    app: AppHandle,
     query: LibraryQuery,
 ) -> Result<FilterCounts, String> {
-    AppError::command(state.filter_counts(query))
+    run_blocking(app, move |state| state.filter_counts(query)).await
 }
 
 #[tauri::command]
-pub fn get_query_total(state: State<'_, AppState>, query: LibraryQuery) -> Result<u64, String> {
-    AppError::command(state.query_total(query))
+pub async fn get_query_total(app: AppHandle, query: LibraryQuery) -> Result<u64, String> {
+    run_blocking(app, move |state| state.query_total(query)).await
 }
 
 #[tauri::command]
-pub fn get_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.folders())
+pub async fn get_folders(app: AppHandle) -> Result<Vec<FolderInfo>, String> {
+    run_blocking(app, |state| state.folders()).await
 }
 
 #[tauri::command]
-pub fn create_folder(state: State<'_, AppState>, path: String) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.create_folder(&path))
+pub async fn create_folder(app: AppHandle, path: String) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| state.create_folder(&path)).await
 }
 
 #[tauri::command]
-pub fn rename_folder(
-    state: State<'_, AppState>,
+pub async fn rename_folder(
+    app: AppHandle,
     folder_id: i64,
     name: String,
-) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.rename_folder(folder_id, &name))
+) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| state.rename_folder(folder_id, &name)).await
 }
 
 #[tauri::command]
-pub fn move_folder(
-    state: State<'_, AppState>,
+pub async fn move_folder(
+    app: AppHandle,
     folder_id: i64,
     parent_id: i64,
-) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.move_folder(folder_id, parent_id))
+) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| state.move_folder(folder_id, parent_id)).await
 }
 
 #[tauri::command]
-pub fn reorder_folders(
-    state: State<'_, AppState>,
+pub async fn reorder_folders(
+    app: AppHandle,
     folder_ids: Vec<i64>,
     parent_id: i64,
     sort_index: i64,
-) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.reorder_folders(&folder_ids, parent_id, sort_index))
+) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| {
+        state.reorder_folders(&folder_ids, parent_id, sort_index)
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,51 +354,54 @@ pub struct FolderOrderInput {
 }
 
 #[tauri::command]
-pub fn place_folders(
-    state: State<'_, AppState>,
+pub async fn place_folders(
+    app: AppHandle,
     folder_ids: Vec<i64>,
     parent_id: i64,
     sort_index: Option<i64>,
-) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.place_folders(&folder_ids, parent_id, sort_index))
+) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| {
+        state.place_folders(&folder_ids, parent_id, sort_index)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn apply_folder_order(
-    state: State<'_, AppState>,
+pub async fn apply_folder_order(
+    app: AppHandle,
     folder_id: i64,
     key: FolderSortKey,
     descending: bool,
     recursive: bool,
     orders: Vec<FolderOrderInput>,
-) -> Result<Vec<FolderInfo>, String> {
+) -> Result<FolderChange, String> {
     let orders: Vec<(i64, Vec<i64>)> = orders
         .into_iter()
         .map(|order| (order.parent_id, order.folder_ids))
         .collect();
-    AppError::command(state.apply_folder_order(folder_id, key, descending, recursive, &orders))
+    run_blocking(app, move |state| {
+        state.apply_folder_order(folder_id, key, descending, recursive, &orders)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_folder(
-    state: State<'_, AppState>,
-    folder_id: i64,
-) -> Result<Vec<FolderInfo>, String> {
-    AppError::command(state.delete_folder(folder_id))
+pub async fn delete_folder(app: AppHandle, folder_id: i64) -> Result<FolderChange, String> {
+    run_blocking(app, move |state| state.delete_folder(folder_id)).await
 }
 
 #[tauri::command]
-pub fn get_tags(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<TagInfo>, String> {
-    AppError::command(state.tags(limit))
+pub async fn get_tags(app: AppHandle, limit: Option<u32>) -> Result<Vec<TagInfo>, String> {
+    run_blocking(app, move |state| state.tags(limit)).await
 }
 
 #[tauri::command]
-pub fn search_tags(
-    state: State<'_, AppState>,
+pub async fn search_tags(
+    app: AppHandle,
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<TagInfo>, String> {
-    AppError::command(state.search_tags(&query, limit))
+    run_blocking(app, move |state| state.search_tags(&query, limit)).await
 }
 
 #[tauri::command]
@@ -488,6 +496,21 @@ pub fn merge_tags(
     target_id: i64,
 ) -> Result<MergeReport, String> {
     AppError::command(state.merge_tags(source_id, target_id))
+}
+
+/// 把读命令放进阻塞线程池：同步命令会在 WebView IPC 回调线程上直接执行，
+/// 一条几百毫秒的聚合就会连窗口一起卡住。
+async fn run_blocking<T, F>(app: AppHandle, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        work(state.inner()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// 在 write lane 上跑一个有进度的批量操作：占用、排队、进度、终态都交给任务总线。
@@ -837,14 +860,19 @@ pub async fn ai_generate_pose(
 
 #[tauri::command]
 pub async fn semantic_search(
+    app: AppHandle,
     state: State<'_, AppState>,
     text: String,
     limit: Option<usize>,
 ) -> Result<SemanticSearchResult, String> {
     let settings = state.settings.snapshot().ai;
     let runtime = state.ai.clone();
+    let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        runtime.semantic_search(&settings, &text, limit, None, None)
+        let stage = move |label: &str| {
+            let _ = handle.emit("semantic-stage", serde_json::json!({ "stage": label }));
+        };
+        runtime.semantic_search(&settings, &text, limit, None, None, Some(&stage))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -909,6 +937,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         open_library_path,
         close_library,
         get_library_status,
+        get_library_counts,
         rename_library,
         window_minimize,
         window_toggle_maximize,

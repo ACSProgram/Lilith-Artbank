@@ -388,10 +388,13 @@ fn perf_metadata_200k() {
     let reopen_start = Instant::now();
     let reopened = service::open(&root, 4).expect("reopen");
     let reopen_elapsed = reopen_start.elapsed();
+    // 批次 6 起开库不再同步算计数，`LibraryInfo` 里先给 0，计数由前端单独拉。
+    let counts_start = Instant::now();
+    let (active, trash, temp) = reopened.db.counts().expect("counts");
     println!(
-        "[perf] reopen library + counts: {:.2}ms (active={})",
+        "[perf] reopen library: {:.2}ms；counts() 单独 {:.2}ms (active={active} trash={trash} temp={temp})",
         ms(reopen_elapsed),
-        reopened.info.image_count
+        ms(counts_start.elapsed())
     );
 
     let database = &reopened.db;
@@ -531,6 +534,65 @@ fn perf_metadata_200k() {
         "[perf] query engine filter counts (subtree folder): p50={:.2}ms p95={:.2}ms",
         ms(percentile(&counts_samples, 0.5)),
         ms(percentile(&counts_samples, 0.95))
+    );
+
+    // ---------- 批次 6：可见性聚合、标签分页与无筛选分面 ----------
+
+    let mut count_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let start = Instant::now();
+        let (active, trash, temp) = database.counts().expect("counts");
+        count_samples.push(start.elapsed());
+        assert_eq!(active, IMAGE_COUNT as u64);
+        assert_eq!((trash, temp), (0, 0));
+    }
+    println!(
+        "[perf] counts() ({IMAGE_COUNT} rows, 3 tiers): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&count_samples, 0.5)),
+        ms(percentile(&count_samples, 0.95))
+    );
+
+    let mut tag_page_samples = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let tags = query::list_tags_page(database, None, 100, 0).expect("tags page");
+        tag_page_samples.push(start.elapsed());
+        assert_eq!(tags.len(), 100, "200 个标签里应有足够多可填满一页");
+    }
+    println!(
+        "[perf] list_tags_page 100 (image_tags 覆盖聚合): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&tag_page_samples, 0.5)),
+        ms(percentile(&tag_page_samples, 0.95))
+    );
+
+    let mut legacy_tag_samples = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        let tags = query::list_tags_page_legacy_bench(database, 100).expect("legacy tags page");
+        legacy_tag_samples.push(start.elapsed());
+        assert_eq!(tags.len(), 100);
+    }
+    println!(
+        "[perf] list_tags_page 100 (旧形状，逐张回表): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&legacy_tag_samples, 0.5)),
+        ms(percentile(&legacy_tag_samples, 0.95))
+    );
+
+    let no_filter_query = LibraryQuery {
+        limit: Some(PAGE_SIZE as u32),
+        ..Default::default()
+    };
+    let mut no_filter_samples = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = Instant::now();
+        let counts = query::filter_counts(database, no_filter_query.clone()).expect("counts");
+        no_filter_samples.push(start.elapsed());
+        assert_eq!(counts.total, IMAGE_COUNT as u64);
+    }
+    println!(
+        "[perf] filter counts (no filters, 5 branches): p50={:.2}ms p95={:.2}ms",
+        ms(percentile(&no_filter_samples, 0.5)),
+        ms(percentile(&no_filter_samples, 0.95))
     );
 
     let start = Instant::now();
@@ -803,6 +865,81 @@ fn perf_metadata_200k() {
         "[perf] schema v3->v4 index build on {IMAGE_COUNT} rows: {:.2}ms",
         ms(index_start.elapsed())
     );
+
+    // schema v7 → v8 只加一张覆盖索引。合成库只有 20 万行、且整库都在页缓存里，
+    // 回表代价远低于真实库（1 GB、随机 IO），所以这里只验证“索引确实被选中、形状没退化”，
+    // 真实库的 620 → 20 ms 见 `docs/guides/performance.md`。
+    let measure_aggregates = |label: &str| {
+        let mut counts = Vec::with_capacity(5);
+        let mut folders = Vec::with_capacity(5);
+        let mut tags = Vec::with_capacity(5);
+        let mut facets = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let start = Instant::now();
+            database.counts().expect("counts");
+            counts.push(start.elapsed());
+
+            let start = Instant::now();
+            query::list_folders(database).expect("list folders");
+            folders.push(start.elapsed());
+
+            let start = Instant::now();
+            query::list_tags_page(database, None, 100, 0).expect("tags page");
+            tags.push(start.elapsed());
+
+            let start = Instant::now();
+            query::filter_counts(database, no_filter_query.clone()).expect("facets");
+            facets.push(start.elapsed());
+        }
+        println!(
+            "[perf] {label}: counts={:.2}ms list_folders={:.2}ms list_tags={:.2}ms filter_counts={:.2}ms",
+            ms(percentile(&counts, 0.5)),
+            ms(percentile(&folders, 0.5)),
+            ms(percentile(&tags, 0.5)),
+            ms(percentile(&facets, 0.5))
+        );
+    };
+    let set_visible_index = |enabled: bool| {
+        database
+            .with_writer(|connection| {
+                if enabled {
+                    connection.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_images_visible_facets
+                             ON images(deleted_at, purge_operation_id, folder_id, file_ext, score);
+                         ANALYZE;",
+                    )?;
+                } else {
+                    connection.execute_batch("DROP INDEX IF EXISTS idx_images_visible_facets;")?;
+                }
+                Ok(())
+            })
+            .expect("toggle v8 index");
+    };
+
+    // 交替测两轮：先“有索引”，再“没有”，最后重建。两次“有索引”分开量，
+    // 才能区分索引本身的影响与缓存/顺序带来的漂移。
+    measure_aggregates("aggregates with idx_images_visible_facets (round 1)");
+    set_visible_index(false);
+    measure_aggregates("aggregates without idx_images_visible_facets");
+    let visible_index_start = Instant::now();
+    set_visible_index(true);
+    println!(
+        "[perf] schema v7->v8 index build on {IMAGE_COUNT} rows: {:.2}ms",
+        ms(visible_index_start.elapsed())
+    );
+    measure_aggregates("aggregates with idx_images_visible_facets (round 2)");
+    let plan = database
+        .with_reader(|connection| {
+            let mut statement = connection.prepare(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM images WHERE deleted_at IS NULL",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.join(" | "))
+        })
+        .expect("plan");
+    println!("[perf] plan counts(): {plan}");
 }
 
 #[test]

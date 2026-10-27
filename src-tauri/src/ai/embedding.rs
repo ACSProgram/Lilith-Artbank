@@ -88,30 +88,24 @@ pub fn store(
 ///
 /// `include_temp` 为 false 时跳过临时文件夹里的图片；全库搜索用 false，
 /// 显式范围（包括临时区）用 true，再由调用方的 id 集合收窄。
+///
+/// 可见性用“回收站/临时区 id 集合”在内存里减掉，不再 `JOIN images`：真实库上
+/// 那是 34.5 万次回表，而这两个集合通常是空的。
 pub fn rows(
     database: &LibraryDb,
     model: &str,
     dim: u32,
     include_temp: bool,
 ) -> AppResult<Vec<EmbeddingRow>> {
-    let temp_filter = if include_temp {
-        "1"
-    } else {
-        crate::library::temp::EXCLUDE_SQL
-    };
-    let sql = format!(
-        "SELECT feature_blobs.image_id, feature_blobs.pack_name, feature_blobs.pack_offset
+    let hidden = hidden_image_ids(database, include_temp)?;
+    let sql = "SELECT image_id, pack_name, pack_offset
          FROM feature_blobs
-         JOIN images ON images.id = feature_blobs.image_id
-         WHERE feature_blobs.kind = 'embedding'
-           AND feature_blobs.model = ?1
-           AND feature_blobs.dim = ?2
-           AND images.deleted_at IS NULL
-           AND {temp_filter}
-         ORDER BY feature_blobs.pack_name, feature_blobs.pack_offset"
-    );
-    database.with_reader(|connection| {
-        let mut statement = connection.prepare(&sql)?;
+         WHERE kind = 'embedding'
+           AND model = ?1
+           AND dim = ?2
+         ORDER BY pack_name, pack_offset";
+    let rows = database.with_reader(|connection| {
+        let mut statement = connection.prepare(sql)?;
         let rows = statement
             .query_map(params![model, dim], |row| {
                 Ok(EmbeddingRow {
@@ -122,6 +116,39 @@ pub fn rows(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    })?;
+    if hidden.is_empty() {
+        return Ok(rows);
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|row| !hidden.contains(&row.image_id))
+        .collect())
+}
+
+/// 回收站（以及 `include_temp` 为 false 时的临时区）里的图片 id。
+fn hidden_image_ids(database: &LibraryDb, include_temp: bool) -> AppResult<HashSet<i64>> {
+    database.with_reader(|connection| {
+        let mut hidden: HashSet<i64> = connection
+            .prepare("SELECT id FROM images WHERE deleted_at IS NOT NULL")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        if !include_temp {
+            let temp_id: Option<i64> = connection
+                .query_row("SELECT id FROM folders WHERE kind = 'temp'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(temp_id) = temp_id {
+                hidden.extend(
+                    connection
+                        .prepare("SELECT id FROM images WHERE folder_id = ?1")?
+                        .query_map([temp_id], |row| row.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+            }
+        }
+        Ok(hidden)
     })
 }
 
@@ -544,32 +571,14 @@ pub fn mean(
     }
     let dim_usize = dim as usize;
     let mut sum = vec![0.0_f32; dim_usize];
-    let mut buffer = vec![0.0_f32; dim_usize];
     let mut count = 0_u64;
     for (pack_name, pack_rows) in group_by_pack(pointers) {
         let map = store.mmap(&pack_name)?;
-        for row in pack_rows {
-            let Some(bytes) = record_slice(&map, row.offset, dim_usize * 2) else {
-                continue;
-            };
-            decode_f16(bytes, &mut buffer);
-            let mut norm = 0.0_f32;
-            let mut finite = true;
-            for value in &buffer {
-                if !value.is_finite() {
-                    finite = false;
-                    break;
-                }
-                norm += value * value;
-            }
-            if !finite || norm <= 1e-12 {
-                continue;
-            }
-            for (slot, value) in sum.iter_mut().zip(buffer.iter()) {
-                *slot += value;
-            }
-            count += 1;
+        let (pack_sum, pack_count) = mean_parallel(&map, &pack_rows, dim_usize);
+        for (slot, value) in sum.iter_mut().zip(pack_sum.iter()) {
+            *slot += value;
         }
+        count += pack_count;
     }
     if count == 0 {
         return Ok(MeanEmbedding {
@@ -743,6 +752,59 @@ fn by_score_desc(left: &(i64, f32), right: &(i64, f32)) -> std::cmp::Ordering {
         .partial_cmp(&left.1)
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| left.0.cmp(&right.0))
+}
+
+/// 均值并行累加的块大小：按行切，每块自己解码、自己求和。
+const MEAN_CHUNK_ROWS: usize = 4_096;
+
+/// 一个块的部分和与有效条数；非有限值与零向量按损坏记录跳过。
+fn mean_of_chunk(bytes: &[u8], rows: &[EmbeddingRow], dim: usize) -> (Vec<f32>, u64) {
+    let mut sum = vec![0.0_f32; dim];
+    let mut buffer = vec![0.0_f32; dim];
+    let mut count = 0_u64;
+    for row in rows {
+        let Some(record) = record_slice(bytes, row.offset, dim * 2) else {
+            continue;
+        };
+        decode_f16(record, &mut buffer);
+        let mut norm = 0.0_f32;
+        let mut finite = true;
+        for value in &buffer {
+            if !value.is_finite() {
+                finite = false;
+                break;
+            }
+            norm += value * value;
+        }
+        if !finite || norm <= 1e-12 {
+            continue;
+        }
+        for (slot, value) in sum.iter_mut().zip(buffer.iter()) {
+            *slot += value;
+        }
+        count += 1;
+    }
+    (sum, count)
+}
+
+/// 一个包内全部行的均值：按固定块大小并行累加，再合并各块的部分和。
+///
+/// 均值要遍历整个特征包（真实库 364 056 行 × 1536 维 fp16）。20 万行实测：单线程
+/// 417 ms、`rayon` 4096 行分块 42 ms。合并树取决于线程数与窃取顺序，所以结果只保证
+/// 在 f32 累加误差内一致，不保证逐位相同——均值只用于中心化，够用。
+fn mean_parallel(bytes: &[u8], rows: &[EmbeddingRow], dim: usize) -> (Vec<f32>, u64) {
+    rows.par_chunks(MEAN_CHUNK_ROWS)
+        .map(|chunk| mean_of_chunk(bytes, chunk, dim))
+        .reduce(
+            || (vec![0.0_f32; dim], 0_u64),
+            |mut left, right| {
+                for (slot, value) in left.0.iter_mut().zip(right.0.iter()) {
+                    *slot += value;
+                }
+                left.1 += right.1;
+                left
+            },
+        )
 }
 
 fn group_by_pack(rows: Vec<EmbeddingRow>) -> BTreeMap<String, Vec<EmbeddingRow>> {
@@ -1015,6 +1077,101 @@ mod tests {
         assert_eq!(groups.missing, 1);
         assert!(!groups.truncated);
     }
+    /// 可见性改成内存减法后，回收站与临时区的图片仍必须被排除。
+    #[test]
+    fn rows_skip_trashed_and_temp_images() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=3 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+
+        let temp = crate::library::temp::ensure(&session.db, &root).unwrap();
+        session
+            .db
+            .with_writer(|connection| {
+                connection.execute("UPDATE images SET deleted_at = 1 WHERE id = 2", [])?;
+                connection.execute(
+                    "UPDATE images SET folder_id = ?1 WHERE id = 3",
+                    params![temp.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let visible: Vec<i64> = rows(&session.db, "model", 4, false)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.image_id)
+            .collect();
+        assert_eq!(visible, vec![1], "回收站与临时图片都不参与全库检索");
+
+        let with_temp: Vec<i64> = rows(&session.db, "model", 4, true)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.image_id)
+            .collect();
+        assert_eq!(
+            with_temp,
+            vec![1, 3],
+            "显式范围可以带临时区，但仍排除回收站"
+        );
+
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        assert_eq!(mean.count, 1);
+    }
+
+    /// 并行累加的块函数：跳过非有限值与零向量，正常记录求和。
+    #[test]
+    fn mean_of_chunk_skips_corrupt_records() {
+        let dim = 2;
+        let record = |values: [f32; 2]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+                .collect()
+        };
+        let mut bytes = Vec::new();
+        bytes.extend(record([1.0, 2.0]));
+        bytes.extend(record([f32::NAN, 1.0]));
+        bytes.extend(record([0.0, 0.0]));
+        bytes.extend(record([3.0, 4.0]));
+
+        let rows: Vec<EmbeddingRow> = [0_u64, 4, 8, 12]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| EmbeddingRow {
+                image_id: index as i64 + 1,
+                pack_name: "pack".into(),
+                offset,
+            })
+            .collect();
+
+        let (sum, count) = mean_of_chunk(&bytes, &rows[..2], dim);
+        assert_eq!(count, 1, "NaN 记录被跳过");
+        assert_eq!(sum, vec![1.0, 2.0]);
+
+        let (sum, count) = mean_of_chunk(&bytes, &rows, dim);
+        assert_eq!(count, 2, "零向量记录被跳过");
+        assert_eq!(sum, vec![4.0, 6.0]);
+
+        // 越界指针不 panic，也不算进条数。
+        let (sum, count) = mean_of_chunk(
+            &bytes,
+            &[EmbeddingRow {
+                image_id: 9,
+                pack_name: "pack".into(),
+                offset: 4_000,
+            }],
+            dim,
+        );
+        assert_eq!(count, 0);
+        assert_eq!(sum, vec![0.0, 0.0]);
+    }
 }
 
 #[cfg(test)]
@@ -1057,6 +1214,27 @@ mod perf_tests {
                 offset: location.offset,
             });
         }
+        // 均值：整段单线程 vs rayon 分块。批次 6 把均值改成并行累加，这里给出同机对比；
+        // 两者只差 f32 累加误差（均值只用于中心化）。
+        let bytes: &[u8] = &packs.mmap(&rows[0].pack_name).unwrap();
+        let started = Instant::now();
+        let (serial_sum, serial_count) = mean_of_chunk(bytes, &rows, DIM as usize);
+        let serial = started.elapsed();
+        let started = Instant::now();
+        let (parallel_sum, parallel_count) = mean_parallel(bytes, &rows, DIM as usize);
+        let parallel = started.elapsed();
+        assert_eq!(serial_count, COUNT as u64);
+        assert_eq!(parallel_count, COUNT as u64);
+        let drift = serial_sum
+            .iter()
+            .zip(parallel_sum.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        eprintln!(
+            "mean {COUNT} rows × {DIM} dims: serial={serial:?} rayon={parallel:?} ({:.1}x), max|Δ|={drift:.4}",
+            serial.as_secs_f64() / parallel.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
         let mean = vec![0.001_f32; DIM as usize];
         let mut query = vec![0.0_f32; DIM as usize];
         query[0] = 1.0;

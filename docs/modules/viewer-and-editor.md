@@ -12,6 +12,7 @@
 - 全屏状态由 `AppRuntimeProvider` 持有：`window_set_fullscreen(value)` 写入后回读真实值，前端另外用 `isFullscreen()` + `onResized` 同步，系统快捷键（F11、Win+↑）改变全屏时按钮图标也跟着变。全屏时隐藏标题栏与查看器自身的顶栏、工具栏、状态栏、侧栏、胶片带，只留画布；关闭查看器会先退出全屏。F11 在 `AppShell` 里全局响应，Esc 在全屏时先退全屏再关查看器。
 - 键盘：Esc（裁剪中先退出裁剪；姿势叠加打开时先关闭叠加；全屏时退全屏）、←/→、F、0、1、+/-、`Ctrl+Z` 撤销、`Ctrl+Shift+Z` / `Ctrl+Y` 重做；输入框聚焦时忽略（滑块聚焦时撤销快捷键仍然生效），弹窗打开时不响应。打开查看器时把焦点移进覆盖层，避免网格的容器级键盘处理与查看器同时响应方向键与 Esc。
 - 大图：浏览器原生格式且 ≤2400 万像素时直接加载原图；超过阈值、格式不能由 WebView2 直接解码（TIFF/TGA）、或带 EXIF 方向时，由 Rust 生成最长边 4096 的 WebP 预览，缓存在 `.artbank/temp/viewer/<id>-<hash>.webp`。打开图库会清空 `temp`，保存会删除该图旧哈希的预览。
+- 单次会话内 `temp/viewer/` 上限 2 GB：累计写入每满 256 MB 扫一次目录，按 mtime 从旧到新删到上限以内。查看路径本身不扫目录，清理失败只记日志。
 - 带 EXIF 方向的图片也走 Rust 预览：预览已转正，避免 WebView2 的自然尺寸/方向语义与数据库宽高不一致，从而保证裁剪坐标可预测。编辑保存始终重新解码原图并应用方向。
 - `img://` 协议：Windows 为 `http://img.localhost/<id>?v=<hash>`（原图）与 `http://img.localhost/preview/<id>?v=<hash>`（预览）。响应带 `Cache-Control: immutable`、ETag=内容哈希；id 不是整数返回 400，图片行/原图/预览缺失返回 404（前端据此走失败态），路径解析失败返回 500。前端统一经 `src/shared/imgUrl.ts` 生成 URL，重试参数由 `withRetry` 追加。
 - 姿势叠加：33 点 MediaPipe 骨架与可见点过滤；`get_image_pose` 从 S6 的 feature pack 读取 landmark。没有可见姿势时按钮调用 `ai_generate_pose`（512px 缩略图输入），保存后立即叠加；服务返回空点集时提示未检测到人体。骨架线宽与关节点半径按屏幕像素换算（`2 / zoom`、`5 / zoom` 与 `3.5 / zoom`），缩放时粗细不变；主线外加深色描边保证在明暗画面上都能看清，置信度低于 0.5 的连线与关节点半透明，头部与躯干节点比四肢大。画布右上的姿势面板显示可见点数（N/33）与不透明度滑块，不透明度存在 `localStorage`。

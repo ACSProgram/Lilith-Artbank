@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyFolderChange,
   buildFolderTree,
   childrenOf,
   defaultExpandedIds,
@@ -94,4 +95,40 @@ test("expansion state maps paths to ids and ignores missing paths", () => {
   assert.deepEqual([...ids], [3]);
   assert.deepEqual(expandedPaths(new Set([3, 4]), tree.byId).sort(), ["甲", "甲/子"]);
   assert.deepEqual([...defaultExpandedIds(tree.nodes)], [3, 2, 5]);
+});
+
+test("folder change merges by id without reordering the rest", () => {
+  // 改名：同 id 换成新路径，其余行保持原对象。
+  const renamed = applyFolderChange(folders, {
+    folders: [folder(3, "甲改", 0, 1, 1)],
+    removedIds: [],
+  });
+  assert.equal(renamed.length, folders.length);
+  assert.equal(renamed.find((item) => item.id === 3)?.path, "甲改");
+  assert.equal(renamed.find((item) => item.id === 2), folders[1]);
+
+  // 新建：不在本地树里的 id 追加到末尾。
+  const created = applyFolderChange(folders, {
+    folders: [folder(6, "丁", 6, 0, 0)],
+    removedIds: [],
+  });
+  assert.equal(created.length, folders.length + 1);
+  assert.equal(created.at(-1)?.path, "丁");
+
+  // 删除：只剔除给定 id，并同时处理同一批里的更新。
+  const removed = applyFolderChange(folders, {
+    folders: [folder(2, "乙", 1, 0, 0)],
+    removedIds: [3],
+  });
+  assert.deepEqual(
+    removed.map((item) => item.id),
+    [1, 2, 4, 5],
+  );
+  assert.equal(removed.find((item) => item.id === 2)?.directImageCount, 0);
+
+  // 空变更不动任何行。
+  assert.deepEqual(
+    applyFolderChange(folders, { folders: [], removedIds: [] }),
+    folders,
+  );
 });

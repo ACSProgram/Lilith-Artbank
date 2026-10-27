@@ -35,11 +35,11 @@ git diff --check
 - 前端纯函数改动（几何换算、标签筛选范围、排序换算）跑 `npm run test:web`；它用 Node 的类型擦除直接跑 `src/**/model.test.ts`，不引入测试框架依赖。
 - Rust 改动至少跑 cargo check 与 cargo test。
 - 导入改动跑 `cargo test`：包含混合格式入库、精确重复、合并策略、取消一致性与 pack 缺失；性能门槛单独跑 `perf_import_1000`。
-- 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。
+- 浏览/查询改动跑 `cargo test`（键集分页、筛选、排序、搜索、计数、全选 id、集合）与 `perf_metadata_200k`；前端只跑 typecheck/build，网格与筛选的界面行为由用户手工验收。批次 6 之后另有三类断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
 - 元数据/回收站改动跑 `cargo test`：详情、评分/描述、标签增删改、文件夹移动回滚、软删除/恢复/永久删除/清空；文件操作测试只用临时图库。
 - 查看器/几何编辑改动跑 `cargo test`：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同时跑 `npm run test:web`（旋转/翻转对裁剪的映射、尺寸按新基底换算）与 typecheck/build，查看器布局、缩放、裁剪拖拽映射、撤销栈、胶片带与上下张由用户手工验收。
 - MCP 改动跑 `cargo test --lib mcp`：设置迁移与端口校验、Bearer 校验、stateless HTTP initialize/tools/list、selector（分页/全量/相似结果切片/排除格）、搜索总数与 `pageSize` 上限、0 张标签过滤、临时图库只读工具、拼图布局/格子状态/来源标签/缓存、相似 token 失效与命中总数、切档保留端口与口令、24 个工具注册、三档阈值判定与确认过期、`library_info` 三档的 `writeAllowed` / `approval.threshold`、列表游标（`tags_list` 遍历与非法游标、`folders_list` 分页）、标签缺失/排除筛选、`tags_modify` 的权限划分与 `expectedImages` 核对、标签合并的迁移与撤销重做、`dryRun` 的 `willChange` 只算真实改动且全无变化时返回 noop、撤销/重做预览与压缩记录阻断、导入输入与路径预检、`optimize`/`workerThreads` 不透传、导入回执与 `includePairs` 归因数组与截断标记、临时区口径与 `temp_features_generate` 的临时 id 校验、`folders_modify` 四种动作与「AI · 」前缀、审计单行截断与导入来源行总数在前；真实 MCP 客户端、确认卡片、`--mcp-stdio` 小桥、导入与便携目录由用户手工验收，代理不启动应用。
-- AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。
+- AI 改动跑 `cargo test --lib ai::`：客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；另跑 `cargo clippy --all-targets` 与前端 typecheck/build。行指针不再 `JOIN images` 之后，`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。
 - `server/` 只做一次性检查，不加入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。一次性检查命令见下方“AI 服务端”。
 - 大图预览、剪贴板、全屏、AI 服务与语义搜索只能在真实 Tauri 窗口由用户手工验收；代理不启动应用、不截图、不驱动界面。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。

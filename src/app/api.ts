@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { mockLibraryCounts } from "../modules/library/mock";
 import type {
   AppInfo,
+  LibraryCounts,
   LibraryInfo,
   LibraryInspection,
   McpApproval,
@@ -12,7 +13,7 @@ import type {
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const defaultSettings: Settings = {
-  settingsVersion: 6,
+  settingsVersion: 7,
   libraryPath: null,
   ai: {
     baseUrl: "http://127.0.0.1:18766",
@@ -22,6 +23,7 @@ const defaultSettings: Settings = {
     serverScript: "server\\main.py",
     modelPath: "resources\\models",
     clipModelPath: "siglip2-giant-opt-patch16-384",
+    prewarmImports: true,
   },
   performance: {
     readerConnections: 4,
@@ -134,6 +136,19 @@ export const appApi = {
       return mockCurrent;
     }
     return invoke<LibraryInfo | null>("get_library_status");
+  },
+
+  /** 三档计数单独拉取：状态查询只返回缓存，不随每次轮询重算。 */
+  async getLibraryCounts(): Promise<LibraryCounts> {
+    if (!isTauri()) {
+      const counts = mockLibraryCounts();
+      return {
+        imageCount: counts.imageCount,
+        trashCount: counts.trashCount,
+        tempCount: counts.tempCount,
+      };
+    }
+    return invoke<LibraryCounts>("get_library_counts");
   },
 
   async renameLibrary(name: string): Promise<LibraryInfo> {

@@ -17,7 +17,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from clip_cache import CapabilityUnavailable, ClipCache, ClipModelInfo, ModelNotReady
+from clip_cache import (
+    CapabilityUnavailable,
+    ClipCache,
+    ClipModelInfo,
+    ModelNotReady,
+    prewarm_imports,
+)
 from image_io import ImageDecodeError, decode_image
 from pose_engine import PoseEngine
 
@@ -38,6 +44,27 @@ def _torch() -> tuple[Any, Any]:
     except Exception as error:
         raise CapabilityUnavailable(f"无法导入 torch：{error}") from error
     return torch, functional
+
+
+def start_prewarm() -> threading.Thread:
+    """后台预热 torch/transformers 的导入；7-8 s 的成本挪到用户还在看图的时候。"""
+
+    def run() -> None:
+        started = time.monotonic()
+        try:
+            elapsed = prewarm_imports()
+        except Exception as error:
+            LOGGER.warning("预热依赖导入失败（首次使用时会再试一次）：%s", error)
+            return
+        LOGGER.info(
+            "已预热 CLIP 依赖导入：耗时=%.1fs（线程内 %.1fs）",
+            time.monotonic() - started,
+            elapsed,
+        )
+
+    thread = threading.Thread(target=run, name="clip-prewarm", daemon=True)
+    thread.start()
+    return thread
 
 
 class ApiError(Exception):
@@ -393,6 +420,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=300,
         help="CLIP 塔空闲卸载时间；0 表示不自动卸载",
     )
+    parser.add_argument(
+        "--prewarm-imports",
+        action="store_true",
+        help="启动后立即在后台导入 torch/transformers，把首次请求的冷启动成本提前",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
@@ -428,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
         model_dir if model_dir is not None else "(未配置)",
         args.idle_unload_seconds,
     )
+    # 没有模型目录时 AI 能力本来就不可用，不必为它占 420 MB。
+    if args.prewarm_imports and cache.info is not None:
+        start_prewarm()
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

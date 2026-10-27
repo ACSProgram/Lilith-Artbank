@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
 
-pub const SETTINGS_VERSION: u32 = 6;
+pub const SETTINGS_VERSION: u32 = 7;
 /// 操作记录保留步数范围；下限保证撤销至少能回到上一步，上限限制历史库体积。
 pub const MIN_HISTORY_STEPS: u32 = 10;
 pub const MAX_HISTORY_STEPS: u32 = 500;
@@ -125,6 +125,8 @@ pub struct AiSettings {
     pub model_path: Option<String>,
     /// CLIP 模型目录；相对 `model_path`，也可以填绝对路径。
     pub clip_model_path: Option<String>,
+    /// 服务启动后在后台导入 torch/transformers；关掉可省下约 420 MB 常驻内存。
+    pub prewarm_imports: bool,
 }
 
 impl Default for AiSettings {
@@ -137,6 +139,7 @@ impl Default for AiSettings {
             server_script: Some(r"server\main.py".into()),
             model_path: Some(r"resources\models".into()),
             clip_model_path: Some("siglip2-giant-opt-patch16-384".into()),
+            prewarm_imports: true,
         }
     }
 }
@@ -487,6 +490,9 @@ fn parse_settings(bytes: &[u8]) -> AppResult<Settings> {
     if version < 6 {
         value = migrate_v5(value);
     }
+    if version < 7 {
+        value = migrate_v6(value);
+    }
     Ok(serde_json::from_value(value)?)
 }
 
@@ -579,6 +585,22 @@ fn migrate_v5(mut value: serde_json::Value) -> serde_json::Value {
                 })
             })
         });
+    }
+    value
+}
+
+/// v6 → v7：新增 `ai.prewarmImports`（默认开）。字段本身由 `serde(default)` 补齐，
+/// 这里显式写一遍是为了让“默认开”这件事留在迁移链上。
+fn migrate_v6(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "settingsVersion".into(),
+            serde_json::json!(SETTINGS_VERSION),
+        );
+        if let Some(ai) = object.get_mut("ai").and_then(|ai| ai.as_object_mut()) {
+            ai.entry("prewarmImports")
+                .or_insert_with(|| serde_json::json!(true));
+        }
     }
     value
 }
@@ -691,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v6_and_drops_dead_cache_field() {
+    fn migrates_v2_to_current_and_drops_dead_cache_field() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -722,11 +744,11 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));
-        assert!(written.contains("\"settingsVersion\": 6"));
+        assert!(written.contains("\"settingsVersion\": 7"));
     }
 
     #[test]
-    fn migrates_v3_to_v6_and_replaces_executable_path() {
+    fn migrates_v3_to_current_and_replaces_executable_path() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -761,12 +783,12 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("executablePath"));
-        assert!(written.contains("\"settingsVersion\": 6"));
+        assert!(written.contains("\"settingsVersion\": 7"));
         assert!(written.contains("\"maxSteps\": 100"));
     }
 
     #[test]
-    fn migrates_v4_to_v6_and_adds_history_defaults() {
+    fn migrates_v4_to_current_and_adds_history_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -791,12 +813,12 @@ mod tests {
         assert_eq!(loaded.mcp, McpSettings::default());
 
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("\"settingsVersion\": 6"));
+        assert!(written.contains("\"settingsVersion\": 7"));
         assert!(written.contains("\"maxSteps\": 100"));
     }
 
     #[test]
-    fn migrates_v5_to_v6_and_adds_mcp_defaults() {
+    fn migrates_v5_to_current_and_adds_mcp_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -817,11 +839,42 @@ mod tests {
         assert_eq!(loaded.mcp, McpSettings::default());
 
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("\"settingsVersion\": 6"));
+        assert!(written.contains("\"settingsVersion\": 7"));
         assert!(written.contains("\"mcp\""));
         assert!(written.contains("\"enabled\": false"));
         assert!(written.contains("\"port\": 18767"));
         assert!(written.contains("\"mode\": \"ask\""));
+    }
+
+    #[test]
+    fn migrates_v6_to_current_and_enables_import_prewarm() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "settingsVersion": 6,
+                "libraryPath": "G:\\Lilith Image Library",
+                "ai": {
+                    "baseUrl": "http://127.0.0.1:18766",
+                    "port": 18766,
+                    "autoStart": false,
+                    "clipModelPath": "siglip2-test"
+                }
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.settings_version, SETTINGS_VERSION);
+        assert!(!loaded.ai.auto_start, "已有字段保持不变");
+        assert_eq!(loaded.ai.clip_model_path.as_deref(), Some("siglip2-test"));
+        assert!(loaded.ai.prewarm_imports, "v6 升上来默认开启预热");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"prewarmImports\": true"));
     }
 
     #[test]

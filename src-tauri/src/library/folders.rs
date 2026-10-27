@@ -83,6 +83,7 @@ pub fn create_with_id(
         return Err(AppError::message("根目录已经存在"));
     }
     let target = LibraryPaths::new(root).folder_dir(&path);
+    let mut affected_ids: Vec<i64> = Vec::new();
     let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(HistoryKind::FolderCreate, format!("新建文件夹「{path}」")),
@@ -98,6 +99,7 @@ pub fn create_with_id(
             if created.is_empty() {
                 return Err(AppError::message("文件夹已存在"));
             }
+            affected_ids = created.iter().map(|(id, _)| *id).collect();
             let rows: Vec<FolderRef> = created
                 .into_iter()
                 .map(|(id, path)| FolderRef { id, path })
@@ -107,7 +109,7 @@ pub fn create_with_id(
             Ok(())
         },
     )?;
-    Ok((query::list_folders(db)?, operation_id))
+    Ok((query::folder_infos(db, &affected_ids)?, operation_id))
 }
 
 pub fn rename(
@@ -127,6 +129,7 @@ pub fn rename_with_id(
 ) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let name = normalize_folder_name(name)?;
     let paths = LibraryPaths::new(root);
+    let mut affected_ids: Vec<i64> = Vec::new();
     let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(
@@ -184,15 +187,16 @@ pub fn rename_with_id(
             draft.json(&FolderPathChange {
                 id: folder_id_value,
                 old_path,
-                new_path,
+                new_path: new_path.clone(),
                 old_sort_index: sort_index,
                 new_sort_index: sort_index,
             })?;
+            affected_ids = subtree_folder_ids(transaction, &new_path)?;
             draft.affected(1);
             Ok(())
         },
     )?;
-    Ok((query::list_folders(db)?, operation_id))
+    Ok((query::folder_infos(db, &affected_ids)?, operation_id))
 }
 
 pub fn move_to(
@@ -212,6 +216,7 @@ pub fn move_to_with_id(
 ) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
     let paths = LibraryPaths::new(root);
     let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
+    let mut affected_ids: Vec<i64> = Vec::new();
     let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(
@@ -288,16 +293,21 @@ pub fn move_to_with_id(
             };
             draft.json(&FolderPathChange {
                 id: folder_id_value,
-                old_path,
-                new_path,
+                old_path: old_path.clone(),
+                new_path: new_path.clone(),
                 old_sort_index,
                 new_sort_index,
             })?;
+            affected_ids = subtree_folder_ids(transaction, &new_path)?;
+            let old_parent = old_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let new_parent = new_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            affected_ids.extend(ancestor_folder_ids(transaction, old_parent)?);
+            affected_ids.extend(ancestor_folder_ids(transaction, new_parent)?);
             draft.affected(1);
             Ok(())
         },
     )?;
-    Ok((query::list_folders(db)?, operation_id))
+    Ok((query::folder_infos(db, &affected_ids)?, operation_id))
 }
 
 /// 把同一父级下的若干文件夹移动到指定位置；只调整 `sort_index`，不动目录。
@@ -316,6 +326,7 @@ pub fn reorder(
             return Err(AppError::message("文件夹 id 无效或重复"));
         }
     }
+    let mut affected_ids: Vec<i64> = Vec::new();
     history::write(
         db,
         NewOperation::new(HistoryKind::FolderReorder, "调整文件夹顺序"),
@@ -388,11 +399,12 @@ pub fn reorder(
             draft.json(&FolderReorder {
                 rows: old_positions,
             })?;
+            affected_ids = siblings.iter().map(|(id, _, _)| *id).collect();
             draft.affected(changed as u64);
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    query::folder_infos(db, &affected_ids)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -430,6 +442,36 @@ fn is_in_subtree(path: &str, ancestor: &str) -> bool {
     ancestor.is_empty() || path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
+/// 子树内全部文件夹 id（含自身）；空路径表示根，不用于重命名/移动。
+fn subtree_folder_ids(connection: &Connection, path: &str) -> AppResult<Vec<i64>> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM folders
+         WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+    )?;
+    let ids = statement
+        .query_map(params![path, subtree_like_pattern(path)], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// 从根到指定路径（含）的祖先文件夹 id；用于移动后更新两侧祖先的子树计数。
+fn ancestor_folder_ids(connection: &Connection, path: &str) -> AppResult<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut current = Some(path);
+    while let Some(prefix) = current {
+        if let Some(id) = folder_id(connection, prefix)? {
+            ids.push(id);
+        }
+        if prefix.is_empty() {
+            break;
+        }
+        current = Some(parent_path(prefix));
+    }
+    Ok(ids)
+}
+
 fn rollback_renames(done: &[(PathBuf, PathBuf)]) {
     for (old, new) in done.iter().rev() {
         if let Err(error) = std::fs::rename(new, old) {
@@ -463,6 +505,7 @@ pub fn place_many(
     };
     let paths = LibraryPaths::new(root);
     let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut affected_ids: Vec<i64> = Vec::new();
     let result = history::write_with_id(
         db,
         NewOperation::new(
@@ -630,6 +673,15 @@ pub fn place_many(
                     })
                     .collect();
                 draft.sort_changes(&FolderSortChange { rows: sort_rows })?;
+                affected_ids.extend(positions.keys().copied());
+                for (_, old_path, _, new_path, _, _) in &targets {
+                    if old_path == new_path {
+                        continue;
+                    }
+                    affected_ids.extend(subtree_folder_ids(transaction, new_path)?);
+                    affected_ids.extend(ancestor_folder_ids(transaction, parent_path(old_path))?);
+                }
+                affected_ids.extend(ancestor_folder_ids(transaction, &target_parent_path)?);
                 draft.affected(kept.len() as u64);
                 Ok(())
             })();
@@ -645,7 +697,7 @@ pub fn place_many(
         rollback_renames(&done);
     }
     result?;
-    query::list_folders(db)
+    query::folder_infos(db, &affected_ids)
 }
 
 /// 把前端算好的同级顺序写回 `sort_index`；一次操作一条记录。
@@ -676,6 +728,7 @@ pub fn apply_order(
         ""
     };
     let direction = if descending { "降序" } else { "升序" };
+    let mut affected_ids: Vec<i64> = Vec::new();
     history::write_with_id(
         db,
         NewOperation::new(
@@ -748,11 +801,12 @@ pub fn apply_order(
             draft.json(&FolderReorder {
                 rows: changes.iter().map(|(id, old, _)| (*id, *old)).collect(),
             })?;
+            affected_ids = changes.iter().map(|(id, _, _)| *id).collect();
             draft.affected(changes.len() as u64);
             Ok(())
         },
     )?;
-    query::list_folders(db)
+    query::folder_infos(db, &affected_ids)
 }
 
 pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Vec<FolderInfo>> {
@@ -817,7 +871,8 @@ pub fn delete_with_id(
             Ok(())
         },
     )?;
-    Ok((query::list_folders(db)?, operation_id))
+    // 删除只移除一行；调用方按 id 从本地树里剔除，无需重取整棵树。
+    Ok((Vec::new(), operation_id))
 }
 
 /// 按相对路径找文件夹 id；大小写不敏感，与建目录时的解析一致。

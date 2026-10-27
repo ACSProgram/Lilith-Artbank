@@ -7,6 +7,15 @@ import { setThumbCacheLimit } from "../shared/thumbCache";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
 import { errorMessage } from "../shared/errors";
 
+/** 计数不在开库路径上计算；拿到状态后再单独补齐，界面先出现、数字稍后到。 */
+async function withCounts(library: LibraryInfo): Promise<LibraryInfo> {
+  try {
+    return { ...library, ...(await appApi.getLibraryCounts()) };
+  } catch {
+    return library;
+  }
+}
+
 export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const { notify } = useNotices();
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -31,13 +40,13 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
         setSettings(loadedSettings);
         setAppInfo(info);
         if (status) {
-          setCurrent(status);
+          setCurrent(await withCounts(status));
           return;
         }
         if (loadedSettings.libraryPath) {
           try {
             const opened = await appApi.openLibraryPath(loadedSettings.libraryPath);
-            if (!cancelled) setCurrent(opened);
+            if (!cancelled) setCurrent(await withCounts(opened));
           } catch (error) {
             if (!cancelled) {
               notify("上次打开的图库无法加载", "error", errorMessage(error));
@@ -132,10 +141,11 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const createLibrary = useCallback(
     async (name: string, path: string) => {
       const library = await run("正在创建图库", () => appApi.createLibrary(name, path));
-      setCurrent(library);
+      const loaded = await withCounts(library);
+      setCurrent(loaded);
       setSettings(await appApi.getSettings());
       notify(`已创建图库「${library.name}」`, "success");
-      return library;
+      return loaded;
     },
     [notify, run],
   );
@@ -143,10 +153,11 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const openLibrary = useCallback(
     async (path: string) => {
       const library = await run("正在打开图库", () => appApi.openLibraryPath(path));
-      setCurrent(library);
+      const loaded = await withCounts(library);
+      setCurrent(loaded);
       setSettings(await appApi.getSettings());
       notify(`已打开图库「${library.name}」`, "success");
-      return library;
+      return loaded;
     },
     [notify, run],
   );
@@ -177,7 +188,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
 
   const refreshStatus = useCallback(async () => {
     const status = await appApi.getLibraryStatus();
-    setCurrent(status);
+    setCurrent(status ? await withCounts(status) : null);
   }, []);
 
   const value = useMemo<AppRuntime>(

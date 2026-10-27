@@ -44,8 +44,8 @@ use crate::{
             self, DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::{self, OptimizeEstimate},
-        query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
-        service::{self, LibraryInfo, LibrarySession},
+        query::{self, FilterCounts, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        service::{self, LibraryCounts, LibraryInfo, LibrarySession},
         temp,
         thumbs::{self, ThumbPack},
         viewer::PoseData,
@@ -132,20 +132,39 @@ impl AppState {
         })
     }
 
+    /// 返回缓存的状态；计数不再随每次状态查询重算，由 [`Self::counts`] 按需刷新。
     pub fn status(&self) -> AppResult<Option<LibraryInfo>> {
-        let snapshot = self
+        Ok(self
             .library
             .lock()
             .as_ref()
-            .map(|session| (session.info.clone(), session.db.clone()));
-        let Some((mut info, database)) = snapshot else {
-            return Ok(None);
+            .map(|session| session.info.clone()))
+    }
+
+    /// 重算三档计数并写回缓存；前端在开库、数据变化后单独调用。
+    pub fn counts(&self) -> AppResult<LibraryCounts> {
+        let Some((database, library_id)) = self
+            .library
+            .lock()
+            .as_ref()
+            .map(|session| (session.db.clone(), session.info.id.clone()))
+        else {
+            return Err(AppError::message("尚未打开图库"));
         };
         let (image_count, trash_count, temp_count) = database.counts()?;
-        info.image_count = image_count;
-        info.trash_count = trash_count;
-        info.temp_count = temp_count;
-        Ok(Some(info))
+        let mut library = self.library.lock();
+        if let Some(session) = library.as_mut()
+            && session.info.id == library_id
+        {
+            session.info.image_count = image_count;
+            session.info.trash_count = trash_count;
+            session.info.temp_count = temp_count;
+        }
+        Ok(LibraryCounts {
+            image_count,
+            trash_count,
+            temp_count,
+        })
     }
 
     pub fn start_import(
@@ -605,19 +624,15 @@ impl AppState {
     pub fn open_library(&self, path: &Path) -> AppResult<LibraryInfo> {
         self.ensure_no_activity()?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
-        let mut session = service::open(path, read_connections)?;
+        let session = service::open(path, read_connections)?;
         let plan = history::recover_on_open(&session.db)?;
         if let Err(error) = history::cleanup_undo_dirs(&session.db, Path::new(&session.info.path)) {
             log::warn!("清理撤销暂存目录失败：{error}");
         }
-        // 上次退出没能清掉的临时图片在这里补清；计数要按清理后的状态重算。
+        // 上次退出没能清掉的临时图片在这里补清；计数由前端随后单独拉取。
         if let Err(error) = temp::clear(&session.db, Path::new(&session.info.path)) {
             log::warn!("清空临时文件夹失败：{error}");
         }
-        let (image_count, trash_count, temp_count) = session.db.counts()?;
-        session.info.image_count = image_count;
-        session.info.trash_count = trash_count;
-        session.info.temp_count = temp_count;
         let info = session.info.clone();
         self.settings.set_library_path(Some(info.path.clone()))?;
         self.clear_previous_temp();
@@ -783,22 +798,25 @@ impl AppState {
         query::list_folders(&database)
     }
 
-    pub fn create_folder(&self, path: &str) -> AppResult<Vec<FolderInfo>> {
+    pub fn create_folder(&self, path: &str) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         self.mutate(|| folder_service::create(&database, &root, path))
+            .map(folder_change)
     }
 
-    pub fn rename_folder(&self, folder_id: i64, name: &str) -> AppResult<Vec<FolderInfo>> {
+    pub fn rename_folder(&self, folder_id: i64, name: &str) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         self.mutate(|| folder_service::rename(&database, &root, folder_id, name))
+            .map(folder_change)
     }
 
-    pub fn move_folder(&self, folder_id: i64, parent_id: i64) -> AppResult<Vec<FolderInfo>> {
+    pub fn move_folder(&self, folder_id: i64, parent_id: i64) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         self.mutate(|| folder_service::move_to(&database, &root, folder_id, parent_id))
+            .map(folder_change)
     }
 
     pub fn place_folders(
@@ -806,12 +824,13 @@ impl AppState {
         folder_ids: &[i64],
         parent_id: i64,
         sort_index: Option<i64>,
-    ) -> AppResult<Vec<FolderInfo>> {
+    ) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
         self.mutate(|| {
             folder_service::place_many(&database, &root, folder_ids, parent_id, sort_index)
         })
+        .map(folder_change)
     }
 
     pub fn apply_folder_order(
@@ -821,12 +840,13 @@ impl AppState {
         descending: bool,
         recursive: bool,
         orders: &[(i64, Vec<i64>)],
-    ) -> AppResult<Vec<FolderInfo>> {
+    ) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, _) = self.query_source()?;
         self.mutate(|| {
             folder_service::apply_order(&database, folder_id, key, descending, recursive, orders)
         })
+        .map(folder_change)
     }
 
     pub fn reorder_folders(
@@ -834,16 +854,21 @@ impl AppState {
         folder_ids: &[i64],
         parent_id: i64,
         sort_index: i64,
-    ) -> AppResult<Vec<FolderInfo>> {
+    ) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, _) = self.query_source()?;
         self.mutate(|| folder_service::reorder(&database, folder_ids, parent_id, sort_index))
+            .map(folder_change)
     }
 
-    pub fn delete_folder(&self, folder_id: i64) -> AppResult<Vec<FolderInfo>> {
+    pub fn delete_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
         let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        self.mutate(|| folder_service::delete(&database, &root, folder_id))
+        self.mutate(|| folder_service::delete(&database, &root, folder_id))?;
+        Ok(FolderChange {
+            folders: Vec::new(),
+            removed_ids: vec![folder_id],
+        })
     }
 
     pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
@@ -1869,4 +1894,12 @@ fn conflict_error(active: &[TaskSummary]) -> AppError {
         .map(|task| task.label.as_str())
         .unwrap_or("其他任务");
     AppError::message(format!("「{label}」正在进行，请等待完成或取消"))
+}
+
+/// 文件夹写命令只回传受影响的行，前端按 id 就地合并。
+fn folder_change(folders: Vec<FolderInfo>) -> FolderChange {
+    FolderChange {
+        folders,
+        removed_ids: Vec::new(),
+    }
 }

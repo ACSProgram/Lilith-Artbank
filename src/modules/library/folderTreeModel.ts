@@ -1,4 +1,4 @@
-import type { FolderInfo, FolderOrder, FolderSortKey } from "./types";
+import type { FolderChange, FolderInfo, FolderOrder, FolderSortKey } from "./types";
 
 export type { FolderOrder, FolderSortKey } from "./types";
 
@@ -30,6 +30,30 @@ export function folderName(path: string): string {
 export function parentFolderPath(path: string): string {
   const index = path.lastIndexOf("/");
   return index < 0 ? "" : path.slice(0, index);
+}
+
+/**
+ * 把写命令的增量结果合进本地文件夹数组：按 id 替换或追加，删除只剔除 id。
+ * 目录顺序由树模型按 sortIndex/id 重排，这里不关心顺序。
+ */
+export function applyFolderChange(
+  current: FolderInfo[],
+  change: FolderChange,
+): FolderInfo[] {
+  const removed = new Set(change.removedIds);
+  const updates = new Map(change.folders.map((folder) => [folder.id, folder]));
+  const next: FolderInfo[] = [];
+  const seen = new Set<number>();
+  for (const folder of current) {
+    if (removed.has(folder.id)) continue;
+    const update = updates.get(folder.id);
+    next.push(update ?? folder);
+    seen.add(folder.id);
+  }
+  for (const folder of change.folders) {
+    if (!seen.has(folder.id)) next.push(folder);
+  }
+  return next;
 }
 
 export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {

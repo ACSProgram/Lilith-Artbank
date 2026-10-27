@@ -139,9 +139,6 @@ interface LibraryViewProps {
   semanticBlockedReason?: string | null;
 }
 
-/** 涉及文件（文件夹移动、永久删除）的批量上限，与 Rust `MAX_FILE_BATCH_IDS` 保持一致。 */
-const MAX_FILE_BATCH = 10_000;
-
 const THUMB_FITS: { value: ThumbFit; label: string; icon: typeof Crop }[] = [
   { value: "cover", label: "裁剪铺满", icon: Crop },
   { value: "contain", label: "完整显示", icon: Maximize },
@@ -1300,14 +1297,6 @@ export function LibraryView({
   const deleteSelected = useCallback(
     async (ids: number[]): Promise<boolean> => {
       if (ids.length === 0 || viewBusy) return false;
-      if (ids.length > MAX_FILE_BATCH) {
-        notify(
-          "一次永久删除的图片过多",
-          "error",
-          `一次最多 ${MAX_FILE_BATCH.toLocaleString()} 张，请分批处理。`,
-        );
-        return false;
-      }
       const accepted = await confirmDelete(confirm, ids.length);
       if (!accepted) return false;
       setViewBusy(true);
@@ -2370,7 +2359,7 @@ export function LibraryView({
                 {similarityActive
                   ? similarMode
                     ? "正在搜索…"
-                    : "首次搜索需要先加载文本模型，请稍候。"
+                    : (similarity.stage ?? "首次搜索需要先加载文本模型，请稍候。")
                   : "正在读取…"}
               </span>
             </div>

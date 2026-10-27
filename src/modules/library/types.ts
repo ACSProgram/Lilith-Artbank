@@ -123,6 +123,12 @@ export interface FolderInfo {
   totalImageCount: number;
 }
 
+/** 文件夹写命令的增量结果：只含受影响的行，前端按 id 就地合并。 */
+export interface FolderChange {
+  folders: FolderInfo[];
+  removedIds: number[];
+}
+
 export type FolderSortKey = "name" | "total";
 
 export interface FolderOrder {

@@ -139,6 +139,19 @@ test("移动图片离开当前文件夹时剔除选择", () => {
   );
 });
 
+test("文件夹操作带上已更新的树时不再重取整棵树", () => {
+  const local = change({
+    kind: "folder",
+    reason: "moveFolder",
+    fields: ["folder"],
+    foldersAlreadyLoaded: true,
+  });
+  assert.equal(planDataChange(local, query(), context).folders, false);
+
+  const external = change({ kind: "folder", source: "mcp", fields: ["folder"] });
+  assert.equal(planDataChange(external, query(), context).folders, true);
+});
+
 test("直属模式下移动到子文件夹即离开结果，移动到本文件夹保留", () => {
   const current = query({ filters: { folderIds: [2], folderDirect: true } });
   const toChild = change({

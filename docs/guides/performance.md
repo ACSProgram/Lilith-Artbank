@@ -412,6 +412,90 @@ WebView2 中的 150 张冷/热加载已由用户手工确认满足 ≤1s 门槛�
 - 现在的做法：排除条件收敛成 `temp::EXCLUDE_SQL` / `temp::ONLY_SQL` 一处；`COALESCE(…, -1)` 兜住“还没有临时文件夹行”的库，否则 `<> NULL` 会把整库都过滤掉。
 - 注意：这台机器在不同时段整体快慢差近 1.8 倍（同一次改动里 6 级排序在 208 ms 与 352 ms 之间波动），跨时段只能比同一序列内的相对值，不要拿单次绝对值下结论。
 
+### 真实库全表聚合、索引 A/B 与 AI 冷启动（批次 6，2026-10-27）
+
+空闲环境（后台任务已清空，GPU 占用 14%）正式测量。**真实库不写**：基线用只读连接（`mode=ro` + `query_only=1`）；索引 A/B 在系统临时目录的库副本上做（含 76 MB WAL，先 `wal_checkpoint(TRUNCATE)` 1 217 ms），测完副本已删除。方法、全部单次值与局限见[批次 6 记录](../planning/archive/2026-10-27-批次6-性能专项.md)的“四、前置测量”。
+
+真实库 `G:\Lilith Image Library`：390 542 张、463 666 条标签关系、345 541 条 embedding、445 个文件夹 + 1 临时、`library.db` 991.8 MB。Python 3.13 `sqlite3`，每条 5 次取中位数：
+
+| 查询 | 现状 | 加覆盖索引后 |
+| --- | --- | --- |
+| `counts()`（`deleted_at IS NULL` + 临时区排除） | 620.9 ms | **19.7 ms** |
+| `list_folders`（`GROUP BY folder_id`） | 683.4 ms | **27.1 ms** |
+| `list_tags` `LIMIT 100`（旧形状 tags→关系→回表） | 1 162.7 ms | 784.6 ms |
+| `list_tags` 新形状（`image_tags` 聚合 + 回连 `tags`） | 23.7 ms | **23.7 ms** |
+| `image_tags` 覆盖扫描 `GROUP BY tag_id` | 23.9 ms | 23.9 ms |
+| `filter_counts` 无筛选（`MATERIALIZED` 五分支） | 1 815.0 ms | 618–824 ms |
+| `filter_counts` 有文件夹子树筛选（`人体`，约 8.5 万张） | — | **160.1 ms** |
+| `count_tags` | 0.3 ms | 0.3 ms |
+| 首屏 150（`imported_at DESC`） / 按 id 取 150 行 | 0.4 / 0.5 ms | 0.4 / 0.2 ms |
+
+索引成本（`CREATE INDEX idx_images_visible_facets ON images(deleted_at, purge_operation_id, folder_id, file_ext, score)`，390 542 行）：
+
+| 项 | 实测 |
+| --- | --- |
+| 建索引 | 533 ms |
+| 库体积 | 991.9 → 998.8 MB（+7.0 MB） |
+| 1000 行 `UPDATE images SET score` | 建前 50 ms / 建后 24 ms（噪声内） |
+| 1000 行 `UPDATE images SET folder_id` | 建后 40 ms |
+
+SigLIP 冷启动（CPU 版 torch 2.13.0、transformers 4.57.6，进程内计时 + RSS）：
+
+| 阶段 | 耗时 | 累计 RSS |
+| --- | --- | --- |
+| `import torch` | 1.8–2.0 s | 204 MB |
+| `import transformers` | 2.4–2.5 s | 272 MB |
+| 再取 `AutoTokenizer` / `SiglipTextModel` 等具体类 | 3.4–3.5 s | 420 MB |
+| 导入小计 | **7.7–8.0 s** | 420 MB |
+| `AutoTokenizer.from_pretrained` | 0.90 s | — |
+| 读文本塔权重（708 M，fp32，mmap 零拷贝） | 0.01 s | 499 MB |
+| meta 构建 + `load_state_dict(assign=True)` | 0.21 s | 499 MB |
+| **首次 forward**（batch 1、ctx 64） | **2 368 ms** | **2 155 MB** |
+| 第二次 forward | 163 ms | 2 155 MB |
+
+均值与扫描（特征包 364 056 × 1536 fp16，1.12 GB；numpy 单线程代理）：均值遍历 1.15–1.44 s，全库点积 0.90 s。
+
+结论与注意：
+
+- 聚合的查询计划都是 `SEARCH images USING INDEX idx_images_active_pixels (deleted_at=?)`：按像素索引顺序回表 39 万次。换成覆盖索引即 20–27 ms，说明瓶颈是索引形状，不是聚合写法。
+- 20 万行合成库上记录的 69 ms 分面计数**不能代表真实库**；真实库每次全表聚合都要重读约 1 GB。
+- `filter_counts` 剩下的 620–824 ms 全在标签分支：390 000 个活跃 id 与 463 666 条关系求交集，属于这类连接的地板（`CROSS JOIN` 强制顺序只有 5–10% 收益）。有筛选时降到 160 ms。
+- `list_tags` 换形状是纯赚：1 163 → 24 ms，结果逐行相同；前提是处理“回收站/临时区图片的关系行”（当前库里为 0 条，但不能依赖）。
+- SigLIP 的时间几乎全部在导入（7.7–8.0 s，占首次搜索一半以上），而且这段代码在 `/v1/models/ensure` 请求内（`server/clip_cache.py` 的 `_load_locked`）。同一脚本在非空闲环境下是 17 s，说明后台负载能把导入翻倍——这就是“有时一分钟”的放大机制。
+- **“加载完成”不等于“可用”**：`ensure` 只把权重映射成 mmap（RSS 499 MB），首次 forward 才把 2.83 GB 拉进物理内存（2.37 s）。因此 `ensure` 之后必须再做一次 warmup forward。
+- 峰值内存与滚动行为（213 MB JSON / 39 万行、缩略图解码缓存、WebView2 帧率）都需要真实窗口，未测；CUDA 路径与冷盘未测（本机为 CPU 版 torch）。
+
+对照（同一份脚本，非空闲环境，仅用于说明放大量级）：`counts()` 1.96–2.03 s、`list_folders` 2.11–2.18 s、`list_tags` 3.6–6.1 s、`filter_counts` 3.6–5.7 s、导入约 17 s。
+
+### 批次 6 实现后复测：20 万行合成库与均值并行（2026-10-27）
+
+实现完成后在空闲环境（CPU 2%、可用 17.6 GB）补跑两项基准。真实库仍只读，未重跑；本节数字只用于“形状是否退化、索引是否被选中”，**不能替代真实库结论**。
+
+`perf_metadata_200k`（20 万图、10 221 文件夹、200 标签、60 万关系；seed 9.0 s）：
+
+| 项 | 现状（含 v8 索引） | 对照 | 说明 |
+| --- | --- | --- | --- |
+| `counts()` 三档 | 5.75 ms | 去掉索引 5.66 ms | 整库在页缓存里，20 万次回表几乎免费，**看不出真实库的 620 → 20 ms** |
+| `list_folders`（10 221 行） | 17.8–18.1 ms | 去掉索引 58.5–59.1 ms | 3.3×；`GROUP BY folder_id` 直接走索引顺序 |
+| `list_tags_page` 100 | 15.6–17.1 ms | 旧形状 225.3–225.6 ms | 13.5×，与真实库 1 163 → 23.7 同向 |
+| `filter_counts` 无筛选（五分支） | 318.7 / 325.7 ms | 去掉索引 243.1 ms | **合成库上反而慢 30%**，见下 |
+
+- 交替测两轮（有索引 → 去掉 → 重建 → 再有索引）确认 `filter_counts` 的差异可复现，不是测量顺序造成的。合成库整库在页缓存里，回表几乎免费，而这张 5 列覆盖索引比 `idx_images_active_pixels` 宽得多，`matched` 物化要多扫页；真实库（1 GB、39 万次随机回表）上是 1 815 → 620–824 ms，方向相反。**分面收益只能由真实库判断，合成库不作为回归门槛。**
+- `counts()` 的计划在合成库上仍是 `SEARCH images USING COVERING INDEX idx_images_active_pixels (deleted_at=?)`——`count(*)` 不需要列，任何以 `deleted_at` 开头的索引都够用，所以计划文本不能用来断言“新索引被选中”；真实库的差异来自 `folder_id <> temp` 触发的回表。
+- v7 → v8 建索引：**316–319 ms**（含 `ANALYZE`，20 万行）；真实库单条 `CREATE INDEX` 533 ms（39 万行、未含 `ANALYZE`）。`reopen` 16.6–20.2 ms，`counts()` 单独 7.3–7.5 ms——开库不再同步算计数。
+- 其余既有指标未退化：首屏 0.63 ms、深键集页 4.9 ms、子树页 2.0 ms、`selection_tags` 20 万选中 92.3 ms、6 级排序建 id 列表 199 ms、v3→v4 两个索引重建 430–436 ms。
+
+`perf_embedding_scan_200k` 追加均值对比（20 万 × 1536 fp16，同机 16 线程）：
+
+| 项 | 耗时 |
+| --- | --- |
+| 均值：整段单线程 | 417.3 ms |
+| 均值：`rayon` 4096 行分块 | **42.5 ms**（9.8×） |
+| 结果最大差异 | 0.0000（该数据集可精确表示） |
+| 全库点积扫描 | 112.5 ms |
+
+按行数线性外推到真实库 364 056 行：均值约 0.76 s → 0.08 s。计划阶段估的“单线程 2–3 s”偏高，实际单线程只要 0.4 s 量级（`decode_f16` 走批量转换），但并行收益仍然接近线程数。
+
 ### 操作记录、待释放统计与释放（操作记录批次 3，2026-10-25）
 
 `perf_history_200k`（临时 SQLite）：
@@ -456,9 +540,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture p
 11. **子树筛选与树计数达标**。1 万文件夹下子树页 4 ms、`get_folders` 25-29 ms、文件夹分面 62-66 ms；子树条件只展开 `folders` 并命中 `folder_id` 索引，没有退化为逐图路径匹配。文件夹分面已接近 100 ms 上限，筛选面板必须保留加载态。
 12. **7 个排序指标都在预算内**。单级排序 0.66-0.76 ms；多级排序首次建 20 万 id 列表 213 ms，后续翻页与深页都是 0.83 ms，深分页不随页数变慢；文件夹排序走同一条 id 列表通道，20 万行 42 ms。schema v4 的两个新索引让修改时间与像素尺寸也走键集游标。
 13. **操作记录不随图库规模变慢**。500 条记录列表 0.88 ms、裁剪 1.64 ms；20 万行待释放统计 26 ms，标记 2.8 s、数据库删行 26.8 s 都是后台 write lane 任务。
+14. **真实库的“卡”来自索引形状，不是 SQL 写法**。`counts()` 620.9 ms、`list_folders` 683.4 ms、`filter_counts` 1 815.0 ms，计划全是 `idx_images_active_pixels` 回表 39 万次；一张 `(deleted_at, purge_operation_id, folder_id, file_ext, score)` 覆盖索引把前两者降到 19.7 / 27.1 ms，代价只有 +7.0 MB 与 533 ms 建索引。
+15. **标签聚合要换驱动方向**。`list_tags` 从“tags → 关系 → 逐张回表”改成“`image_tags` 覆盖聚合 + 回连 `tags`”，1 162.7 → 23.7 ms 且结果逐行相同；剩下的 `filter_counts` 标签分面（620–824 ms）是 39 万 id 与 46 万关系求交集的地板，靠异步化解决体感，不靠继续调 SQL。
+16. **AI 冷启动的时间几乎全在依赖导入**。`import torch` 1.8–2.0 s + `import transformers` 2.4–2.5 s + 取 SigLIP 具体类 3.4–3.5 s = 7.7–8.0 s（RSS 420 MB），而这段代码在 `/v1/models/ensure` 请求内；后台有负载时同一脚本涨到 17 s。另外 `ensure` 只 mmap 权重（RSS 499 MB），首次 forward 还要 2.37 s 把 2.83 GB 拉进物理内存——所以优化点是“启动时预热导入 + ensure 末尾 warmup forward”，不是缩短模型加载本身。
+17. **合成库只能验证形状，不能验证 I/O**。实现后在同一台空闲机器上用 20 万行合成库复测：`list_folders` 58.5 → 17.9 ms（3.3×）、`list_tags` 225.3 → 16.2 ms（13.5×）、均值 417 → 42.5 ms（9.8×），但 `counts()` 在两态都是 5.7 ms，`filter_counts` 反而从 243 变 319 ms。合成库整库在页缓存里、回表几乎免费，真实库（1 GB、随机 IO）才体现 620 → 20 ms 的收益——**性能结论必须以真实库为准，合成库只用来防止形状退化**。
 
 ## 仍需复测
 
+- **批次 6 剩余项（实现后）**：`refreshKeepingRows` 深滚动后的行数与滚动位置；满滚动（5 000 / 20 000 / 50 000 行）时的进程内存与缩略图解码缓存占用；真实 `python_embeded` + CUDA 下导入/首次 forward 的耗时与 GPU 竞争；冷盘读取 2.83 GB 文本塔权重；v7→v8 迁移在“真实库首次打开”的整体耗时；真实库上 `filter_counts` 加索引后的分面耗时（合成库复现不了，见上一节的 30% 反向差异）。方案见[批次 6 记录](../planning/archive/2026-10-27-批次6-性能专项.md)。**聚合与均值的合成库复测已补**（2026-10-27 空闲环境，见“批次 6 实现后复测”）：`list_folders` 3.3×、`list_tags` 13.5×、均值 9.8×，`counts` 与 `filter_counts` 在合成库上不具代表性。真实库数字仍是改动前测的方案验证数据。
 - 真实库（39 万行）首次打开时 schema v3→v4 建两个索引的耗时（20 万行实测 459 ms，按同量级估算在 1 s 左右）。
 - 真实库（39 万行）文件夹单级排序的首页耗时（20 万行 42 ms，按 id 列表通道线性增长）。
 - 真实 Tauri WebView2 的缩略图冷/热具体耗时与 WebView2 缓存行为；

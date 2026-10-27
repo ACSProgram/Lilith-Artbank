@@ -21,6 +21,46 @@ LOGGER = logging.getLogger("artbank.clip")
 TOWER_PREFIX = {"image": "vision_model.", "text": "text_model."}
 TOWER_LABEL = {"image": "图片塔", "text": "文本塔"}
 
+# 文本塔一次 forward 的上下文长度；与 /v1/embed/text 的 max_length 一致。
+WARMUP_TEXT = "warmup"
+WARMUP_TEXT_LENGTH = 64
+
+
+def import_deps() -> tuple[Any, dict[str, Any]]:
+    """导入 torch 与 transformers 的 SigLIP 具体类，返回 ``(torch, 类字典)``。
+
+    首次 AI 请求的 7.7–8.0 s 几乎全花在这几行。预热与真正加载共用这一处：
+    两边各写一份导入列表时，预热很容易漏掉某个具体类，第一次请求又要多等几秒。
+    """
+    import torch
+    from transformers import (
+        AutoTokenizer,
+        SiglipImageProcessor,
+        SiglipTextConfig,
+        SiglipTextModel,
+        SiglipVisionConfig,
+        SiglipVisionModel,
+    )
+
+    return torch, {
+        "AutoTokenizer": AutoTokenizer,
+        "SiglipImageProcessor": SiglipImageProcessor,
+        "SiglipTextConfig": SiglipTextConfig,
+        "SiglipTextModel": SiglipTextModel,
+        "SiglipVisionConfig": SiglipVisionConfig,
+        "SiglipVisionModel": SiglipVisionModel,
+    }
+
+
+def prewarm_imports() -> float:
+    """把依赖导入成本从“第一次请求”挪到服务启动时，返回耗时（秒）。
+
+    导入失败只记日志：真正的加载会再报一次带上下文的错误。
+    """
+    started = time.monotonic()
+    import_deps()
+    return time.monotonic() - started
+
 
 class CapabilityUnavailable(RuntimeError):
     """模型目录缺失、依赖不可用或加载失败。"""
@@ -114,15 +154,7 @@ class ClipCache:
     def _load_locked(self, kind: str) -> None:
         started = time.monotonic()
         try:
-            import torch
-            from transformers import (
-                AutoTokenizer,
-                SiglipImageProcessor,
-                SiglipTextConfig,
-                SiglipTextModel,
-                SiglipVisionConfig,
-                SiglipVisionModel,
-            )
+            torch, deps = import_deps()
         except Exception as error:
             raise CapabilityUnavailable(f"无法导入 CLIP 依赖：{error}") from error
 
@@ -135,14 +167,16 @@ class ClipCache:
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             dtype = torch.float16 if device.type == "cuda" else torch.float32
             if kind == "image":
-                config = SiglipVisionConfig.from_dict(raw["vision_config"])
-                model_class = SiglipVisionModel
-                processor = SiglipImageProcessor.from_pretrained(self._info.model_dir)
+                config = deps["SiglipVisionConfig"].from_dict(raw["vision_config"])
+                model_class = deps["SiglipVisionModel"]
+                processor = deps["SiglipImageProcessor"].from_pretrained(
+                    self._info.model_dir
+                )
                 expected_dim = int(config.hidden_size)
             else:
-                config = SiglipTextConfig.from_dict(raw["text_config"])
-                model_class = SiglipTextModel
-                processor = AutoTokenizer.from_pretrained(self._info.model_dir)
+                config = deps["SiglipTextConfig"].from_dict(raw["text_config"])
+                model_class = deps["SiglipTextModel"]
+                processor = deps["AutoTokenizer"].from_pretrained(self._info.model_dir)
                 expected_dim = int(config.projection_size)
             # 维度先比，别把不匹配的权重搬上显存再报错。
             if expected_dim != self._info.dim:
@@ -158,6 +192,7 @@ class ClipCache:
             self._restore_position_ids(model, device)
             model.to(device)
             model.eval()
+            warmup = self._warmup_locked(kind, model, processor, config, device, dtype)
         except CapabilityUnavailable:
             raise
         except Exception as error:
@@ -180,13 +215,54 @@ class ClipCache:
                 last_used=time.monotonic(),
             )
         LOGGER.info(
-            "已加载%s：model=%s device=%s dtype=%s 耗时=%.1fs",
+            "已加载%s：model=%s device=%s dtype=%s 耗时=%.1fs（含预热 %.1fs）",
             TOWER_LABEL[kind],
             self._info.model_name,
             device,
             dtype,
             time.monotonic() - started,
+            warmup,
         )
+
+    @staticmethod
+    def _warmup_locked(
+        kind: str,
+        model: Any,
+        processor: Any,
+        config: Any,
+        device: Any,
+        dtype: Any,
+    ) -> float:
+        """加载后立刻跑一次前向。
+
+        权重是按需分页的 mmap，``ensure`` 返回时物理内存里还没有它们；第一次
+        真正的请求要再花几秒把权重读进来。在这里付掉这段时间，“加载完成”才等于
+        “可以直接用”。失败按加载失败处理：连一次前向都跑不通的塔不能算就绪。
+        """
+        import torch
+
+        started = time.monotonic()
+        if kind == "image":
+            size = int(getattr(config, "image_size", 384) or 384)
+            pixel_values = torch.zeros((1, 3, size, size), device=device, dtype=dtype)
+            with torch.inference_mode():
+                model(pixel_values=pixel_values)
+        else:
+            inputs = processor(
+                [WARMUP_TEXT],
+                padding="max_length",
+                max_length=WARMUP_TEXT_LENGTH,
+                truncation=True,
+                return_tensors="pt",
+            )
+            tensors = {
+                name: value.to(device)
+                for name, value in inputs.items()
+                if name in ("input_ids", "attention_mask")
+            }
+            with torch.inference_mode():
+                model(**tensors)
+        return time.monotonic() - started
 
     def _load_tower_state(self, kind: str, device: Any, dtype: Any) -> dict[str, Any]:
         from safetensors import safe_open

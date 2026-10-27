@@ -30,6 +30,7 @@ import { libraryApi } from "./api";
 import { FolderNameDialog, FolderSortDialog } from "./FolderDialogs";
 import {
   ancestorPaths,
+  applyFolderChange,
   buildFolderTree,
   defaultExpandedIds,
   expandedPaths,
@@ -42,7 +43,7 @@ import {
   type FolderNode,
   type FolderSortKey,
 } from "./folderTreeModel";
-import type { FolderInfo } from "./types";
+import type { FolderChange, FolderInfo } from "./types";
 
 interface FolderTreeProps {
   libraryId: string;
@@ -240,11 +241,11 @@ export function FolderTree({
   };
 
   const refreshAfterOperation = useCallback(
-    (next: FolderInfo[]) => {
-      onFoldersChanged(next);
+    (change: FolderChange) => {
+      onFoldersChanged(applyFolderChange(folders, change));
       onDataChanged();
     },
-    [onDataChanged, onFoldersChanged],
+    [folders, onDataChanged, onFoldersChanged],
   );
 
   const createFolder = async (name: string) => {
@@ -253,10 +254,10 @@ export function FolderTree({
     setDialogBusy(true);
     setDialogError(null);
     try {
-      const next = await libraryApi.createFolder(path);
-      refreshAfterOperation(next);
+      const change = await libraryApi.createFolder(path);
+      refreshAfterOperation(change);
       setCreateParent(null);
-      const created = next.find((folder) => folder.path === path);
+      const created = change.folders.find((folder) => folder.path === path);
       if (created) {
         onSelect([created.id]);
         setAnchorId(created.id);
@@ -273,8 +274,8 @@ export function FolderTree({
     setDialogBusy(true);
     setDialogError(null);
     try {
-      const next = await libraryApi.renameFolder(renameTarget.id, name);
-      refreshAfterOperation(next);
+      const change = await libraryApi.renameFolder(renameTarget.id, name);
+      refreshAfterOperation(change);
       setRenameTarget(null);
     } catch (cause) {
       setDialogError(errorMessage(cause));
@@ -292,8 +293,8 @@ export function FolderTree({
     });
     if (!accepted) return;
     try {
-      const next = await libraryApi.deleteFolder(node.id);
-      refreshAfterOperation(next);
+      const change = await libraryApi.deleteFolder(node.id);
+      refreshAfterOperation(change);
       if (selected.has(node.id)) {
         onSelect(selectedFolderIds.filter((id) => id !== node.id));
       }
@@ -304,8 +305,8 @@ export function FolderTree({
 
   const moveFolderTo = async (folderId: number, parentId: number) => {
     try {
-      const next = await libraryApi.moveFolder(folderId, parentId);
-      refreshAfterOperation(next);
+      const change = await libraryApi.moveFolder(folderId, parentId);
+      refreshAfterOperation(change);
       setMoveTarget(null);
     } catch (cause) {
       notify("移动文件夹失败", "error", errorMessage(cause));
@@ -316,8 +317,9 @@ export function FolderTree({
     if (imageIds.length === 0) return;
     try {
       const report = await libraryApi.moveImagesToFolder(imageIds, node?.path ?? "");
-      const next = await libraryApi.getFolders();
-      refreshAfterOperation(next);
+      // 移动图片只改计数，不增删文件夹；直接整树替换一次，比按 id 合并更省事。
+      onFoldersChanged(await libraryApi.getFolders());
+      onDataChanged();
       notify(
         `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`,
         report.failures.length > 0 ? "error" : "success",
@@ -343,14 +345,14 @@ export function FolderTree({
     setSortBusy(true);
     setSortError(null);
     try {
-      const next = await libraryApi.applyFolderOrder(
+      const change = await libraryApi.applyFolderOrder(
         sortTarget.id,
         key,
         descending,
         recursive,
         orders,
       );
-      onFoldersChanged(next);
+      onFoldersChanged(applyFolderChange(folders, change));
       setSortTarget(null);
       const count = orders.reduce((sum, order) => sum + order.folderIds.length, 0);
       notify(`已调整 ${count.toLocaleString()} 个文件夹的顺序`, "success");

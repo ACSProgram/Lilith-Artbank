@@ -409,6 +409,8 @@ export interface SimilarityBrowseState {
   total: number;
   elapsedMs: number;
   busy: boolean;
+  /** 语义搜索当前阶段（加载模型 / 计算均值 / 扫描向量）；再次搜索前会清空。 */
+  stage: string | null;
   error: string | null;
   items: ImageRow[];
   status: "loading" | "ready" | "error";

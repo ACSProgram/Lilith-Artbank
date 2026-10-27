@@ -23,6 +23,7 @@ interface InternalState {
   total: number;
   elapsedMs: number;
   busy: boolean;
+  stage: string | null;
   error: string | null;
   items: ImageRow[];
   status: "loading" | "ready" | "error";
@@ -43,6 +44,7 @@ const INITIAL: InternalState = {
   total: 0,
   elapsedMs: 0,
   busy: false,
+  stage: null,
   error: null,
   items: [],
   status: "ready",
@@ -65,6 +67,28 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
     },
     [],
   );
+
+  // 语义搜索的慢阶段在后端推进；把阶段名显示在加载态里，避免“加载完成”后再次卡住。
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      if (disposed) return;
+      unlisten = await listen<{ stage: string }>("semantic-stage", (event) => {
+        setState((previous) =>
+          previous.busy && previous.mode === "semantic"
+            ? { ...previous, stage: event.payload.stage }
+            : previous,
+        );
+      });
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const clear = useCallback(() => {
     generation.current += 1;
@@ -116,6 +140,7 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
           total: result.total,
           elapsedMs: result.elapsedMs,
           busy: false,
+          stage: null,
           error: null,
           items: page.items,
           status: "ready",

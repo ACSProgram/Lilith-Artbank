@@ -713,6 +713,22 @@ export function SettingsDialog({
                       <small>只在服务地址是本机时启动。</small>
                     </span>
                   </label>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.ai.prewarmImports}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          ai: { ...current.ai, prewarmImports: event.target.checked },
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>启动时预热模型依赖</strong>
+                      <small>服务进程多占约 420 MB，首次搜索少等 8 秒左右。</small>
+                    </span>
+                  </label>
                   <div className="settings-note">路径与端口改动保存后生效。</div>
                   <div className="ai-settings-status">
                     <div>

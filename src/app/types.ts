@@ -15,6 +15,8 @@ export interface AiSettings {
   modelPath: string | null;
   /** CLIP 模型目录；相对 modelPath，也可以填绝对路径。 */
   clipModelPath: string | null;
+  /** 服务启动后在后台导入 torch/transformers；关掉可省下约 420 MB 常驻内存。 */
+  prewarmImports: boolean;
 }
 
 export interface PerformanceSettings {
@@ -117,6 +119,12 @@ export interface LibraryInfo {
   tempCount: number;
   schemaVersion: number;
   openedAt: number;
+}
+
+export interface LibraryCounts {
+  imageCount: number;
+  trashCount: number;
+  tempCount: number;
 }
 
 export interface AppInfo {

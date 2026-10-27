@@ -18,6 +18,16 @@ pub const PREVIEW_PIXELS: u64 = 24_000_000;
 pub const PREVIEW_MAX_EDGE: u32 = 4096;
 const PREVIEW_QUALITY: u8 = 85;
 
+/// `temp/viewer/` 的单次会话上限与清理粒度。
+///
+/// 只有大图、带 EXIF 方向与浏览器不能解码的格式会生成预览；连续浏览这些图
+/// 单次会话可以积累到数 GB。写够 `PREVIEW_SWEEP_BYTES` 才扫一次目录，查看路径
+/// 本身不做 IO。
+const PREVIEW_CACHE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PREVIEW_SWEEP_BYTES: u64 = 256 * 1024 * 1024;
+
+static PREVIEW_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 浏览器可直接解码的格式；其余格式即使不大也需要 Rust 生成预览。
 const BROWSER_FORMATS: [&str; 5] = ["jpeg", "png", "webp", "gif", "bmp"];
 
@@ -152,7 +162,60 @@ fn ensure_preview(paths: &LibraryPaths, row: &ContentRow, source: &Path) -> AppR
     let mut bytes = Vec::new();
     edit::encode(&image, OutputFormat::WebP, PREVIEW_QUALITY, &mut bytes)?;
     write_preview(&target, &bytes)?;
+    note_preview_written(paths, bytes.len() as u64);
     Ok((width, height))
+}
+
+/// 累计写入量到阈值后按 mtime 清理旧预览；失败只记日志，不影响本次查看。
+fn note_preview_written(paths: &LibraryPaths, bytes: u64) {
+    use std::sync::atomic::Ordering;
+
+    let written = PREVIEW_WRITTEN.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if written < PREVIEW_SWEEP_BYTES {
+        return;
+    }
+    PREVIEW_WRITTEN.store(0, Ordering::Relaxed);
+    if let Err(error) = trim_preview_cache(paths) {
+        log::warn!("清理查看器预览缓存失败：{error}");
+    }
+}
+
+fn trim_preview_cache(paths: &LibraryPaths) -> AppResult<()> {
+    let dir = paths.temp.join("viewer");
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        total += metadata.len();
+        entries.push((
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            metadata.len(),
+            entry.path(),
+        ));
+    }
+    if total <= PREVIEW_CACHE_LIMIT_BYTES {
+        return Ok(());
+    }
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in entries {
+        if total <= PREVIEW_CACHE_LIMIT_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    Ok(())
 }
 
 fn write_preview(target: &Path, bytes: &[u8]) -> AppResult<()> {

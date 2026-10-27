@@ -12,6 +12,7 @@
 - **使用反馈整改批次 3（文件夹树与会话状态）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次3-文件夹树与会话状态.md)的“七、用户手工验收”验收。文件夹排序改为右键一次性动作（`apply_folder_order`，一条 `FolderReorder` 记录），树内新增“直属图片 N”虚拟行与 `filters.folderDirect` 直属筛选，多选文件夹可一次拖动（`place_folders` + 排序位回滚 chunk），主窗口位置/大小/最大化交给 `tauri-plugin-window-state` 并在启动后做离屏回退，展开集合按图库存 `localStorage`。
 - **使用反馈整改批次 4（后台任务健壮性与并发）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次4-后台任务健壮性与并发.md)的“七、用户手工验收”验收。长任务冲突时自动排队（同 lane FIFO、`write` 优先、`ai`/`scan` 并行），短写与撤销/重做/清空记录仍快速失败；任务线程 panic、线程起不来或提前返回都落到失败终态并释放 lane；release 移除 `panic = "abort"` 并加全局 panic hook；长任务操作记录由 `LiveOperation`、撤销/重做由 `HistoryRunGuard` 兜底收尾；任务历史只裁剪已结束任务；`HistoryPage` 增加 `storage` 与 `recoveryNeeded`。
 - **使用反馈整改批次 5（MCP 接口一致性与规则自描述）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次5-MCP接口一致性与规则自描述.md)的“七、用户手工验收”验收。`tags_list` / `folders_list` 增加 offset 游标与 `total`（`tags_list` 原本默认 100 条且无总数，真实库 175 个有图标签里 75 个对 AI 不可见），`library_info.mcp` 改为 `writeAllowed` + 结构化 `approval`（阈值只在询问档给出），筛选新增 `tagPresence` / `excludeTagIds` 并在面板加“无标签”，新工具 `tags_modify`（重命名 / 删除 / 合并）与 `tagMerge` 记录，标签管理器补“合并到…”。
+- **使用反馈整改批次 6（性能专项）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次6-性能专项.md)的“十一、实现记录”里的“用户手工验收”验收。schema v8 只加覆盖索引 `idx_images_visible_facets`（`counts` 620.9→19.7 ms、`list_folders` 683.4→27.1 ms，成本 +7.0 MB / 建索引 533 ms）；`list_tags` 换成 `image_tags` 覆盖聚合（1 162.7→23.7 ms，回收站/临时区用有界减法，死亡关系超 5 万退回旧 SQL）；重读命令改 `spawn_blocking`、文件夹写命令返回 `FolderChange` 增量、计数拆出 `get_library_counts`；语义搜索加 `semantic-stage` 阶段事件，`ensure` 末尾 warmup forward，服务启动后台预热依赖导入（设置 v7 的 `ai.prewarmImports`，默认开），均值 `Computing` 时等待不重算并改 rayon 分块累加；行指针去掉 `JOIN images`；刷新按已加载行数重取；`temp/viewer/` 加 2 GB 上限。**实现后已在空闲环境补跑 20 万行合成库基准**：`list_folders` 58.5→17.9 ms、`list_tags` 225.3→16.2 ms、均值 417→42.5 ms（rayon 9.8×），但 `counts` 两态都是 5.7 ms、`filter_counts` 反而 243→319 ms（合成库整库在页缓存里，回表几乎免费），所以分面与计数的收益仍以真实库数字为准；真实库复测与真实窗口验收见[待办](todo.md)。
 - **MCP 图库控制**：应用内 stateless Streamable HTTP 服务（只绑 `127.0.0.1` + 随机 Bearer 口令 + 程序目录的 `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；24 个工具覆盖浏览、搜索、拼图、写入、撤销/重做、任务、导入、临时区特征、文件夹与标签管理；三档权限（只读 / 询问 / 完全）与 10 分钟确认队列；`logs/mcp.log` 审计。永久删除、清空回收站、图片空间优化、像素编辑与普通图库的批量 AI 生成仍不开放。契约见 [MCP 图库控制](../modules/mcp.md)。
 - **临时文件夹**：schema v7 的 `folders.kind = 'temp'`，与回收站同级的会话级暂存区；只能经导入进入，打开、关闭、换库与退出时清空，元数据改动不写操作记录。见[图库与元数据](../modules/library.md#临时文件夹)与[导入与缩略图](../modules/import.md)。
 - **图库操作撤销**：schema v5 的操作记录、线性撤销与重做、延迟释放、`.artbank/undo/` 暂存；评分/描述/标签/集合/相似分组、导入、编辑、移动、文件夹全部接入。见[图库与元数据](../modules/library.md#操作记录与撤销)。
@@ -22,8 +23,8 @@
 ## 基线
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、445 个普通文件夹 + 1 个临时文件夹、556 个标签（175 个有图）、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
-- 存储版本：schema v7（v1→…→v7 链式迁移，v7 新增 `folders.kind` 与唯一的临时文件夹）、设置 v6（v1→…→v6，v6 新增 `mcp`）。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（357 通过、8 ignored）、`npx tsc --noEmit`、`npm run test:web`（52 通过）、`npm run build`、`git diff --check`。
+- 存储版本：schema v8（v1→…→v8 链式迁移，v7 新增 `folders.kind` 与唯一的临时文件夹，v8 只加覆盖索引 `idx_images_visible_facets`）、设置 v7（v1→…→v7，v6 新增 `mcp`，v7 新增 `ai.prewarmImports`）。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
+- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（366 通过、8 ignored）、`npx tsc --noEmit`、`npm run test:web`（54 通过）、`npm run build`、`git diff --check`。
 - 20 万行元数据基准（`perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms；批次 2 的 `selection_tags` 在 2 / 1 千 / 2 万 / 20 万选中下 p50 为 0.21 / 3.13 / 56.13 / 204.95 ms；批次 3 的直属文件夹页 150 p50 0.16 ms、直属总数 0.04 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 
@@ -38,6 +39,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [使用反馈整改 批次 6：性能专项](archive/2026-10-27-批次6-性能专项.md) | 覆盖索引与 `list_tags` 形状、命令异步化与文件夹增量返回、`get_library_counts`、导入预热 + warmup forward、均值等待/rayon、行指针去 `JOIN images`、刷新按行数重取、预览缓存上限；已实现，性能复测与验收未完成。 |
 | [使用反馈整改 批次 5：MCP 接口一致性与规则自描述](archive/2026-10-27-批次5-MCP接口一致性与规则自描述.md) | 列表分页与 `total`、`library_info` 三档规则表达、`tagPresence` / `excludeTagIds`、`tags_modify` 与标签合并、`tagMerge` 记录；已实现，验收未完成。 |
 | [使用反馈整改 批次 4：后台任务健壮性与并发](archive/2026-10-27-批次4-后台任务健壮性与并发.md) | 任务终态兜底与 release unwind、`LiveOperation` / `HistoryRunGuard`、长任务 FIFO 排队与写优先、任务历史裁剪、`HistoryPage.storage` 占用与中断恢复提示；已实现，验收未完成。 |
 | [使用反馈整改 批次 3：文件夹树与会话状态](archive/2026-10-27-批次3-文件夹树与会话状态.md) | 一次性递归排序、直属图片虚拟行与 `folderDirect` 筛选、多选文件夹拖动、批量移动排序位回滚、窗口状态插件与离屏回退、按图库保存展开集合；已实现，验收未完成。 |
