@@ -10,7 +10,7 @@ import {
   Layers,
   Palette,
   PanelRight,
-  Plus,
+  Pencil,
   RotateCcw,
   Sparkles,
   Star,
@@ -22,17 +22,24 @@ import { Button, IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Popover } from "../../shared/components/Popover";
 import { Spinner } from "../../shared/components/Spinner";
+import { TagInput, type TagInputHandle } from "../../shared/components/TagInput";
 import { copyText } from "../../shared/clipboard";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import { useNotices } from "../../app/noticeContext";
 import { libraryApi } from "./api";
+import { useSelectionTags } from "./useSelectionTags";
 import {
   formatBytes,
   formatDate,
   formatDimensions,
   folderLabel,
 } from "./model";
-import type { ColorEntry, FolderInfo, ImageDetails } from "./types";
+import type {
+  ColorEntry,
+  FolderInfo,
+  ImageDetails,
+  SelectionTag,
+} from "./types";
 import type { DataChange } from "./dataChange";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import { errorMessage } from "../../shared/errors";
@@ -40,6 +47,8 @@ import { errorMessage } from "../../shared/errors";
 interface InspectorPanelProps {
   selectedIds: number[];
   version: number;
+  /** 标签关系或标签目录变化时递增；批量标签候选只在它变化时重算。 */
+  tagVersion?: number;
   folders: FolderInfo[];
   currentCollectionId: number | null;
   /** 当前在临时视图：隐藏移动、集合与回收站操作。 */
@@ -67,9 +76,14 @@ function descriptionSourceLabel(source: string): string {
   return "手工";
 }
 
+function searchTagSuggestions(query: string): Promise<string[]> {
+  return libraryApi.searchTags(query, 12).then((tags) => tags.map((tag) => tag.name));
+}
+
 export function InspectorPanel({
   selectedIds,
   version,
+  tagVersion = 0,
   folders,
   currentCollectionId,
   inTemp,
@@ -134,6 +148,7 @@ export function InspectorPanel({
       ) : (
         <BatchInspector
           imageIds={selectedIds}
+          tagVersion={tagVersion}
           folders={folders}
           currentCollectionId={currentCollectionId}
           inTemp={inTemp}
@@ -186,7 +201,7 @@ function ImageInspector({
   collectionScopeLabel,
   onGenerateDescription,
 }: ImageInspectorProps) {
-  const { notify } = useNotices();
+  const { notify, confirm } = useNotices();
   const tagMenuAnchorRef = useRef<HTMLDivElement>(null);
   const [tagMenu, setTagMenu] = useState<{
     id: number;
@@ -199,9 +214,10 @@ function ImageInspector({
   const [busy, setBusy] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [thumbFailed, setThumbFailed] = useState(false);
-  const [descriptionDraft, setDescriptionDraft] = useState("");
-  const [tagDraft, setTagDraft] = useState("");
-  const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
+  /** 未保存描述按图片 id 暂存；切走再回来仍能恢复编辑态。 */
+  const [descriptionDrafts, setDescriptionDrafts] = useState<Map<number, string>>(
+    () => new Map(),
+  );
   const [folderDraft, setFolderDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
@@ -218,7 +234,6 @@ function ImageInspector({
       .then((next) => {
         if (disposed) return;
         setDetail(next);
-        setDescriptionDraft(next.description);
         setFolderDraft(next.folderPath);
         setThumbFailed(false);
       })
@@ -233,31 +248,6 @@ function ImageInspector({
       disposed = true;
     };
   }, [imageId, version]);
-
-  useEffect(() => {
-    const needle = tagDraft.trim();
-    if (!needle) {
-      setTagSuggestions([]);
-      return;
-    }
-    let disposed = false;
-    const timer = window.setTimeout(() => {
-      void libraryApi
-        .searchTags(needle, 12)
-        .then((tags) => {
-          if (disposed) return;
-          const applied = new Set(detail?.tags.map((tag) => tag.name) ?? []);
-          setTagSuggestions(tags.map((tag) => tag.name).filter((name) => !applied.has(name)));
-        })
-        .catch(() => {
-          if (!disposed) setTagSuggestions([]);
-        });
-    }, 160);
-    return () => {
-      disposed = true;
-      window.clearTimeout(timer);
-    };
-  }, [tagDraft, detail?.tags]);
 
   /** 单张写入：操作成功后返回它引起的变化，由图库统一决定谁失效。 */
   const run = useCallback(
@@ -277,28 +267,87 @@ function ImageInspector({
     [busy, notify, onChanged],
   );
 
+  const descriptionDraft = detail ? descriptionDrafts.get(detail.id) : undefined;
+  const editingDescription = descriptionDraft != null;
+  const descriptionDirty =
+    detail != null &&
+    descriptionDraft != null &&
+    descriptionDraft.trim() !== detail.description.trim();
+  const descriptionSource =
+    detail && detail.description.trim()
+      ? descriptionSourceLabel(detail.descriptionSource)
+      : null;
+  const descriptionHeading = [descriptionSource, descriptionDirty ? "未保存" : null]
+    .filter(Boolean)
+    .join(" · ");
+  const aiBlocked =
+    detail != null &&
+    detail.descriptionSource === "user" &&
+    detail.description.trim() !== "";
+
+  /** 写入或丢弃（`null`）某张图的描述草稿；保存与取消都走这里。 */
+  const setDescriptionDraftFor = (id: number, value: string | null) => {
+    setDescriptionDrafts((previous) => {
+      if (value == null && !previous.has(id)) return previous;
+      const next = new Map(previous);
+      if (value == null) next.delete(id);
+      else next.set(id, value);
+      return next;
+    });
+  };
+
+  const startEditingDescription = () => {
+    if (!detail) return;
+    setDescriptionDraftFor(detail.id, detail.description);
+  };
+
+  const cancelDescription = () => {
+    if (!detail) return;
+    setDescriptionDraftFor(detail.id, null);
+  };
+
   const saveDescription = () => {
-    if (!detail || descriptionDraft.trim() === detail.description.trim()) return;
+    if (!detail || descriptionDraft == null) return;
+    const nextDescription = descriptionDraft.trim();
+    if (nextDescription === detail.description.trim()) return;
     void run(async () => {
-      await libraryApi.updateImageDescription(detail.id, descriptionDraft);
+      await libraryApi.updateImageDescription(detail.id, nextDescription);
+      setDetail((previous) =>
+        previous
+          ? {
+              ...previous,
+              description: nextDescription,
+              descriptionSource: "user",
+              descriptionModel: "",
+            }
+          : previous,
+      );
+      setDescriptionDraftFor(detail.id, null);
       return {
         kind: "metadata",
         source: "local",
         reason: "description",
         ids: [detail.id],
         fields: ["description"],
-        descriptionEmpty: descriptionDraft.trim() === "",
+        descriptionEmpty: nextDescription === "",
         similarity: "keep",
       };
     }, "描述已保存");
   };
 
   const generateDescription = async () => {
-    if (!onGenerateDescription || !detail || aiBusy) return;
+    if (!onGenerateDescription || !detail || aiBusy || aiBlocked) return;
+    if (descriptionDirty) {
+      const accepted = await confirm({
+        title: "AI 生成会覆盖当前修改？",
+        message: "当前描述有未保存的修改，AI 生成会用它返回的文本替换并直接保存。",
+        confirmLabel: "生成并保存",
+      });
+      if (!accepted) return;
+    }
     setAiBusy(true);
     try {
       const result = await onGenerateDescription(detail.id);
-      setDescriptionDraft(result.text);
       setDetail((previous) =>
         previous
           ? {
@@ -309,7 +358,8 @@ function ImageInspector({
             }
           : previous,
       );
-      notify("AI 描述已生成", "success");
+      setDescriptionDraftFor(detail.id, null);
+      notify("AI 描述已生成并保存", "success");
       onChanged({
         kind: "metadata",
         source: "local",
@@ -343,21 +393,20 @@ function ImageInspector({
     });
   };
 
-  const addTag = (name: string) => {
-    const trimmed = name.trim();
-    if (!detail || !trimmed) return;
-    if (detail.tags.some((tag) => tag.name.toLowerCase() === trimmed.toLowerCase())) {
-      setTagDraft("");
-      return;
-    }
+  const addTags = (names: string[]) => {
+    if (!detail || names.length === 0) return;
+    const appliedNames = new Set(detail.tags.map((tag) => tag.name.toLowerCase()));
+    const additions = names.filter((name) => {
+      const key = name.trim().toLowerCase();
+      return key !== "" && !appliedNames.has(key);
+    });
+    if (additions.length === 0) return;
     void run(async () => {
       const applied = await libraryApi.setImageTags(detail.id, [
         ...detail.tags.map((tag) => tag.name),
-        trimmed,
+        ...additions,
       ]);
       setDetail((previous) => (previous ? { ...previous, tags: applied } : previous));
-      setTagDraft("");
-      setTagSuggestions([]);
       return {
         kind: "metadata",
         source: "local",
@@ -616,90 +665,24 @@ function ImageInspector({
             </>
           ) : null}
         </Popover>
-        <div className="tag-input-wrap">
-          <input
-            className="input"
-            value={tagDraft}
-            placeholder="输入标签，回车添加"
-            disabled={busy}
-            onChange={(event) => setTagDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                addTag(tagDraft);
-              }
-            }}
-          />
-          <IconButton
-            label="添加标签"
-            disabled={busy || !tagDraft.trim()}
-            onClick={() => addTag(tagDraft)}
-          >
-            <Plus size={13} />
-          </IconButton>
-          {tagSuggestions.length > 0 ? (
-            <div className="tag-suggestions">
-              {tagSuggestions.map((name) => (
-                <button key={name} type="button" onClick={() => addTag(name)}>
-                  {name}
-                </button>
-              ))}
-            </div>
-          ) : null}
-        </div>
+        <TagInput
+          value={[]}
+          onChange={addTags}
+          max={Math.max(0, 64 - detail.tags.length)}
+          maxLabel={64}
+          disabled={busy}
+          exclude={detail.tags.map((tag) => tag.name)}
+          placeholder="输入标签，回车添加"
+          searchSuggestions={searchTagSuggestions}
+        />
       </section>
 
       <section className="inspector-section">
-        <div className="inspector-section-heading">
-          <h4>
-            <FileText size={12} /> 描述
-          </h4>
-          <span>{descriptionSourceLabel(detail.descriptionSource)}</span>
-        </div>
-        <textarea
-          className="input inspector-textarea"
-          value={descriptionDraft}
-          placeholder="记录构图、角色、用途或来源…"
-          disabled={busy}
-          onChange={(event) => setDescriptionDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-              event.preventDefault();
-              saveDescription();
-            }
-          }}
-        />
-        <div className="inspector-inline-actions">
-          <Button
-            size="sm"
-            variant="primary"
-            icon={<Check size={13} />}
-            loading={busy}
-            disabled={descriptionDraft.trim() === detail.description.trim()}
-            onClick={saveDescription}
-          >
-            保存描述
-          </Button>
-          {onGenerateDescription ? (
-            <Button
-              size="sm"
-              variant="secondary"
-              icon={<Sparkles size={13} />}
-              loading={aiBusy}
-              disabled={busy || detail.deletedAt != null}
-              onClick={() => void generateDescription()}
-            >
-              AI 生成
-            </Button>
-          ) : null}
-          <IconButton
-            label="复制描述"
-            disabled={!detail.description}
-            onClick={() => void copy(detail.description, "描述")}
-          >
-            <Copy size={13} />
-          </IconButton>
-        </div>
+        <h4>
+          <Palette size={12} /> 主色
+        </h4>
+        <ColorRow label="4 色" colors={detail.colors4} onCopy={copy} />
+        <ColorRow label="8 色" colors={detail.colors8} onCopy={copy} />
       </section>
 
       {!inTemp ? (
@@ -757,11 +740,94 @@ function ImageInspector({
       ) : null}
 
       <section className="inspector-section">
-        <h4>
-          <Palette size={12} /> 主色
-        </h4>
-        <ColorRow label="4 色" colors={detail.colors4} />
-        <ColorRow label="8 色" colors={detail.colors8} />
+        <div className="inspector-section-heading">
+          <h4>
+            <FileText size={12} /> 描述
+          </h4>
+          {descriptionHeading ? <span>{descriptionHeading}</span> : null}
+        </div>
+        {editingDescription ? (
+          <>
+            <textarea
+              className="input inspector-textarea"
+              value={descriptionDraft ?? ""}
+              placeholder="记录构图、角色、用途或来源…"
+              disabled={busy}
+              onChange={(event) => setDescriptionDraftFor(detail.id, event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  saveDescription();
+                }
+              }}
+            />
+            <div className="inspector-inline-actions">
+              <Button
+                size="sm"
+                variant="primary"
+                icon={<Check size={13} />}
+                loading={busy}
+                disabled={!descriptionDirty}
+                onClick={saveDescription}
+              >
+                保存
+              </Button>
+              {onGenerateDescription ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<Sparkles size={13} />}
+                  loading={aiBusy}
+                  disabled={busy || detail.deletedAt != null || aiBlocked}
+                  title={aiBlocked ? "已有手写描述，AI 不会覆盖" : undefined}
+                  onClick={() => void generateDescription()}
+                >
+                  AI 生成
+                </Button>
+              ) : null}
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy || aiBusy}
+                onClick={cancelDescription}
+              >
+                取消
+              </Button>
+              <IconButton
+                label="复制描述"
+                disabled={!(descriptionDraft ?? "").trim()}
+                onClick={() => void copy(descriptionDraft ?? "", "描述")}
+              >
+                <Copy size={13} />
+              </IconButton>
+            </div>
+          </>
+        ) : (
+          <>
+            {detail.description ? (
+              <div className="inspector-description">{detail.description}</div>
+            ) : (
+              <span className="inspector-empty">还没有描述</span>
+            )}
+            <div className="inspector-inline-actions">
+              <Button
+                size="sm"
+                variant="secondary"
+                icon={<Pencil size={13} />}
+                onClick={startEditingDescription}
+              >
+                编辑描述
+              </Button>
+              <IconButton
+                label="复制描述"
+                disabled={!detail.description}
+                onClick={() => void copy(detail.description, "描述")}
+              >
+                <Copy size={13} />
+              </IconButton>
+            </div>
+          </>
+        )}
       </section>
 
       <section className="inspector-section">
@@ -820,28 +886,91 @@ function ImageInspector({
   );
 }
 
-function ColorRow({ label, colors }: { label: string; colors: ColorEntry[] }) {
+function colorHex(color: ColorEntry): string {
+  return `#${[color.r, color.g, color.b]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()}`;
+}
+
+function ColorRow({
+  label,
+  colors,
+  onCopy,
+}: {
+  label: string;
+  colors: ColorEntry[];
+  onCopy: (text: string, label: string) => void;
+}) {
+  const visible = colors.filter((color) => color.weight > 0);
   return (
     <div className="color-row">
       <span className="color-row-label">{label}</span>
-      <div className="color-swatches">
-        {colors.map((color, index) => (
-          <span
-            key={`${color.r}-${color.g}-${color.b}-${index}`}
-            className="color-swatch"
-            title={`rgb(${color.r}, ${color.g}, ${color.b}) · ${Math.round(
-              (color.weight / 255) * 100,
-            )}%`}
-            style={{ background: `rgb(${color.r} ${color.g} ${color.b})` }}
-          />
-        ))}
-      </div>
+      {visible.length === 0 ? (
+        <span className="inspector-empty">未计算</span>
+      ) : (
+        <div className="color-swatches">
+          {visible.map((color, index) => {
+            const percent = Math.round((color.weight / 255) * 100);
+            const hex = colorHex(color);
+            const title = `${hex} · ${percent}% · rgb(${color.r}, ${color.g}, ${color.b})`;
+            return (
+              <button
+                key={`${hex}-${index}`}
+                type="button"
+                className="color-swatch"
+                title={title}
+                aria-label={`${title}，点击复制`}
+                style={{
+                  background: `rgb(${color.r} ${color.g} ${color.b})`,
+                  flexGrow: color.weight,
+                }}
+                onClick={() => onCopy(hex, "颜色")}
+              />
+            );
+          })}
+        </div>
+      )}
     </div>
+  );
+}
+
+function SelectionTagChip({
+  tag,
+  total,
+  busy,
+  onRemove,
+}: {
+  tag: SelectionTag;
+  total: number;
+  busy: boolean;
+  onRemove: (tag: SelectionTag) => void;
+}) {
+  const common = total > 0 && tag.count >= total;
+  return (
+    <button
+      type="button"
+      className={`tag-chip tag-chip-remove${common ? "" : " is-partial"}`}
+      disabled={busy}
+      title={
+        common
+          ? `全部 ${total.toLocaleString()} 张都有；点击从全部选中图片移除`
+          : `${tag.count.toLocaleString()}/${total.toLocaleString()} 张有；点击从拥有它的图片移除`
+      }
+      onClick={() => onRemove(tag)}
+    >
+      <span className="tag-chip-name">{tag.name}</span>
+      <em className="tag-chip-count">
+        {common ? "全部" : `${tag.count}/${total}`}
+      </em>
+      <X size={10} />
+    </button>
   );
 }
 
 interface BatchInspectorProps {
   imageIds: number[];
+  tagVersion: number;
   folders: FolderInfo[];
   currentCollectionId: number | null;
   inTemp: boolean;
@@ -855,6 +984,7 @@ interface BatchInspectorProps {
 
 function BatchInspector({
   imageIds,
+  tagVersion,
   folders,
   currentCollectionId,
   inTemp,
@@ -868,12 +998,38 @@ function BatchInspector({
   const { notify } = useNotices();
   const [busy, setBusy] = useState(false);
   const [score, setScore] = useState("unset");
-  const [tagAdd, setTagAdd] = useState("");
-  const [tagRemove, setTagRemove] = useState("");
+  const [tagAdd, setTagAdd] = useState<string[]>([]);
+  const [partialQuery, setPartialQuery] = useState("");
+  const tagAddRef = useRef<TagInputHandle>(null);
   const [folderDraft, setFolderDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
   const count = imageIds.length;
+  const {
+    tags: selectionTags,
+    loading: tagsLoading,
+    error: tagsError,
+    retry: retryTags,
+    forget: forgetSelectionTag,
+  } = useSelectionTags(imageIds, tagVersion);
+
+  // 换一批选择时，上一批的暂存标签与搜索词不再适用。
+  useEffect(() => {
+    setTagAdd([]);
+    setPartialQuery("");
+  }, [imageIds]);
+
+  const total = selectionTags?.total ?? count;
+  const selectionTagList = selectionTags?.tags ?? [];
+  const commonTags = selectionTagList.filter((tag) => total > 0 && tag.count >= total);
+  const partialTags = selectionTagList.filter((tag) => tag.count < total);
+  const needle = partialQuery.trim().toLowerCase();
+  const partialMatches = needle
+    ? partialTags.filter((tag) => tag.name.toLowerCase().includes(needle))
+    : partialTags;
+  const visiblePartial = partialMatches.slice(0, 200);
+  const commonTagNames = commonTags.map((tag) => tag.name);
+
   const run = async (
     operation: () => Promise<string>,
     fallback: string,
@@ -914,19 +1070,14 @@ function BatchInspector({
     );
   };
 
-  const splitTags = (value: string) =>
-    value
-      .split(/[,，;；\n]/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-
   const applyAddTags = () => {
-    const names = splitTags(tagAdd);
+    if (busy) return;
+    const names = tagAddRef.current?.commitPending() ?? tagAdd;
     if (names.length === 0) return;
     void run(
       async () => {
         const added = await libraryApi.addTagsToImages(imageIds, names);
-        setTagAdd("");
+        setTagAdd([]);
         return `新增 ${added.toLocaleString()} 个标签关联`;
       },
       "标签已添加",
@@ -942,14 +1093,13 @@ function BatchInspector({
     );
   };
 
-  const applyRemoveTags = () => {
-    const names = splitTags(tagRemove);
-    if (names.length === 0) return;
+  const removeSelectionTag = (tag: SelectionTag) => {
+    if (busy) return;
     void run(
       async () => {
-        const removed = await libraryApi.removeTagsFromImages(imageIds, names);
-        setTagRemove("");
-        return `移除 ${removed.toLocaleString()} 个标签关联`;
+        const removed = await libraryApi.removeTagsFromImages(imageIds, [tag.name]);
+        forgetSelectionTag(tag.name);
+        return `已从 ${removed.toLocaleString()} 张图片移除「${tag.name}」`;
       },
       "标签已移除",
       () => ({
@@ -1055,48 +1205,105 @@ function BatchInspector({
         <h4>
           <Tags size={12} /> 添加标签
         </h4>
+        <TagInput
+          ref={tagAddRef}
+          value={tagAdd}
+          onChange={setTagAdd}
+          max={64}
+          disabled={busy}
+          exclude={commonTagNames}
+          placeholder="输入标签，回车添加"
+          searchSuggestions={searchTagSuggestions}
+          commitOnBlur
+        />
         <div className="inspector-inline-actions">
-          <input
-            className="input"
-            value={tagAdd}
-            placeholder="用逗号分隔多个标签"
-            disabled={busy}
-            onChange={(event) => setTagAdd(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                applyAddTags();
-              }
-            }}
-          />
-          <Button size="sm" loading={busy} disabled={!tagAdd.trim()} onClick={applyAddTags}>
+          <Button
+            size="sm"
+            loading={busy}
+            disabled={tagAdd.length === 0}
+            onClick={applyAddTags}
+          >
             添加
           </Button>
+          {tagAdd.length > 0 ? (
+            <span className="field-hint">将添加 {tagAdd.length} 个标签</span>
+          ) : null}
         </div>
       </section>
 
       <section className="inspector-section">
-        <h4>
-          <Tags size={12} /> 移除标签
-        </h4>
-        <div className="inspector-inline-actions">
-          <input
-            className="input"
-            value={tagRemove}
-            placeholder="用逗号分隔多个标签"
-            disabled={busy}
-            onChange={(event) => setTagRemove(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                applyRemoveTags();
-              }
-            }}
-          />
-          <Button size="sm" loading={busy} disabled={!tagRemove.trim()} onClick={applyRemoveTags}>
-            移除
-          </Button>
+        <div className="inspector-section-heading">
+          <h4>
+            <Tags size={12} /> 移除标签
+          </h4>
+          {tagsLoading ? <Spinner size={12} /> : null}
         </div>
+        {tagsError ? (
+          <div className="tag-load-error">
+            <span>读取选中标签失败：{tagsError}</span>
+            <button type="button" className="text-button" onClick={retryTags}>
+              重试
+            </button>
+          </div>
+        ) : null}
+        {!selectionTags ? (
+          tagsError ? null : (
+            <div className="inspector-tag-state">
+              <Spinner size={12} />
+              <span>正在读取标签…</span>
+            </div>
+          )
+        ) : selectionTagList.length === 0 ? (
+          <span className="inspector-empty">所选图片还没有标签</span>
+        ) : (
+          <>
+            <div className="tag-group-label">
+              全部 {total.toLocaleString()} 张都有
+            </div>
+            {commonTags.length === 0 ? (
+              <span className="inspector-empty">没有共同标签</span>
+            ) : (
+              <div className="tag-chips">
+                {commonTags.map((tag) => (
+                  <SelectionTagChip
+                    key={tag.name}
+                    tag={tag}
+                    total={total}
+                    busy={busy}
+                    onRemove={removeSelectionTag}
+                  />
+                ))}
+              </div>
+            )}
+            {partialTags.length > 0 ? (
+              <details className="selection-tags-partial">
+                <summary>部分图片有 ({partialTags.length})</summary>
+                <input
+                  className="input"
+                  value={partialQuery}
+                  placeholder="查找标签"
+                  onChange={(event) => setPartialQuery(event.target.value)}
+                />
+                <div className="tag-chips">
+                  {visiblePartial.map((tag) => (
+                    <SelectionTagChip
+                      key={tag.name}
+                      tag={tag}
+                      total={total}
+                      busy={busy}
+                      onRemove={removeSelectionTag}
+                    />
+                  ))}
+                </div>
+                {partialMatches.length > visiblePartial.length ? (
+                  <span className="field-hint">
+                    还有 {partialMatches.length - visiblePartial.length} 个，继续输入以缩小范围。
+                  </span>
+                ) : null}
+              </details>
+            ) : null}
+          </>
+        )}
       </section>
 
       {!inTemp ? (

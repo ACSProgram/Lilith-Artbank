@@ -336,6 +336,15 @@ function contentPlan(
 }
 
 /** 数据变化 → 各类界面状态的效果。纯函数，便于测试与复用。 */
+/**
+ * 这次变化是否可能改了标签关系或标签目录；批量侧栏的移除候选只在它为真时重算。
+ * `unknown`（撤销/重做、认不出的外部写入）按“可能改了标签”处理，宁可多算一次。
+ */
+export function touchesTags(change: DataChange): boolean {
+  if (change.kind === "tagCatalog" || change.kind === "unknown") return true;
+  return (change.fields ?? []).includes("tags");
+}
+
 export function planDataChange(
   change: DataChange,
   query: LibraryQuery,

@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 use crate::{
     app::error::AppResult,
     library::{
+        metadata,
         query::{self, LibraryFilters, LibraryQuery, QueryCursor, SortKey, SortSpec},
         service,
     },
@@ -521,6 +522,28 @@ fn perf_metadata_200k() {
         all_ids.len(),
         ms(start.elapsed())
     );
+
+    let selections = [
+        ("2", all_ids.iter().copied().take(2).collect::<Vec<_>>()),
+        ("1k", all_ids.iter().copied().take(1_000).collect()),
+        ("20k", all_ids.iter().copied().take(20_000).collect()),
+        ("200k", all_ids.clone()),
+    ];
+    for (label, selection) in selections {
+        let iterations = if selection.len() > 20_000 { 3 } else { 10 };
+        let mut samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let result = metadata::selection_tags(database, &selection).expect("selection tags");
+            assert_eq!(result.total, selection.len() as u64);
+            samples.push(start.elapsed());
+        }
+        println!(
+            "[perf] selection tags ({label}): p50={:.2}ms p95={:.2}ms",
+            ms(percentile(&samples, 0.5)),
+            ms(percentile(&samples, 0.95))
+        );
+    }
 
     let search_query = LibraryQuery {
         search: "人物速".into(),

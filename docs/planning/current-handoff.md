@@ -8,6 +8,7 @@
 
 - **数据变化与刷新**：所有写入统一成 `DataChange`，由 `planDataChange` 决定列表、选择、文件夹、集合、图库计数、特征、分面、标签选项、详情与相似结果各自失效；排序与数据刷新保留旧行、重取已加载范围并按活动图锚定滚动，只有换结果集才清空与回顶。外部任务/MCP 的范围变化清空选择，相似参考/比较图/查看器活动图主动复核。契约见[浏览与检索](../modules/browse-and-query.md)。
 - **使用反馈整改批次 1（刷新与失效契约）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次1-刷新与失效契约.md)的“九、用户手工验收”验收；验收项在[待办](todo.md)。
+- **使用反馈整改批次 2（详情与批量编辑）**：已实现并归档，自动检查通过，等待用户按[归档记录](archive/2026-10-27-批次2-详情与批量编辑.md)的“七、用户手工验收”验收；新增只读命令 `get_selection_tags`，详情描述改为只读/编辑两态，详情/批量/导入统一 chip 标签输入。
 - **MCP 图库控制**：应用内 stateless Streamable HTTP 服务（只绑 `127.0.0.1` + 随机 Bearer 口令 + 程序目录的 `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；23 个工具覆盖浏览、搜索、拼图、写入、撤销/重做、任务、导入、临时区特征与文件夹管理；三档权限（只读 / 询问 / 完全）与 10 分钟确认队列；`logs/mcp.log` 审计。永久删除、清空回收站、图片空间优化、像素编辑与普通图库的批量 AI 生成仍不开放。契约见 [MCP 图库控制](../modules/mcp.md)。
 - **临时文件夹**：schema v7 的 `folders.kind = 'temp'`，与回收站同级的会话级暂存区；只能经导入进入，打开、关闭、换库与退出时清空，元数据改动不写操作记录。见[图库与元数据](../modules/library.md#临时文件夹)与[导入与缩略图](../modules/import.md)。
 - **图库操作撤销**：schema v5 的操作记录、线性撤销与重做、延迟释放、`.artbank/undo/` 暂存；评分/描述/标签/集合/相似分组、导入、编辑、移动、文件夹全部接入。见[图库与元数据](../modules/library.md#操作记录与撤销)。
@@ -19,8 +20,8 @@
 
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、38 个文件夹、81 649 条 pose、9 个缩略图段），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
 - 存储版本：schema v7（v1→…→v7 链式迁移，v7 新增 `folders.kind` 与唯一的临时文件夹）、设置 v6（v1→…→v6，v6 新增 `mcp`）。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（324 通过、8 ignored）、`npx tsc --noEmit`、`npm run test:web`（41 通过）、`npm run build`、`git diff --check`。
-- 20 万行元数据基准（`perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms。全部数字见 [性能基准](../guides/performance.md)。
+- 自动检查（本阶段收尾）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（327 通过、8 ignored）、`npx tsc --noEmit`、`npm run test:web`（45 通过）、`npm run build`、`git diff --check`。
+- 20 万行元数据基准（`perf_metadata_200k`）：单级排序首页 0.66-0.76 ms（文件夹 42 ms，走 id 列表）、6 级排序首次建 id 列表 213 ms、后续翻页 0.83 ms、offset 199 850 的深页 0.83 ms；批次 2 的 `selection_tags` 在 2 / 1 千 / 2 万 / 20 万选中下 p50 为 0.21 / 3.13 / 56.13 / 204.95 ms。全部数字见 [性能基准](../guides/performance.md)。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 
 ## 约束

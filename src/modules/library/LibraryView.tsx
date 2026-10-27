@@ -96,6 +96,7 @@ import {
   combinePlans,
   planDataChange,
   selectionAfterChange,
+  touchesTags,
   type DataChange,
   type DataChangeSignal,
 } from "./dataChange";
@@ -236,6 +237,7 @@ export function LibraryView({
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [selectingAll, setSelectingAll] = useState(false);
   const [detailVersion, setDetailVersion] = useState(0);
+  const [tagVersion, setTagVersion] = useState(0);
   const [facetVersion, setFacetVersion] = useState(0);
   const [tagOptionsVersion, setTagOptionsVersion] = useState(0);
   const [featureVersion, setFeatureVersion] = useState(0);
@@ -619,6 +621,9 @@ export function LibraryView({
       if (plan.features) setFeatureVersion((value) => value + 1);
       if (plan.facets) setFacetVersion((value) => value + 1);
       if (plan.tagOptions) setTagOptionsVersion((value) => value + 1);
+      if (meaningful.some(touchesTags)) {
+        setTagVersion((value) => value + 1);
+      }
       if (plan.detail) setDetailVersion((value) => value + 1);
       if (plan.folders || plan.collections || plan.status || plan.detail) {
         setFindSimilarContextVersion((value) => value + 1);
@@ -2453,6 +2458,7 @@ export function LibraryView({
           <InspectorPanel
             selectedIds={selectedIds}
             version={detailVersion}
+            tagVersion={tagVersion}
             folders={folders}
             currentCollectionId={effectiveCollectionId}
             inTemp={effectiveView === "temp"}

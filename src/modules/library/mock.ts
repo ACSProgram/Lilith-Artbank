@@ -19,6 +19,8 @@ import type {
   LibraryQuery,
   MoveReport,
   QueryCursor,
+  SelectionTag,
+  SelectionTags,
   SortKey,
   TagCount,
   TagInfo,
@@ -590,6 +592,27 @@ export function mockRemoveTags(ids: number[], names: string[]): number {
     removed += before - image.tags.length;
   }
   return removed;
+}
+
+export function mockSelectionTags(ids: number[]): SelectionTags {
+  const unique = [...new Set(ids)];
+  const counts = new Map<string, number>();
+  for (const id of unique) {
+    const image = mockImages.find((item) => item.id === id);
+    if (!image) continue;
+    for (const name of image.tags) {
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+  }
+  const tags: SelectionTag[] = [...counts].map(([name, count]) => {
+    const tag = tagState.find((item) => item.name === name);
+    return { id: tag?.id ?? 0, name, count };
+  });
+  tags.sort(
+    (left, right) =>
+      right.count - left.count || left.name.localeCompare(right.name, "zh-Hans-CN"),
+  );
+  return { total: unique.length, tags };
 }
 
 export function mockRenameTag(tagId: number, name: string): void {

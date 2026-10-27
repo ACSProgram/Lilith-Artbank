@@ -15,6 +15,7 @@ import {
   needsCursorRefresh,
   planDataChange,
   selectionAfterChange,
+  touchesTags,
   type DataChange,
 } from "./dataChange.ts";
 
@@ -257,4 +258,14 @@ test("合并计划取最保守的动作", () => {
   assert.equal(merged.list, "refresh");
   assert.equal(merged.selection, "clear");
   assert.equal(merged.similarity, "clear");
+});
+
+test("标签候选只随标签变化与未知变化重算", () => {
+  assert.equal(touchesTags(change({ fields: ["tags"] })), true);
+  assert.equal(touchesTags(change({ kind: "tagCatalog" })), true);
+  // 撤销/重做与认不出的外部写入可能改了标签，按保守口径重算。
+  assert.equal(touchesTags(change({ kind: "unknown" })), true);
+  assert.equal(touchesTags(change({ fields: ["score", "description"] })), false);
+  assert.equal(touchesTags(change({ kind: "folder", fields: ["folder"] })), false);
+  assert.equal(touchesTags(change({ kind: "features", feature: "pose" })), false);
 });

@@ -2949,6 +2949,88 @@ textarea:focus-visible {
   color: var(--accent);
 }
 
+.tag-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tag-editor-chips {
+  margin-bottom: 0;
+}
+
+.tag-group-label {
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+/* 批量移除候选：chip 自身就是按钮，按钮不继承字体，需要显式重置。 */
+.tag-chip-remove {
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.tag-chip-remove:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.tag-chip-remove.is-partial {
+  border-color: var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.tag-chip-count {
+  color: var(--text-faint);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.tag-load-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+.inspector-tag-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.selection-tags-partial {
+  margin-top: 7px;
+}
+
+.selection-tags-partial summary {
+  margin-bottom: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.selection-tags-partial .input {
+  width: 100%;
+  height: 26px;
+  margin-bottom: 5px;
+  font-size: 10.5px;
+}
+
+.inspector-description {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .inspector-textarea {
   width: 100%;
   min-height: 84px;
@@ -2996,8 +3078,15 @@ textarea:focus-visible {
   flex: 1;
   min-width: 14px;
   height: 18px;
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: 3px;
+  cursor: pointer;
+}
+
+.color-swatch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .inspector-facts {

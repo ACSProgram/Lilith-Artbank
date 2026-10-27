@@ -128,6 +128,19 @@ export interface TagRef {
   name: string;
 }
 
+/** 选中集合内某个标签的拥有数；不是全库数量。 */
+export interface SelectionTag {
+  id: number;
+  name: string;
+  count: number;
+}
+
+export interface SelectionTags {
+  /** 去重后的选中图片数，用于判断“全部都有”。 */
+  total: number;
+  tags: SelectionTag[];
+}
+
 export interface ColorEntry {
   r: number;
   g: number;

@@ -34,6 +34,7 @@ import {
   mockReorderFolders,
   mockRestoreImages,
   mockSearchTags,
+  mockSelectionTags,
   mockSetImageTags,
   mockSetScores,
   mockTags,
@@ -56,6 +57,7 @@ import type {
   ImageState,
   LibraryQuery,
   MoveReport,
+  SelectionTags,
   TagInfo,
   TagRef,
 } from "./types";
@@ -138,6 +140,13 @@ export const libraryApi = {
     if (imageIds.length === 0) return [];
     if (!isTauri()) return mockImageStates(imageIds);
     return invoke<ImageState[]>("get_image_states", { imageIds });
+  },
+
+  /** 选中集合内各标签的拥有数；只用于批量标签候选。 */
+  async getSelectionTags(imageIds: number[]): Promise<SelectionTags> {
+    if (imageIds.length === 0) return { total: 0, tags: [] };
+    if (!isTauri()) return mockSelectionTags(imageIds);
+    return invoke<SelectionTags>("get_selection_tags", { imageIds });
   },
 
   async updateImageScore(imageId: number, score: number): Promise<void> {

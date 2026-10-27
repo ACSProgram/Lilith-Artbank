@@ -5,6 +5,7 @@ import { Button } from "../../shared/components/Button";
 import { Field } from "../../shared/components/Field";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Modal } from "../../shared/components/Modal";
+import { TagInput, type TagInputHandle } from "../../shared/components/TagInput";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import { formatBytes } from "../../shared/format";
 import { confirmImportOptimize } from "../../shared/confirm";
@@ -41,6 +42,8 @@ interface ImportDialogProps {
   /** 导入到临时文件夹时不写操作记录、不建目录层级，关闭图库时清空。 */
   target?: ImportTarget;
   folders: ImportFolder[];
+  /** 标签自动补全；由 app 层注入，避免 import 模块依赖 library 模块。 */
+  searchTags?: (query: string) => Promise<string[]>;
   onClose: () => void;
   onFinished: () => void;
 }
@@ -48,13 +51,6 @@ interface ImportDialogProps {
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
-}
-
-function parseTags(value: string): string[] {
-  return value
-    .split(/[,，;；\s]+/)
-    .map((tag) => tag.trim())
-    .filter(Boolean);
 }
 
 function phaseLabel(phase: ImportPhase): string {
@@ -92,6 +88,7 @@ export function ImportDialog({
   initialFolder = "",
   target = "library",
   folders,
+  searchTags,
   onClose,
   onFinished,
 }: ImportDialogProps) {
@@ -101,7 +98,8 @@ export function ImportDialog({
   const [folder, setFolder] = useState("");
   const [folderMode, setFolderMode] = useState<FolderMode>("flat");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
-  const [tagsText, setTagsText] = useState("");
+  const [tags, setTags] = useState<string[]>([]);
+  const tagInputRef = useRef<TagInputHandle>(null);
   const [score, setScore] = useState(0);
   const [policy, setPolicy] = useState<DuplicatePolicy>("skip");
   const [optimizeEnabled, setOptimizeEnabled] = useState(false);
@@ -154,7 +152,7 @@ export function ImportDialog({
     setFolder(temp ? "" : initialFolderRef.current);
     setFolderMode("flat");
     setFolderPickerOpen(false);
-    setTagsText("");
+    setTags([]);
     setScore(0);
     setPolicy("skip");
     setOptimizeEnabled(false);
@@ -273,6 +271,7 @@ export function ImportDialog({
       setError("请先选择图片或目录");
       return;
     }
+    const pendingTags = tagInputRef.current?.commitPending() ?? tags;
     if (!temp && optimizeEnabled) {
       const accepted = await confirmImportOptimize(confirm, paths.length);
       if (!accepted) return;
@@ -285,7 +284,7 @@ export function ImportDialog({
         target,
         folder: temp ? "" : folder.trim(),
         folderMode: temp ? "flat" : folderMode,
-        tags: parseTags(tagsText),
+        tags: pendingTags,
         score,
         duplicatePolicy: temp ? "skip" : policy,
         perceptualThreshold: 6,
@@ -440,12 +439,15 @@ export function ImportDialog({
             </Field>
           </div>
 
-          <Field label="初始标签" hint="用逗号或空格分隔，最多 32 个">
-            <input
-              className="input"
-              value={tagsText}
-              placeholder="例如 速写 人物 参考"
-              onChange={(event) => setTagsText(event.target.value)}
+          <Field label="初始标签" hint="最多 32 个">
+            <TagInput
+              ref={tagInputRef}
+              value={tags}
+              onChange={setTags}
+              max={32}
+              placeholder="输入标签，回车添加"
+              searchSuggestions={searchTags}
+              commitOnBlur
             />
           </Field>
 

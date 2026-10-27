@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -24,6 +24,10 @@ use crate::{
 };
 
 const SQL_CHUNK: usize = 400;
+const SELECTION_TAG_CHUNK: usize = 4_000;
+/// 关系数超过“选中数 × 该系数”时，分块探测比全表扫描便宜。阈值校准见
+/// `docs/guides/performance.md` 的“选中标签聚合”。
+const SELECTION_TAG_SCAN_FACTOR: i64 = 16;
 const MAX_BATCH_IDS: usize = 1_000_000;
 const MAX_FILE_BATCH_IDS: usize = 10_000;
 const MAX_STATE_IDS: usize = 1_000;
@@ -52,6 +56,23 @@ pub struct ColorEntry {
 pub struct TagRef {
     pub id: i64,
     pub name: String,
+}
+
+/// 选中集合内某个标签的拥有数；不是全库数量。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionTag {
+    pub id: i64,
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionTags {
+    /// 去重后的选中图片数，用于判断“全部都有”。
+    pub total: u64,
+    pub tags: Vec<SelectionTag>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,6 +238,118 @@ pub fn image_states(database: &LibraryDb, image_ids: &[i64]) -> AppResult<Vec<Im
         }
         Ok(states)
     })
+}
+
+/// 选中集合内各标签的拥有数。小选择按 id 分块探测；大选择扫描关系表并用集合过滤。
+pub fn selection_tags(database: &LibraryDb, image_ids: &[i64]) -> AppResult<SelectionTags> {
+    if image_ids.is_empty() {
+        return Ok(SelectionTags {
+            total: 0,
+            tags: Vec::new(),
+        });
+    }
+    let ids = validate_ids(image_ids, MAX_BATCH_IDS)?;
+    let total = ids.len() as u64;
+    database.with_reader(|connection| {
+        let relation_count: i64 =
+            connection.query_row("SELECT count(*) FROM image_tags", [], |row| row.get(0))?;
+        let counts = if prefer_chunked_probe(relation_count, ids.len()) {
+            count_selection_tags_by_chunk(connection, &ids)?
+        } else {
+            count_selection_tags_by_scan(connection, &ids)?
+        };
+        if counts.is_empty() {
+            return Ok(SelectionTags {
+                total,
+                tags: Vec::new(),
+            });
+        }
+
+        let mut names = tag_names(connection, counts.keys().copied())?;
+        let mut tags: Vec<SelectionTag> = counts
+            .into_iter()
+            .filter_map(|(id, count)| {
+                names
+                    .remove(&id)
+                    .map(|name| SelectionTag { id, name, count })
+            })
+            .collect();
+        tags.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        Ok(SelectionTags { total, tags })
+    })
+}
+
+/// 关系表远大于选择时，逐块主键探测比整表扫描便宜。
+fn prefer_chunked_probe(relation_count: i64, selection: usize) -> bool {
+    relation_count > (selection as i64).saturating_mul(SELECTION_TAG_SCAN_FACTOR)
+}
+
+/// 小块主键探测：按 `SELECTION_TAG_CHUNK` 分块聚合，再在内存里合并计数。
+fn count_selection_tags_by_chunk(
+    connection: &Connection,
+    ids: &[i64],
+) -> AppResult<HashMap<i64, u64>> {
+    let mut counts: HashMap<i64, u64> = HashMap::new();
+    for chunk in ids.chunks(SELECTION_TAG_CHUNK) {
+        let marks = placeholders(chunk.len());
+        let mut statement = connection.prepare(&format!(
+            "SELECT tag_id, count(*) FROM image_tags
+             WHERE image_id IN ({marks}) GROUP BY tag_id"
+        ))?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (tag_id, count) = row?;
+            *counts.entry(tag_id).or_insert(0) += count as u64;
+        }
+    }
+    Ok(counts)
+}
+
+/// 关系表一次覆盖索引扫描：SQL 侧不按选择过滤，只在 Rust 侧统计选中的图片。
+fn count_selection_tags_by_scan(
+    connection: &Connection,
+    ids: &[i64],
+) -> AppResult<HashMap<i64, u64>> {
+    let selected: HashSet<i64> = ids.iter().copied().collect();
+    let mut counts: HashMap<i64, u64> = HashMap::new();
+    let mut statement = connection.prepare("SELECT image_id, tag_id FROM image_tags")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (image_id, tag_id) = row?;
+        if selected.contains(&image_id) {
+            *counts.entry(tag_id).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// 按 id 批量取标签名；关系表里引用了已删除标签的 id 会缺席。
+fn tag_names(
+    connection: &Connection,
+    tag_ids: impl Iterator<Item = i64>,
+) -> AppResult<HashMap<i64, String>> {
+    let tag_ids: Vec<i64> = tag_ids.collect();
+    let mut names: HashMap<i64, String> = HashMap::new();
+    for chunk in tag_ids.chunks(SQL_CHUNK) {
+        let marks = placeholders(chunk.len());
+        let mut statement =
+            connection.prepare(&format!("SELECT id, name FROM tags WHERE id IN ({marks})"))?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, name) = row?;
+            names.insert(id, name);
+        }
+    }
+    Ok(names)
 }
 
 fn parse_palette(bytes: &[u8]) -> Vec<ColorEntry> {
@@ -1564,6 +1697,62 @@ mod tests {
 
         let too_many: Vec<i64> = (1..=1_001).collect();
         assert!(image_states(&fixture.session.db, &too_many).is_err());
+    }
+
+    #[test]
+    fn selection_tags_reports_common_and_partial_counts() {
+        let fixture = fixture();
+        let first = insert_image(&fixture, "s1", "jpg", 0, fixture.folder);
+        let second = insert_image(&fixture, "s2", "jpg", 0, fixture.folder);
+        let third = insert_image(&fixture, "s3", "jpg", 0, fixture.folder);
+        set_image_tags(&fixture.session.db, first, &["共同".into(), "仅一".into()]).unwrap();
+        set_image_tags(&fixture.session.db, second, &["共同".into(), "甲".into()]).unwrap();
+        set_image_tags(&fixture.session.db, third, &["共同".into(), "乙".into()]).unwrap();
+
+        let result = selection_tags(&fixture.session.db, &[first, second, third, first]).unwrap();
+        assert_eq!(result.total, 3);
+        assert_eq!(result.tags[0].name, "共同");
+        assert_eq!(result.tags[0].count, 3);
+        let partial: Vec<_> = result.tags.iter().filter(|tag| tag.count < 3).collect();
+        assert_eq!(partial.len(), 3);
+        assert!(partial.iter().all(|tag| tag.count == 1));
+    }
+
+    #[test]
+    fn selection_tags_uses_chunk_path_for_dense_selection() {
+        let fixture = fixture();
+        let first = insert_image(&fixture, "d1", "jpg", 0, fixture.folder);
+        let second = insert_image(&fixture, "d2", "jpg", 0, fixture.folder);
+        let first_tags: Vec<String> = (0..64).map(|index| format!("标签{index:02}")).collect();
+        let second_tags: Vec<String> = (32..96).map(|index| format!("标签{index:02}")).collect();
+        set_image_tags(&fixture.session.db, first, &first_tags).unwrap();
+        set_image_tags(&fixture.session.db, second, &second_tags).unwrap();
+
+        let result = selection_tags(&fixture.session.db, &[first, second]).unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(result.tags.len(), 96);
+        assert_eq!(result.tags.iter().filter(|tag| tag.count == 2).count(), 32);
+        assert_eq!(result.tags.iter().filter(|tag| tag.count == 1).count(), 64);
+    }
+
+    #[test]
+    fn selection_tags_handles_empty_and_invalid_ids() {
+        let fixture = fixture();
+        let empty = selection_tags(&fixture.session.db, &[]).unwrap();
+        assert_eq!(empty.total, 0);
+        assert!(empty.tags.is_empty());
+        assert!(selection_tags(&fixture.session.db, &[0]).is_err());
+
+        let too_many: Vec<i64> = (1..=1_000_001).collect();
+        assert!(selection_tags(&fixture.session.db, &too_many).is_err());
+    }
+
+    #[test]
+    fn chunked_probe_only_wins_for_sparse_relations() {
+        // 60 万条关系：2 万选中走分块，20 万选中走扫描。
+        assert!(prefer_chunked_probe(600_000, 20_000));
+        assert!(!prefer_chunked_probe(600_000, 200_000));
+        assert!(!prefer_chunked_probe(0, 0));
     }
 
     #[test]

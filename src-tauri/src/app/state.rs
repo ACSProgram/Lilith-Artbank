@@ -40,7 +40,9 @@ use crate::{
         folders as folder_service,
         history::{self, HistoryKind, HistoryPage, NewOperation, RecoveryPlan},
         manifest::{LibraryInspection, inspect},
-        metadata::{self, DeleteReport, ImageDetails, ImageState, MoveReport, TagRef},
+        metadata::{
+            self, DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef,
+        },
         optimize_estimate::{self, OptimizeEstimate},
         query::{self, FilterCounts, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryInfo, LibrarySession},
@@ -818,6 +820,11 @@ impl AppState {
     pub fn image_states(&self, image_ids: &[i64]) -> AppResult<Vec<ImageState>> {
         let (database, _) = self.query_source()?;
         metadata::image_states(&database, image_ids)
+    }
+
+    pub fn selection_tags(&self, image_ids: &[i64]) -> AppResult<SelectionTags> {
+        let (database, _) = self.query_source()?;
+        metadata::selection_tags(&database, image_ids)
     }
 
     pub fn update_image_score(&self, image_id: i64, score: i64) -> AppResult<()> {
