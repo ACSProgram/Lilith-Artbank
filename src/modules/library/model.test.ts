@@ -7,6 +7,7 @@ import {
   defaultBrowseState,
   effectiveSort,
   emptyFilters,
+  imageActions,
   normalizeFilters,
   rowInTagScope,
   sortForViewChange,
@@ -211,6 +212,11 @@ test("sort summary names the first levels", () => {
     ]),
     "评分 ↓ + 导入时间 ↑ +1",
   );
+});
+
+test("trash actions follow the view, not the row state", () => {
+  assert.deepEqual(imageActions(false), ["trash"]);
+  assert.deepEqual(imageActions(true), ["restore", "delete"]);
 });
 
 test("rowInTagScope matches folder subtrees and trash state", () => {

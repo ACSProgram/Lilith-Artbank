@@ -221,6 +221,13 @@ export function hasActiveQuery(state: BrowseState): boolean {
   return state.search.trim().length > 0 || hasActiveFilters(state.filters);
 }
 
+export type ImageAction = "trash" | "restore" | "delete";
+
+/** 详情、批量与查看器共用：回收站视图只给恢复/永久删除，普通视图只给移入回收站。 */
+export function imageActions(inTrash: boolean): ImageAction[] {
+  return inTrash ? ["restore", "delete"] : ["trash"];
+}
+
 export function toggleValue<T>(values: T[], value: T): T[] {
   return values.includes(value)
     ? values.filter((item) => item !== value)

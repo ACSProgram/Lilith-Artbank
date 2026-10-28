@@ -361,7 +361,7 @@ export function ImportDialog({
             ? "原图会复制到临时文件夹，关闭、切换图库或退出应用时清空。"
             : "原图会复制到图库，源文件不动。"
           : view === "running"
-            ? "任务在后台执行，可以继续使用其他功能。"
+            ? "导入完成前无法使用其他功能，可以取消导入。"
             : undefined
       }
       width={660}
@@ -588,10 +588,9 @@ export function ImportDialog({
         <div className="import-progress">
           {view === "running" ? (
             <div className="import-progress-heading">
-              <div>
-                <strong>{phaseLabel(progress?.phase ?? "processing")}</strong>
-                <span>{progress?.current ? basename(progress.current) : "准备中…"}</span>
-              </div>
+              <strong title={progress?.current}>
+                {progress?.current ? basename(progress.current) : "准备中…"}
+              </strong>
               <em>{percent}%</em>
             </div>
           ) : null}

@@ -1,6 +1,6 @@
 # 当前阶段状态
 
-日期：2026-10-27
+日期：2026-10-28
 
 本文件只写“现在”：当前生效的能力、基线与约束。未完成、未验收与待决策事项只写在[待办与待决策](todo.md)；后续阶段见[路线图](roadmap.md)；历史记录见[规划归档](archive/README.md)。没有进行中的批次。
 
@@ -24,7 +24,7 @@
 - 图库：主库 `G:\Lilith Image Library`（390 542 张、445 个普通文件夹 + 1 个临时文件夹、556 个标签（175 个有图）、81 649 条 pose、9 个缩略图段、345 541 条 embedding、`library.db` 991.8 MB），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
 - 压缩候选：主库 274 068 张 / 467.44 GB / 1 939.08 GP；默认 200 张档位只覆盖候选体积的 0.078%，`s5`（有损源 bpp ≥ 0.50）一层占候选体积 82.8%。
 - 存储版本：schema v8、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（文档整理前一轮）：`cargo fmt --check`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（372 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（54 通过）、`npm run build`、`git diff --check`。
+- 自动检查（2026-10-28，第二轮批次 1 后）：`cargo fmt --check`、`cargo clippy --all-targets`（0 警告）、`cargo test --lib`（372 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（58 通过）、`npm run build`、`git diff --check`。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

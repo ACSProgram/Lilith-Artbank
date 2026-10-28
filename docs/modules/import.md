@@ -131,7 +131,7 @@
 
 - 命令入口：`src/modules/import/api.ts`。
 - 类型：`src/modules/import/types.ts`。
-- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。目标文件夹使用与侧栏相同的 `FolderPickerDialog`，打开时预填当前浏览的单选文件夹（多选或根目录时为空）；目录层级用“平铺 / 保留源目录”两个按钮切换。初始标签使用共享 `TagInput`，标签建议由 `LibraryWorkspace` 注入的 `searchTags` 提供，导入模块不直接依赖 `libraryApi`。
+- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。运行中弹窗模态阻塞，右上角关闭、Esc 与点击遮罩都不可用，只能“取消导入”；标题显示阶段名，正文显示当前文件与百分比。目标文件夹使用与侧栏相同的 `FolderPickerDialog`，打开时预填当前浏览的单选文件夹（多选或根目录时为空）；目录层级用“平铺 / 保留源目录”两个按钮切换。初始标签使用共享 `TagInput`，标签建议由 `LibraryWorkspace` 注入的 `searchTags` 提供，导入模块不直接依赖 `libraryApi`。
 - 导入完成时工作区递增浏览刷新令牌，`LibraryView` 重新查询第一页并刷新图库计数；筛选条件保留，图片选择清空。结果弹窗仍显示最近 24 张预览，关闭后回到网格。
 
 | 命令 | 输入 | 输出 |

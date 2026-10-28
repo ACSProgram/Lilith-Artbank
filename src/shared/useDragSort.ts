@@ -1,17 +1,13 @@
 import { useCallback, useEffect, useRef } from "react";
+import {
+  directRowAccepts,
+  dropPositionFor,
+  type DragPayload,
+  type DropPosition,
+  type DropTarget,
+} from "./dragModel";
 
-/** 指针拖动的载荷：图片集合或多选文件夹。 */
-export type DragPayload =
-  | { kind: "images"; imageIds: number[]; label: string }
-  | { kind: "folders"; folderIds: number[]; label: string };
-
-export type DropPosition = "before" | "inside" | "after";
-
-export interface DropTarget {
-  kind: "folder" | "root";
-  folderId: number | null;
-  position: DropPosition;
-}
+export type { DragPayload, DropPosition, DropTarget } from "./dragModel";
 
 interface DropOptions {
   onDrop: (item: DragPayload, target: DropTarget) => void | Promise<void>;
@@ -96,18 +92,32 @@ export function useDragSort({ onDrop, canDrop, onReject }: DropOptions) {
     rafRef.current = 0;
   };
 
-  const resolveTarget = (x: number, y: number): { target: DropTarget; element: HTMLElement } | null => {
-    const element = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-drop-root], [data-drop-folder]");
+  const resolveTarget = (
+    x: number,
+    y: number,
+    kind: DragPayload["kind"],
+  ): { target: DropTarget; element: HTMLElement } | null => {
+    const element = document
+      .elementFromPoint(x, y)
+      ?.closest<HTMLElement>("[data-drop-root], [data-drop-folder], [data-drop-direct]");
     if (!element) return null;
     if (element.hasAttribute("data-drop-root")) {
       return { target: { kind: "root", folderId: null, position: "inside" }, element };
+    }
+    if (element.hasAttribute("data-drop-direct")) {
+      if (!directRowAccepts(kind)) return null;
+      const id = Number(element.dataset.dropDirect);
+      if (!Number.isInteger(id) || id <= 0) return null;
+      return { target: { kind: "folder", folderId: id, position: "inside" }, element };
     }
     const id = Number(element.dataset.dropFolder);
     if (!Number.isInteger(id) || id <= 0) return null;
     const rect = element.getBoundingClientRect();
     const ratio = rect.height > 0 ? (y - rect.top) / rect.height : 0.5;
-    const position: DropPosition = ratio < 0.25 ? "before" : ratio > 0.75 ? "after" : "inside";
-    return { target: { kind: "folder", folderId: id, position }, element };
+    return {
+      target: { kind: "folder", folderId: id, position: dropPositionFor(kind, ratio) },
+      element,
+    };
   };
 
   const applyHighlight = (element: HTMLElement, position: DropPosition) => {
@@ -211,7 +221,7 @@ export function useDragSort({ onDrop, canDrop, onReject }: DropOptions) {
       }
       moveGhost(x, y);
 
-      const hit = resolveTarget(x, y);
+      const hit = resolveTarget(x, y, drag.payload.kind);
       if (!hit) {
         clearHighlight();
         drag.target = null;

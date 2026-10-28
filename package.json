@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test:web": "node --test src/modules/viewer/model.test.ts src/modules/library/model.test.ts src/modules/library/folderTreeModel.test.ts src/modules/library/dataChange.test.ts src/shared/scope.test.ts src/shared/tagNames.test.ts",
+    "test:web": "node --test src/modules/viewer/model.test.ts src/modules/library/model.test.ts src/modules/library/folderTreeModel.test.ts src/modules/library/dataChange.test.ts src/shared/dragModel.test.ts src/shared/scope.test.ts src/shared/tagNames.test.ts",
     "tauri": "tauri",
     "pack:portable": "node tools/package-portable.mjs",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo check --manifest-path src-tauri/Cargo.toml",

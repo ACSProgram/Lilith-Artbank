@@ -496,6 +496,7 @@ export function FolderTree({
                   aria-selected={directFolderId === node.id}
                   style={{ paddingLeft: 6 + (node.depth + 1) * 14 }}
                   title={`只显示直接放在「${node.path}」的 ${node.directImageCount.toLocaleString()} 张图片`}
+                  data-drop-direct={node.id}
                   onClick={(event) => {
                     event.stopPropagation();
                     setMenu(null);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -33,6 +33,7 @@ import {
   formatDate,
   formatDimensions,
   folderLabel,
+  imageActions,
 } from "./model";
 import type {
   ColorEntry,
@@ -53,6 +54,8 @@ interface InspectorPanelProps {
   currentCollectionId: number | null;
   /** 当前在临时视图：隐藏移动、集合与回收站操作。 */
   inTemp: boolean;
+  /** 当前在回收站视图：回收站操作只给恢复/永久删除。 */
+  inTrash: boolean;
   onClose: () => void;
   onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
@@ -87,6 +90,7 @@ export function InspectorPanel({
   folders,
   currentCollectionId,
   inTemp,
+  inTrash,
   onClose,
   onChanged,
   onAddToCollection,
@@ -133,6 +137,7 @@ export function InspectorPanel({
           folders={folders}
           currentCollectionId={currentCollectionId}
           inTemp={inTemp}
+          inTrash={inTrash}
           onChanged={onChanged}
           onAddToCollection={onAddToCollection}
           onRemoveFromCollection={() => onRemoveFromCollection([single])}
@@ -152,6 +157,7 @@ export function InspectorPanel({
           folders={folders}
           currentCollectionId={currentCollectionId}
           inTemp={inTemp}
+          inTrash={inTrash}
           onChanged={onChanged}
           onAddToCollection={onAddToCollection}
           onRemoveFromCollection={() => onRemoveFromCollection(selectedIds)}
@@ -164,12 +170,40 @@ export function InspectorPanel({
   );
 }
 
+function TrashActions({
+  inTrash,
+  onTrash,
+  onRestore,
+  onDelete,
+}: {
+  inTrash: boolean;
+  onTrash: () => void;
+  onRestore: () => void;
+  onDelete: () => void;
+}) {
+  return imageActions(inTrash).includes("trash") ? (
+    <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
+      移入回收站
+    </Button>
+  ) : (
+    <>
+      <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
+        恢复
+      </Button>
+      <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
+        永久删除
+      </Button>
+    </>
+  );
+}
+
 interface ImageInspectorProps {
   imageId: number;
   version: number;
   folders: FolderInfo[];
   currentCollectionId: number | null;
   inTemp: boolean;
+  inTrash: boolean;
   onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
@@ -189,6 +223,7 @@ function ImageInspector({
   folders,
   currentCollectionId,
   inTemp,
+  inTrash,
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
@@ -203,6 +238,10 @@ function ImageInspector({
 }: ImageInspectorProps) {
   const { notify, confirm } = useNotices();
   const tagMenuAnchorRef = useRef<HTMLDivElement>(null);
+  const descriptionViewRef = useRef<HTMLDivElement>(null);
+  const descriptionTextareaRef = useRef<HTMLTextAreaElement>(null);
+  /** 进入编辑前只读正文的高度；带图片 id，切图后不会套用上一张的高度。 */
+  const readonlyHeightRef = useRef<{ id: number; height: number } | null>(null);
   const [tagMenu, setTagMenu] = useState<{
     id: number;
     name: string;
@@ -285,6 +324,24 @@ function ImageInspector({
     detail.descriptionSource === "user" &&
     detail.description.trim() !== "";
 
+  useLayoutEffect(() => {
+    if (!editingDescription) return;
+    const element = descriptionTextareaRef.current;
+    if (!element) return;
+    element.style.height = "auto";
+    const border = element.offsetHeight - element.clientHeight;
+    const measured = readonlyHeightRef.current;
+    const readonlyHeight =
+      detail != null &&
+      measured != null &&
+      measured.id === detail.id &&
+      descriptionDraft === detail.description
+        ? measured.height
+        : 0;
+    const next = Math.max(element.scrollHeight + border, readonlyHeight);
+    element.style.height = `${next}px`;
+  }, [editingDescription, detail?.id, descriptionDraft]);
+
   /** 写入或丢弃（`null`）某张图的描述草稿；保存与取消都走这里。 */
   const setDescriptionDraftFor = (id: number, value: string | null) => {
     setDescriptionDrafts((previous) => {
@@ -298,6 +355,10 @@ function ImageInspector({
 
   const startEditingDescription = () => {
     if (!detail) return;
+    readonlyHeightRef.current = {
+      id: detail.id,
+      height: descriptionViewRef.current?.offsetHeight ?? 0,
+    };
     setDescriptionDraftFor(detail.id, detail.description);
   };
 
@@ -749,6 +810,7 @@ function ImageInspector({
         {editingDescription ? (
           <>
             <textarea
+              ref={descriptionTextareaRef}
               className="input inspector-textarea"
               value={descriptionDraft ?? ""}
               placeholder="记录构图、角色、用途或来源…"
@@ -805,7 +867,9 @@ function ImageInspector({
         ) : (
           <>
             {detail.description ? (
-              <div className="inspector-description">{detail.description}</div>
+              <div ref={descriptionViewRef} className="inspector-description">
+                {detail.description}
+              </div>
             ) : (
               <span className="inspector-empty">还没有描述</span>
             )}
@@ -861,20 +925,12 @@ function ImageInspector({
         </section>
       ) : (
         <section className="inspector-section inspector-actions">
-          {detail.deletedAt == null ? (
-            <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
-              移入回收站
-            </Button>
-          ) : (
-            <>
-              <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
-                恢复
-              </Button>
-              <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
-                永久删除
-              </Button>
-            </>
-          )}
+          <TrashActions
+            inTrash={inTrash}
+            onTrash={onTrash}
+            onRestore={onRestore}
+            onDelete={onDelete}
+          />
           {inCollection ? (
             <Button size="sm" variant="ghost" icon={<Layers size={13} />} onClick={onRemoveFromCollection}>
               移出当前集合
@@ -974,6 +1030,7 @@ interface BatchInspectorProps {
   folders: FolderInfo[];
   currentCollectionId: number | null;
   inTemp: boolean;
+  inTrash: boolean;
   onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
@@ -988,6 +1045,7 @@ function BatchInspector({
   folders,
   currentCollectionId,
   inTemp,
+  inTrash,
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
@@ -1277,7 +1335,7 @@ function BatchInspector({
             )}
             {partialTags.length > 0 ? (
               <details className="selection-tags-partial">
-                <summary>部分图片有 ({partialTags.length})</summary>
+                <summary>部分共同标签 ({partialTags.length})</summary>
                 <input
                   className="input"
                   value={partialQuery}
@@ -1383,15 +1441,12 @@ function BatchInspector({
           </section>
 
           <section className="inspector-section inspector-actions">
-            <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
-              移入回收站
-            </Button>
-            <Button size="sm" variant="primary" icon={<RotateCcw size={13} />} onClick={onRestore}>
-              恢复
-            </Button>
-            <Button size="sm" variant="danger" icon={<Trash2 size={13} />} onClick={onDelete}>
-              永久删除
-            </Button>
+            <TrashActions
+              inTrash={inTrash}
+              onTrash={onTrash}
+              onRestore={onRestore}
+              onDelete={onDelete}
+            />
           </section>
         </>
       ) : (

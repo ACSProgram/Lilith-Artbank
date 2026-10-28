@@ -13,6 +13,7 @@ import {
   ArrowLeft,
   ChevronRight,
   Crop,
+  FilterX,
   FolderOpen,
   HardDrive,
   History,
@@ -2331,7 +2332,12 @@ export function LibraryView({
         <div className="filter-summary">
           <span>{filterSummary.join(" · ")}</span>
           {hasActiveFilters(browse.filters) ? (
-            <Button size="sm" variant="ghost" onClick={resetFilters}>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<FilterX size={12} />}
+              onClick={resetFilters}
+            >
               清除筛选
             </Button>
           ) : null}
@@ -2472,6 +2478,7 @@ export function LibraryView({
             folders={folders}
             currentCollectionId={effectiveCollectionId}
             inTemp={effectiveView === "temp"}
+            inTrash={effectiveView === "trash"}
             onClose={() => setInspectorOpen(false)}
             onChanged={(change) => applyChange(change)}
             onAddToCollection={() => setCollectionPickerOpen(true)}
