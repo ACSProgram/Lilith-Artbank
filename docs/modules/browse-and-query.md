@@ -1,6 +1,6 @@
 # 浏览与检索
 
-浏览层负责“把当前图库视图查出来、显示出来并改掉”。前端不持有全库数组，每次只请求一页；文件夹树与网格共享同一份 `filters.folderIds`；筛选计数只在筛选面板打开时计算。本文件记录查询 DTO、搜索、筛选、排序、分页游标、视图与选择、详情与批量编辑、找相似结果视图的命令契约，以及数据变化后的失效规则（`DataChange` + `planDataChange`）。
+浏览层负责“把当前图库视图查出来、显示出来并改掉”。前端不持有全库数组，每次只请求一页；文件夹树与网格共享同一份 `filters.folderIds`；筛选计数与文件夹概览只在对应界面需要时计算，并由同一个前端统计缓存按数据版本失效。本文件记录查询 DTO、搜索、筛选、排序、分页游标、视图与选择、文件夹概览、详情与批量编辑、找相似结果视图的命令契约，以及数据变化后的失效规则（`DataChange` + `planDataChange`）。
 
 ## 查询 DTO
 
@@ -82,8 +82,22 @@ tags: string[]
 - 每个分面计数排除该分面自身的筛选条件；标签维度指 `tagIds`、`tagMode`、`tagPresence`、`excludeTagIds` 四项一起排除。文件夹分面在计数时按子树展开：先统计每个文件夹的直接命中数，再沿路径前缀累加到自身与全部祖先；`FilterCounts.folders[].count` 因此与树上的子树总数一致。
 - 搜索或集合视图下，计数用单条 `WITH matched AS MATERIALIZED (...)` 语句一次求出命中集，再在五个 `UNION ALL` 分支里分别统计总数/文件夹/扩展名/评分/标签；普通视图直接按分面查询。命中集已经带上了全部筛选，所以这条路径里的标签分面只含命中集内的标签——与普通视图的“标签分面自排除”不是一回事，`search_images` 的 `facetsNote` 已写明。
 - 计数只在筛选面板打开时请求，面板内有 160 ms 防抖与加载态；搜索/集合很大时可能超过 100 ms（见[性能](../guides/performance.md)），不会阻塞网格翻页。
+- 筛选计数与文件夹概览共用只读命令 `get_library_stats` 和前端 `statsStore`：缓存键是“profile + 视图/集合/搜索/筛选”（排序、游标与分页不影响键），容量 48，按最久未用淘汰。成功返回的 `facets` 可派生出同一查询的 `summary`，不再单独计数。
+- 缓存采用“先显示旧值、后台刷新”：`DataChange` 的 `planDataChange().facets` 为真时（元数据、文件夹、集合成员、标签目录与未知变化）统计版本递增，已渲染的概览与筛选计数继续显示，随后各自在有订阅时重新请求；缩略图重建不影响统计。失败保留旧值并给出重试入口。
+- 前端在 `src/modules/library/StatsProvider.tsx` 提供 store 与 `useStats`；`FolderInspector.tsx` 与 `FilterPanel.tsx` 都通过它读取，不直接调用命令。
 - 标签管理器提供标签搜索、计数、重命名、删除与合并；删除与合并前在确认框显示影响数量。无查询时载入图片最多的 500 个标签；输入查询后改走后端 `search_tags`（最多 200），不再只过滤本地列表。合并目标与改名建议同样走后端搜索（最多 50），建议列表展示前 12 个。
 - 合并把源标签的全部图片关系迁到目标标签（已存在的关系只去重），然后删除源标签行；一次操作一条 `tagMerge` 记录，撤销按原 id 重建源标签并插回关系。
+
+## 文件夹概览
+
+没有选中图片、但选中了至少一个文件夹时，右侧详情从“未选择”切换为“文件夹概览”；选中图片后仍显示图片详情。只读，不写操作记录。
+
+- **范围**：选中文件夹的子树并集；`folderDirect` 时只算直接位于所选文件夹的图片。根目录等于全库。多选包含父子文件夹时不重复计数。
+- **筛选**：应用当前搜索与全部筛选，口径与网格一致。始终排除回收站、待释放行与临时区；唯一的差异是全库搜索——列表按既有语义包含回收站，概览只算正常图片。
+- **内容**：图片数、子文件夹数（只数选中范围之内、且未被选中的后代）、总字节、扩展名分布、评分分布（补齐 0–5）、最常见的 8 个标签（带名称与计数）。扩展名前端只画前 6 项，其余合并为“其他”；扩展名与评分的条形按图片总数占比，标签条形按最大标签计数归一。
+- **查询**：`FolderStats` 使用与列表相同的 `PreparedQuery` 条件（可见性、搜索、筛选），不另写一套语义。总字节用 `coalesce(sum(file_size), 0)`；无搜索、导入时间、大小、描述与特征筛选且在图库视图时，总字节与分组查询使用 `INDEXED BY`，分别走 `idx_images_visible_bytes` 与 `idx_images_visible_facets`。
+- **切换与空态**：同一范围在缓存中时先显示旧值并在后台刷新，面板显示“更新中”；新的范围显示加载态。请求失败保留旧值并给“重试”。空文件夹仍显示图片数、子文件夹数与总大小，分布区显示空态。
+- **不适用**：回收站、临时文件夹视图与找相似结果不显示文件夹概览；这些视图的 `folderIds` 即使非空也不会发统计请求。
 
 ## 按标签筛选
 
@@ -105,8 +119,7 @@ tags: string[]
 | --- | --- | --- |
 | `query_images` | `{ query }` | `{ items, nextCursor, nextPageToken }`（两者至多一个非空） |
 | `query_image_ids` | `{ query }` | `number[]`（当前查询的全部 id，最多 100 万） |
-| `get_filter_counts` | `{ query }` | `FilterCounts` |
-| `get_query_total` | `{ query }` | `number`（只算命中总数，不取分面） |
+| `get_library_stats` | `{ request: StatsRequest }` | `StatsSnapshot`（筛选分面、总数或文件夹概览） |
 | `get_folders` | — | `FolderInfo[]`（`directImageCount` / `totalImageCount`，按路径排序，含 `sortIndex`） |
 | `get_tags` | `{ limit? }` | `TagInfo[]`（默认/最多 500，按活跃图片数降序） |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]`（按名称子串，最多 200） |
@@ -121,6 +134,24 @@ tags: string[]
   extensions:  [{ value, count }],
   scores:      [{ value, count }],
   tags:        [{ tagId, count }]
+}
+```
+
+统计请求与快照（`StatsProfile = "facets" | "summary" | "folderDetail"`）：
+
+```text
+StatsRequest { profile, query: LibraryQuery }   // 排序、游标、分页与锚点被忽略
+
+StatsSnapshot =
+  { profile: "facets",       data: FilterCounts }
+  { profile: "summary",      data: { total } }
+  { profile: "folderDetail", data: FolderStats }
+
+FolderStats {
+  imageCount, totalBytes, subfolderCount,
+  extensions: [{ value, count }],
+  scores:     [{ value, count }],
+  tags:       [{ id, name, count }]    // 最多 8 个，按计数降序
 }
 ```
 

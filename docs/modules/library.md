@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v8、多级文件夹、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v9、多级文件夹、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,7 +36,7 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 8；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 9；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
@@ -44,6 +44,7 @@ PRAGMA mmap_size = 268435456;
 - v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行。
 - v6 → v7 给 `folders` 增加 `kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','temp'))` 与唯一部分索引 `idx_folders_single_temp`，并插入唯一的临时文件夹行；内部路径固定为 `.artbank-temp`，已有同名文件夹时追加 `-1`、`-2` 后缀。v1–v6 库按链式迁移到 v7。
 - v7 → v8 只新增覆盖索引 `idx_images_visible_facets(deleted_at, purge_operation_id, folder_id, file_ext, score)`，不改数据与语义。真实库（39 万行）建索引 533 ms、库体积 +7 MB；计数与文件夹聚合从 620/683 ms 降到 20/27 ms。
+- v8 → v9 只新增覆盖索引 `idx_images_visible_bytes(deleted_at, folder_id, file_size)`，供文件夹概览的 `SUM(file_size)` 在索引内完成，不改数据与语义。分面索引保持窄，避免标签聚合因索引变宽而退化。
 
 ### 表
 
@@ -100,6 +101,8 @@ origin_operation_id 导入批次；用于撤销导入时找回本次新增的行
 - `images(deleted_at, file_size DESC, id DESC)`：大小排序。
 - `images(deleted_at, width * height DESC, id DESC)`：像素尺寸排序（表达式索引，schema v4）。
 - `images(folder_id, deleted_at, imported_at DESC, id DESC)`：文件夹页。
+- `images(deleted_at, purge_operation_id, folder_id, file_ext, score)`：可见集分面与计数覆盖索引（schema v8）。
+- `images(deleted_at, folder_id, file_size)`：文件夹概览的字节汇总覆盖索引（schema v9）。
 - `folders(path COLLATE NOCASE)` UNIQUE：路径解析、重名检查与 v2 迁移。
 - `images(deleted_at) WHERE deleted_at IS NOT NULL`：回收站。
 - `images(purge_operation_id) WHERE purge_operation_id IS NOT NULL`：待释放批次（schema v5）。
@@ -168,7 +171,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `rename_library` | `{ name }` | `LibraryInfo`（只改名称，不改目录） |
 | `query_images` | `{ query }` | `{ items, nextCursor, nextPageToken }` |
 | `query_image_ids` | `{ query }` | `number[]` |
-| `get_filter_counts` | `{ query }` | `FilterCounts` |
+| `get_library_stats` | `{ request: StatsRequest }` | `StatsSnapshot`（统计契约见[浏览与检索](browse-and-query.md)） |
 | `get_folders` | — | `FolderInfo[]` |
 | `create_folder` | `{ path }` | `FolderChange`（新建的行，含自动补齐的缺失祖先） |
 | `rename_folder` | `{ folderId, name }` | `FolderChange`（整个子树，路径都变了） |
@@ -338,7 +341,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 `cargo test` 覆盖：
 
 - 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、v6→v7 迁移（补 `ai.prewarmImports=true`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、v7→v8 迁移（只建覆盖索引、幂等、现有行不变）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
+- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、v7→v8 迁移（只建覆盖索引、幂等、现有行不变）、v8→v9 迁移（只建字节汇总覆盖索引、幂等、现有行不变）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
 - 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
 - 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
 - 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、空文件夹删除与“仍有图片/子文件夹”拒绝、跨子树移动拒绝、临时文件夹不进入排序；

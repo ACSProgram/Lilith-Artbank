@@ -12,6 +12,7 @@ use crate::{
         metadata,
         query::{self, LibraryFilters, LibraryQuery, QueryCursor, SortKey, SortSpec},
         service,
+        stats::{self, StatsProfile, StatsRequest},
     },
 };
 
@@ -535,6 +536,48 @@ fn perf_metadata_200k() {
         ms(percentile(&counts_samples, 0.5)),
         ms(percentile(&counts_samples, 0.95))
     );
+
+    let index_build = database
+        .with_writer(|connection| {
+            connection.execute("DROP INDEX idx_images_visible_bytes", [])?;
+            let start = Instant::now();
+            connection.execute(
+                "CREATE INDEX idx_images_visible_bytes
+                 ON images(deleted_at, folder_id, file_size)",
+                [],
+            )?;
+            Ok(start.elapsed())
+        })
+        .expect("rebuild visible bytes index");
+    println!(
+        "[perf] v8->v9 visible bytes index build on {IMAGE_COUNT} rows: {:.2}ms",
+        ms(index_build)
+    );
+
+    for (label, profile) in [
+        ("summary", StatsProfile::Summary),
+        ("facets", StatsProfile::Facets),
+        ("folderDetail", StatsProfile::FolderDetail),
+    ] {
+        let mut samples = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let start = Instant::now();
+            stats::library_stats(
+                database,
+                StatsRequest {
+                    profile,
+                    query: folder_query.clone(),
+                },
+            )
+            .expect("stats profile");
+            samples.push(start.elapsed());
+        }
+        println!(
+            "[perf] stats {label} (subtree folder): p50={:.2}ms p95={:.2}ms",
+            ms(percentile(&samples, 0.5)),
+            ms(percentile(&samples, 0.95))
+        );
+    }
 
     // ---------- 批次 6：可见性聚合、标签分页与无筛选分面 ----------
 

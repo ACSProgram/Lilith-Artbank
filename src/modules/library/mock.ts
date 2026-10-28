@@ -10,6 +10,7 @@ import type {
   FolderCount,
   FolderChange,
   FolderInfo,
+  FolderStats,
   FolderOrder,
   FolderSortKey,
   HistoryEntry,
@@ -25,6 +26,9 @@ import type {
   SelectionTag,
   SelectionTags,
   SortKey,
+  StatsRequest,
+  StatsSnapshot,
+  StatsTag,
   TagCount,
   TagInfo,
   TagMergeReport,
@@ -446,6 +450,68 @@ export function mockFilterCounts(query: LibraryQuery): FilterCounts {
     .sort((a, b) => b.count - a.count || a.tagId - b.tagId);
 
   return { total, folders, extensions, scores, tags };
+}
+
+function mockFolderStats(query: LibraryQuery): FolderStats {
+  const matched = mockImages.filter(
+    (image) => image.deletedAt == null && matches(image, query, null),
+  );
+  const extensionCounts = groupCounts(matched, (image) => image.fileExt);
+  const scoreCounts = groupCounts(matched, (image) => String(image.score));
+  const tagCounts = new Map<string, number>();
+  for (const image of matched) {
+    for (const tag of image.tags) {
+      tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+    }
+  }
+
+  const folders = folderState.filter((folder) =>
+    query.filters.folderIds.some((id) => {
+      const path = folderPathOf(id);
+      return path != null && folder.path !== path && isSameOrDescendant(folder.path, path);
+    }),
+  );
+  const selected = new Set(query.filters.folderIds);
+  const subfolderCount = folders.filter((folder) => !selected.has(folder.id)).length;
+
+  const extensions: ValueCount[] = [...extensionCounts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+  const scores: ValueCount[] = [...scoreCounts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => Number(b.value) - Number(a.value));
+  const tags: StatsTag[] = [...tagCounts.entries()]
+    .map(([name, count]) => ({
+      id: tagState.find((tag) => tag.name === name)?.id ?? 0,
+      name,
+      count,
+    }))
+    .filter((tag) => tag.id > 0)
+    .sort((a, b) => b.count - a.count || a.id - b.id)
+    .slice(0, 8);
+
+  return {
+    imageCount: matched.length,
+    totalBytes: matched.reduce((sum, image) => sum + image.fileSize, 0),
+    subfolderCount,
+    extensions,
+    scores,
+    tags,
+  };
+}
+
+export function mockLibraryStats(request: StatsRequest): StatsSnapshot {
+  switch (request.profile) {
+    case "facets":
+      return { profile: "facets", data: mockFilterCounts(request.query) };
+    case "summary":
+      return {
+        profile: "summary",
+        data: { total: mockFilterCounts(request.query).total },
+      };
+    case "folderDetail":
+      return { profile: "folderDetail", data: mockFolderStats(request.query) };
+  }
 }
 
 function paletteFor(id: number): { colors4: ColorEntry[]; colors8: ColorEntry[] } {

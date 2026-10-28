@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Tags, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
@@ -10,12 +10,10 @@ import {
   localDayEnd,
   localDayStart,
   mbToBytes,
-  queryKey,
   toggleValue,
 } from "./model";
 import type {
   FeatureSummary,
-  FilterCounts,
   LibraryFilters,
   LibraryQuery,
   PresenceFilter,
@@ -23,13 +21,12 @@ import type {
 } from "./types";
 import { presenceAvailability } from "../../shared/capability";
 import { errorMessage } from "../../shared/errors";
+import { useStats } from "./StatsProvider";
 
 interface FilterPanelProps {
   open: boolean;
   filters: LibraryFilters;
   query: LibraryQuery;
-  /** 分面计数版本；只有可能改变计数的数据变化才递增。 */
-  countsVersion: number;
   /** 标签选项版本；标签目录变化才递增。 */
   tagOptionsVersion: number;
   featureSummary?: FeatureSummary | null;
@@ -43,7 +40,6 @@ export function FilterPanel({
   open,
   filters,
   query,
-  countsVersion,
   tagOptionsVersion,
   featureSummary = null,
   onFiltersChange,
@@ -52,15 +48,19 @@ export function FilterPanel({
   onManageTags,
 }: FilterPanelProps) {
   const [tags, setTags] = useState<TagInfo[]>([]);
-  const [counts, setCounts] = useState<FilterCounts | null>(null);
   const [optionsLoading, setOptionsLoading] = useState(false);
   const [optionsError, setOptionsError] = useState<string | null>(null);
-  const [countsLoading, setCountsLoading] = useState(false);
-  const [countsError, setCountsError] = useState<string | null>(null);
   const [tagQuery, setTagQuery] = useState("");
   const [sizeMinDraft, setSizeMinDraft] = useState(bytesToMbInput(filters.sizeMin));
   const [sizeMaxDraft, setSizeMaxDraft] = useState(bytesToMbInput(filters.sizeMax));
-  const countsGeneration = useRef(0);
+
+  const countsStats = useStats("facets", query, open);
+  const counts = countsStats.data;
+  const countsLoading =
+    countsStats.status === "loading" ||
+    countsStats.status === "idle" ||
+    countsStats.status === "refreshing";
+  const countsError = countsStats.error;
 
   const loadOptions = useCallback(async () => {
     setOptionsLoading(true);
@@ -84,32 +84,6 @@ export function FilterPanel({
     setSizeMinDraft(bytesToMbInput(filters.sizeMin));
     setSizeMaxDraft(bytesToMbInput(filters.sizeMax));
   }, [filters.sizeMin, filters.sizeMax]);
-
-  // 计数只随筛选条件（countsKey）与数据版本变化重算；排序、翻页不触发。
-  const countsKey = queryKey(query);
-
-  useEffect(() => {
-    if (!open) return;
-    const generation = countsGeneration.current + 1;
-    countsGeneration.current = generation;
-    setCountsLoading(true);
-    setCountsError(null);
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const next = await libraryApi.getFilterCounts(query);
-          if (generation !== countsGeneration.current) return;
-          setCounts(next);
-        } catch (cause) {
-          if (generation !== countsGeneration.current) return;
-          setCountsError(errorMessage(cause));
-        } finally {
-          if (generation === countsGeneration.current) setCountsLoading(false);
-        }
-      })();
-    }, 160);
-    return () => window.clearTimeout(timer);
-  }, [open, countsKey, countsVersion]);
 
   useEffect(() => {
     if (!open) setTagQuery("");
@@ -229,6 +203,9 @@ export function FilterPanel({
         {countsError ? (
           <div className="filter-panel-error">
             <span>{countsError}</span>
+            <button type="button" className="text-button" onClick={countsStats.retry}>
+              重试
+            </button>
           </div>
         ) : null}
 

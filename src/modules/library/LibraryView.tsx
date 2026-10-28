@@ -53,6 +53,7 @@ import {
 import { FilterPanel } from "./FilterPanel";
 import { FindSimilarPanel, type SimilarReference } from "./FindSimilarPanel";
 import { InspectorPanel } from "./Inspector";
+import { useStats, useStatsStore } from "./StatsProvider";
 import { LibraryContextMenu, type ContextMenuState } from "./LibraryContextMenu";
 import { OperationHistoryPanel } from "./OperationHistoryPanel";
 import { SortMenu } from "./SortMenu";
@@ -236,7 +237,6 @@ export function LibraryView({
   const [selectingAll, setSelectingAll] = useState(false);
   const [detailVersion, setDetailVersion] = useState(0);
   const [tagVersion, setTagVersion] = useState(0);
-  const [facetVersion, setFacetVersion] = useState(0);
   const [tagOptionsVersion, setTagOptionsVersion] = useState(0);
   const [featureVersion, setFeatureVersion] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
@@ -247,7 +247,6 @@ export function LibraryView({
   const [createPreset, setCreatePreset] = useState<CollectionInfo | null>(null);
   const [renameTarget, setRenameTarget] = useState<CollectionInfo | null>(null);
   const [combineOpen, setCombineOpen] = useState(false);
-  const [viewCount, setViewCount] = useState<number | null>(null);
   const [taskMenuOpen, setTaskMenuOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
@@ -318,7 +317,17 @@ export function LibraryView({
 
   const query = useMemo(() => buildQuery(browse), [browse]);
   const imageQuery = useImageQuery(query);
+  const stats = useStatsStore();
+  const viewCountStats = useStats("summary", query, createCollectionOpen);
+  const viewCount = viewCountStats.data?.total ?? null;
   const similarityActive = similarity?.active === true;
+  const folderStatsContext = useMemo(
+    () =>
+      !similarityActive && (query.view === "all" || query.view === "collection")
+        ? { query }
+        : null,
+    [similarityActive, query],
+  );
   // 结果来自“找相似”而不是文本语义搜索；状态文案按它分支。
   const similarMode = similarity?.mode === "similar";
   // 相似模式下网格换成结果数据源；两者共享 items/status/error/hasMore 契约。
@@ -617,7 +626,7 @@ export function LibraryView({
         });
       }
       if (plan.features) setFeatureVersion((value) => value + 1);
-      if (plan.facets) setFacetVersion((value) => value + 1);
+      if (plan.facets) stats.invalidate();
       if (plan.tagOptions) setTagOptionsVersion((value) => value + 1);
       if (meaningful.some(touchesTags)) {
         setTagVersion((value) => value + 1);
@@ -656,6 +665,7 @@ export function LibraryView({
       similarity,
       similarityActive,
       similarityClear,
+      stats,
     ],
   );
 
@@ -836,24 +846,6 @@ export function LibraryView({
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [findSimilarOpen]);
-
-  // 新建集合对话框里要显示“当前视图 N 张”，打开时取一次总数（不拉全量 id）。
-  useEffect(() => {
-    if (!createCollectionOpen) return;
-    let cancelled = false;
-    setViewCount(null);
-    void libraryApi
-      .getFilterCounts(query)
-      .then((counts) => {
-        if (!cancelled) setViewCount(counts.total);
-      })
-      .catch(() => {
-        if (!cancelled) setViewCount(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [createCollectionOpen, query]);
 
   const goBack = useCallback(() => {
     onGoBack();
@@ -1087,13 +1079,13 @@ export function LibraryView({
       if (!context?.query) return context;
       let viewTotal: number | null = null;
       try {
-        viewTotal = await libraryApi.getQueryTotal(context.query);
+        viewTotal = (await stats.fetch("summary", context.query)).total;
       } catch {
         viewTotal = null;
       }
       return { ...context, viewTotal };
     },
-    [buildTaskContextBase],
+    [buildTaskContextBase, stats],
   );
 
   // 面板打开期间数据变化：只换计数与范围可用性，不清空用户已选的指标与阈值。
@@ -2206,7 +2198,6 @@ export function LibraryView({
               open={filterOpen}
               filters={browse.filters}
               query={query}
-              countsVersion={facetVersion}
               tagOptionsVersion={tagOptionsVersion}
               featureSummary={featureSummary}
               onFiltersChange={(filters) =>
@@ -2491,6 +2482,7 @@ export function LibraryView({
             folderScopeLabel={folderScopeLabel}
             collectionScopeLabel={collectionScopeLabel}
             onGenerateDescription={onGenerateDescription}
+            statsContext={folderStatsContext}
           />
         ) : null}
       </div>

@@ -40,11 +40,17 @@ import type {
   ColorEntry,
   FolderInfo,
   ImageDetails,
+  LibraryQuery,
   SelectionTag,
 } from "./types";
 import type { DataChange } from "./dataChange";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 import { errorMessage } from "../../shared/errors";
+import { FolderInspector } from "./FolderInspector";
+
+export interface InspectorStatsContext {
+  query: LibraryQuery;
+}
 
 interface InspectorPanelProps {
   selectedIds: number[];
@@ -72,6 +78,8 @@ interface InspectorPanelProps {
   /** 当前集合；为空表示“当前集合”范围不可用。 */
   collectionScopeLabel?: string | null;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
+  /** 空选且有选中文件夹时显示文件夹概览；查看器不传。 */
+  statsContext?: InspectorStatsContext | null;
 }
 
 function descriptionSourceLabel(source: string): string {
@@ -106,29 +114,37 @@ export function InspectorPanel({
   folderScopeLabel = null,
   collectionScopeLabel = null,
   onGenerateDescription,
+  statsContext = null,
 }: InspectorPanelProps) {
   const single = selectedIds.length === 1 ? selectedIds[0] : null;
   const empty = selectedIds.length === 0;
   // 空选与单张都是“详情”，多选才是“批量编辑”。
   const detail = empty || single != null;
+  const folderOverview =
+    empty && statsContext != null && statsContext.query.filters.folderIds.length > 0;
+  const title = folderOverview ? "文件夹概览" : detail ? "图片详情" : "批量编辑";
   return (
-    <aside className="inspector" aria-label={detail ? "图片详情" : "批量编辑"}>
+    <aside className="inspector" aria-label={title}>
       <header className="inspector-head">
         <div>
-          <strong>{detail ? "图片详情" : "批量编辑"}</strong>
+          <strong>{title}</strong>
           <span>
-            {empty
-              ? "未选择"
-              : single
-                ? `#${single}`
-                : `已选择 ${selectedIds.length.toLocaleString()} 张`}
+            {folderOverview
+              ? (folderScopeLabel ?? "已选文件夹")
+              : empty
+                ? "未选择"
+                : single
+                  ? `#${single}`
+                  : `已选择 ${selectedIds.length.toLocaleString()} 张`}
           </span>
         </div>
         <IconButton label="关闭侧栏" onClick={onClose}>
           <X size={15} />
         </IconButton>
       </header>
-      {empty ? (
+      {folderOverview && statsContext ? (
+        <FolderInspector query={statsContext.query} />
+      ) : empty ? (
         <div className="inspector-placeholder">
           <PanelRight size={22} />
           <span>点选一张图片查看详情</span>

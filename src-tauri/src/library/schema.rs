@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -166,6 +166,11 @@ CREATE INDEX idx_images_purge
 CREATE INDEX idx_images_visible_facets
     ON images(deleted_at, purge_operation_id, folder_id, file_ext, score);
 
+-- 文件夹概览的字节汇总：SUM(file_size) 完全在索引内完成，不再逐行回表。
+-- 分面索引保持窄，避免标签聚合因索引变宽而退化为 image_tags 扫描。
+CREATE INDEX idx_images_visible_bytes
+    ON images(deleted_at, folder_id, file_size);
+
 CREATE TABLE operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -262,7 +267,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v4_to_v5(connection)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
@@ -271,7 +277,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v4_to_v5(connection)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
@@ -279,29 +286,38 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v4_to_v5(connection)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         4 => {
             verify_meta(connection, manifest)?;
             migrate_v4_to_v5(connection)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         5 => {
             verify_meta(connection, manifest)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         6 => {
             verify_meta(connection, manifest)?;
             migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
         }
         7 => {
             verify_meta(connection, manifest)?;
-            migrate_v7_to_v8(connection)
+            migrate_v7_to_v8(connection)?;
+            migrate_v8_to_v9(connection)
+        }
+        8 => {
+            verify_meta(connection, manifest)?;
+            migrate_v8_to_v9(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -476,6 +492,20 @@ fn migrate_v7_to_v8(connection: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v8 → v9：给文件夹概览的字节汇总补一张覆盖索引，不改数据与语义。
+fn migrate_v8_to_v9(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "CREATE INDEX IF NOT EXISTS idx_images_visible_bytes
+         ON images(deleted_at, folder_id, file_size)",
+        [],
+    )?;
+    mark_version(&transaction, 9)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v8 升级到 v9");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +580,22 @@ mod tests {
         ensure(&mut connection, &manifest()).unwrap();
     }
 
+    #[test]
+    fn new_library_has_the_visible_bytes_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        let index: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_images_visible_bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
     fn downgrade_to_v1(connection: &Connection) {
         downgrade_to_v4(connection);
         connection
@@ -583,6 +629,9 @@ mod tests {
 
     fn downgrade_to_v6(connection: &Connection) {
         connection
+            .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
+            .unwrap();
+        connection
             .execute("DROP INDEX IF EXISTS idx_images_visible_facets", [])
             .unwrap();
         connection
@@ -605,12 +654,28 @@ mod tests {
 
     fn downgrade_to_v7(connection: &Connection) {
         connection
+            .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
+            .unwrap();
+        connection
             .execute("DROP INDEX IF EXISTS idx_images_visible_facets", [])
             .unwrap();
         connection.pragma_update(None, "user_version", 7).unwrap();
         connection
             .execute(
                 "UPDATE meta SET value = '7' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v8(connection: &Connection) {
+        connection
+            .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 8).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '8' WHERE key = 'schemaVersion'",
                 [],
             )
             .unwrap();
@@ -984,6 +1049,46 @@ mod tests {
             .unwrap();
         assert_eq!(active, 1, "迁移不改现有行");
         // 再跑一次不报错，也不重复建索引。
+        ensure(&mut connection, &manifest()).unwrap();
+    }
+
+    #[test]
+    fn migrates_v8_to_v9_and_adds_the_visible_bytes_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v8(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 8);
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'jpg', 1, 10, 4, 3, 'jpeg', 0, zeroblob(32), zeroblob(16),
+                           zeroblob(32), 3, '', 1, 1)",
+                [("d".repeat(64))],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let index: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_images_visible_bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let active: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM images WHERE deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1, "迁移不改现有行");
         ensure(&mut connection, &manifest()).unwrap();
     }
 

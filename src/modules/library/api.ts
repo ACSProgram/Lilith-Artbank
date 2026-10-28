@@ -15,11 +15,11 @@ import {
   mockDeleteImages,
   mockDeleteTag,
   mockEmptyTrash,
-  mockFilterCounts,
   mockFolders,
   mockImageDetail,
   mockImageStates,
   mockLibraryCounts,
+  mockLibraryStats,
   mockMergeTags,
   mockMoveFolder,
   mockMoveImages,
@@ -50,7 +50,6 @@ import type {
   CollectionInfo,
   CombineMode,
   DeleteReport,
-  FilterCounts,
   FeatureSummary,
   FolderChange,
   FolderInfo,
@@ -64,6 +63,8 @@ import type {
   LibraryQuery,
   MoveReport,
   SelectionTags,
+  StatsRequest,
+  StatsSnapshot,
   TagInfo,
   TagMergeReport,
   TagRef,
@@ -82,15 +83,9 @@ export const libraryApi = {
     return invoke<number[]>("query_image_ids", { query });
   },
 
-  async getFilterCounts(query: LibraryQuery): Promise<FilterCounts> {
-    if (!isTauri()) return mockFilterCounts(query);
-    return invoke<FilterCounts>("get_filter_counts", { query });
-  },
-
-  /** 只算命中总数，不取分面；对话框显示“当前视图 N 张”时用它。 */
-  async getQueryTotal(query: LibraryQuery): Promise<number> {
-    if (!isTauri()) return mockFilterCounts(query).total;
-    return invoke<number>("get_query_total", { query });
+  async getLibraryStats(request: StatsRequest): Promise<StatsSnapshot> {
+    if (!isTauri()) return mockLibraryStats(request);
+    return invoke<StatsSnapshot>("get_library_stats", { request });
   },
 
   async getFolders(): Promise<FolderInfo[]> {

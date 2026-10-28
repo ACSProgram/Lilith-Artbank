@@ -112,6 +112,37 @@ export interface FilterCounts {
   tags: TagCount[];
 }
 
+export type StatsProfile = "facets" | "summary" | "folderDetail";
+
+export interface StatsRequest {
+  profile: StatsProfile;
+  query: LibraryQuery;
+}
+
+export interface SummaryStats {
+  total: number;
+}
+
+export interface StatsTag {
+  id: number;
+  name: string;
+  count: number;
+}
+
+export interface FolderStats {
+  imageCount: number;
+  totalBytes: number;
+  subfolderCount: number;
+  extensions: ValueCount[];
+  scores: ValueCount[];
+  tags: StatsTag[];
+}
+
+export type StatsSnapshot =
+  | { profile: "facets"; data: FilterCounts }
+  | { profile: "summary"; data: SummaryStats }
+  | { profile: "folderDetail"; data: FolderStats };
+
 export interface FolderInfo {
   id: number;
   path: string;

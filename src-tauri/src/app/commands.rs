@@ -31,8 +31,9 @@ use crate::{
             DeleteReport, ImageDetails, ImageState, MergeReport, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::OptimizeEstimate,
-        query::{FilterCounts, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        query::{FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{LibraryCounts, LibraryInfo},
+        stats::{StatsRequest, StatsSnapshot},
         viewer::{self, PoseData, ViewerSource},
     },
 };
@@ -293,16 +294,11 @@ pub async fn query_image_ids(app: AppHandle, query: LibraryQuery) -> Result<Vec<
 }
 
 #[tauri::command]
-pub async fn get_filter_counts(
+pub async fn get_library_stats(
     app: AppHandle,
-    query: LibraryQuery,
-) -> Result<FilterCounts, String> {
-    run_blocking(app, move |state| state.filter_counts(query)).await
-}
-
-#[tauri::command]
-pub async fn get_query_total(app: AppHandle, query: LibraryQuery) -> Result<u64, String> {
-    run_blocking(app, move |state| state.query_total(query)).await
+    request: StatsRequest,
+) -> Result<StatsSnapshot, String> {
+    run_blocking(app, move |state| state.library_stats(request)).await
 }
 
 #[tauri::command]
@@ -952,8 +948,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         copy_text,
         query_images,
         query_image_ids,
-        get_filter_counts,
-        get_query_total,
+        get_library_stats,
         get_folders,
         create_folder,
         rename_folder,

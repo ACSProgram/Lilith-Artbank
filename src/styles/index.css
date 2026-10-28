@@ -2838,6 +2838,109 @@ textarea:focus-visible {
   font-size: 10px;
 }
 
+.folder-stats-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.folder-stat-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text-muted);
+}
+
+.folder-stat-tile svg {
+  color: var(--text-faint);
+}
+
+.folder-stat-tile strong {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-stat-tile span {
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.folder-stats-note,
+.folder-stats-refreshing,
+.folder-stats-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -2px 0 8px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.folder-stats-error {
+  color: var(--danger);
+}
+
+.folder-stats-empty {
+  padding-top: 10px;
+}
+
+.folder-stat-rows,
+.folder-stat-tag-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.folder-stat-row,
+.folder-stat-tag {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.folder-stat-label {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-stat-track {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--border);
+}
+
+.folder-stat-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.folder-stat-value {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .score-stars {
   display: flex;
   align-items: center;

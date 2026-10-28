@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
+use rusqlite::{Connection, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -211,7 +211,7 @@ pub struct FolderCount {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueCount {
     pub value: String,
@@ -234,6 +234,28 @@ pub struct FilterCounts {
     pub scores: Vec<ValueCount>,
     pub tags: Vec<TagCount>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsTag {
+    pub id: i64,
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderStats {
+    pub image_count: u64,
+    pub total_bytes: u64,
+    /// 选中范围（子树并集）内的子文件夹数，不含选中的文件夹自身。
+    pub subfolder_count: u64,
+    pub extensions: Vec<ValueCount>,
+    pub scores: Vec<ValueCount>,
+    pub tags: Vec<StatsTag>,
+}
+
+const FOLDER_STATS_TAG_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -630,6 +652,148 @@ pub fn query_total(database: &LibraryDb, query: LibraryQuery) -> AppResult<u64> 
         let (sql, params) = count_sql(&prepared);
         count_rows(connection, &sql, &params)
     })
+}
+
+/// 选中文件夹的概览统计；应用全部筛选，始终排除回收站与临时区。
+pub fn folder_stats(database: &LibraryDb, query: LibraryQuery) -> AppResult<FolderStats> {
+    let (mut query, _) = normalize(query)?;
+    if query.filters.folder_ids.is_empty() {
+        return Err(AppError::message("请选择一个文件夹"));
+    }
+    if !matches!(query.view, LibraryView::All | LibraryView::Collection) {
+        return Err(AppError::message("文件夹统计只在图库视图可用"));
+    }
+    query.sort.clear();
+    query.cursor = None;
+    query.page_token = None;
+    query.anchor_id = None;
+    query.limit = None;
+
+    database.with_reader(|connection| {
+        let transaction = connection.unchecked_transaction()?;
+        let folder_paths = folder_scope_paths(&transaction, &query.filters.folder_ids)?;
+        let mut prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
+        // 全库搜索不按视图加可见性条件；统计仍只算正常图片。
+        prepared.require_active_images();
+
+        let pin = pin_stats_indexes(&query);
+        let facet_index = pin.then_some("idx_images_visible_facets");
+
+        let (count_query, count_params) = count_sql(&prepared);
+        let image_count = count_rows(&transaction, &count_query, &count_params)?;
+
+        let (sum_query, sum_params) = sum_sql(&prepared, pin.then_some("idx_images_visible_bytes"));
+        let total_bytes = sum_rows(&transaction, &sum_query, &sum_params)?;
+
+        let subfolder_count = subfolder_count(&transaction, &query.filters.folder_ids)?;
+
+        let (extension_query, extension_params) = grouped_sql(
+            &prepared,
+            facet_index,
+            "images.file_ext, count(*)",
+            "GROUP BY images.file_ext ORDER BY count(*) DESC, images.file_ext",
+        );
+        let extensions = grouped_values(&transaction, &extension_query, &extension_params)?;
+
+        let (score_query, score_params) = grouped_sql(
+            &prepared,
+            facet_index,
+            "images.score, count(*)",
+            "GROUP BY images.score ORDER BY images.score DESC",
+        );
+        let scores = grouped_i64(&transaction, &score_query, &score_params)?
+            .into_iter()
+            .map(|(score, count)| ValueCount {
+                value: score.to_string(),
+                count,
+            })
+            .collect();
+
+        let (tag_query, tag_params) = tags_grouped_sql(&prepared, facet_index);
+        let tags = stats_tags(
+            &transaction,
+            grouped_i64(&transaction, &tag_query, &tag_params)?,
+        )?;
+
+        transaction.commit()?;
+        Ok(FolderStats {
+            image_count,
+            total_bytes,
+            subfolder_count,
+            extensions,
+            scores,
+            tags,
+        })
+    })
+}
+
+/// 只在“图库视图 + 纯文件夹/标签条件”时钉住覆盖索引；搜索、日期、大小、描述与特征
+/// 条件会改变最优计划，交给规划器。
+fn pin_stats_indexes(query: &LibraryQuery) -> bool {
+    query.view == LibraryView::All
+        && query.search.is_empty()
+        && query.filters.imported_from.is_none()
+        && query.filters.imported_to.is_none()
+        && query.filters.size_min.is_none()
+        && query.filters.size_max.is_none()
+        && query.filters.description == PresenceFilter::Any
+        && query.filters.embedding == PresenceFilter::Any
+        && query.filters.pose == PresenceFilter::Any
+}
+
+fn subfolder_count(connection: &Connection, folder_ids: &[i64]) -> AppResult<u64> {
+    let folders = all_folders(connection)?;
+    let selected_ids: HashSet<i64> = folder_ids.iter().copied().collect();
+    let selected_paths: HashSet<&str> = folders
+        .iter()
+        .filter(|(id, _)| selected_ids.contains(id))
+        .map(|(_, path)| path.as_str())
+        .collect();
+    if selected_paths.is_empty() {
+        return Ok(0);
+    }
+    let count = folders
+        .iter()
+        .filter(|(id, path)| {
+            if selected_ids.contains(id) {
+                return false;
+            }
+            let mut current = Some(path.as_str());
+            while let Some(prefix) = current {
+                if selected_paths.contains(prefix) {
+                    return true;
+                }
+                if prefix.is_empty() {
+                    break;
+                }
+                current = Some(parent_path(prefix));
+            }
+            false
+        })
+        .count();
+    Ok(count as u64)
+}
+
+fn stats_tags(connection: &Connection, counts: Vec<(i64, u64)>) -> AppResult<Vec<StatsTag>> {
+    let top: Vec<(i64, u64)> = counts.into_iter().take(FOLDER_STATS_TAG_LIMIT).collect();
+    if top.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks = placeholders(top.len());
+    let mut statement =
+        connection.prepare(&format!("SELECT id, name FROM tags WHERE id IN ({marks})"))?;
+    let rows = statement.query_map(params_from_iter(top.iter().map(|(id, _)| *id)), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut names: HashMap<i64, String> = HashMap::new();
+    for row in rows {
+        let (id, name) = row?;
+        names.insert(id, name);
+    }
+    Ok(top
+        .into_iter()
+        .filter_map(|(id, count)| names.remove(&id).map(|name| StatsTag { id, name, count }))
+        .collect())
 }
 
 /// 每个文件夹的直属图片数。单独提出来是为了让测试能断言查询计划。
@@ -1220,6 +1384,20 @@ impl PreparedQuery {
             .push_filters(&query.filters, exclude, folder_paths);
         prepared
     }
+
+    /// 统计只算正常图片；全库搜索不带视图可见性条件时需要补上。
+    fn require_active_images(&mut self) {
+        if !self
+            .filters
+            .clauses
+            .iter()
+            .any(|clause| clause == "images.deleted_at IS NULL")
+        {
+            self.filters
+                .clauses
+                .push("images.deleted_at IS NULL".to_owned());
+        }
+    }
 }
 
 struct FilterSet {
@@ -1504,6 +1682,7 @@ fn build_filter_counts(
             PreparedQuery::new(query, Some(Facet::Folders), SearchMode::Count, folder_paths);
         let (sql, params) = grouped_sql(
             &prepared,
+            None,
             "images.folder_id, count(*)",
             "GROUP BY images.folder_id ORDER BY count(*) DESC, images.folder_id",
         );
@@ -1531,17 +1710,11 @@ fn build_filter_counts(
         );
         let (sql, params) = grouped_sql(
             &prepared,
+            None,
             "images.file_ext, count(*)",
             "GROUP BY images.file_ext ORDER BY count(*) DESC, images.file_ext",
         );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(params.iter()), |row| {
-            Ok(ValueCount {
-                value: row.get(0)?,
-                count: row.get::<_, i64>(1)?.max(0) as u64,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        grouped_values(connection, &sql, &params)?
     };
 
     let scores = {
@@ -1549,6 +1722,7 @@ fn build_filter_counts(
             PreparedQuery::new(query, Some(Facet::Scores), SearchMode::Count, folder_paths);
         let (sql, params) = grouped_sql(
             &prepared,
+            None,
             "images.score, count(*)",
             "GROUP BY images.score ORDER BY images.score DESC",
         );
@@ -1564,7 +1738,7 @@ fn build_filter_counts(
     let tags = {
         let prepared =
             PreparedQuery::new(query, Some(Facet::Tags), SearchMode::Count, folder_paths);
-        let (sql, params) = tags_grouped_sql(&prepared);
+        let (sql, params) = tags_grouped_sql(&prepared, None);
         grouped_i64(connection, &sql, &params)?
             .into_iter()
             .map(|(tag_id, count)| TagCount { tag_id, count })
@@ -1754,17 +1928,15 @@ fn filters_only(
 
 /// 把选中的文件夹 id 解析成路径；已不存在或非法的 id 直接丢弃。
 fn folder_scope_paths(connection: &Connection, ids: &[i64]) -> AppResult<Vec<String>> {
-    let mut paths = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(path) = connection
-            .query_row("SELECT path FROM folders WHERE id = ?1", [id], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-        {
-            paths.push(path);
-        }
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let marks = placeholders(ids.len());
+    let mut statement =
+        connection.prepare(&format!("SELECT path FROM folders WHERE id IN ({marks})"))?;
+    let paths = statement
+        .query_map(params_from_iter(ids.iter().copied()), |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(paths)
 }
 
@@ -1844,22 +2016,47 @@ fn count_sql(prepared: &PreparedQuery) -> (String, Vec<Value>) {
     (sql, params)
 }
 
-fn grouped_sql(prepared: &PreparedQuery, columns: &str, suffix: &str) -> (String, Vec<Value>) {
+fn index_hint(index: Option<&str>) -> String {
+    index
+        .map(|name| format!(" INDEXED BY {name}"))
+        .unwrap_or_default()
+}
+
+fn sum_sql(prepared: &PreparedQuery, index: Option<&str>) -> (String, Vec<Value>) {
     let mut params = prepared.join_params.clone();
     params.extend(prepared.filters.params.iter().cloned());
+    let hint = index_hint(index);
     let sql = format!(
-        "SELECT {columns} FROM images {} WHERE {} {suffix}",
+        "SELECT coalesce(sum(images.file_size), 0) FROM images{hint} {} WHERE {}",
         prepared.join_sql,
         prepared.filters.clauses.join(" AND ")
     );
     (sql, params)
 }
 
-fn tags_grouped_sql(prepared: &PreparedQuery) -> (String, Vec<Value>) {
+fn grouped_sql(
+    prepared: &PreparedQuery,
+    index: Option<&str>,
+    columns: &str,
+    suffix: &str,
+) -> (String, Vec<Value>) {
     let mut params = prepared.join_params.clone();
     params.extend(prepared.filters.params.iter().cloned());
+    let hint = index_hint(index);
     let sql = format!(
-        "SELECT image_tags.tag_id, count(*) FROM images
+        "SELECT {columns} FROM images{hint} {} WHERE {} {suffix}",
+        prepared.join_sql,
+        prepared.filters.clauses.join(" AND ")
+    );
+    (sql, params)
+}
+
+fn tags_grouped_sql(prepared: &PreparedQuery, index: Option<&str>) -> (String, Vec<Value>) {
+    let mut params = prepared.join_params.clone();
+    params.extend(prepared.filters.params.iter().cloned());
+    let hint = index_hint(index);
+    let sql = format!(
+        "SELECT image_tags.tag_id, count(*) FROM images{hint}
          JOIN image_tags ON image_tags.image_id = images.id
          {} WHERE {}
          GROUP BY image_tags.tag_id ORDER BY count(*) DESC, image_tags.tag_id",
@@ -1873,6 +2070,26 @@ fn count_rows(connection: &Connection, sql: &str, params: &[Value]) -> AppResult
     let count: i64 =
         connection.query_row(sql, params_from_iter(params.iter()), |row| row.get(0))?;
     Ok(count.max(0) as u64)
+}
+
+fn sum_rows(connection: &Connection, sql: &str, params: &[Value]) -> AppResult<u64> {
+    let sum: i64 = connection.query_row(sql, params_from_iter(params.iter()), |row| row.get(0))?;
+    Ok(sum.max(0) as u64)
+}
+
+fn grouped_values(
+    connection: &Connection,
+    sql: &str,
+    params: &[Value],
+) -> AppResult<Vec<ValueCount>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+        Ok(ValueCount {
+            value: row.get(0)?,
+            count: row.get::<_, i64>(1)?.max(0) as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn grouped_i64(connection: &Connection, sql: &str, params: &[Value]) -> AppResult<Vec<(i64, u64)>> {
@@ -3610,5 +3827,234 @@ mod tests {
             !plan.contains("idx_images_active"),
             "文件夹计数仍在逐行回表：{plan}"
         );
+    }
+
+    fn folder_query(folder_ids: Vec<i64>) -> LibraryQuery {
+        LibraryQuery {
+            filters: LibraryFilters {
+                folder_ids,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn explain(connection: &Connection, sql: &str, params: &[Value]) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn folder_stats_match_counts_bytes_and_distributions() {
+        let fixture = fixture();
+        let query = folder_query(vec![fixture.folder_people]);
+        let stats = folder_stats(&fixture.session.db, query.clone()).unwrap();
+        let counts = filter_counts(&fixture.session.db, query).unwrap();
+
+        assert_eq!(stats.image_count, counts.total);
+        assert_eq!(stats.image_count, 2, "回收站里的 e 不计入");
+        assert_eq!(stats.total_bytes, 3_000);
+        assert_eq!(stats.subfolder_count, 0);
+        assert_eq!(
+            stats.extensions,
+            vec![
+                ValueCount {
+                    value: "jpg".into(),
+                    count: 1
+                },
+                ValueCount {
+                    value: "png".into(),
+                    count: 1
+                }
+            ]
+        );
+        let scores: Vec<(String, u64)> = stats
+            .scores
+            .into_iter()
+            .map(|item| (item.value, item.count))
+            .collect();
+        assert_eq!(scores, vec![("5".into(), 1), ("3".into(), 1)]);
+        let tags: Vec<(String, u64)> = stats
+            .tags
+            .into_iter()
+            .map(|tag| (tag.name, tag.count))
+            .collect();
+        assert_eq!(tags, vec![("速写".into(), 2), ("参考".into(), 1)]);
+    }
+
+    #[test]
+    fn folder_stats_handle_children_direct_mode_and_union() {
+        let fixture = fixture();
+        let child = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                let child = ensure_folder(connection, "人物/速写", 1)?;
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    2,
+                    child,
+                    700,
+                    600,
+                    800,
+                    800,
+                    None,
+                    &[],
+                );
+                Ok(child)
+            })
+            .unwrap();
+
+        let subtree = folder_stats(
+            &fixture.session.db,
+            folder_query(vec![fixture.folder_people]),
+        )
+        .unwrap();
+        assert_eq!(subtree.image_count, 3);
+        assert_eq!(subtree.total_bytes, 3_700);
+        assert_eq!(subtree.subfolder_count, 1);
+
+        let mut direct = folder_query(vec![fixture.folder_people]);
+        direct.filters.folder_direct = true;
+        let direct = folder_stats(&fixture.session.db, direct).unwrap();
+        assert_eq!(direct.image_count, 2);
+        assert_eq!(direct.total_bytes, 3_000);
+        assert_eq!(direct.subfolder_count, 1);
+
+        let union = folder_stats(
+            &fixture.session.db,
+            folder_query(vec![fixture.folder_people, child]),
+        )
+        .unwrap();
+        assert_eq!(union.image_count, 3, "嵌套选择不能重复计数");
+        assert_eq!(union.subfolder_count, 0, "选中的子文件夹不算子文件夹");
+    }
+
+    #[test]
+    fn folder_stats_library_search_excludes_trash() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET description = '人物速写' WHERE id = 5",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let query = LibraryQuery {
+            search: "人物速写".into(),
+            search_scope: SearchScope::Library,
+            filters: LibraryFilters {
+                folder_ids: vec![fixture.folder_people],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stats = folder_stats(&fixture.session.db, query.clone()).unwrap();
+        let counts = filter_counts(&fixture.session.db, query).unwrap();
+        assert_eq!(counts.total, 2, "列表命中回收站里的 e");
+        assert_eq!(stats.image_count, 1, "统计始终排除回收站");
+    }
+
+    #[test]
+    fn folder_stats_limit_tags_to_eight() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                for name in ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛"] {
+                    connection.execute("INSERT INTO tags(name) VALUES (?1)", [name])?;
+                    let tag_id = connection.last_insert_rowid();
+                    connection.execute(
+                        "INSERT INTO image_tags(image_id, tag_id) VALUES (1, ?1)",
+                        [tag_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = folder_stats(
+            &fixture.session.db,
+            folder_query(vec![fixture.folder_people]),
+        )
+        .unwrap();
+        assert_eq!(stats.tags.len(), 8);
+        assert_eq!(stats.tags[0].name, "速写");
+        assert_eq!(stats.tags[0].count, 2);
+    }
+
+    #[test]
+    fn folder_stats_use_covering_indexes() {
+        let fixture = fixture();
+        let query = folder_query(vec![fixture.folder_people]);
+        let (sum_plan, score_plan) = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+                let prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
+                assert!(pin_stats_indexes(&query));
+                let (sum_sql, sum_params) = sum_sql(&prepared, Some("idx_images_visible_bytes"));
+                let (score_sql, score_params) = grouped_sql(
+                    &prepared,
+                    Some("idx_images_visible_facets"),
+                    "images.score, count(*)",
+                    "GROUP BY images.score",
+                );
+                Ok((
+                    explain(connection, &sum_sql, &sum_params),
+                    explain(connection, &score_sql, &score_params),
+                ))
+            })
+            .unwrap();
+        assert!(
+            sum_plan.contains("idx_images_visible_bytes"),
+            "总字节没有走覆盖索引：{sum_plan}"
+        );
+        assert!(
+            score_plan.contains("idx_images_visible_facets"),
+            "评分分组没有走分面索引：{score_plan}"
+        );
+    }
+
+    #[test]
+    fn pin_stats_indexes_policy() {
+        let mut query = folder_query(vec![1]);
+        assert!(pin_stats_indexes(&query));
+
+        query.search = "人物".into();
+        assert!(!pin_stats_indexes(&query));
+
+        query.search.clear();
+        query.view = LibraryView::Trash;
+        assert!(!pin_stats_indexes(&query));
+
+        query.view = LibraryView::All;
+        query.filters.size_min = Some(1);
+        assert!(!pin_stats_indexes(&query));
+
+        query.filters.size_min = None;
+        query.filters.tag_ids = vec![1];
+        assert!(pin_stats_indexes(&query), "标签条件仍可由分面索引覆盖");
+
+        query.filters.description = PresenceFilter::Has;
+        assert!(!pin_stats_indexes(&query));
     }
 }

@@ -44,8 +44,9 @@ use crate::{
             self, DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::{self, OptimizeEstimate},
-        query::{self, FilterCounts, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        query::{self, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryCounts, LibraryInfo, LibrarySession},
+        stats::{self, StatsRequest, StatsSnapshot},
         temp,
         thumbs::{self, ThumbPack},
         viewer::PoseData,
@@ -782,15 +783,9 @@ impl AppState {
         query::query_ids(&database, query)
     }
 
-    pub fn filter_counts(&self, query: LibraryQuery) -> AppResult<FilterCounts> {
+    pub fn library_stats(&self, request: StatsRequest) -> AppResult<StatsSnapshot> {
         let (database, _) = self.query_source()?;
-        query::filter_counts(&database, query)
-    }
-
-    /// 只算命中总数，不取分面；对话框要一个“当前视图 N 张”时用它，别跑完整统计。
-    pub fn query_total(&self, query: LibraryQuery) -> AppResult<u64> {
-        let (database, _) = self.query_source()?;
-        query::query_total(&database, query)
+        stats::library_stats(&database, request)
     }
 
     pub fn folders(&self) -> AppResult<Vec<FolderInfo>> {

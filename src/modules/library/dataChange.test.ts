@@ -304,6 +304,22 @@ test("合并计划取最保守的动作", () => {
   assert.equal(merged.similarity, "clear");
 });
 
+test("统计失效跟随分面版本", () => {
+  const current = query();
+  for (const kind of ["metadata", "folder", "membership", "tagCatalog", "unknown"] as const) {
+    assert.equal(
+      planDataChange(change({ kind }), current, context).facets,
+      true,
+      `${kind} 应让统计失效`,
+    );
+  }
+  assert.equal(
+    planDataChange(change({ kind: "thumbnails", source: "task" }), current, context).facets,
+    false,
+    "缩略图重建不改统计",
+  );
+});
+
 test("标签候选只随标签变化与未知变化重算", () => {
   assert.equal(touchesTags(change({ fields: ["tags"] })), true);
   assert.equal(touchesTags(change({ kind: "tagCatalog" })), true);

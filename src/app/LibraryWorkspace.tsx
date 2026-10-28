@@ -9,6 +9,11 @@ import type { CollectionInfo, FolderChange, FolderInfo } from "../modules/librar
 import { sortForViewChange } from "../modules/library/model";
 import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
+import {
+  createStatsStore,
+  type StatsStore,
+} from "../modules/library/statsStore";
+import { StatsStoreProvider } from "../modules/library/StatsProvider";
 import { aiApi } from "../modules/ai/api";
 import { useAiStatus } from "../modules/ai/useAiStatus";
 import { viewerApi } from "../modules/viewer/api";
@@ -56,6 +61,7 @@ interface ContextSources {
 async function refreshTaskContext(
   previous: BatchTaskContextInfo,
   sources: ContextSources,
+  stats: StatsStore,
 ): Promise<BatchTaskContextInfo> {
   const folder =
     previous.folderId != null
@@ -69,7 +75,7 @@ async function refreshTaskContext(
   let viewTotal = previous.viewTotal;
   if (previous.query) {
     try {
-      viewTotal = await libraryApi.getQueryTotal(previous.query);
+      viewTotal = (await stats.fetch("summary", previous.query)).total;
     } catch {
       viewTotal = null;
     }
@@ -93,6 +99,17 @@ async function refreshTaskContext(
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
   const { current, settings } = useAppRuntime();
   const { notify } = useNotices();
+  const statsStore = useMemo(
+    () =>
+      current?.id
+        ? createStatsStore({ fetch: (request) => libraryApi.getLibraryStats(request) })
+        : null,
+    [current?.id],
+  );
+  useEffect(() => {
+    if (!statsStore) return;
+    return () => statsStore.dispose();
+  }, [statsStore]);
   const [importOpen, setImportOpen] = useState(false);
   const [pendingPaths, setPendingPaths] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -414,13 +431,15 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   // 优化对话框先打开、后补范围计数：只查总数，不跑分面统计。
   // 放在 `if (!current)` 之前，避免关闭图库时少注册一个 effect。
   useEffect(() => {
-    if (!optimizeContext?.query || optimizeContext.viewTotal != null) return;
+    if (!optimizeContext?.query || optimizeContext.viewTotal != null || !statsStore) {
+      return;
+    }
     const generation = optimizeQueryRef.current + 1;
     optimizeQueryRef.current = generation;
     let disposed = false;
-    void libraryApi
-      .getQueryTotal(optimizeContext.query)
-      .then((total) => {
+    void statsStore
+      .fetch("summary", optimizeContext.query)
+      .then(({ total }) => {
         if (disposed || generation !== optimizeQueryRef.current) return;
         setOptimizeContext((previous) =>
           previous && previous.query ? { ...previous, viewTotal: total } : previous,
@@ -432,7 +451,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return () => {
       disposed = true;
     };
-  }, [optimizeContext]);
+  }, [optimizeContext, statsStore]);
 
   const handleContextsChanged = useCallback(() => {
     setContextsRevision((value) => value + 1);
@@ -440,7 +459,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
 
   // 对话框打开期间数据变化：重取范围数量与选择；估算保留，只标记“执行前会复核”。
   useEffect(() => {
-    if (contextsRevision === 0) return;
+    if (contextsRevision === 0 || !statsStore) return;
     const previousBatch = batchContext;
     const previousOptimize = optimizeContext;
     if (!previousBatch && !previousOptimize) return;
@@ -466,8 +485,10 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
         tempTotal: current?.tempCount ?? null,
       };
       const [nextBatch, nextOptimize] = await Promise.all([
-        previousBatch ? refreshTaskContext(previousBatch, sources) : null,
-        previousOptimize ? refreshTaskContext(previousOptimize, sources) : null,
+        previousBatch ? refreshTaskContext(previousBatch, sources, statsStore) : null,
+        previousOptimize
+          ? refreshTaskContext(previousOptimize, sources, statsStore)
+          : null,
       ]);
       if (generation !== contextsRevisionRef.current) return;
       if (nextBatch) setBatchContext((current) => (current ? nextBatch : current));
@@ -477,7 +498,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       }
     })();
     // 只在计数版本推进时按打开时的上下文重取，不随上下文对象本身重跑。
-  }, [contextsRevision]);
+  }, [contextsRevision, statsStore]);
 
   if (!current) return null;
 
@@ -577,38 +598,40 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       />
       <main className="app-main">
         <div className={`workspace${hasImages ? " workspace-browse" : ""}`}>
-          {hasImages ? (
-            <LibraryView
-              key={current.id}
-              browse={browse.browse}
-              canGoBack={browse.canGoBack}
-              folders={folders}
-              onApplyBrowse={browse.applyBrowse}
-              onGoBack={browse.goBack}
-              onFoldersChanged={() => reloadFolders()}
-              onImageSelectionChange={setSelectedImageIds}
-              changeSignal={changeSignal}
-              onOpenViewer={setViewerSession}
-              onCloseViewer={() => setViewerSession(null)}
-              onContextsChanged={handleContextsChanged}
-              onCopyImage={(imageId) => void handleCopyImage(imageId)}
-              onOpenImport={() => openImport()}
-              onBeginImageDrag={(imageIds, label, event) =>
-                beginDrag({ kind: "images", imageIds, label }, event)
-              }
-              similarity={similarity}
-              onOpenSimilarityGroups={() => {
-                setSimilarityGroupsOpen(true);
-              }}
-              onOpenBatchTasks={setBatchContext}
-              onOpenOptimize={(context) => {
-                setOptimizeContext(context);
-                setOptimizeStale(false);
-              }}
-              onGenerateDescription={generateDescription}
-              semanticBlockedReason={semanticBlockedReason}
-            />
-          ) : (
+          {hasImages && statsStore ? (
+            <StatsStoreProvider store={statsStore}>
+              <LibraryView
+                key={current.id}
+                browse={browse.browse}
+                canGoBack={browse.canGoBack}
+                folders={folders}
+                onApplyBrowse={browse.applyBrowse}
+                onGoBack={browse.goBack}
+                onFoldersChanged={() => reloadFolders()}
+                onImageSelectionChange={setSelectedImageIds}
+                changeSignal={changeSignal}
+                onOpenViewer={setViewerSession}
+                onCloseViewer={() => setViewerSession(null)}
+                onContextsChanged={handleContextsChanged}
+                onCopyImage={(imageId) => void handleCopyImage(imageId)}
+                onOpenImport={() => openImport()}
+                onBeginImageDrag={(imageIds, label, event) =>
+                  beginDrag({ kind: "images", imageIds, label }, event)
+                }
+                similarity={similarity}
+                onOpenSimilarityGroups={() => {
+                  setSimilarityGroupsOpen(true);
+                }}
+                onOpenBatchTasks={setBatchContext}
+                onOpenOptimize={(context) => {
+                  setOptimizeContext(context);
+                  setOptimizeStale(false);
+                }}
+                onGenerateDescription={generateDescription}
+                semanticBlockedReason={semanticBlockedReason}
+              />
+            </StatsStoreProvider>
+          ) : hasImages ? null : (
             <>
               <div className="stat-grid">
                 <div className="stat-card">
