@@ -46,8 +46,35 @@ Lilith Artbank 是用于管理大量图片参考图的个人工具。它为**上
 ## 运行环境
 
 - **操作系统**：Windows 10/11，WebView2 使用系统自带运行时。
-- **模型能力可选**：需要语义、向量或姿势时才要 `python_embeded/` 与 `resources/models/`。
-- **便携使用**：`npm run pack:portable` 产出 exe 与 `server/` 的文件夹，把 Python 环境与模型放进去即可直接运行，不生成安装器。
+- **模型能力可选**：需要语义、向量或姿势时才要 `python_embeded` 与 `resources\models`。
+
+## 部署
+
+程序以 Windows 便携文件夹分发，不生成安装器，目标电脑不需要 Node.js、Rust 或管理员权限。
+
+1. 在开发机上运行 `npm run pack:portable`，得到 `release\Lilith Artbank`。程序包已经包含 `server`，不需要单独准备；它只是服务代码，必须配合 Python 环境才能启动 AI 服务。
+2. 需要语义、向量或姿势能力时，按下一节把 `python_embeded` 与 `resources\models` 放进这个文件夹；不启用 AI 时跳过，导入、浏览、文本搜索与编辑都可以正常使用。
+3. 把整个文件夹复制到目标电脑的本地可写目录，例如 `D:\Apps\Lilith Artbank`。设置、日志与 AI 服务输出都写在程序旁边，`Program Files` 等只读位置不可用。
+4. 双击 `lilith-artbank.exe` 启动，首次运行选择或新建图库目录。图库是独立的普通文件夹，与程序目录分开。
+
+目标电脑需要 WebView2 运行时：Windows 11 自带，Windows 10 通常已随 Edge 安装。
+
+### Python 环境（可选）
+
+语义、向量与姿势能力需要同目录的 `python_embeded` 与 `resources\models`。`python_embeded` 是 Python 3.11 + CUDA 12.1 环境，不随包分发。
+
+已有可用的 conda 环境 `LilithArtbank` 时，用 conda-pack 打包：
+
+```bash
+conda install -n base -c conda-forge conda-pack   # 未安装时
+conda-pack -n LilithArtbank -o python_embeded.zip
+```
+
+把 zip 解压到程序目录并命名为 `python_embeded`（根目录应有 `python.exe`），再运行一次 `python_embeded\Scripts\conda-unpack.exe`。
+
+从零重建可用 `conda env create -f environment.yml -p "<程序目录>\python_embeded"`；如果 pip 阶段找不到 CUDA 版 torch，先设置 `PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121` 后重试，或按 `server\requirements.txt` 安装。
+
+模型放到程序目录下的 `resources\models`，CLIP 默认读取其中的 `siglip2-giant-opt-patch16-384`。
 
 ## 开发与构建
 
