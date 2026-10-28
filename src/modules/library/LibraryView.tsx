@@ -25,6 +25,7 @@ import {
   RefreshCw,
   ScanSearch,
   Search,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Upload,
@@ -41,7 +42,7 @@ import { Spinner } from "../../shared/components/Spinner";
 import { copyText } from "../../shared/clipboard";
 import { confirmDelete, confirmEmptyTrash, confirmTrash } from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
-import type { ThumbFit, UiSettings } from "../../app/types";
+import { LIST_COLUMNS, type ThumbFit, type UiSettings } from "../../app/types";
 import { libraryApi } from "./api";
 import { CollectionManagerDialog } from "./CollectionManagerDialog";
 import { CollectionPickerDialog } from "./CollectionPickerDialog";
@@ -136,6 +137,8 @@ interface LibraryViewProps {
   onOpenSimilarityGroups?: () => void;
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
   onOpenOptimize?: (context: BatchTaskContextInfo) => void;
+  /** 打开维护与检查；与批量任务共用同一份范围上下文。 */
+  onOpenMaintenance?: (context: BatchTaskContextInfo) => void;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
   /** 语义搜索不可用的原因；为空表示可用。 */
   semanticBlockedReason?: string | null;
@@ -214,6 +217,7 @@ export function LibraryView({
   onOpenSimilarityGroups,
   onOpenBatchTasks,
   onOpenOptimize,
+  onOpenMaintenance,
   onGenerateDescription,
   semanticBlockedReason = null,
 }: LibraryViewProps) {
@@ -349,6 +353,7 @@ export function LibraryView({
   );
   const thumbPx = settings?.ui.gridThumbPx ?? 220;
   const thumbFit: ThumbFit = settings?.ui.thumbFit ?? "cover";
+  const listColumns = settings?.ui.listColumns ?? LIST_COLUMNS;
 
   const itemsRef = useRef(items);
   itemsRef.current = items;
@@ -1107,6 +1112,13 @@ export function LibraryView({
     if (context) onOpenBatchTasks(context);
   }, [buildTaskContext, onOpenBatchTasks]);
 
+  const openMaintenance = useCallback(async () => {
+    setTaskMenuOpen(false);
+    if (!onOpenMaintenance) return;
+    const context = await buildTaskContext();
+    if (context) onOpenMaintenance(context);
+  }, [buildTaskContext, onOpenMaintenance]);
+
   const openOptimize = useCallback(() => {
     setTaskMenuOpen(false);
     if (!onOpenOptimize) return;
@@ -1837,6 +1849,9 @@ export function LibraryView({
         `标签 ${browse.filters.tagIds.length}（${browse.filters.tagMode === "all" ? "全部" : "任一"}）`,
       );
     }
+    if (browse.filters.excludeTagIds.length > 0) {
+      parts.push(`不含 ${browse.filters.excludeTagIds.length} 个标签`);
+    }
     if (browse.filters.importedFrom != null || browse.filters.importedTo != null) {
       parts.push("导入时间");
     }
@@ -1992,6 +2007,17 @@ export function LibraryView({
               >
                 <ScanSearch size={14} />
                 <span>相似分组…</span>
+              </button>
+            </MenuSection>
+            <MenuSection title="维护">
+              <button
+                type="button"
+                className="context-menu-item"
+                disabled={!onOpenMaintenance}
+                onClick={() => void openMaintenance()}
+              >
+                <ShieldCheck size={14} />
+                <span>维护与检查…</span>
               </button>
             </MenuSection>
           </Popover>
@@ -2440,6 +2466,8 @@ export function LibraryView({
             <VirtualList
               ref={viewRef}
               items={items}
+              columns={listColumns}
+              onColumnsChange={(next) => persistUi({ listColumns: next })}
               resetKey={resetSignature}
               anchorRevision={imageQuery.replaceRevision}
               selected={selected}

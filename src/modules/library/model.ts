@@ -228,6 +228,44 @@ export function imageActions(inTrash: boolean): ImageAction[] {
   return inTrash ? ["restore", "delete"] : ["trash"];
 }
 
+/** 单个标签在筛选面板里的三态：不参与、要求包含、要求排除。 */
+export type TagOptionState = "neutral" | "include" | "exclude";
+
+export function tagOptionState(filters: LibraryFilters, tagId: number): TagOptionState {
+  if (filters.tagIds.includes(tagId)) return "include";
+  if (filters.excludeTagIds.includes(tagId)) return "exclude";
+  return "neutral";
+}
+
+/**
+ * 点一次走一格：中性 → 包含 → 排除 → 中性。
+ *
+ * 包含与排除互斥：同一个标签不能既要求有又要求没有，切换时把另一边摘掉。
+ * 从「无标签」状态下点标签视为包含，顺手把存在性条件让位。
+ */
+export function cycleTagFilter(filters: LibraryFilters, tagId: number): LibraryFilters {
+  const state = tagOptionState(filters, tagId);
+  if (state === "neutral") {
+    return {
+      ...filters,
+      tagIds: [...filters.tagIds, tagId],
+      excludeTagIds: filters.excludeTagIds.filter((id) => id !== tagId),
+      tagPresence: "any",
+    };
+  }
+  if (state === "include") {
+    return {
+      ...filters,
+      tagIds: filters.tagIds.filter((id) => id !== tagId),
+      excludeTagIds: [...filters.excludeTagIds, tagId],
+    };
+  }
+  return {
+    ...filters,
+    excludeTagIds: filters.excludeTagIds.filter((id) => id !== tagId),
+  };
+}
+
 export function toggleValue<T>(values: T[], value: T): T[] {
   return values.includes(value)
     ? values.filter((item) => item !== value)

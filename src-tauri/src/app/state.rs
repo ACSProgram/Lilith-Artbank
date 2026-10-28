@@ -19,8 +19,10 @@ use crate::{
         runtime::{AiRuntime, GroupOptions, SimilarityGroupsResult},
     },
     app::{
+        activity,
         batch_preview::{self, BatchTaskPreview, BatchTaskPreviewRequest},
         error::{AppError, AppResult},
+        idle::{self as idle_loop, IdleLoop},
         settings::SettingsStore,
         tasks::{
             BatchTaskKind, BatchTaskRequest, ConflictPolicy, LaneGuard, TaskBus, TaskHandle,
@@ -46,12 +48,17 @@ use crate::{
         db::LibraryDb,
         folders as folder_service,
         history::{self, HistoryKind, HistoryPage, NewOperation, RecoveryPlan},
+        inspect::{self as inspector, InspectScope, InspectionMode, InspectionReport},
+        maintenance_actions,
         manifest::{LibraryInspection, inspect},
         metadata::{
             self, DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::{self, OptimizeEstimate},
-        paths::{join_folder, normalize_folder, normalize_folder_name, parent_path},
+        pack_gc::{self, CompactMark, PackStats},
+        paths::{
+            join_folder, normalize_folder, normalize_folder_name, parent_path, subtree_like_pattern,
+        },
         query::{self, FolderChange, FolderInfo, ImagePage, LibraryQuery, PendingFilter, TagInfo},
         service::{self, LibraryCounts, LibraryInfo, LibrarySession},
         stats::{self, StatsRequest, StatsSnapshot},
@@ -84,6 +91,10 @@ pub struct AppState {
     managed: AtomicBool,
     recovery: Mutex<RecoveryPlan>,
     optimize_estimates: Arc<Mutex<VecDeque<(String, OptimizeEstimate)>>>,
+    /// 最近几次检查的报告，按任务 id 索引；被挤掉时界面提示重新扫描。
+    inspection_reports: Arc<Mutex<VecDeque<(String, InspectionReport)>>>,
+    /// 空闲回收线程；开库时启动，关库时停。
+    idle_loop: Mutex<Option<IdleLoop>>,
     mcp_sheets: Arc<Mutex<SheetCache>>,
     mcp_write: Arc<Mutex<()>>,
     mcp_approvals: Arc<ApprovalQueue>,
@@ -94,6 +105,8 @@ pub struct AppState {
 const MAX_MCP_TASKS: usize = 100;
 /// 导入回执与未结束导入的句柄保留同样量级，旧的滚动淘汰；运行中的导入永不淘汰。
 const MAX_IMPORT_RECEIPTS: usize = 20;
+/// 检查报告缓存条数；与压缩估算的 10 条同一个滚动淘汰模式。
+const MAX_INSPECTION_REPORTS: usize = 5;
 
 /// 缩略图重建连续失败达到该数量即停止，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
@@ -118,6 +131,8 @@ impl AppState {
             managed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryPlan::default()),
             optimize_estimates: Arc::new(Mutex::new(VecDeque::new())),
+            inspection_reports: Arc::new(Mutex::new(VecDeque::new())),
+            idle_loop: Mutex::new(None),
             mcp_sheets: Arc::new(Mutex::new(SheetCache::default())),
             mcp_write: Arc::new(Mutex::new(())),
             mcp_approvals,
@@ -728,14 +743,18 @@ impl AppState {
             session.thumbs.clone(),
             PathBuf::from(&info.path),
         );
+        // 刚开库算「人在」，别让空闲循环在用户还没碰过界面时先动手。
+        activity::touch();
         *self.library.lock() = Some(session);
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.inspection_reports.lock().clear();
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        self.restart_idle_loop();
         Ok(info)
     }
 
@@ -751,6 +770,8 @@ impl AppState {
         if let Err(error) = temp::clear(&session.db, Path::new(&session.info.path)) {
             log::warn!("清空临时文件夹失败：{error}");
         }
+        // 让位、提交失败与进程崩溃都会在 thumbs/ 留下没登记的段文件。
+        self.cleanup_pack_residue(&session.db, Path::new(&session.info.path));
         let info = session.info.clone();
         self.settings.set_library_path(Some(info.path.clone()))?;
         self.clear_previous_temp();
@@ -760,19 +781,48 @@ impl AppState {
             session.thumbs.clone(),
             PathBuf::from(&info.path),
         );
+        // 刚开库算「人在」，别让空闲循环在用户还没碰过界面时先动手。
+        activity::touch();
         *self.library.lock() = Some(session);
         *self.recovery.lock() = plan;
         self.optimize_estimates.lock().clear();
+        self.inspection_reports.lock().clear();
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        self.restart_idle_loop();
         drop(_session);
         if self.managed.load(Ordering::SeqCst) {
             self.after_library_open();
         }
         Ok(info)
+    }
+
+    /// 打开图库时清理缩略图包残留：`thumbs/` 里不在 `thumb_segments` 表里的 `.pack` 都删。
+    ///
+    /// 覆盖三种来源：让位时没删成的、提交失败留下的、进程崩溃留在磁盘上的。
+    fn cleanup_pack_residue(&self, database: &LibraryDb, root: &Path) {
+        match pack_gc::cleanup_orphan_segments(database, root) {
+            Ok(0) => {}
+            Ok(removed) => log::info!("清理了 {removed} 个残留缩略图包"),
+            Err(error) => log::warn!("清理残留缩略图包失败：{error}"),
+        }
+    }
+
+    /// 开库时起空闲回收线程；换库时先停旧的，避免两个循环同时提交任务。
+    fn restart_idle_loop(&self) {
+        // 两次取锁不嵌套：旧线程的 Drop 要 join，不能在持锁时等。
+        *self.idle_loop.lock() = None;
+        if self.library.lock().is_some() {
+            let started = IdleLoop::start(self.app.clone());
+            *self.idle_loop.lock() = Some(started);
+        }
+    }
+
+    fn stop_idle_loop(&self) {
+        *self.idle_loop.lock() = None;
     }
 
     /// 切换图库时清空旧库的临时区；失败只记日志，不能挡住换库。
@@ -825,9 +875,12 @@ impl AppState {
             log::warn!("关闭图库前清空临时文件夹失败：{error}");
         }
         self.ai.library_closed();
+        self.stop_idle_loop();
+        activity::reset();
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
         self.optimize_estimates.lock().clear();
+        self.inspection_reports.lock().clear();
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
@@ -851,6 +904,7 @@ impl AppState {
         // 排队任务还没占资源，退出前直接取消，避免关闭过程中突然启动。
         self.tasks.cancel_queued();
         self.tasks.cancel_for_close();
+        self.stop_idle_loop();
         if !self.tasks.wait_idle(Duration::from_secs(2)) {
             log::warn!("退出时任务未停止，临时文件夹留到下次打开图库时清空");
             return;
@@ -1061,14 +1115,19 @@ impl AppState {
         })
     }
 
-    pub fn tags(&self, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
+    pub fn tags(&self, limit: Option<u32>, include_empty: bool) -> AppResult<Vec<TagInfo>> {
         let (database, _) = self.query_source()?;
-        query::list_tags(&database, limit)
+        query::list_tags_with_empty(&database, limit, include_empty)
     }
 
-    pub fn search_tags(&self, query_text: &str, limit: Option<u32>) -> AppResult<Vec<TagInfo>> {
+    pub fn search_tags(
+        &self,
+        query_text: &str,
+        limit: Option<u32>,
+        include_empty: bool,
+    ) -> AppResult<Vec<TagInfo>> {
         let (database, _) = self.query_source()?;
-        query::search_tags(&database, query_text, limit)
+        query::search_tags_with_empty(&database, query_text, limit, include_empty)
     }
 
     pub fn image_detail(&self, image_id: i64) -> AppResult<ImageDetails> {
@@ -1783,6 +1842,12 @@ impl AppState {
             ),
             BatchTaskKind::OptimizeEstimate => self.start_optimize_estimate(app, request),
             BatchTaskKind::Optimize => self.start_optimize_task(app, request),
+            BatchTaskKind::CheckFast | BatchTaskKind::CheckFull => {
+                self.start_check_task(app, request)
+            }
+            BatchTaskKind::Export => self.start_export_task(app, request),
+            // 「立即回收」与空闲循环提交的是同一个任务，区别只在提交前是否等空闲条件。
+            BatchTaskKind::PackCompact => self.compact_pack_now(app),
         }
     }
 
@@ -2161,6 +2226,373 @@ impl AppState {
         batch_preview::preview(&database, &request)
     }
 
+    // ---------------- 维护：包回收、检查、孤儿、导出 ----------------
+
+    /// 缩略图包当前的垃圾率；空闲循环用它做第 3 条判定，平时一次都不查。
+    pub fn pack_garbage_ratio(&self) -> AppResult<f64> {
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        Ok(pack_gc::stats(&database, &root)?.garbage_ratio())
+    }
+
+    pub fn pack_stats(&self) -> AppResult<PackStats> {
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        pack_gc::stats(&database, &root)
+    }
+
+    pub fn last_pack_compact(&self) -> AppResult<Option<CompactMark>> {
+        let (database, _) = self.query_source()?;
+        pack_gc::last_compact(&database)
+    }
+
+    /// 手动「立即回收」：不等空闲条件，但仍受任务互斥（有导入在跑时会排队）。
+    pub fn compact_pack_now(&self, app: AppHandle) -> AppResult<TaskStartResult> {
+        self.start_pack_compact_inner(app, false)
+    }
+
+    /// 空闲循环提交的回收：用户一有活动就让位。
+    pub fn start_pack_compact(&self, app: AppHandle) -> AppResult<TaskStartResult> {
+        self.start_pack_compact_inner(app, true)
+    }
+
+    fn start_pack_compact_inner(
+        &self,
+        app: AppHandle,
+        automatic: bool,
+    ) -> AppResult<TaskStartResult> {
+        let (database, thumbs, root) = self.edit_handles()?;
+        let scope = if automatic {
+            "空闲回收"
+        } else {
+            "立即回收"
+        };
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::PackCompact,
+            scope,
+        );
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        // 与导入、编辑、重建缩略图互斥——这些正是唯一会 append 的路径；
+        // `Access::Replace` 不与读互斥，查看器与 MCP 拼图照常可用。
+        let request = ResourceRequest::path_replace("")
+            .with_timeline(Access::Read)
+            .with_content_writer()
+            .with_path_note("正在回收缩略图包");
+        self.tasks.launch(
+            app,
+            handle,
+            request,
+            ConflictPolicy::Queue,
+            move |guard| {
+                let _ = tasks.spawn_worker("pack-compact".to_owned(), worker.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Preparing);
+                    worker.set_message("正在检查缩略图包…");
+                    let user_back = move || {
+                        if !automatic {
+                            return false;
+                        }
+                        matches!(activity::idle_for(), Some(idle) if idle < idle_loop::IDLE_THRESHOLD)
+                    };
+                    match pack_gc::compact(&database, &root, &thumbs, &*worker, &user_back) {
+                        Ok(report) => {
+                            let freed = format_savings(report.freed_bytes);
+                            let message = match report.stop {
+                                pack_gc::CompactStop::Done => {
+                                    format!("已回收 {} 个段 · 释放 {freed}", report.segments)
+                                }
+                                pack_gc::CompactStop::Yielded => format!(
+                                    "已让位 · 已回收 {} 个段 · 释放 {freed}，剩余部分下次空闲继续",
+                                    report.segments
+                                ),
+                                pack_gc::CompactStop::Cancelled => {
+                                    format!("已停止 · 已回收 {} 个段 · 释放 {freed}", report.segments)
+                                }
+                            };
+                            worker.set_message(&message);
+                            match report.stop {
+                                pack_gc::CompactStop::Yielded => {
+                                    worker.finish(TaskPhase::Yielded)
+                                }
+                                pack_gc::CompactStop::Cancelled => {
+                                    worker.finish(TaskPhase::Cancelled)
+                                }
+                                pack_gc::CompactStop::Done => {
+                                    worker.finish_from(&Ok::<(), AppError>(()))
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                });
+            },
+        )
+    }
+
+    /// 检查报告按任务 id 取；被新的检查挤掉时返回 `None`。
+    pub fn inspection_report(&self, task_id: &str) -> Option<InspectionReport> {
+        self.inspection_reports
+            .lock()
+            .iter()
+            .find(|(id, _)| id == task_id)
+            .map(|(_, report)| report.clone())
+    }
+
+    /// 报告导出 CSV：后端直接写文件，几万行不塞进 IPC 再塞回来。
+    ///
+    /// `group` 为空时四组全写；给了 `missing / orphan / sizeMismatch / hashMismatch`
+    /// 就只写那一组，界面上的「导出这一组」走这条。
+    pub fn save_inspection_report(
+        &self,
+        task_id: &str,
+        path: &Path,
+        group: Option<&str>,
+    ) -> AppResult<()> {
+        const GROUPS: [&str; 4] = ["missing", "orphan", "sizeMismatch", "hashMismatch"];
+        if let Some(group) = group
+            && !GROUPS.contains(&group)
+        {
+            return Err(AppError::message("报告分组无效"));
+        }
+        let report = self
+            .inspection_report(task_id)
+            .ok_or_else(|| AppError::message("报告已被新的检查覆盖，请重新扫描"))?;
+        let path = path.to_path_buf();
+        if path.as_os_str().is_empty() {
+            return Err(AppError::message("请选择保存位置"));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, inspector::report_csv_group(&report, group))?;
+        Ok(())
+    }
+
+    fn start_check_task(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let mode = if request.kind == BatchTaskKind::CheckFull {
+            InspectionMode::Full
+        } else {
+            InspectionMode::Fast
+        };
+        let folder_ids = check_scope_folder_ids(&database, &request.scope)?;
+        let library_id = self.status()?.map(|info| info.id).unwrap_or_default();
+        let label = format!("{} · {}", mode.label(), request.scope.label());
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::CheckLibrary,
+            label,
+        );
+        let task_id = handle.id().to_owned();
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let reports = self.inspection_reports.clone();
+        // 不持路径锁：全库完整校验要读二三十分钟，长期占根路径读锁会挡住导入与编辑。
+        self.tasks.launch(
+            app,
+            handle,
+            ResourceRequest::session_read(),
+            request.conflict,
+            move |guard| {
+                let _ = tasks.spawn_worker("library-check".to_owned(), worker.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Running);
+                    let scope = InspectScope { folder_ids };
+                    match inspector::inspect(
+                        &database,
+                        &root,
+                        &task_id,
+                        &library_id,
+                        mode,
+                        &scope,
+                        &*worker,
+                    ) {
+                        Ok(report) => {
+                            worker.set_message(inspection_summary(&report));
+                            store_inspection_report(&reports, report);
+                            worker.finish_from(&Ok::<(), AppError>(()));
+                        }
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                });
+            },
+        )
+    }
+
+    fn start_export_task(
+        &self,
+        app: AppHandle,
+        request: BatchTaskRequest,
+    ) -> AppResult<TaskStartResult> {
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let target = request.target_dir.clone().unwrap_or_default();
+        if target.trim().is_empty() {
+            return Err(AppError::message("请选择导出目录"));
+        }
+        let target = PathBuf::from(target.trim());
+        if !target.is_absolute() {
+            return Err(AppError::message("导出目录必须是绝对路径"));
+        }
+        let ids = request.scope.resolve(&database)?;
+        if ids.is_empty() {
+            return Err(AppError::message("当前范围没有图片"));
+        }
+        let include_manifest = request.include_manifest;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::Export,
+            format!("{} 张 · {}", ids.len(), request.scope.label()),
+        );
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        // 根路径读锁 + 内容/元数据写者：导出期间导入、编辑、移动、删除都被拒绝。
+        let resource = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_content_writer()
+            .with_metadata_writer()
+            .with_paths(vec![PathScope::read("")])
+            .with_path_note("正在导出");
+        self.tasks
+            .launch(app, handle, resource, request.conflict, move |guard| {
+                let _ = tasks.spawn_worker("export".to_owned(), worker.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Running);
+                    match maintenance_actions::export(
+                        &database,
+                        &root,
+                        &ids,
+                        &target,
+                        include_manifest,
+                        &*worker,
+                    ) {
+                        Ok(report) => {
+                            let mut message = format!(
+                                "已导出 {} 张 · {}",
+                                report.copied,
+                                format_savings(report.bytes)
+                            );
+                            if report.skipped > 0 {
+                                message.push_str(&format!(
+                                    " · 跳过 {} 张（目标已存在）",
+                                    report.skipped
+                                ));
+                            }
+                            if !report.failed.is_empty() {
+                                message.push_str(&format!(" · 失败 {} 张", report.failed.len()));
+                                for failure in &report.failed {
+                                    worker.add_failure(None, "", failure);
+                                }
+                            }
+                            worker.set_message(&message);
+                            worker.finish_from(&Ok::<(), AppError>(()));
+                        }
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                });
+            })
+    }
+
+    /// 孤儿移入回收站：必须基于一份当次扫描的报告，不接受任意路径列表。
+    pub fn move_orphans_task(
+        &self,
+        app: AppHandle,
+        report_task_id: &str,
+        paths: Vec<String>,
+    ) -> AppResult<TaskStartResult> {
+        let report = self
+            .inspection_report(report_task_id)
+            .ok_or_else(|| AppError::message("报告已被新的检查覆盖，请先重新扫描"))?;
+        let library_id = self
+            .status()?
+            .ok_or_else(|| AppError::message("尚未打开图库"))?
+            .id;
+        if report.library_id != library_id {
+            return Err(AppError::message("这份报告属于另一个图库，请重新扫描"));
+        }
+        if paths.is_empty() {
+            return Err(AppError::message("没有勾选要移走的孤儿文件"));
+        }
+        let (database, _, root) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        let handle = TaskHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            TaskKind::OrphanMove,
+            format!("{} 个", paths.len()),
+        );
+        let worker = handle.clone();
+        let tasks = self.tasks.clone();
+        let reports = self.inspection_reports.clone();
+        let report_task_id = report_task_id.to_owned();
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_paths(vec![PathScope::replace("")])
+            .with_path_note("正在移动文件");
+        self.tasks
+            .launch(app, handle, request, ConflictPolicy::Queue, move |guard| {
+                let _ = tasks.spawn_worker("orphan-move".to_owned(), worker.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    worker.set_phase(TaskPhase::Running);
+                    match maintenance_actions::move_orphans(
+                        &database, &root, &report, &paths, &*worker,
+                    ) {
+                        Ok(result) => {
+                            let mut message = format!("已移入回收站 {} 个", result.moved);
+                            if !result.failed.is_empty() {
+                                message.push_str(&format!(" · 失败 {} 个", result.failed.len()));
+                                for failure in &result.failed {
+                                    worker.add_failure(
+                                        None,
+                                        "",
+                                        format!("{}：{}", failure.path, failure.reason),
+                                    );
+                                }
+                            }
+                            worker.set_operation_id(result.operation_id);
+                            worker.set_total(paths.len());
+                            worker.set_completed(result.moved as usize);
+                            worker.set_message(&message);
+                            // 只摘真正搬走的条目：取消时没轮到的那部分仍留在报告里等下次。
+                            prune_orphans(&reports, &report_task_id, &result.moved_paths);
+                            worker.finish_from(&Ok::<(), AppError>(()));
+                        }
+                        Err(error) => {
+                            worker.set_message(error.to_string());
+                            worker.finish(TaskPhase::Failed);
+                        }
+                    }
+                });
+            })
+    }
+
+    pub fn delete_zero_tags(&self) -> AppResult<u64> {
+        let (database, _) = self.query_source()?;
+        self.mutate(|| metadata::delete_zero_tags(&database))
+    }
+
     pub fn tasks_snapshot(&self) -> Vec<TaskSnapshot> {
         self.tasks.list()
     }
@@ -2320,4 +2752,110 @@ fn folder_change(folders: Vec<FolderInfo>) -> FolderChange {
         folders,
         removed_ids: Vec::new(),
     }
+}
+
+/// 检查范围落成「要遍历哪些文件夹」。
+///
+/// 收集按文件夹走，不看单张 id：遍历是按目录 `read_dir` 的，把范围收成文件夹集合
+/// 才能保证内存是 O(最大单文件夹) 而不是 O(全库)。
+fn check_scope_folder_ids(database: &LibraryDb, scope: &TaskScope) -> AppResult<Option<Vec<i64>>> {
+    match scope {
+        TaskScope::Library => Ok(None),
+        TaskScope::Temp => Err(AppError::message("临时文件夹不参与检查")),
+        TaskScope::Folder {
+            folder_id,
+            include_subfolders,
+        } => {
+            if *folder_id <= 0 {
+                return Err(AppError::message("文件夹 id 无效"));
+            }
+            if !*include_subfolders {
+                return Ok(Some(vec![*folder_id]));
+            }
+            let path = folder_service::info(database, *folder_id)?.path;
+            let ids = database.with_reader(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT id FROM folders WHERE id = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params![folder_id, subtree_like_pattern(&path)],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })?;
+            Ok(Some(ids))
+        }
+        other => {
+            let ids = other.resolve(database)?;
+            if ids.is_empty() {
+                return Err(AppError::message("当前范围没有图片"));
+            }
+            let mut folders = std::collections::HashSet::new();
+            for chunk in ids.chunks(400) {
+                let marks = crate::library::placeholders(chunk.len());
+                database.with_reader(|connection| {
+                    let mut statement = connection.prepare(&format!(
+                        "SELECT DISTINCT folder_id FROM images WHERE id IN ({marks})"
+                    ))?;
+                    for folder in statement
+                        .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                            row.get::<_, i64>(0)
+                        })?
+                    {
+                        folders.insert(folder?);
+                    }
+                    Ok(())
+                })?;
+            }
+            if folders.is_empty() {
+                return Err(AppError::message("当前范围没有可检查的文件夹"));
+            }
+            Ok(Some(folders.into_iter().collect()))
+        }
+    }
+}
+
+fn store_inspection_report(
+    store: &Mutex<VecDeque<(String, InspectionReport)>>,
+    report: InspectionReport,
+) {
+    let mut entries = store.lock();
+    entries.push_front((report.task_id.clone(), report));
+    entries.truncate(MAX_INSPECTION_REPORTS);
+}
+
+/// 移走之后把这几条从缓存报告里摘掉，界面不必重新扫描就能看到剩余项。
+fn prune_orphans(
+    store: &Mutex<VecDeque<(String, InspectionReport)>>,
+    task_id: &str,
+    moved: &[String],
+) {
+    let mut entries = store.lock();
+    let Some((_, report)) = entries.iter_mut().find(|(id, _)| id == task_id) else {
+        return;
+    };
+    let moved: std::collections::HashSet<&str> = moved.iter().map(String::as_str).collect();
+    report
+        .orphans
+        .retain(|orphan| !moved.contains(orphan.path.as_str()));
+    report.orphan_total = report.orphan_total.saturating_sub(moved.len() as u64);
+    // `truncated` 是四份清单共用的标记，摘掉孤儿不能替别的清单消掉它，保持原样。
+}
+
+fn inspection_summary(report: &InspectionReport) -> String {
+    let mut message = format!(
+        "扫描 {} 张 · 缺失 {} · 孤儿 {} · 大小不符 {}",
+        report.scanned_rows, report.missing_total, report.orphan_total, report.size_mismatch_total
+    );
+    if report.mode == InspectionMode::Full {
+        message.push_str(&format!(" · 哈希不符 {}", report.hash_mismatch_total));
+    }
+    if report.changed_during_scan > 0 {
+        message.push_str(&format!(" · 扫描期间变动 {}", report.changed_during_scan));
+    }
+    if report.is_clean() {
+        message = format!("扫描 {} 张 · 没有发现问题", report.scanned_rows);
+    }
+    message
 }

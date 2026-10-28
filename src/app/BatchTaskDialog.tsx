@@ -47,21 +47,30 @@ interface BatchTaskDialogProps {
   libraryId: string;
 }
 
-const KIND_LABELS: Record<BatchTaskKind, string> = {
+/**
+ * 这个对话框只处理「范围 + 选项」这四类；检查、导出、包回收在维护页里，
+ * 它们的参数形状不同（目标目录、报告 id），放进来只会让两边都别扭。
+ */
+type DialogKind = Extract<
+  BatchTaskKind,
+  "thumbnail" | "aiEmbedding" | "aiPose" | "aiDescription"
+>;
+
+const KIND_LABELS: Record<DialogKind, string> = {
   thumbnail: "重建缩略图",
   aiEmbedding: "Embedding",
   aiPose: "姿势",
   aiDescription: "描述",
 };
 
-const KIND_HINTS: Record<BatchTaskKind, string> = {
+const KIND_HINTS: Record<DialogKind, string> = {
   thumbnail: "为原图重新生成缩略图，可选重算 pHash 与主色。",
   aiEmbedding: "为图片生成语义向量，用于语义搜索与找相似。",
   aiPose: "识别画面里的人物姿势，用于按姿势找相似。",
   aiDescription: "为没有描述的图片生成文字描述。",
 };
 
-const AI_CAPABILITY: Partial<Record<BatchTaskKind, string>> = {
+const AI_CAPABILITY: Partial<Record<DialogKind, string>> = {
   aiEmbedding: "imageEmbedding",
   aiPose: "pose",
   aiDescription: "description",
@@ -80,7 +89,7 @@ export function BatchTaskDialog({
 }: BatchTaskDialogProps) {
   const { start, cancel, find } = useTaskCenter();
   const { dataVersion } = useTaskData();
-  const [kind, setKind] = useState<BatchTaskKind>("thumbnail");
+  const [kind, setKind] = useState<DialogKind>("thumbnail");
   const [scope, setScope] = useState<ScopeChoice>("library");
   const [overwrite, setOverwrite] = useState(false);
   const [recalcVisuals, setRecalcVisuals] = useState(false);
@@ -116,8 +125,8 @@ export function BatchTaskDialog({
   const descriptionConfigured = status?.health?.capabilities.description != null;
 
   const kindAvailability = useMemo(() => {
-    const map = {} as Record<BatchTaskKind, ActionAvailability>;
-    for (const value of Object.keys(KIND_LABELS) as BatchTaskKind[]) {
+    const map = {} as Record<DialogKind, ActionAvailability>;
+    for (const value of Object.keys(KIND_LABELS) as DialogKind[]) {
       if (value === "thumbnail") {
         map[value] = { enabled: true };
       } else if (value === "aiDescription" && online && !descriptionConfigured) {
@@ -329,7 +338,7 @@ export function BatchTaskDialog({
     >
       <div className="batch-task">
         <div className="batch-task-types" role="radiogroup" aria-label="任务类型">
-          {(Object.keys(KIND_LABELS) as BatchTaskKind[]).map((value) => {
+          {(Object.keys(KIND_LABELS) as DialogKind[]).map((value) => {
             const availability = kindAvailability[value];
             return (
               <button

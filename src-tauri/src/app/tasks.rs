@@ -63,6 +63,14 @@ pub enum TaskKind {
     Optimize,
     /// 仅用于临时区的 embedding/pose 生成；占用 AI 服务资源。
     TempFeatures,
+    /// 图库检查：快速检查或完整校验；不持路径锁，容忍扫描期间的变动。
+    CheckLibrary,
+    /// 导出到目录：复制原图，占根路径读锁。
+    Export,
+    /// 把检查报告里的孤儿移入回收站；可撤销。
+    OrphanMove,
+    /// 缩略图包回收；空闲时自动提交，也可以手动「立即回收」。
+    PackCompact,
 }
 
 impl TaskKind {
@@ -76,11 +84,15 @@ impl TaskKind {
             | Self::Undo
             | Self::Redo
             | Self::ReleaseGarbage
-            | Self::Optimize => TaskLane::Write,
+            | Self::Optimize
+            | Self::OrphanMove
+            | Self::PackCompact => TaskLane::Write,
             Self::AiEmbedding | Self::AiPose | Self::AiDescription | Self::TempFeatures => {
                 TaskLane::Ai
             }
-            Self::SimilarityGroups | Self::OptimizeEstimate => TaskLane::Scan,
+            Self::SimilarityGroups | Self::OptimizeEstimate | Self::CheckLibrary | Self::Export => {
+                TaskLane::Scan
+            }
         }
     }
 
@@ -101,6 +113,10 @@ impl TaskKind {
             Self::OptimizeEstimate => "估算压缩空间",
             Self::Optimize => "优化图片空间",
             Self::TempFeatures => "生成临时区特征",
+            Self::CheckLibrary => "检查图库",
+            Self::Export => "导出图片",
+            Self::OrphanMove => "清理孤儿文件",
+            Self::PackCompact => "回收缩略图包",
         }
     }
 
@@ -115,6 +131,9 @@ impl TaskKind {
                 | Self::SimilarityGroups
                 | Self::OptimizeEstimate
                 | Self::TempFeatures
+                | Self::CheckLibrary
+                | Self::Export
+                | Self::PackCompact
         )
     }
 }
@@ -137,12 +156,17 @@ pub enum TaskPhase {
     Cancelling,
     Completed,
     Cancelled,
+    /// 空闲回收让位给用户；不复用「已取消」，用户没点取消。
+    Yielded,
     Failed,
 }
 
 impl TaskPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Yielded | Self::Failed
+        )
     }
 }
 
@@ -186,9 +210,9 @@ pub struct TaskSnapshot {
     pub run_started_at: Option<i64>,
     /// 当前处理的相对路径；没有时前端回退为 `#图片id`。
     pub current_file: Option<String>,
-    /// 已提交批次的原图字节；只有压缩任务非 0。
+    /// 已处理字节：压缩任务是已提交批次的原图字节，导出任务是已复制字节；其余为 0。
     pub original_bytes: u64,
-    /// 已提交批次节省的字节；只有压缩任务非 0。
+    /// 已节省字节；只有压缩任务非 0。
     pub saved_bytes: u64,
     /// 运行以来平均每秒结算的张数（含失败与跳过）；未开始或还没有结算项时为空。
     pub rate_per_second: Option<f64>,
@@ -1229,6 +1253,14 @@ pub enum BatchTaskKind {
     SimilarityGroups,
     OptimizeEstimate,
     Optimize,
+    /// 快速检查（只看存在性与大小）。
+    CheckFast,
+    /// 完整校验（重算 BLAKE3）。
+    CheckFull,
+    /// 立即回收缩略图包，不等空闲条件。
+    PackCompact,
+    /// 导出到目录。
+    Export,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1250,6 +1282,9 @@ pub struct BatchTaskRequest {
     /// 执行时用于校验估算凭证；估算任务不用。
     pub estimate_id: Option<String>,
     pub estimate_sample_size: Option<usize>,
+    /// 导出：目标目录与是否附带 `manifest.csv`。
+    pub target_dir: Option<String>,
+    pub include_manifest: bool,
     pub conflict: ConflictPolicy,
 }
 
@@ -1525,6 +1560,44 @@ mod tests {
             (breakdown[0].key.as_str(), breakdown[0].count),
             ("notSmaller", 7)
         );
+    }
+
+    /// 让位是终态：用户没点取消，胶囊上是「已让位」而不是「已取消」。
+    #[test]
+    fn yielded_is_terminal_and_not_retried() {
+        let handle = TaskHandle::new("y1", TaskKind::PackCompact, "空闲回收");
+        handle.set_phase(TaskPhase::Running);
+        handle.set_message("已让位 · 已回收 1 个段");
+        handle.finish(TaskPhase::Yielded);
+        let snapshot = handle.snapshot();
+        assert!(snapshot.phase.is_terminal());
+        assert_eq!(snapshot.phase, TaskPhase::Yielded);
+        assert!(handle.is_finished());
+        assert_eq!(TaskKind::PackCompact.lane(), TaskLane::Write);
+        assert_eq!(TaskKind::PackCompact.label(), "回收缩略图包");
+
+        // 终态之后取消请求不再改写相位。
+        handle.request_cancel();
+        assert_eq!(handle.phase(), TaskPhase::Yielded);
+        // 让位的任务不参与「还在跑」的判断，排队中的下一个可以启动。
+        let bus = TaskBus::new();
+        bus.register(handle.clone());
+        assert!(bus.is_idle());
+    }
+
+    #[test]
+    fn maintenance_task_kinds_have_lanes_and_labels() {
+        assert_eq!(TaskKind::CheckLibrary.lane(), TaskLane::Scan);
+        assert_eq!(TaskKind::Export.lane(), TaskLane::Scan);
+        assert_eq!(TaskKind::OrphanMove.lane(), TaskLane::Write);
+        assert_eq!(TaskKind::CheckLibrary.label(), "检查图库");
+        assert_eq!(TaskKind::Export.label(), "导出图片");
+        assert_eq!(TaskKind::OrphanMove.label(), "清理孤儿文件");
+        // 关库时不阻塞的：检查、导出、回收；孤儿移动要等它做完。
+        assert!(TaskKind::CheckLibrary.can_cancel_for_close());
+        assert!(TaskKind::Export.can_cancel_for_close());
+        assert!(TaskKind::PackCompact.can_cancel_for_close());
+        assert!(!TaskKind::OrphanMove.can_cancel_for_close());
     }
 
     #[test]

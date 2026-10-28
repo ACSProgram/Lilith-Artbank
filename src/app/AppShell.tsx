@@ -4,15 +4,24 @@ import { useAppRuntime } from "./runtimeContext";
 import { LibraryDialog } from "./LibraryDialog";
 import { LibraryWorkspace } from "./LibraryWorkspace";
 import { SettingsDialog } from "./SettingsDialog";
+import { ShortcutSheet } from "./ShortcutSheet";
 import { Sidebar } from "./Sidebar";
 import { WelcomeView } from "./WelcomeView";
 import { WindowTitleBar } from "./WindowTitleBar";
 import { Spinner } from "../shared/components/Spinner";
 
+/** 输入框 / 文本域 / 下拉 / 可编辑区里不抢键位。 */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+}
+
 export function AppShell() {
   const { loading, current, closeLibrary, fullscreen, toggleFullscreen } = useAppRuntime();
   const [libraryDialogOpen, setLibraryDialogOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -35,6 +44,12 @@ export function AppShell() {
       if (key === "f11") {
         event.preventDefault();
         void toggleFullscreen();
+        return;
+      }
+      // `?` 是 shift + /；只在不在输入框里时打开快捷键总表。
+      if (event.key === "?" && !isTypingTarget(event.target)) {
+        event.preventDefault();
+        setShortcutsOpen(true);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -78,12 +93,14 @@ export function AppShell() {
       <SettingsDialog
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
         onChangeLibrary={() => {
           setSettingsOpen(false);
           setLibraryDialogOpen(true);
         }}
         onCloseLibrary={closeLibrary}
       />
+      <ShortcutSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </div>
   );
 }

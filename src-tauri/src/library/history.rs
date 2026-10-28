@@ -64,6 +64,8 @@ pub enum HistoryKind {
     AiDescription,
     /// 图片空间压缩；文件已替换、原图已删除，不可撤销。
     Optimize,
+    /// 把检查报告里的孤儿文件移入 `recycle/orphans/`；不涉及数据库行。
+    OrphanMove,
 }
 
 impl HistoryKind {
@@ -99,6 +101,7 @@ impl HistoryKind {
             Self::SimilarityGroups => "similarityGroups",
             Self::AiDescription => "aiDescription",
             Self::Optimize => "optimize",
+            Self::OrphanMove => "orphanMove",
         }
     }
 
@@ -475,6 +478,10 @@ pub enum RedoRecord {
         collection_id: i64,
         items: Vec<(i64, i64)>,
         updated_at: i64,
+    },
+    /// 孤儿清理：`(来源绝对路径, 回收站绝对路径)`；撤销按它反向搬回，重做正向搬走。
+    PathMoves {
+        pairs: Vec<(String, String)>,
     },
 }
 
@@ -1788,6 +1795,7 @@ fn undo_operation(
         | HistoryKind::CollectionRemove
         | HistoryKind::CollectionCombine
         | HistoryKind::SimilarityGroups => undo_collection(database, operation_id, kind)?,
+        HistoryKind::OrphanMove => undo_orphan_move(database, operation_id)?,
         HistoryKind::Optimize => {
             return Err(AppError::message("压缩操作不可撤销，原图已删除"));
         }
@@ -1834,11 +1842,60 @@ fn redo_operation(
         | HistoryKind::CollectionRemove
         | HistoryKind::CollectionCombine
         | HistoryKind::SimilarityGroups => redo_collection(database, operation_id)?,
+        HistoryKind::OrphanMove => redo_orphan_move(database, operation_id)?,
         HistoryKind::Optimize => {
             return Err(AppError::message("压缩操作不可撤销，原图已删除"));
         }
     }
     Ok(())
+}
+
+/// 孤儿清理：把文件从 `recycle/orphans/` 搬回原位；原路径已被占用时跳过并计数。
+fn undo_orphan_move(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for chunk in load_chunks(&transaction, operation_id)? {
+            if chunk.format == ChunkFormat::Json {
+                pairs.extend(decode_json::<Vec<(String, String)>>(&chunk.data)?);
+            }
+        }
+        if pairs.is_empty() {
+            return Err(AppError::message("这条记录缺少撤销数据"));
+        }
+        let reverse: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(source, destination)| (destination.clone(), source.clone()))
+            .collect();
+        let skipped = crate::library::maintenance_actions::move_pairs(&reverse);
+        if !skipped.is_empty() {
+            log::warn!("撤销孤儿清理时跳过 {} 个文件：{skipped:?}", skipped.len());
+        }
+        append_redo(&transaction, operation_id, &RedoRecord::PathMoves { pairs })?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn redo_orphan_move(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = false;
+        for record in load_redo_records(&transaction, operation_id)? {
+            if let RedoRecord::PathMoves { pairs } = record {
+                let skipped = crate::library::maintenance_actions::move_pairs(&pairs);
+                if !skipped.is_empty() {
+                    log::warn!("重做孤儿清理时跳过 {} 个文件：{skipped:?}", skipped.len());
+                }
+                applied = true;
+            }
+        }
+        if !applied {
+            return Err(AppError::message("这条记录缺少重做数据"));
+        }
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 /// 回收站/删除类：撤销时把当前状态写进 redo chunk，重做时原样写回。
@@ -2331,47 +2388,56 @@ fn undo_tags(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -> AppR
                 }
             }
             HistoryKind::TagDelete => {
-                let mut header: Option<(i64, String)> = None;
-                let mut pairs = Vec::new();
+                // 一条记录可能是删一个标签，也可能是一次清理多个 0 张标签：
+                // 每个 `Delete` 表头后面跟着它自己的关系清单，顺序即归属。
+                // 分组内容是 `(标签 id, 名称, 关系)`。
+                type TagGroup = (i64, String, Vec<(i64, i64)>);
+                let mut groups: Vec<TagGroup> = Vec::new();
                 for record in &records {
                     match record {
                         TagRecord::Delete { tag_id, name } => {
-                            header = Some((*tag_id, name.clone()));
+                            groups.push((*tag_id, name.clone(), Vec::new()))
                         }
-                        TagRecord::Pairs { pairs: batch } => pairs.extend(batch.iter().copied()),
+                        TagRecord::Pairs { pairs: batch } => {
+                            if let Some(last) = groups.last_mut() {
+                                last.2.extend(batch.iter().copied());
+                            }
+                        }
                         _ => {}
                     }
                 }
-                let Some((tag_id, name)) = header else {
+                if groups.is_empty() {
                     return Err(AppError::message("这条记录缺少撤销数据"));
-                };
-                let existing: Option<i64> = transaction
-                    .query_row(
-                        "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
-                        [&name],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let target_id = if let Some(existing_id) = existing {
-                    // 同名标签已存在（例如崩溃续做）：合并关系，重做时只移除关系。
-                    existing_id
-                } else {
-                    transaction.execute(
-                        "INSERT INTO tags(id, name) VALUES (?1, ?2)",
-                        params![tag_id, name],
-                    )?;
-                    redo_deletions.push(tag_id);
-                    tag_id
-                };
-                let mut restored = Vec::new();
-                for (image_id, _) in &pairs {
-                    if insert_tag_pair(&transaction, *image_id, target_id)? {
-                        restored.push((*image_id, target_id));
-                    }
                 }
-                // 重建的标签重做时整行删除（关系随外键一起消失）；同名合并时只回退关系。
-                if target_id != tag_id {
-                    redo_removals.extend(restored);
+                for (tag_id, name, pairs) in groups {
+                    let existing: Option<i64> = transaction
+                        .query_row(
+                            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
+                            [&name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let target_id = if let Some(existing_id) = existing {
+                        // 同名标签已存在（例如崩溃续做）：合并关系，重做时只移除关系。
+                        existing_id
+                    } else {
+                        transaction.execute(
+                            "INSERT INTO tags(id, name) VALUES (?1, ?2)",
+                            params![tag_id, name],
+                        )?;
+                        redo_deletions.push(tag_id);
+                        tag_id
+                    };
+                    let mut restored = Vec::new();
+                    for (image_id, _) in &pairs {
+                        if insert_tag_pair(&transaction, *image_id, target_id)? {
+                            restored.push((*image_id, target_id));
+                        }
+                    }
+                    // 重建的标签重做时整行删除（关系随外键一起消失）；同名合并时只回退关系。
+                    if target_id != tag_id {
+                        redo_removals.extend(restored);
+                    }
                 }
             }
             HistoryKind::TagMerge => {

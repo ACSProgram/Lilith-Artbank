@@ -106,6 +106,8 @@ pub(crate) fn format(out: FormatCallback, message: &std::fmt::Arguments<'_>, rec
 /// `started` 没有 `finished` 就是现场证据。闭包形式让命令体里的 `?` 仍然正确：
 /// 提前返回发生在闭包内，`finish` 依旧会执行。
 pub(crate) fn write<T>(name: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    // 每一次命令调用都是一次「人在操作」；空闲回收用它判断人还在不在。
+    crate::app::activity::touch();
     log::info!(target: COMMAND_TARGET, "command started: name={name}");
     let started = Instant::now();
     let result = run();
@@ -117,6 +119,7 @@ pub(crate) async fn write_async<T>(
     name: &str,
     run: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
+    crate::app::activity::touch();
     log::info!(target: COMMAND_TARGET, "command started: name={name}");
     let started = Instant::now();
     let result = run.await;
@@ -128,6 +131,7 @@ pub(crate) async fn write_async<T>(
 /// 读命令里有随滚动与翻页反复触发的那几个（`query_images`、`get_image_states`、
 /// `get_viewer_source`），成功路径必须保持零落盘，否则日志会被读路径刷满。
 pub(crate) fn read<T>(name: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    crate::app::activity::touch();
     let started = Instant::now();
     let result = run();
     report_read(name, started, SLOW_READ_MS, result)
@@ -147,6 +151,7 @@ pub(crate) async fn read_async_with<T>(
     threshold_ms: u64,
     run: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
+    crate::app::activity::touch();
     let started = Instant::now();
     let result = run.await;
     report_read(name, started, threshold_ms, result)

@@ -13,7 +13,9 @@ import {
   rowInTagScope,
   sortForViewChange,
   sortSummary,
+  cycleTagFilter,
   tagFilterState,
+  tagOptionState,
   type BrowseState,
 } from "./model.ts";
 import type { ImageRow } from "./types.ts";
@@ -162,6 +164,38 @@ test("tag presence and exclusions count as filters", () => {
   const excluded = normalizeFilters({ ...emptyFilters(), excludeTagIds: [9, 3, 9] });
   assert.deepEqual(excluded.excludeTagIds, [3, 9]);
   assert.equal(activeFilterCount(excluded), 1);
+});
+
+test("标签在筛选面板里走三态循环，包含与排除互斥", () => {
+  const empty = emptyFilters();
+  assert.equal(tagOptionState(empty, 7), "neutral");
+
+  const included = cycleTagFilter(empty, 7);
+  assert.deepEqual(included.tagIds, [7]);
+  assert.deepEqual(included.excludeTagIds, []);
+  assert.equal(tagOptionState(included, 7), "include");
+
+  const excluded = cycleTagFilter(included, 7);
+  assert.deepEqual(excluded.tagIds, []);
+  assert.deepEqual(excluded.excludeTagIds, [7]);
+  assert.equal(tagOptionState(excluded, 7), "exclude");
+
+  const cleared = cycleTagFilter(excluded, 7);
+  assert.deepEqual(cleared.tagIds, []);
+  assert.deepEqual(cleared.excludeTagIds, []);
+  assert.equal(tagOptionState(cleared, 7), "neutral");
+});
+
+test("从「无标签」里点标签会切回包含口径，不用先手动取消", () => {
+  const missing = { ...emptyFilters(), tagPresence: "missing" as const };
+  const next = cycleTagFilter(missing, 4);
+  assert.equal(next.tagPresence, "any");
+  assert.deepEqual(next.tagIds, [4]);
+  // 反选只动自己那一边，不含标签与排除可以同时存在。
+  const both = cycleTagFilter({ ...emptyFilters(), excludeTagIds: [9] }, 4);
+  assert.deepEqual(both.tagIds, [4]);
+  assert.deepEqual(both.excludeTagIds, [9]);
+  assert.equal(activeFilterCount(both), 2);
 });
 
 test("global sort applies to every library view", () => {

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockLibraryCounts } from "../modules/library/mock";
+import { LIST_COLUMNS } from "./types";
 import type {
   AppInfo,
   LibraryCounts,
@@ -48,6 +49,10 @@ const defaultSettings: Settings = {
     sort: [{ key: "importedAt", descending: true }],
     sortProfiles: [],
     viewerFilmstrip: true,
+    listColumns: [...LIST_COLUMNS],
+  },
+  maintenance: {
+    autoCompactThumbs: true,
   },
 };
 

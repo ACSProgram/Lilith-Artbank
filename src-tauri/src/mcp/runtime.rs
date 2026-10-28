@@ -308,6 +308,8 @@ where
                             if !authorized(request.headers(), &token) {
                                 return Ok::<_, Infallible>(unauthorized_response());
                             }
+                            // MCP 调用也是人在操作，和命令入口一样刷新活动时间。
+                            crate::app::activity::touch();
                             Service::call(&mut service, request).await
                         }
                     });

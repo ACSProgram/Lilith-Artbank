@@ -94,9 +94,14 @@ fn filter_for(request: &BatchTaskPreviewRequest) -> AppResult<Option<PendingFilt
         BatchTaskKind::AiDescription => Some(PendingFilter::Description {
             overwrite: request.overwrite,
         }),
+        // 检查与导出都要处理范围内全部图片，没有「待处理」这个子集。
+        BatchTaskKind::CheckFast | BatchTaskKind::CheckFull | BatchTaskKind::Export => {
+            Some(PendingFilter::All)
+        }
         BatchTaskKind::SimilarityGroups
         | BatchTaskKind::OptimizeEstimate
-        | BatchTaskKind::Optimize => {
+        | BatchTaskKind::Optimize
+        | BatchTaskKind::PackCompact => {
             return Err(AppError::message("该任务类型不提供待处理数量"));
         }
     })

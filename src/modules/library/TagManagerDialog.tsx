@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Merge, Pencil, Tags, Trash2, X } from "lucide-react";
+import { Eraser, Merge, Pencil, Tags, Trash2, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Modal } from "../../shared/components/Modal";
 import { Spinner } from "../../shared/components/Spinner";
@@ -17,14 +17,18 @@ interface TagManagerDialogProps {
 }
 
 export interface TagChange {
-  tagId: number;
+  /** 清理 0 张标签涉及多个标签，此时不带 id。 */
+  tagId?: number;
   action: "rename" | "delete" | "merge";
   /** action=merge 时保留的目标标签。 */
   targetTagId?: number;
 }
 
-/** 与 Rust `query::MAX_TAGS` 一致：无查询时浏览图片最多的这些标签。 */
-const TAG_LIMIT = 500;
+/**
+ * 与 Rust `query::MAX_TAGS_WITH_EMPTY` 一致：管理器要连 0 张标签一起看全，
+ * 才数得准「要清理多少个」。滚动与分面用的是另一条 500 上限的查询。
+ */
+const TAG_LIMIT = 5000;
 const SEARCH_LIMIT = 200;
 const MERGE_LIMIT = 50;
 const SUGGESTION_LIMIT = 12;
@@ -97,7 +101,7 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     setLoading(true);
     setError(null);
     try {
-      const next = await libraryApi.getTags(TAG_LIMIT);
+      const next = await libraryApi.getTags(TAG_LIMIT, true);
       if (!openRef.current || seq !== loadSeq.current) return;
       setTags(next);
     } catch (cause) {
@@ -129,7 +133,7 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     setSearchError(null);
     const timer = window.setTimeout(() => {
       void libraryApi
-        .searchTags(needle, SEARCH_LIMIT)
+        .searchTags(needle, SEARCH_LIMIT, true)
         .then((rows) => {
           if (!openRef.current || seq !== searchSeq.current) return;
           setSearchResults(rows);
@@ -272,6 +276,42 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
     );
   };
 
+  /** 0 张标签：按定义没有任何 `image_tags` 关系，删掉不影响任何图片。 */
+  const zeroCount = tags.filter((tag) => tag.imageCount === 0).length;
+  const listTruncated = tags.length >= TAG_LIMIT;
+
+  const purgeZero = async () => {
+    if (zeroCount === 0 || busy) return;
+    const accepted = await confirm({
+      title: `清理 ${zeroCount.toLocaleString()} 个没有图片的标签？`,
+      message:
+        "这些标签不在任何图片上，删除不会动到图片。整次操作只写一条操作记录，可以在「记录」里一次撤销。",
+      confirmLabel: "清理标签",
+      danger: true,
+    });
+    if (!accepted) return;
+    setBusy(true);
+    try {
+      // 删除前重算一次：期间可能在别处给某个标签挂了图，数量对不上就先刷新再让用户确认。
+      const fresh = await libraryApi.getTags(TAG_LIMIT, true);
+      const freshCount = fresh.filter((tag) => tag.imageCount === 0).length;
+      if (freshCount !== zeroCount) {
+        setTags(fresh);
+        notify("数量已变化，请重试", "info", `现在有 ${freshCount.toLocaleString()} 个 0 张标签`);
+        return;
+      }
+      const removed = await libraryApi.deleteZeroTags();
+      notify(`已清理 ${removed.toLocaleString()} 个标签`, "success");
+      await load();
+      onChanged({ action: "delete" });
+      setRefreshKey((key) => key + 1);
+    } catch (cause) {
+      notify("清理标签失败", "error", errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const needle = query.trim();
   const visible = needle ? searchResults ?? [] : tags;
   const listBusy = loading || searchLoading;
@@ -322,6 +362,21 @@ export function TagManagerDialog({ open, onClose, onChanged }: TagManagerDialogP
         <h3>
           <Tags size={14} /> 全部标签
           {listBusy ? <Spinner size={12} /> : null}
+          {zeroCount > 0 ? (
+            <button
+              type="button"
+              className="text-button tag-manager-purge"
+              disabled={busy || listTruncated}
+              title={
+                listTruncated
+                  ? "标签太多，列表未显示全部；清理前请先用搜索确认"
+                  : "一次删掉所有没有图片的标签，可撤销"
+              }
+              onClick={() => void purgeZero()}
+            >
+              <Eraser size={12} /> 清理 {zeroCount.toLocaleString()} 个 0 张标签
+            </button>
+          ) : null}
         </h3>
         {visible.length === 0 ? (
           <p className="dialog-empty">

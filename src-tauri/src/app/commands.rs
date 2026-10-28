@@ -29,11 +29,13 @@ use crate::{
         edit::{self, EditRequest, EditResult, EditSizeEstimate},
         folders::FolderSortKey,
         history::HistoryPage,
+        inspect::InspectionReport,
         manifest::LibraryInspection,
         metadata::{
             DeleteReport, ImageDetails, ImageState, MergeReport, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::OptimizeEstimate,
+        pack_gc::{CompactMark, FeaturePackStat, SegmentStat},
         query::{FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{LibraryCounts, LibraryInfo},
         stats::{StatsRequest, StatsSnapshot},
@@ -481,10 +483,16 @@ pub async fn delete_folder(app: AppHandle, folder_id: i64) -> Result<FolderChang
 }
 
 #[tauri::command]
-pub async fn get_tags(app: AppHandle, limit: Option<u32>) -> Result<Vec<TagInfo>, String> {
+pub async fn get_tags(
+    app: AppHandle,
+    limit: Option<u32>,
+    include_empty: Option<bool>,
+) -> Result<Vec<TagInfo>, String> {
     trace::read_async(
         "get_tags",
-        run_blocking(app, move |state| state.tags(limit)),
+        run_blocking(app, move |state| {
+            state.tags(limit, include_empty.unwrap_or(false))
+        }),
     )
     .await
 }
@@ -494,10 +502,13 @@ pub async fn search_tags(
     app: AppHandle,
     query: String,
     limit: Option<u32>,
+    include_empty: Option<bool>,
 ) -> Result<Vec<TagInfo>, String> {
     trace::read_async(
         "search_tags",
-        run_blocking(app, move |state| state.search_tags(&query, limit)),
+        run_blocking(app, move |state| {
+            state.search_tags(&query, limit, include_empty.unwrap_or(false))
+        }),
     )
     .await
 }
@@ -1170,6 +1181,104 @@ pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(),
     .await
 }
 
+/// 维护页「包」分区要的全部数字；一次取回，避免三四个来回。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackStatsView {
+    pub segments: Vec<SegmentStat>,
+    pub features: Vec<FeaturePackStat>,
+    pub total_size: u64,
+    pub total_used: u64,
+    pub garbage_bytes: u64,
+    pub last_compact: Option<CompactMark>,
+    /// 触发阈值；界面据此判断有没有可回收空间。
+    pub trigger_ratio: f64,
+}
+
+#[tauri::command]
+pub async fn get_pack_stats(app: AppHandle) -> Result<PackStatsView, String> {
+    trace::read_async(
+        "get_pack_stats",
+        run_blocking(app, |state| {
+            let stats = state.pack_stats()?;
+            Ok(PackStatsView {
+                segments: stats.segments,
+                features: stats.features,
+                total_size: stats.total_size,
+                total_used: stats.total_used,
+                garbage_bytes: stats.garbage_bytes,
+                last_compact: state.last_pack_compact().unwrap_or(None),
+                trigger_ratio: crate::library::pack_gc::TRIGGER_RATIO,
+            })
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn start_pack_compact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TaskStartResult, String> {
+    trace::write("start_pack_compact", || {
+        AppError::command(state.compact_pack_now(app))
+    })
+}
+
+/// 报告按任务 id 存在后端内存里；拿不到（被新的检查挤掉）时返回 `null`。
+///
+/// 走阻塞池：一份报告最多四组各 5000 条，克隆与序列化不该压在命令线程上。
+#[tauri::command]
+pub async fn get_inspection_report(
+    app: AppHandle,
+    task_id: String,
+) -> Result<Option<InspectionReport>, String> {
+    trace::read_async(
+        "get_inspection_report",
+        run_blocking(app, move |state| {
+            Ok::<_, AppError>(state.inspection_report(&task_id))
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn save_inspection_report(
+    app: AppHandle,
+    task_id: String,
+    path: String,
+    group: Option<String>,
+) -> Result<(), String> {
+    trace::write_async(
+        "save_inspection_report",
+        run_blocking(app, move |state| {
+            state.save_inspection_report(&task_id, &PathBuf::from(path), group.as_deref())
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn move_orphans(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    report_task_id: String,
+    paths: Vec<String>,
+) -> Result<TaskStartResult, String> {
+    trace::write("move_orphans", || {
+        AppError::command(state.move_orphans_task(app, &report_task_id, paths))
+    })
+}
+
+#[tauri::command]
+pub async fn delete_zero_tags(app: AppHandle) -> Result<u64, String> {
+    trace::write_async(
+        "delete_zero_tags",
+        run_blocking(app, |state| state.delete_zero_tags()),
+    )
+    .await
+}
+
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         get_settings,
@@ -1252,6 +1361,12 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_optimize_estimate,
         get_image_capabilities,
         get_feature_summary,
+        get_pack_stats,
+        start_pack_compact,
+        get_inspection_report,
+        save_inspection_report,
+        move_orphans,
+        delete_zero_tags,
         ai_describe_image,
         ai_generate_pose,
         semantic_search,

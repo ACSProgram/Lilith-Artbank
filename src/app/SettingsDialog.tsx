@@ -126,11 +126,14 @@ export function SettingsDialog({
   onClose,
   onChangeLibrary,
   onCloseLibrary,
+  onOpenShortcuts,
 }: {
   open: boolean;
   onClose: () => void;
   onChangeLibrary: () => void;
   onCloseLibrary: () => Promise<void>;
+  /** 打开只读的快捷键总表；由 AppShell 持有，`?` 与这里的按钮是同一个入口。 */
+  onOpenShortcuts: () => void;
 }) {
   const { settings, current, appInfo, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
@@ -483,6 +486,42 @@ export function SettingsDialog({
                       }
                     />
                   </Field>
+                </Panel>
+              ) : null}
+
+              {tab === "general" ? (
+                <Panel title="维护与帮助">
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={draft.maintenance.autoCompactThumbs}
+                      onChange={(event) =>
+                        patch((current) => ({
+                          ...current,
+                          maintenance: {
+                            ...current.maintenance,
+                            autoCompactThumbs: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    <span>
+                      <strong>空闲时自动回收缩略图空间</strong>
+                      <small>
+                        连续重建缩略图会让段文件里留下空洞。人走开三分钟且没有任务在跑时，
+                        自动把空洞压掉；关掉后「维护与检查 → 包 → 立即回收」仍然可用。
+                      </small>
+                    </span>
+                  </label>
+                  <div className="settings-field">
+                    <span className="field-label">快捷键</span>
+                    <div className="settings-inline-actions">
+                      <Button size="sm" variant="secondary" onClick={onOpenShortcuts}>
+                        查看快捷键
+                      </Button>
+                      <span className="settings-note">随时按 ? 也能打开。</span>
+                    </div>
+                  </div>
                 </Panel>
               ) : null}
 

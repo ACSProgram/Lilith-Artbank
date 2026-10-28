@@ -150,14 +150,15 @@ export const libraryApi = {
     return invoke<FolderChange>("delete_folder", { folderId });
   },
 
-  async getTags(limit = 500): Promise<TagInfo[]> {
+  /** `includeEmpty` 只在标签管理器用：把 0 张标签也列出来，方便一次清理。 */
+  async getTags(limit = 500, includeEmpty = false): Promise<TagInfo[]> {
     if (!isTauri()) return mockTags().slice(0, limit);
-    return invoke<TagInfo[]>("get_tags", { limit });
+    return invoke<TagInfo[]>("get_tags", { limit, includeEmpty });
   },
 
-  async searchTags(query: string, limit = 50): Promise<TagInfo[]> {
+  async searchTags(query: string, limit = 50, includeEmpty = false): Promise<TagInfo[]> {
     if (!isTauri()) return mockSearchTags(query, limit);
-    return invoke<TagInfo[]>("search_tags", { query, limit });
+    return invoke<TagInfo[]>("search_tags", { query, limit, includeEmpty });
   },
 
   async getImageDetail(imageId: number): Promise<ImageDetails> {
@@ -226,6 +227,12 @@ export const libraryApi = {
   async deleteTag(tagId: number): Promise<number> {
     if (!isTauri()) return mockDeleteTag(tagId);
     return invoke<number>("delete_tag", { tagId });
+  },
+
+  /** 一次删掉全部 0 张标签；只写一条 `tagDelete` 记录，可撤销。 */
+  async deleteZeroTags(): Promise<number> {
+    if (!isTauri()) return mockDeleteTag(-1);
+    return invoke<number>("delete_zero_tags");
   },
 
   async mergeTags(sourceId: number, targetId: number): Promise<TagMergeReport> {

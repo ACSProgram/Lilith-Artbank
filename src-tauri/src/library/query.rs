@@ -19,6 +19,11 @@ use crate::{
 pub const DEFAULT_LIMIT: u32 = 150;
 pub const MAX_LIMIT: u32 = 300;
 pub const MAX_TAGS: u32 = 500;
+/// 标签管理器一次要看全（含 0 张标签）才数得准「要清理多少个」。
+///
+/// 只有 `include_empty = true` 这条管理路径放宽；滚动、搜索、分面这些热路径仍是
+/// [`MAX_TAGS`]。0 张标签按定义没有关系行，逐行子查询都是空集，很便宜。
+pub const MAX_TAGS_WITH_EMPTY: u32 = 5_000;
 const MAX_IDS: usize = 1_000_000;
 /// 排序级数上限：等于可用指标数量，每个指标最多用一次。设置文件的校验沿用这个值。
 pub const MAX_SORT_LEVELS: usize = 7;
@@ -1051,12 +1056,47 @@ pub fn list_tags(database: &LibraryDb, limit: Option<u32>) -> AppResult<Vec<TagI
     list_tags_page(database, None, limit.unwrap_or(MAX_TAGS), 0)
 }
 
+/// 与 [`list_tags`] 相同，但可以带上图片数为 0 的标签（标签管理器要用）；
+/// 默认不带的旧行为保持不变。
+pub fn list_tags_with_empty(
+    database: &LibraryDb,
+    limit: Option<u32>,
+    include_empty: bool,
+) -> AppResult<Vec<TagInfo>> {
+    if !include_empty {
+        return list_tags(database, limit);
+    }
+    list_tags_page_with(database, None, limit.unwrap_or(MAX_TAGS), 0, true)
+}
+
 pub fn search_tags(
     database: &LibraryDb,
     query: &str,
     limit: Option<u32>,
 ) -> AppResult<Vec<TagInfo>> {
     search_tags_page(database, query, limit.unwrap_or(50), 0)
+}
+
+pub fn search_tags_with_empty(
+    database: &LibraryDb,
+    query: &str,
+    limit: Option<u32>,
+    include_empty: bool,
+) -> AppResult<Vec<TagInfo>> {
+    if !include_empty {
+        return search_tags(database, query, limit);
+    }
+    let needle = query.trim();
+    if needle.is_empty() {
+        return list_tags_with_empty(database, limit, true);
+    }
+    list_tags_page_with(
+        database,
+        Some(needle),
+        limit.unwrap_or(50).clamp(1, MAX_TAGS_WITH_EMPTY),
+        0,
+        true,
+    )
 }
 
 /// 按名称模糊匹配标签；`limit` 最高 200，供界面自动补全使用。
@@ -1087,10 +1127,69 @@ pub fn list_tags_page(
     limit: u32,
     offset: u32,
 ) -> AppResult<Vec<TagInfo>> {
+    list_tags_page_with(database, search, limit, offset, false)
+}
+
+/// 带 0 张标签的版本：走一条独立查询，不做「减法」那条快路径。
+///
+/// 只有标签管理器会用，不在任何滚动/翻页热路径上；556 个标签逐个子查询也是毫秒级。
+pub fn list_tags_page_with(
+    database: &LibraryDb,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+    include_empty: bool,
+) -> AppResult<Vec<TagInfo>> {
     let search = search.map(str::trim).filter(|text| !text.is_empty());
     database.with_reader(|connection| {
+        if include_empty {
+            return list_tags_with_empty_in(connection, search, limit, offset);
+        }
         list_tags_page_in(connection, search, limit, offset, MAX_TAG_DEAD_IMAGES)
     })
+}
+
+/// 0 张标签也列出来：计数子查询与 [`count_tags`] 同一口径（排除回收站与临时区）。
+fn list_tags_with_empty_in(
+    connection: &Connection,
+    search: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> AppResult<Vec<TagInfo>> {
+    let limit = limit.clamp(1, MAX_TAGS_WITH_EMPTY);
+    let mut statement = connection.prepare(&format!(
+        "SELECT tags.id, tags.name,
+                (SELECT count(*) FROM image_tags
+                 JOIN images ON images.id = image_tags.image_id
+                 WHERE image_tags.tag_id = tags.id
+                   AND images.deleted_at IS NULL
+                   AND {exclude}) AS image_count
+         FROM tags
+         {name_filter}
+         ORDER BY image_count DESC, tags.name
+         LIMIT ?1 OFFSET ?2",
+        exclude = temp::EXCLUDE_SQL,
+        name_filter = if search.is_some() {
+            "WHERE tags.name LIKE ?3 ESCAPE '\\'"
+        } else {
+            ""
+        },
+    ))?;
+    let mut params = vec![
+        Value::Integer(i64::from(limit)),
+        Value::Integer(i64::from(offset)),
+    ];
+    if let Some(needle) = search {
+        params.push(Value::Text(format!("%{}%", escape_like(needle))));
+    }
+    let rows = statement.query_map(params_from_iter(params.iter()), |row| {
+        Ok(TagInfo {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            image_count: row.get::<_, i64>(2)?.max(0) as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// 回收站与临时区的图片数超过这个量时，减法不再划算，改回旧形状。
@@ -3890,6 +3989,42 @@ mod tests {
 
         let (_, _, temp_count) = fixture.session.db.counts().unwrap();
         assert_eq!(temp_count, 1);
+    }
+
+    /// 标签管理器要看到 0 张标签；默认查询仍然过滤掉它们。
+    #[test]
+    fn include_empty_lists_zero_count_tags() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute("INSERT INTO tags(name) VALUES ('空标签')", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let visible = list_tags(&fixture.session.db, None).unwrap();
+        assert!(
+            !visible.iter().any(|tag| tag.name == "空标签"),
+            "默认口径不返回 0 张标签"
+        );
+
+        let all = list_tags_with_empty(&fixture.session.db, None, true).unwrap();
+        let empty = all.iter().find(|tag| tag.name == "空标签").unwrap();
+        assert_eq!(empty.image_count, 0);
+        // 有图片的标签仍在，且顺序按图片数降序。
+        assert!(all.len() > visible.len());
+        assert!(all[0].image_count >= all[all.len() - 1].image_count);
+
+        let searched = search_tags_with_empty(&fixture.session.db, "空", Some(50), true).unwrap();
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].name, "空标签");
+        assert!(
+            search_tags(&fixture.session.db, "空", Some(50))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 标签分页换形状后必须与旧 SQL 逐行一致：回收站、临时区、两者都有、死亡关系超阈值。

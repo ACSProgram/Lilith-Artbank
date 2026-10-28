@@ -1854,24 +1854,53 @@ textarea:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
-@media (max-width: 1180px) {
-  .virtual-list-grid {
-    grid-template-columns: 34px 94px 46px 70px 56px minmax(80px, 1fr) 120px;
-  }
+/*
+ * 列可显示/隐藏，`grid-template-columns` 由 VirtualList 按当前可见列内联给出；
+ * 窄窗口的自动让列也在那里按容器宽度算，所以这里不再写 :nth-child 的媒体查询
+ * （列一隐藏，序号就对不上了）。
+ */
 
-  .virtual-list-grid > :nth-child(8) {
-    display: none;
-  }
+.list-column-menu {
+  position: absolute;
+  z-index: 40;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px var(--scrim-soft);
 }
 
-@media (max-width: 900px) {
-  .virtual-list-grid {
-    grid-template-columns: 34px 88px 44px 66px 52px minmax(70px, 1fr);
-  }
+.list-column-menu-title {
+  padding: 3px 8px 5px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.4px;
+}
 
-  .virtual-list-grid > :nth-child(7) {
-    display: none;
-  }
+.list-column-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.list-column-menu-item:hover {
+  background: var(--bg-soft);
+  color: var(--text);
+}
+
+.list-column-menu-item input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.list-column-menu-item input:disabled + span {
+  opacity: 0.55;
 }
 
 /* ---------- Filter panel ---------- */
@@ -2039,6 +2068,53 @@ textarea:focus-visible {
 .filter-option input {
   margin: 0;
   accent-color: var(--accent);
+}
+
+/*
+ * 三态标签：一个按钮走「中性 → 包含 → 排除 → 中性」。
+ * 中性是空心方框；包含是实心勾；排除用减号 + 删除线，与包含一眼能分开。
+ */
+.filter-option-tri {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  color: var(--text-muted);
+}
+
+.filter-option-mark {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--control-border);
+  border-radius: 3px;
+  color: transparent;
+}
+
+.filter-option-tri.is-active .filter-option-mark {
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
+  color: var(--on-accent);
+}
+
+.filter-option-tri.is-excluded {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.filter-option-tri.is-excluded .filter-option-mark {
+  border-color: var(--danger-border);
+  background: var(--panel);
+  color: var(--danger);
+}
+
+.filter-option-tri.is-excluded .filter-option-label {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  opacity: 0.85;
 }
 
 .filter-option-label {
@@ -3538,6 +3614,25 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+
+/* 「清理 0 张标签」贴着标题右端；它是批量删除入口，用警示色而不是强调色。 */
+.tag-manager-purge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+.tag-manager-purge:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.tag-manager-purge:disabled {
+  color: var(--text-faint);
+  text-decoration: none;
 }
 
 .collection-manager-edit,
@@ -7289,4 +7384,286 @@ body.is-drag-sorting * {
 .find-similar-limit span {
   color: var(--text-faint);
   font-size: 10.5px;
+}
+
+/* ---------- Maintenance dialog ---------- */
+
+.maintenance {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.maintenance-tabs {
+  display: flex;
+  gap: 4px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.maintenance-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.maintenance-tab:hover {
+  background: var(--bg-soft);
+  color: var(--text);
+}
+
+.maintenance-tab.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.maintenance-choices {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.maintenance-choice {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  text-align: left;
+}
+
+.maintenance-choice:hover {
+  border-color: var(--border-strong);
+}
+
+.maintenance-choice.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.maintenance-choice strong {
+  display: block;
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.maintenance-choice small {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.maintenance-fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.maintenance-fieldset:disabled {
+  opacity: 0.55;
+}
+
+.maintenance-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.maintenance-summary {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.maintenance-progress {
+  margin-top: 9px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
+.maintenance-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.maintenance-progress-bar {
+  height: 3px;
+  margin: 6px 0 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.maintenance-progress-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.maintenance-progress-note {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.maintenance-report {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.maintenance-report-group h4 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.maintenance-report-group h4 em {
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-style: normal;
+  font-size: 9.5px;
+}
+
+.maintenance-table-wrap {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.maintenance-report-group .maintenance-table-wrap {
+  margin-top: 6px;
+}
+
+.maintenance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.maintenance-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.maintenance-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.maintenance-table tr:last-child td {
+  border-bottom: none;
+}
+
+.maintenance-path {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- Shortcut sheet ---------- */
+
+.shortcut-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.shortcut-group h3 {
+  margin: 0 0 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.3px;
+}
+
+.shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+}
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: 176px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 4px 6px;
+  border-radius: 5px;
+}
+
+.shortcut-row:nth-child(odd) {
+  background: var(--bg-soft);
+}
+
+.shortcut-row dt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.shortcut-row dd {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.shortcut-row kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 1px 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 10px;
+  text-align: center;
+}
+
+.shortcut-plus {
+  color: var(--text-faint);
+  font-size: 9px;
 }

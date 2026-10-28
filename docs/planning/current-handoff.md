@@ -2,7 +2,7 @@
 
 日期：2026-10-28
 
-本文件只写“现在”：当前生效的能力、基线与约束。未完成、未验收与待决策事项只写在[待办与待决策](todo.md)；后续阶段见[路线图](roadmap.md)；历史记录见[规划归档](archive/README.md)。第二轮使用反馈整改的七个批次与《压缩进度口径统一与导入压缩持久化》都已落实代码与自动检查，真实窗口验收待做；没有进行中的批次。
+本文件只写“现在”：当前生效的能力、基线与约束。未完成、未验收与待决策事项只写在[待办与待决策](todo.md)；后续阶段见[路线图](roadmap.md)；历史记录见[规划归档](archive/README.md)。S8（维护与体验补全）已落实代码与自动检查，真实窗口验收待做；没有进行中的批次。
 
 ## 能力现状
 
@@ -17,7 +17,9 @@
 - **任务与并发**：`app/tasks.rs` 配合 `concurrency/` 资源表（会话、时间线、内容写、元数据写、AI 服务与文件夹子树路径锁），同一资源 FIFO、路径写优先；路径访问分读 / 原地替换 / 写三级，原地替换只与写互斥（图片空间优化用它，压缩期间查看器与 MCP 读图照常可用）。短写冲突立即失败，撤销/重做/清空记录不排队；全局图像预算（`performance.workerThreads`，默认逻辑核数 − 1）统一约束导入、压缩、估算、缩略图、查看器预览、AI 解码与 MCP 拼图。panic、线程起不来与提前返回都落到失败终态并释放资源。批量任务开始前显示“范围 N 张 / 将处理 M 张”，任务 `total` 与 M 一致；快照带运行时长、完成速度、ETA、当前文件与已提交字节；收到取消请求先切“取消中”相位（非终态），收尾完成后才落到“已取消”。
 - **图片空间优化**：只读估算 → 确认执行两阶段，分层切片抽样与按层外推，执行前三道复核（参数指纹、候选集合指纹、逐张 `stat`），不可撤销的 `optimize` 记录。进度与收益曲线只用一种计量单位：候选张数——顶部进度条、环图中心、实线终点与里程碑横轴读同一个 `(已替换 + 已跳过 + 失败) / 候选张数`；速度含跳过，ETA 走同一套计数。执行时复用同一张估算视图并填入实际数据：环图四段「已替换 / 已跳过（按 6 个原因展开）/ 失败 / 未处理」，曲线叠一条实际实线，里程碑表多一列实际，结束后顶部换成一行结论并给一行“实际 vs 预计”。体积只出现在「已省 / 已替换体积」区块。见[维护与批量工作流](../modules/maintenance.md#图片空间优化)。
 - **MCP 图库控制**：应用内 stateless Streamable HTTP 服务（`127.0.0.1` + Bearer 口令 + `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；24 个工具、三档权限、10 分钟确认队列、`logs/mcp.log` 审计。永久删除、清空回收站、空间优化、像素编辑与普通库批量 AI 生成不开放。见[MCP 图库控制](../modules/mcp.md)。
-- **日志与命令记录**：等级为发布 Info、调试 Debug，`LILITH_ARTBANK_LOG_LEVEL` 覆盖；行前缀是本地时间 + `[run:xxxxxx]`，可按单次运行切分。52 个写命令成对记 `started` / `finished`（带 `elapsed_ms`），30 个读命令只在失败或超阈值时记（默认 500ms，语义搜索与找相似 3000ms），8 个无 `Result` 的命令不包装；不记命令参数。按 4MB 轮转、保留 5 份归档。见[日志与命令记录](../guides/logging.md)。
+- **维护与检查**：入口是「任务 → 维护与检查…」的四个分区。检查一次目录遍历同时出四类结论（缺失原图 / 孤儿 / 大小不符 / 哈希不符），快速检查只看存在性与大小、完整校验重算 BLAKE3，不持路径锁而容忍扫描期间变动；孤儿可移入 `recycle/orphans/`（一条 `orphanMove` 记录，可撤销）；缩略图包按段统计垃圾率，超过 20% 且空闲 3 分钟时自动回收（让位落「已让位」），也可手动立即回收；导出复制原图到目录并可选写 `manifest.csv`。见[维护与批量工作流](../modules/maintenance.md)。
+- **界面缺口补齐**：标签列表三态（包含 / 排除 / 中性）、「清理 0 张标签」（一条 `tagDelete` 记录）、列表列显示/隐藏（`settings.ui.listColumns`）、`?` 与设置页的快捷键总表。
+- **日志与命令记录**：等级为发布 Info、调试 Debug，`LILITH_ARTBANK_LOG_LEVEL` 覆盖；行前缀是本地时间 + `[run:xxxxxx]`，可按单次运行切分。56 个写命令成对记 `started` / `finished`（带 `elapsed_ms`），32 个读命令只在失败或超阈值时记（默认 500ms，语义搜索与找相似 3000ms），8 个无 `Result` 的命令不包装；不记命令参数。按 4MB 轮转、保留 5 份归档。见[日志与命令记录](../guides/logging.md)。
 - **前端契约**：`src/modules/<module>/api.ts` 是命令唯一入口，跨模块编排在 `src/app/`，主题只走 `src/styles/tokens.css` 的语义变量，破坏性操作确认文案统一在 `src/shared/confirm.ts`。
 
 ## 基线
@@ -25,7 +27,8 @@
 - 图库：主库 `G:\Lilith Image Library`（396 180 张、758 个普通文件夹（659 个有图）+ 1 个临时文件夹、556 个标签（174 个有图）、81 649 条 pose、396 181 条 embedding、10 个缩略图段、`library.db` 1 019.9 MB），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
 - 压缩候选：主库按默认参数（JPEG 输出、跳过已处理、非透明、非 GIF、bpp ≥ 0.12）为 127 837 张 / 179.58 GB / 853.24 GP，平均 6.67 MP/张；已优化过 249 767 张。
 - 存储版本：schema v9、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（2026-10-28，压缩进度口径统一后）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test`（419 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（101 通过）、`npm run build`、`git diff --check`。
+- 维护实测（主库）：39.6 万行逐张 `stat` 的快速检查 19.9 s，缺失 0、孤儿 0、非内容寻址文件 1；缩略图 9 段 9.24 GB、未引用字节 0；embedding 1.217 GB 与 pose 43.1 MB 各恰好一条/张、垃圾 0；556 个标签里 382 个图片数为 0。
+- 自动检查（2026-10-28，S8 之后）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test`（455 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（109 通过）、`npm run build`、`git diff --check`。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

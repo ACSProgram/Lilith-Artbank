@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Tags, X } from "lucide-react";
+import { Check, Minus, Tags, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import { libraryApi } from "./api";
 import {
   activeFilterCount,
   bytesToMbInput,
+  cycleTagFilter,
   dateInputValue,
   localDayEnd,
   localDayStart,
   mbToBytes,
+  tagOptionState,
   toggleValue,
 } from "./model";
 import type {
@@ -125,9 +127,13 @@ export function FilterPanel({
       // “无标签”时不按计数过滤：搜索与集合视图的标签分面按命中集统计，会全是 0；
       // 仍列出全部标签，方便直接切回按标签筛选。
       if (filters.tagPresence === "missing") return true;
-      return filters.tagIds.includes(tag.id) || (tagCounts.get(tag.id) ?? 0) > 0;
+      return (
+        filters.tagIds.includes(tag.id) ||
+        filters.excludeTagIds.includes(tag.id) ||
+        (tagCounts.get(tag.id) ?? 0) > 0
+      );
     });
-  }, [counts, filters.tagIds, filters.tagPresence, tagCounts, tagQuery, tags]);
+  }, [counts, filters.tagIds, filters.excludeTagIds, filters.tagPresence, tagCounts, tagQuery, tags]);
 
   if (!open) return null;
 
@@ -410,23 +416,35 @@ export function FilterPanel({
               </span>
             ) : (
               tagOptions.map((tag) => {
-                const active = filters.tagIds.includes(tag.id);
+                const state = tagOptionState(filters, tag.id);
                 const count = counts ? (tagCounts.get(tag.id) ?? 0) : tag.imageCount;
                 return (
-                  <label key={tag.id} className={`filter-option${active ? " is-active" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={active}
-                      onChange={() =>
-                        patch({
-                          tagIds: toggleValue(filters.tagIds, tag.id),
-                          tagPresence: "any",
-                        })
-                      }
-                    />
+                  <button
+                    key={tag.id}
+                    type="button"
+                    className={`filter-option filter-option-tri${state === "include" ? " is-active" : ""}${
+                      state === "exclude" ? " is-excluded" : ""
+                    }`}
+                    role="checkbox"
+                    aria-checked={state === "neutral" ? false : state === "include" ? true : "mixed"}
+                    title={
+                      state === "include"
+                        ? "已要求包含；再点一次改为排除"
+                        : state === "exclude"
+                          ? "已排除；再点一次取消"
+                          : "点一次要求包含，再点一次排除"
+                    }
+                    onClick={() =>
+                      onFiltersChange(cycleTagFilter(filters, tag.id))
+                    }
+                  >
+                    <span className="filter-option-mark" aria-hidden="true">
+                      {state === "include" ? <Check size={11} /> : null}
+                      {state === "exclude" ? <Minus size={11} /> : null}
+                    </span>
                     <span className="filter-option-label">{tag.name}</span>
                     <em>{count}</em>
-                  </label>
+                  </button>
                 );
               })
             )}

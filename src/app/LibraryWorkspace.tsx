@@ -21,6 +21,7 @@ import { browserPreview } from "./api";
 import { useSimilarityBrowse } from "./useSimilarityBrowse";
 import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { BatchTaskDialog } from "./BatchTaskDialog";
+import { MaintenanceDialog } from "./MaintenanceDialog";
 import { OptimizeDialog } from "./OptimizeDialog";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { useTaskData } from "./taskContext";
@@ -122,6 +123,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
   const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
+  const [maintenanceContext, setMaintenanceContext] = useState<BatchTaskContextInfo | null>(null);
   const [contextsRevision, setContextsRevision] = useState(0);
   const [optimizeStale, setOptimizeStale] = useState(false);
   const contextsRevisionRef = useRef(0);
@@ -623,6 +625,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                   setSimilarityGroupsOpen(true);
                 }}
                 onOpenBatchTasks={setBatchContext}
+                onOpenMaintenance={setMaintenanceContext}
                 onOpenOptimize={(context) => {
                   setOptimizeContext(context);
                   setOptimizeStale(false);
@@ -697,6 +700,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             context={batchContext}
             status={aiStatus}
             onRefreshStatus={refreshAi}
+            libraryId={current.id}
+          />
+          <MaintenanceDialog
+            open={maintenanceContext !== null}
+            onClose={() => setMaintenanceContext(null)}
+            context={maintenanceContext}
             libraryId={current.id}
           />
           <OptimizeDialog

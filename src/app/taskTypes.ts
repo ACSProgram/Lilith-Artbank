@@ -17,7 +17,11 @@ export type TaskKind =
   | "releaseGarbage"
   | "optimizeEstimate"
   | "optimize"
-  | "tempFeatures";
+  | "tempFeatures"
+  | "checkLibrary"
+  | "export"
+  | "orphanMove"
+  | "packCompact";
 
 export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =
@@ -27,10 +31,20 @@ export type TaskPhase =
   | "cancelling"
   | "completed"
   | "cancelled"
+  /** 空闲回收让位给用户；不是用户取消。 */
+  | "yielded"
   | "failed";
 
 export type ConflictPolicy = "fail" | "queue";
-export type BatchTaskKind = "thumbnail" | "aiEmbedding" | "aiPose" | "aiDescription";
+export type BatchTaskKind =
+  | "thumbnail"
+  | "aiEmbedding"
+  | "aiPose"
+  | "aiDescription"
+  | "checkFast"
+  | "checkFull"
+  | "packCompact"
+  | "export";
 export type TaskRequestKind =
   | BatchTaskKind
   | "similarityGroups"
@@ -168,9 +182,9 @@ export interface TaskSnapshot {
   runStartedAt: number | null;
   /** 当前处理的相对路径；没有时回退为 #图片id。 */
   currentFile: string | null;
-  /** 已提交批次的原图字节；只有压缩任务非 0。 */
+  /** 已处理字节：压缩任务是已提交批次的原图字节，导出任务是已复制字节；其余为 0。 */
   originalBytes: number;
-  /** 已提交批次节省的字节；只有压缩任务非 0。 */
+  /** 已节省字节；只有压缩任务非 0。 */
   savedBytes: number;
   ratePerSecond: number | null;
   etaSeconds: number | null;
@@ -208,6 +222,9 @@ export interface BatchTaskRequest {
   /** 执行压缩时提交的估算任务 id；估算任务不用。 */
   estimateId?: string | null;
   estimateSampleSize?: number | null;
+  /** 导出：目标目录与是否附带 `manifest.csv`。 */
+  targetDir?: string | null;
+  includeManifest?: boolean;
   conflict: ConflictPolicy;
 }
 
@@ -240,6 +257,7 @@ export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
   cancelling: "取消中",
   completed: "已完成",
   cancelled: "已取消",
+  yielded: "已让位",
   failed: "失败",
 };
 
@@ -247,7 +265,12 @@ export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
 export const CANCEL_PENDING_NOTE = "等当前批次提交完成，已执行的部分不会撤销。";
 
 export function isTaskActive(task: TaskSnapshot): boolean {
-  return task.phase !== "completed" && task.phase !== "cancelled" && task.phase !== "failed";
+  return !isTerminalPhase(task.phase);
+}
+
+/** 终态：与 Rust 的 `TaskPhase::is_terminal` 一一对应，含「已让位」。 */
+export function isTerminalPhase(phase: TaskPhase): boolean {
+  return phase === "completed" || phase === "cancelled" || phase === "yielded" || phase === "failed";
 }
 
 /** 进度条百分比：后端给了加权值就用它，否则按「已完成 + 失败 + 跳过 / 总数」计算。 */

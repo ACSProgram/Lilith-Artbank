@@ -33,6 +33,8 @@ pub fn register(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
 }
 
 fn respond(app: &AppHandle<Wry>, path: &str, responder: UriSchemeResponder) {
+    // 纯滚动浏览只发缩略图/原图请求，不发命令；不接这一处，「光看不点」会被当成没人。
+    crate::app::activity::touch();
     let response = match route(app, path) {
         Ok(response) => response,
         Err(ImageError::BadRequest(reason)) => {

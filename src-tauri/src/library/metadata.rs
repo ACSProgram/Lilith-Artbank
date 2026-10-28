@@ -995,6 +995,61 @@ pub fn delete_tag_with_id(database: &LibraryDb, tag_id: i64) -> AppResult<(u64, 
     )
 }
 
+/// 一次删掉所有「0 张」标签：判定与 `list_tags` 同口径（可见图片数为 0）。
+///
+/// 整次操作写**一条** `tagDelete` 记录：382 个标签各写一条会把记录面板冲垮。
+/// 撤销时按记录里的 `(id, name)` 把标签行插回，关系（只可能指向回收站或临时区）
+/// 一并恢复，不涉及任何正常图片。
+pub fn delete_zero_tags(database: &LibraryDb) -> AppResult<u64> {
+    history::write(
+        database,
+        NewOperation::new(HistoryKind::TagDelete, "清理 0 张标签"),
+        |transaction, draft| {
+            let zero: Vec<(i64, String)> = {
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT tags.id, tags.name FROM tags
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM image_tags
+                     JOIN images ON images.id = image_tags.image_id
+                     WHERE image_tags.tag_id = tags.id
+                       AND images.deleted_at IS NULL
+                       AND {exclude}
+                 )
+                 ORDER BY tags.id",
+                    exclude = temp::EXCLUDE_SQL
+                ))?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if zero.is_empty() {
+                return Ok(0);
+            }
+            for (tag_id, name) in &zero {
+                draft.json(&TagRecord::Delete {
+                    tag_id: *tag_id,
+                    name: name.clone(),
+                })?;
+                let pairs: Vec<(i64, i64)> = {
+                    let mut statement =
+                        transaction.prepare("SELECT image_id FROM image_tags WHERE tag_id = ?1")?;
+                    statement
+                        .query_map([tag_id], |row| Ok((row.get::<_, i64>(0)?, *tag_id)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for chunk in pairs.chunks(1_000) {
+                    draft.json(&TagRecord::Pairs {
+                        pairs: chunk.to_vec(),
+                    })?;
+                }
+                transaction.execute("DELETE FROM tags WHERE id = ?1", [tag_id])?;
+            }
+            draft.affected(zero.len() as u64);
+            Ok(zero.len() as u64)
+        },
+    )
+}
+
 /// 合并两个标签：把源标签的全部图片关系迁到目标标签，然后删掉源标签行。
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1819,6 +1874,77 @@ mod tests {
                 Ok(connection.last_insert_rowid())
             })
             .unwrap()
+    }
+
+    /// 0 张标签一次事务删完、只写一条记录；撤销把标签行与关系一起恢复。
+    #[test]
+    fn deletes_zero_tags_in_one_operation_and_undoes() {
+        let fixture = fixture();
+        let image_id = insert_image(&fixture, "a", "jpg", 3, fixture.folder);
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO tags(id, name) VALUES (10, '有人用'), (11, '空一'), (12, '空二')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, 10)",
+                    [image_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let removed = delete_zero_tags(&fixture.session.db).unwrap();
+        assert_eq!(removed, 2);
+        let remaining: Vec<String> = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                let mut statement = connection.prepare("SELECT name FROM tags ORDER BY id")?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(remaining, vec!["有人用".to_owned()]);
+
+        let entries = history::list(&fixture.session.db).unwrap();
+        assert_eq!(entries.len(), 1, "一次清理只写一条记录");
+        assert_eq!(entries[0].kind, HistoryKind::TagDelete);
+        assert_eq!(entries[0].affected, 2);
+
+        let task = crate::app::tasks::TaskHandle::new(
+            "undo-zero-tags",
+            crate::app::tasks::TaskKind::Undo,
+            "测试",
+        );
+        history::run_undo(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            entries[0].id,
+            task,
+        )
+        .unwrap();
+        let restored: Vec<String> = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                let mut statement = connection.prepare("SELECT name FROM tags ORDER BY id")?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            restored,
+            vec!["有人用".to_owned(), "空一".to_owned(), "空二".to_owned()]
+        );
     }
 
     fn write_content(

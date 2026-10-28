@@ -95,6 +95,26 @@ export interface UiSettings {
   sort: SortSpec[];
   sortProfiles: SortProfile[];
   viewerFilmstrip: boolean;
+  /** 列表视图显示哪些列；缩略图列不在其中，永远显示。 */
+  listColumns: ListColumn[];
+}
+
+/** 列表视图可隐藏的列；与 Rust `settings::LIST_COLUMNS` 一一对应。 */
+export type ListColumn = "pixels" | "format" | "size" | "score" | "tags" | "importedAt" | "folder";
+
+export const LIST_COLUMNS: ListColumn[] = [
+  "pixels",
+  "format",
+  "size",
+  "score",
+  "tags",
+  "importedAt",
+  "folder",
+];
+
+export interface MaintenanceSettings {
+  /** 空闲时自动回收缩略图包；关掉之后「立即回收」仍然可用。 */
+  autoCompactThumbs: boolean;
 }
 
 export interface Settings {
@@ -106,6 +126,7 @@ export interface Settings {
   import: ImportSettings;
   mcp: McpSettings;
   ui: UiSettings;
+  maintenance: MaintenanceSettings;
 }
 
 export interface LibraryManifest {

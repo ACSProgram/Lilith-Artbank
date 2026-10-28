@@ -44,6 +44,7 @@ pub struct Settings {
     pub import: ImportSettings,
     pub mcp: McpSettings,
     pub ui: UiSettings,
+    pub maintenance: MaintenanceSettings,
 }
 
 impl Default for Settings {
@@ -57,6 +58,7 @@ impl Default for Settings {
             import: ImportSettings::default(),
             mcp: McpSettings::default(),
             ui: UiSettings::default(),
+            maintenance: MaintenanceSettings::default(),
         }
     }
 }
@@ -269,6 +271,26 @@ pub struct UiSettings {
     pub sort: Vec<SortSpec>,
     pub sort_profiles: Vec<SortProfile>,
     pub viewer_filmstrip: bool,
+    /// 列表视图显示哪些列；缺键或为空时按默认全显示。
+    pub list_columns: Vec<String>,
+}
+
+/// 列表视图可隐藏的列；缩略图列不在其中，永远显示。
+pub const LIST_COLUMNS: [&str; 7] = [
+    "pixels",
+    "format",
+    "size",
+    "score",
+    "tags",
+    "importedAt",
+    "folder",
+];
+
+pub fn default_list_columns() -> Vec<String> {
+    LIST_COLUMNS
+        .iter()
+        .map(|column| (*column).to_owned())
+        .collect()
 }
 
 impl Default for UiSettings {
@@ -281,6 +303,23 @@ impl Default for UiSettings {
             sort: vec![SortSpec::default()],
             sort_profiles: Vec::new(),
             viewer_filmstrip: true,
+            list_columns: default_list_columns(),
+        }
+    }
+}
+
+/// 维护相关开关；缺键走默认值，不升 `SETTINGS_VERSION`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MaintenanceSettings {
+    /// 空闲时自动回收缩略图包；关掉之后「立即回收」仍然可用。
+    pub auto_compact_thumbs: bool,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            auto_compact_thumbs: true,
         }
     }
 }
@@ -364,6 +403,14 @@ impl Settings {
             return Err(AppError::message("缩略图缓存张数必须在 256-8192 之间"));
         }
         validate_sort(&self.ui.sort)?;
+        if self
+            .ui
+            .list_columns
+            .iter()
+            .all(|column| !LIST_COLUMNS.contains(&column.as_str()))
+        {
+            return Err(AppError::message("列表至少要保留一列"));
+        }
         if self.ui.sort_profiles.len() > MAX_SORT_PROFILES {
             return Err(AppError::message(format!(
                 "排序方案最多保存 {MAX_SORT_PROFILES} 个"
@@ -646,6 +693,29 @@ mod tests {
             library_path: Some(r"G:\Lilith Image Library".into()),
             ..Default::default()
         }
+    }
+
+    /// 旧 `settings.json` 缺 `listColumns` / `maintenance` 时走默认值，不升版本、不写迁移。
+    #[test]
+    fn old_settings_without_new_keys_use_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"settingsVersion":7,"ui":{"theme":"dark"}}"#).unwrap();
+        let store = SettingsStore::load_or_create(path).unwrap();
+        let settings = store.snapshot();
+        assert_eq!(settings.ui.theme, "dark");
+        assert_eq!(settings.ui.list_columns, default_list_columns());
+        assert_eq!(settings.ui.list_columns.len(), LIST_COLUMNS.len());
+        assert!(settings.maintenance.auto_compact_thumbs, "默认开启自动回收");
+    }
+
+    #[test]
+    fn list_columns_must_keep_one() {
+        let mut settings = sample();
+        settings.ui.list_columns = vec!["unknown".into()];
+        assert!(settings.validate().is_err());
+        settings.ui.list_columns = vec!["folder".into()];
+        assert!(settings.validate().is_ok());
     }
 
     /// 新增一个 `SortKey` 时必须同步这里的字符串列表，否则设置里的排序会被判成未知指标。

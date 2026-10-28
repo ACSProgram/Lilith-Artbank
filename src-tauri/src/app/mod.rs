@@ -1,6 +1,8 @@
+pub mod activity;
 pub mod batch_preview;
 pub mod commands;
 pub mod error;
+pub mod idle;
 pub mod img_protocol;
 pub mod paths;
 pub mod settings;

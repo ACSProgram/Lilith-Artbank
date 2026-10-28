@@ -141,6 +141,37 @@ impl ThumbPack {
         Ok(std::fs::metadata(segment_path(&self.directory, segment))?.len())
     }
 
+    /// 包被重写后重新读最新段头，让写指针落到新段末尾。
+    ///
+    /// 回收任务提交后调用：新段号比原来大，旧段的读句柄已经失效，一起丢掉。
+    pub fn reload_from_disk(&self) -> AppResult<()> {
+        let mut latest = 0_u32;
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".pack") else {
+                continue;
+            };
+            if let Ok(segment) = stem.parse::<u32>() {
+                latest = latest.max(segment);
+            }
+        }
+        let offset = if latest == 0 {
+            0
+        } else {
+            read_header(&segment_path(&self.directory, latest))?
+        };
+        {
+            let mut state = self.state.lock();
+            state.file = None;
+            state.segment = latest;
+            state.offset = offset;
+        }
+        self.readers.write().clear();
+        Ok(())
+    }
+
     pub fn read(&self, location: ThumbLocation) -> AppResult<Vec<u8>> {
         if location.length == 0 || location.length > MAX_THUMBNAIL_BYTES {
             return Err(AppError::message("缩略图指针长度无效"));
@@ -487,6 +518,30 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// 包被重写后重新读段头：新的 append 必须落到最新段末尾，不能写回旧段。
+    #[test]
+    fn reload_points_writes_at_the_latest_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("thumbs");
+        let pack = ThumbPack::open(&directory).unwrap();
+        pack.append(b"first").unwrap();
+
+        // 造一个回收后的 2 号段（段头必须是真的，否则重读会拒绝）。
+        let mut header = [0_u8; HEADER_LEN as usize];
+        header[..8].copy_from_slice(HEADER_MAGIC);
+        header[8..12].copy_from_slice(&HEADER_VERSION.to_le_bytes());
+        let mut file = File::create(segment_path(&directory, 2)).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(b"moved").unwrap();
+        drop(file);
+
+        pack.reload_from_disk().unwrap();
+        let location = pack.append(b"second").unwrap();
+        assert_eq!(location.segment, 2);
+        assert_eq!(location.offset, HEADER_LEN + 5);
+        assert_eq!(pack.read(location).unwrap(), b"second");
     }
 
     #[test]

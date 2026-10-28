@@ -215,7 +215,7 @@ Content-Type: application/octet-stream
 
 - 文件名由 kind、模型 slug（小写、非字母数字折叠为 `-`、最多 48 字符）、维度、dtype 与模型名 BLAKE3 前 8 位组成，同一模型名始终落到同一个包。
 - 包头 32 字节：magic `ARTBFTR1`、version、kind、dtype、dim、record_len、创建时间（14-15 字节保留）；`record_len` 必须等于 `dim × 2`（f16）或 `dim × 4`（f32）。
-- 追加式写入，`feature_blobs` 记录 `(image_id, kind, model, dim, pack_name, pack_offset, pack_length)`；同一图片重算时追加新记录并更新指针，旧字节由 S8 的整理任务回收。
+- 追加式写入，`feature_blobs` 记录 `(image_id, kind, model, dim, pack_name, pack_offset, pack_length)`；同一图片重算时追加新记录并更新指针。旧字节不回收，只在维护页的「特征包」里统计（实测 0 垃圾；模型切换会让整包作废重算，压了没有意义）。
 - `feature_blobs.dim` 对 embedding 是向量维度，对 pose 是 landmark 个数（33）；pose 包的 `dim` 是 f32 元素数 132（33 × 4），两者不要混用。
 - embedding 磁盘上每条 `dim × 2` 字节（仅存 fp16）；读入后立即转 fp32，均值、点积、范数与余弦全部用 f32 在 CPU 计算。pose 每条 33 × 4 × 4 字节（f32，x/y/z/visibility）。
 - 读取向量不整体载入：扫描按 `pack_offset` 排序后 mmap 顺序读，数据库只做一次批量查询；单条读取（查看器 pose）按偏移定位。
@@ -304,7 +304,7 @@ Content-Type: application/octet-stream
 
 - 任务状态不持久化；关库/退出后重跑会重新计算缺失项。
 - 新增 embedding 不会实时更新均值；按用户决定，重开图库才刷新。
-- feature pack 采用追加写入，重算会留下旧字节；压缩/回收留到 S8。
+- feature pack 采用追加写入，重算会留下旧字节；不做压缩回收（模型切换会让整包作废重算），维护页只显示每个包的条数、已用与垃圾字节。
 - 相似模式（语义或找相似）不叠加图库筛选条件；进入后筛选与排序控件禁用。找相似可以显式选择当前视图等范围，范围在进入结果视图前解析。
 - 多张参考图只支持主色与 embedding 的平均；pHash 与姿势平均没有意义。缺特征时弹窗置灰，不在查询路径里自动生成。
 - 结果缓存只保留最近一次查询；换一次搜索/找相似后旧 token 失效。相似分组结果按 taskId 在内存里最多保留 5 份，关库即清空。
