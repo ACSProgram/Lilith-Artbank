@@ -8,8 +8,6 @@ use std::{
 
 use parking_lot::Mutex;
 
-// 批次 6 会把滚动吞吐与 ETA 放进任务快照；这里先把采样与计算备好。
-#[allow(dead_code)]
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 
 pub struct WorkMeter {
@@ -19,7 +17,6 @@ pub struct WorkMeter {
     weight: AtomicU8,
     explicit_percent: AtomicU8,
     finished: AtomicBool,
-    #[allow(dead_code)]
     samples: Mutex<VecDeque<(Instant, u64)>>,
 }
 
@@ -56,7 +53,6 @@ impl WorkMeter {
         self.note_sample(done);
     }
 
-    #[allow(dead_code)]
     pub fn advance_units(&self, units: u64) -> u64 {
         let done = self.done_units.fetch_add(units, Ordering::Relaxed) + units;
         self.note_sample(done);
@@ -117,7 +113,6 @@ impl WorkMeter {
     }
 
     /// 最近 10 秒的滚动吞吐（单位/秒）；样本不足时返回 `None`。
-    #[allow(dead_code)]
     pub fn rate(&self) -> Option<f64> {
         let samples = self.samples.lock();
         let (first_time, first_units) = *samples.front()?;
@@ -130,7 +125,6 @@ impl WorkMeter {
     }
 
     /// 按总单位与滚动吞吐估算剩余时间；样本不足时返回 `None`。
-    #[allow(dead_code)]
     pub fn eta(&self) -> Option<Duration> {
         let total = self.total_units();
         if total == 0 {
@@ -148,7 +142,6 @@ impl WorkMeter {
         self.finished.store(true, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     fn note_sample(&self, done: u64) {
         let now = Instant::now();
         let mut samples = self.samples.lock();

@@ -5,6 +5,7 @@ import {
   defaultScopeChoice,
   scopeAvailability,
   scopeCountLabel,
+  scopeCountValue,
   type ScopeChoice,
 } from "./scope.ts";
 import type { BatchTaskContextInfo } from "./batchTaskContext.ts";
@@ -82,6 +83,22 @@ test("folder_count_label_follows_subfolder_toggle", () => {
   assert.equal(scopeCountLabel("temp", base), "3 张");
   assert.equal(scopeCountLabel("library", base), "9,000 张");
   assert.equal(scopeCountLabel("collection", base), "");
+});
+
+test("scopeCountValue 各范围与空值", () => {
+  const base = context({ selectedIds: [1, 2] });
+  assert.equal(scopeCountValue("selected", base), 2);
+  assert.equal(scopeCountValue("folder", base), 120);
+  assert.equal(scopeCountValue("folder", base, { includeSubfolders: false }), 20);
+  assert.equal(scopeCountValue("collection", base), null);
+  assert.equal(scopeCountValue("view", base), 120);
+  assert.equal(scopeCountValue("temp", base), 3);
+  assert.equal(scopeCountValue("library", base), 9_000);
+  assert.equal(scopeCountValue("library", null), null);
+  assert.equal(
+    scopeCountValue("folder", context({ folderTotal: null })),
+    null,
+  );
 });
 
 test("availability_disables_choices_without_context", () => {

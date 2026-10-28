@@ -14,3 +14,9 @@ export function formatDuration(seconds: number): string {
   if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`;
   return `${(seconds / 3600).toFixed(1)} 小时`;
 }
+
+/** 每秒张数 → 一位小数；两位数以上取整，避免面板宽度抖动。 */
+export function formatRate(rate: number): string {
+  if (!Number.isFinite(rate) || rate <= 0) return "0";
+  return rate >= 10 ? rate.toFixed(0) : rate.toFixed(1);
+}

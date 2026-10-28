@@ -1,17 +1,28 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Play, RotateCcw, Square } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
 import { Spinner } from "../shared/components/Spinner";
-import { formatBytes, formatDuration } from "../shared/format";
+import { formatBytes, formatDuration, formatRate } from "../shared/format";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { confirmOptimize } from "../shared/confirm";
 import { errorMessage } from "../shared/errors";
 import { useNotices } from "./noticeContext";
 import { useTaskCenter } from "./taskContext";
 import { taskApi } from "./taskApi";
-import { OptimizeCurveChart, OptimizeShareChart, type OptimizeShareSegment } from "./OptimizeCharts";
+import {
+  OptimizeCurveChart,
+  OptimizeProgressChart,
+  OptimizeShareChart,
+  type OptimizeShareSegment,
+} from "./OptimizeCharts";
+import {
+  appendRuntimePoint,
+  compareOptimizeEstimate,
+  type OptimizeComparisonKey,
+  type RuntimeOptimizePoint,
+} from "./optimizeProgress";
 import {
   TASK_PHASE_LABELS,
   isTaskActive,
@@ -123,9 +134,8 @@ function sampleWaitLabel(
   return formatDuration(seconds);
 }
 
-/** 估算与执行共用同一块进度展示，只有数据来源不同。 */
+/** 估算统计候选时没有可按张计的进度，只留百分比与文案。 */
 function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number }) {
-  // 估算统计候选时没有可按张计的进度，只留百分比与文案。
   const counted = task.total > 0;
   return (
     <div className="batch-task-progress">
@@ -148,6 +158,156 @@ function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number 
       <div className="batch-task-progress-meta">
         <span>{task.message || (isTaskActive(task) ? <Spinner size={12} /> : "已结束")}</span>
       </div>
+    </div>
+  );
+}
+
+/** 执行中把估算结果收进可展开的明细，避免和实际进度抢版面。 */
+function EstimateDetails({
+  collapsed,
+  children,
+}: {
+  collapsed: boolean;
+  children: ReactNode;
+}) {
+  if (!collapsed) return <>{children}</>;
+  return (
+    <details className="optimize-estimate-details">
+      <summary>估算明细（预估参考）</summary>
+      {children}
+    </details>
+  );
+}
+
+function comparisonValue(key: OptimizeComparisonKey, value: number): string {
+  if (key === "savings") return formatBytes(value);
+  if (key === "duration") return formatDuration(value);
+  return `${value.toLocaleString()} 张`;
+}
+
+function comparisonDelta(key: OptimizeComparisonKey, delta: number): string {
+  const sign = delta >= 0 ? "+" : "-";
+  if (key === "savings") return `${sign}${formatBytes(Math.abs(delta))}`;
+  if (key === "duration") return `${sign}${formatDuration(Math.abs(delta))}`;
+  return `${sign}${Math.abs(delta).toLocaleString()} 张`;
+}
+
+/** 执行面板：实际进度、字节、速度、ETA、当前文件与预计对照。 */
+function OptimizeExecutionPanel({
+  task,
+  estimate,
+  percent,
+  points,
+}: {
+  task: TaskSnapshot;
+  estimate: OptimizeEstimate | null;
+  percent: number;
+  points: RuntimeOptimizePoint[];
+}) {
+  const done = task.completed + task.failed + task.skipped;
+  const active = isTaskActive(task);
+  const end = task.finishedAt ?? Date.now();
+  // 实际耗时从真正进入编码算起，不含排队、准备与执行前复核。
+  const elapsedSeconds =
+    task.runStartedAt != null
+      ? Math.max(0, (end - task.runStartedAt) / 1000)
+      : 0;
+  const comparison = estimate
+    ? compareOptimizeEstimate(estimate, {
+        savedBytes: task.savedBytes,
+        elapsedSeconds,
+        completed: task.completed,
+        status: task.phase,
+      })
+    : null;
+  const settling = active && percent >= 90;
+
+  return (
+    <div className="batch-task-progress optimize-execution">
+      <div className="batch-task-progress-head">
+        <strong>
+          {task.label} · {TASK_PHASE_LABELS[task.phase]}
+        </strong>
+        <span>{percent}%</span>
+      </div>
+      <div className="task-progress">
+        <span style={{ width: `${percent}%` }} />
+      </div>
+
+      <div className="batch-task-facts">
+        <span>
+          已处理 {done.toLocaleString()} / {task.total.toLocaleString()}
+        </span>
+        <span>已替换 {task.completed.toLocaleString()} 张</span>
+        {task.failed > 0 ? <span>失败 {task.failed.toLocaleString()}</span> : null}
+        {task.skipped > 0 ? <span>跳过 {task.skipped.toLocaleString()}</span> : null}
+      </div>
+      <div className="batch-task-facts">
+        <span>已省 {task.savedBytes > 0 ? formatBytes(task.savedBytes) : "—"}</span>
+        <span>原图 {task.originalBytes > 0 ? formatBytes(task.originalBytes) : "—"}</span>
+        {task.ratePerSecond != null ? (
+          <span>{formatRate(task.ratePerSecond)} 张/秒</span>
+        ) : null}
+        {settling ? (
+          <span>正在收尾</span>
+        ) : task.etaSeconds != null ? (
+          <span>预计还需 {formatDuration(task.etaSeconds)}</span>
+        ) : null}
+        {task.currentFile ? (
+          <span className="batch-task-current" title={task.currentFile}>
+            当前：{task.currentFile}
+          </span>
+        ) : task.currentImageId ? (
+          <span>当前：#{task.currentImageId}</span>
+        ) : null}
+      </div>
+
+      <div className="batch-task-progress-meta">
+        <span>{task.message || (active ? <Spinner size={12} /> : "已结束")}</span>
+      </div>
+
+      {estimate ? (
+        <div className="optimize-compare-hint">
+          预计：省 {formatBytes(estimate.savingsBytes)} · 用时{" "}
+          {formatDuration(estimate.estimatedSeconds)} · 处理{" "}
+          {estimate.processCount.toLocaleString()} 张
+        </div>
+      ) : null}
+
+      {comparison && !active ? (
+        <table className="optimize-compare">
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>预计</th>
+              <th>实际</th>
+              {comparison.completed ? <th>差异</th> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {comparison.rows.map((row) => (
+              <tr key={row.key}>
+                <td>{row.label}</td>
+                <td>{comparisonValue(row.key, row.estimated)}</td>
+                <td>{comparisonValue(row.key, row.actual)}</td>
+                {comparison.completed ? (
+                  <td>{comparisonDelta(row.key, row.delta)}</td>
+                ) : null}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+
+      {points.length > 1 || (!active && task.savedBytes > 0) ? (
+        <div className="optimize-runtime-curve">
+          <span className="field-label">运行时收益（按已用时）</span>
+          <OptimizeProgressChart
+            points={points}
+            estimated={estimate?.curve ?? []}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -234,6 +394,7 @@ export function OptimizeDialog({
   /** 当前展示的结果对应的设置签名；与表单签名不一致时结果作废。 */
   const [resultSignature, setResultSignature] = useState<string | null>(null);
   const [measurements, setMeasurements] = useState<Record<string, SampleMeasurement>>({});
+  const [runtimePoints, setRuntimePoints] = useState<RuntimeOptimizePoint[]>([]);
   // 结果在表单下方，估算完成时可能落在可视区外，需要主动滚进来。
   const resultRef = useRef<HTMLDivElement>(null);
   const fetchedEstimate = useRef<string | null>(null);
@@ -285,6 +446,7 @@ export function OptimizeDialog({
     setEstimate(null);
     abandoned.current.clear();
     launched.current.clear();
+    setRuntimePoints([]);
   }, [libraryId]);
 
   /** 打开窗口时按“执行 → 估算中 → 已有结果 → 已完成估算 → 默认配置”的顺序接管。 */
@@ -367,6 +529,27 @@ export function OptimizeDialog({
   const activeExecution = execution && isTaskActive(execution) ? execution : null;
   const percent = task ? taskPercent(task) : 0;
   const executionPercent = execution ? taskPercent(execution) : 0;
+  const runtimeKey = execution
+    ? `${execution.taskId}:${execution.runStartedAt ?? "none"}`
+    : null;
+
+  // 执行前的复核阶段没有 runStartedAt；开始计时后才采样，避免时间倒退。
+  useEffect(() => {
+    setRuntimePoints([]);
+  }, [runtimeKey]);
+
+  useEffect(() => {
+    if (!execution || execution.runStartedAt == null) return;
+    const end = execution.finishedAt ?? Date.now();
+    const elapsedSeconds = Math.max(0, (end - execution.runStartedAt) / 1000);
+    setRuntimePoints((previous) =>
+      appendRuntimePoint(previous, {
+        elapsedSeconds,
+        savingsBytes: execution.savedBytes,
+        processed: execution.completed,
+      }),
+    );
+  }, [runtimeKey, execution]);
 
   // 只依赖原始值：任务快照每 150ms 换一次对象，用对象做依赖会在请求在飞时
   // 触发 cleanup，把结果丢掉并永久停在「正在读取估算结果…」。
@@ -600,6 +783,7 @@ export function OptimizeDialog({
     setRunConfig(null);
     setError(null);
     fetchedEstimate.current = null;
+    setRuntimePoints([]);
   };
 
   const footer = activeExecution ? (
@@ -935,7 +1119,14 @@ export function OptimizeDialog({
           <ProgressPanel task={task} percent={percent} />
         ) : null}
 
-        {execution ? <ProgressPanel task={execution} percent={executionPercent} /> : null}
+        {execution ? (
+          <OptimizeExecutionPanel
+            task={execution}
+            estimate={estimate}
+            percent={executionPercent}
+            points={runtimePoints}
+          />
+        ) : null}
 
         {loadingEstimate ? (
           <div className="optimize-loading">
@@ -944,167 +1135,169 @@ export function OptimizeDialog({
         ) : null}
 
         {estimate ? (
-          <div className="optimize-result" ref={resultRef}>
-            <div className="optimize-result-head">
-              <strong>估算完成</strong>
-              <span>
-                样本 {estimate.sampleCount.toLocaleString()} 张
-                {sampleShort ? "（候选不足）" : ""} · 覆盖{" "}
-                {coverageLabel(estimate.coverage)} 体积
-                {estimate.candidateLargeCount > 0
-                  ? ` · 含 ≥32MP 大图 ${estimate.sampleLargeCount.toLocaleString()} 张`
-                  : ""}
-              </span>
-            </div>
-
-            {dataChanged ? (
-              <p className="dialog-hint">图库数据已变化，执行前会重新复核候选数量与体积。</p>
-            ) : null}
-
-            <div className="optimize-funnel">
-              <span>
-                范围 {estimate.totalCount.toLocaleString()} 张 ·{" "}
-                {formatBytes(estimate.totalBytes)}
-              </span>
-              <span>
-                候选 {estimate.candidateCount.toLocaleString()} 张 ·{" "}
-                {formatBytes(estimate.candidateBytes)}
-              </span>
-            </div>
-
-            <div className="optimize-summary">
-              <OptimizeShareChart
-                processed={{
-                  key: "process",
-                  label: "处理",
-                  count: estimate.processCount,
-                  bytes: estimate.processBytes,
-                }}
-                skipped={{
-                  key: "skip",
-                  label: "候选内跳过",
-                  count: candidateSkipCount,
-                  bytes: candidateSkipBytes,
-                }}
-                breakdown={candidateBreakdown}
-              />
-
-              <div className="optimize-outcome">
-                <div className="optimize-outcome-main">
-                  <span>预计节省</span>
-                  <strong>{formatBytes(estimate.savingsBytes)}</strong>
-                  {estimate.savingsBytes > 0 ? (
-                    <em>
-                      {estimate.savingsMarginBytes > 0
-                        ? `± ${formatBytes(estimate.savingsMarginBytes)}`
-                        : "误差可忽略"}
-                    </em>
-                  ) : (
-                    <em>这个范围没有可压缩的图片</em>
-                  )}
-                </div>
-                <div className="optimize-outcome-rows">
-                  <div className="optimize-outcome-row">
-                    <span>体积</span>
-                    <strong>
-                      {formatBytes(estimate.totalBytes)} → {formatBytes(estimate.predictedBytes)}
-                    </strong>
-                  </div>
-                  <div className="optimize-outcome-row">
-                    <span>预计耗时</span>
-                    <strong>
-                      {formatDuration(estimate.estimatedSeconds)}
-                      {estimate.estimatedSecondsMargin > 0
-                        ? ` ± ${formatDuration(estimate.estimatedSecondsMargin)}`
-                        : ""}
-                    </strong>
-                  </div>
-                  {timingParts.length > 0 ? (
-                    <div className="optimize-timing-detail">
-                      其中：
-                      {timingParts
-                        .map((part) => `${part.label} ${formatDuration(part.value)}`)
-                        .join(" · ")}
-                    </div>
-                  ) : null}
-                  {estimate.savingsBytes > 0 && estimate.coverage < SHALLOW_COVERAGE ? (
-                    <div className="optimize-coverage-hint">
-                      抽样只读取了 {coverageLabel(estimate.coverage)}{" "}
-                      的候选体积，实际误差可能大于上面的 ± 值。
-                    </div>
-                  ) : null}
-                </div>
+          <EstimateDetails collapsed={execution !== null}>
+            <div className="optimize-result" ref={resultRef}>
+              <div className="optimize-result-head">
+                <strong>估算完成</strong>
+                <span>
+                  样本 {estimate.sampleCount.toLocaleString()} 张
+                  {sampleShort ? "（候选不足）" : ""} · 覆盖{" "}
+                  {coverageLabel(estimate.coverage)} 体积
+                  {estimate.candidateLargeCount > 0
+                    ? ` · 含 ≥32MP 大图 ${estimate.sampleLargeCount.toLocaleString()} 张`
+                    : ""}
+                </span>
               </div>
-            </div>
 
-            {prefilterBreakdown.length > 0 ? (
-              <div className="optimize-prefilter">
-                <span className="field-label">未纳入候选</span>
-                <div className="optimize-prefilter-list">
-                  {prefilterBreakdown.map((segment) => (
-                    <div key={segment.key} className="optimize-prefilter-row">
-                      <span>{segment.label}</span>
-                      <em>{segment.count.toLocaleString()} 张</em>
-                      <strong>{formatBytes(segment.bytes)}</strong>
-                    </div>
-                  ))}
-                </div>
+              {dataChanged ? (
+                <p className="dialog-hint">图库数据已变化，执行前会重新复核候选数量与体积。</p>
+              ) : null}
+
+              <div className="optimize-funnel">
+                <span>
+                  范围 {estimate.totalCount.toLocaleString()} 张 ·{" "}
+                  {formatBytes(estimate.totalBytes)}
+                </span>
+                <span>
+                  候选 {estimate.candidateCount.toLocaleString()} 张 ·{" "}
+                  {formatBytes(estimate.candidateBytes)}
+                </span>
               </div>
-            ) : null}
 
-            {estimate.curve.length > 1 && estimate.savingsBytes > 0 ? (
-              <div className="optimize-curve">
-                <span className="field-label">收益曲线</span>
-                <OptimizeCurveChart
-                  points={estimate.curve}
-                  totalSavings={estimate.savingsBytes}
+              <div className="optimize-summary">
+                <OptimizeShareChart
+                  processed={{
+                    key: "process",
+                    label: "处理",
+                    count: estimate.processCount,
+                    bytes: estimate.processBytes,
+                  }}
+                  skipped={{
+                    key: "skip",
+                    label: "候选内跳过",
+                    count: candidateSkipCount,
+                    bytes: candidateSkipBytes,
+                  }}
+                  breakdown={candidateBreakdown}
                 />
-              </div>
-            ) : null}
 
-            {qualityTotal > 0 ? (
-              <div className="optimize-quality">
-                <span className="field-label">质量分布</span>
-                <div className="optimize-quality-chips">
-                  {estimate.qualityCounts.map((entry) => (
-                    <span key={entry.quality} className="optimize-quality-chip">
-                      q{entry.quality}
-                      <em>{Math.round((entry.count / qualityTotal) * 100)}%</em>
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-
-            {estimate.folders.length > 0 ? (
-              <details className="optimize-folders">
-                <summary>按文件夹明细（{estimate.folders.length} 个）</summary>
-                <div className="optimize-folder-list">
-                  {estimate.folders.map((folder) => (
-                    <div key={folder.folderId} className="optimize-folder-row">
-                      <span title={folder.path}>{folder.path || "根目录"}</span>
-                      <em>{folder.count.toLocaleString()} 张</em>
-                      <em>{formatBytes(folder.bytes)}</em>
-                      <strong>省 {formatBytes(folder.savingsBytes)}</strong>
+                <div className="optimize-outcome">
+                  <div className="optimize-outcome-main">
+                    <span>预计节省</span>
+                    <strong>{formatBytes(estimate.savingsBytes)}</strong>
+                    {estimate.savingsBytes > 0 ? (
+                      <em>
+                        {estimate.savingsMarginBytes > 0
+                          ? `± ${formatBytes(estimate.savingsMarginBytes)}`
+                          : "误差可忽略"}
+                      </em>
+                    ) : (
+                      <em>这个范围没有可压缩的图片</em>
+                    )}
+                  </div>
+                  <div className="optimize-outcome-rows">
+                    <div className="optimize-outcome-row">
+                      <span>体积</span>
+                      <strong>
+                        {formatBytes(estimate.totalBytes)} → {formatBytes(estimate.predictedBytes)}
+                      </strong>
                     </div>
-                  ))}
-                </div>
-              </details>
-            ) : null}
-
-            {estimate.sampleFailures.length > 0 ? (
-              <details className="optimize-folders">
-                <summary>样本失败 {estimate.sampleFailures.length} 张</summary>
-                <div className="optimize-folder-list">
-                  {estimate.sampleFailures.map((failure) => (
-                    <div key={failure} className="optimize-folder-row">
-                      <span title={failure}>{failure}</span>
+                    <div className="optimize-outcome-row">
+                      <span>预计耗时</span>
+                      <strong>
+                        {formatDuration(estimate.estimatedSeconds)}
+                        {estimate.estimatedSecondsMargin > 0
+                          ? ` ± ${formatDuration(estimate.estimatedSecondsMargin)}`
+                          : ""}
+                      </strong>
                     </div>
-                  ))}
+                    {timingParts.length > 0 ? (
+                      <div className="optimize-timing-detail">
+                        其中：
+                        {timingParts
+                          .map((part) => `${part.label} ${formatDuration(part.value)}`)
+                          .join(" · ")}
+                      </div>
+                    ) : null}
+                    {estimate.savingsBytes > 0 && estimate.coverage < SHALLOW_COVERAGE ? (
+                      <div className="optimize-coverage-hint">
+                        抽样只读取了 {coverageLabel(estimate.coverage)}{" "}
+                        的候选体积，实际误差可能大于上面的 ± 值。
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
-              </details>
-            ) : null}
-          </div>
+              </div>
+
+              {prefilterBreakdown.length > 0 ? (
+                <div className="optimize-prefilter">
+                  <span className="field-label">未纳入候选</span>
+                  <div className="optimize-prefilter-list">
+                    {prefilterBreakdown.map((segment) => (
+                      <div key={segment.key} className="optimize-prefilter-row">
+                        <span>{segment.label}</span>
+                        <em>{segment.count.toLocaleString()} 张</em>
+                        <strong>{formatBytes(segment.bytes)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {estimate.curve.length > 1 && estimate.savingsBytes > 0 ? (
+                <div className="optimize-curve">
+                  <span className="field-label">收益曲线</span>
+                  <OptimizeCurveChart
+                    points={estimate.curve}
+                    totalSavings={estimate.savingsBytes}
+                  />
+                </div>
+              ) : null}
+
+              {qualityTotal > 0 ? (
+                <div className="optimize-quality">
+                  <span className="field-label">质量分布</span>
+                  <div className="optimize-quality-chips">
+                    {estimate.qualityCounts.map((entry) => (
+                      <span key={entry.quality} className="optimize-quality-chip">
+                        q{entry.quality}
+                        <em>{Math.round((entry.count / qualityTotal) * 100)}%</em>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {estimate.folders.length > 0 ? (
+                <details className="optimize-folders">
+                  <summary>按文件夹明细（{estimate.folders.length} 个）</summary>
+                  <div className="optimize-folder-list">
+                    {estimate.folders.map((folder) => (
+                      <div key={folder.folderId} className="optimize-folder-row">
+                        <span title={folder.path}>{folder.path || "根目录"}</span>
+                        <em>{folder.count.toLocaleString()} 张</em>
+                        <em>{formatBytes(folder.bytes)}</em>
+                        <strong>省 {formatBytes(folder.savingsBytes)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+
+              {estimate.sampleFailures.length > 0 ? (
+                <details className="optimize-folders">
+                  <summary>样本失败 {estimate.sampleFailures.length} 张</summary>
+                  <div className="optimize-folder-list">
+                    {estimate.sampleFailures.map((failure) => (
+                      <div key={failure} className="optimize-folder-row">
+                        <span title={failure}>{failure}</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
+            </div>
+          </EstimateDetails>
         ) : null}
 
         {error ? (

@@ -98,32 +98,43 @@ export function scopeName(
   }
 }
 
+/** 范围当前可显示的图片数；拿不到时返回 null。 */
+export function scopeCountValue(
+  choice: ScopeChoice,
+  context: BatchTaskContextInfo | null,
+  options?: ScopeBuildOptions,
+): number | null {
+  if (!context) return null;
+  switch (choice) {
+    case "selected":
+      return context.selectedIds.length;
+    case "folder": {
+      const includeSubfolders = options?.includeSubfolders ?? true;
+      return includeSubfolders ? context.folderTotal : context.folderDirectTotal;
+    }
+    case "collection":
+      return context.collectionTotal;
+    case "view":
+      return context.viewTotal;
+    case "temp":
+      return context.tempTotal;
+    case "library":
+      return context.libraryTotal;
+  }
+}
+
 export function scopeCountLabel(
   choice: ScopeChoice,
   context: BatchTaskContextInfo | null,
   options?: ScopeBuildOptions,
 ): string {
-  if (!context) return "";
-  switch (choice) {
-    case "selected":
-      return `${context.selectedIds.length.toLocaleString()} 张`;
-    case "folder": {
-      const includeSubfolders = options?.includeSubfolders ?? true;
-      const total = includeSubfolders ? context.folderTotal : context.folderDirectTotal;
-      if (total == null) return "";
-      return `${total.toLocaleString()} 张${includeSubfolders ? "（含子文件夹）" : ""}`;
-    }
-    case "collection":
-      return context.collectionTotal != null
-        ? `${context.collectionTotal.toLocaleString()} 张`
-        : "";
-    case "view":
-      return context.viewTotal != null ? `${context.viewTotal.toLocaleString()} 张` : "";
-    case "temp":
-      return `${context.tempTotal.toLocaleString()} 张`;
-    case "library":
-      return `${context.libraryTotal.toLocaleString()} 张`;
+  const total = scopeCountValue(choice, context, options);
+  if (total == null) return "";
+  if (choice === "folder") {
+    const includeSubfolders = options?.includeSubfolders ?? true;
+    return `${total.toLocaleString()} 张${includeSubfolders ? "（含子文件夹）" : ""}`;
   }
+  return `${total.toLocaleString()} 张`;
 }
 
 export function scopeAvailability(

@@ -1,5 +1,6 @@
 import { Fragment } from "react";
 import { formatBytes, formatDuration } from "../shared/format";
+import type { RuntimeOptimizePoint } from "./optimizeProgress";
 import type { OptimizeCurvePoint } from "./taskTypes";
 
 /** 饼图图例的一项：处理、跳过，或某一类跳过原因。 */
@@ -243,6 +244,126 @@ export function OptimizeCurveChart({ points, totalSavings }: CurveChartProps) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+interface ProgressChartProps {
+  points: RuntimeOptimizePoint[];
+  estimated: OptimizeCurvePoint[];
+}
+
+/**
+ * 运行时收益曲线：横轴是已用时，实际线与预估线放在同一时间尺度上。
+ *
+ * 估算曲线只记录每个点的累计耗时，没有与执行百分比一一对应的横轴。
+ */
+export function OptimizeProgressChart({ points, estimated }: ProgressChartProps) {
+  const actual = [...points].sort(
+    (left, right) => left.elapsedSeconds - right.elapsedSeconds,
+  );
+  const estimate = [...estimated].sort(
+    (left, right) => left.elapsedSeconds - right.elapsedSeconds,
+  );
+  const maxSeconds = Math.max(
+    1,
+    actual.at(-1)?.elapsedSeconds ?? 0,
+    estimate.at(-1)?.elapsedSeconds ?? 0,
+  );
+  const maxSavings = Math.max(
+    1,
+    actual.at(-1)?.savingsBytes ?? 0,
+    estimate.at(-1)?.savingsBytes ?? 0,
+  );
+  const x = (seconds: number) =>
+    CURVE_LEFT + Math.min(1, Math.max(0, seconds / maxSeconds)) * PLOT_WIDTH;
+  const y = (savings: number) =>
+    BASELINE - (Math.min(Math.max(savings, 0), maxSavings) / maxSavings) * PLOT_HEIGHT;
+
+  const line = (values: Array<{ elapsedSeconds: number; savingsBytes: number }>) =>
+    values
+      .map(
+        (point, index) =>
+          `${index === 0 ? "M" : "L"}${x(point.elapsedSeconds).toFixed(1)} ${y(
+            point.savingsBytes,
+          ).toFixed(1)}`,
+      )
+      .join(" ");
+
+  return (
+    <div className="optimize-progress-chart">
+      <svg
+        className="optimize-curve-chart"
+        viewBox={`0 0 ${CURVE_WIDTH} ${CURVE_HEIGHT}`}
+        role="img"
+        aria-label={`运行时收益曲线：已省 ${formatBytes(
+          actual.at(-1)?.savingsBytes ?? 0,
+        )}`}
+      >
+        {[0, 0.5, 1].map((fraction) => {
+          const gridY = BASELINE - fraction * PLOT_HEIGHT;
+          return (
+            <g key={fraction}>
+              <line
+                className="optimize-chart-grid"
+                x1={CURVE_LEFT}
+                x2={CURVE_WIDTH - CURVE_RIGHT}
+                y1={gridY}
+                y2={gridY}
+                strokeWidth={1}
+                strokeDasharray={fraction === 0 ? undefined : "3 4"}
+              />
+              <text
+                x={CURVE_LEFT - 8}
+                y={gridY + 3.5}
+                textAnchor="end"
+                className="optimize-chart-axis"
+              >
+                {formatBytes(maxSavings * fraction)}
+              </text>
+            </g>
+          );
+        })}
+
+        {estimate.length > 1 ? (
+          <path
+            className="optimize-chart-line is-estimate"
+            d={line(estimate)}
+            strokeWidth={1.5}
+            strokeDasharray="4 3"
+          />
+        ) : null}
+        {actual.length > 1 ? (
+          <path
+            className="optimize-chart-line is-actual"
+            d={line(actual)}
+            strokeWidth={1.9}
+          />
+        ) : null}
+
+        {[0, 0.5, 1].map((fraction) => (
+          <text
+            key={fraction}
+            x={x(maxSeconds * fraction)}
+            y={BASELINE + 16}
+            textAnchor={
+              fraction === 0 ? "start" : fraction === 1 ? "end" : "middle"
+            }
+            className="optimize-chart-axis"
+          >
+            {fraction === 0 ? "0" : formatDuration(maxSeconds * fraction)}
+          </text>
+        ))}
+      </svg>
+
+      <div className="optimize-progress-legend">
+        <span className="is-actual">
+          实际 {formatBytes(actual.at(-1)?.savingsBytes ?? 0)}
+        </span>
+        <span className="is-estimate">
+          预估 {formatBytes(estimate.at(-1)?.savingsBytes ?? 0)}
+        </span>
       </div>
     </div>
   );

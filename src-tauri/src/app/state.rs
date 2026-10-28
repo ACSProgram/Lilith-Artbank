@@ -19,6 +19,7 @@ use crate::{
         runtime::{AiRuntime, GroupOptions, SimilarityGroupsResult},
     },
     app::{
+        batch_preview::{self, BatchTaskPreview, BatchTaskPreviewRequest},
         error::{AppError, AppResult},
         settings::SettingsStore,
         tasks::{
@@ -51,7 +52,7 @@ use crate::{
         },
         optimize_estimate::{self, OptimizeEstimate},
         paths::{join_folder, normalize_folder, normalize_folder_name, parent_path},
-        query::{self, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        query::{self, FolderChange, FolderInfo, ImagePage, LibraryQuery, PendingFilter, TagInfo},
         service::{self, LibraryCounts, LibraryInfo, LibrarySession},
         stats::{self, StatsRequest, StatsSnapshot},
         temp,
@@ -1816,12 +1817,32 @@ impl AppState {
                     tasks.spawn_worker("thumbnail-rebuild".to_owned(), worker.clone(), move || {
                         // 内容写者由这个线程持有，直到所有图片处理结束。
                         let _guard: LaneGuard = guard;
+                        worker.set_phase(TaskPhase::Preparing);
+                        worker.set_message("正在统计待处理图片…");
+                        let filter = if only_missing {
+                            PendingFilter::Thumbnail
+                        } else {
+                            PendingFilter::All
+                        };
+                        let pending = match query::selected_pending_ids(&database, &ids, &filter) {
+                            Ok(pending) => pending,
+                            Err(error) => {
+                                worker.set_message(error.to_string());
+                                worker.finish(TaskPhase::Failed);
+                                return;
+                            }
+                        };
+                        worker.set_total(pending.len());
                         worker.set_phase(TaskPhase::Running);
-                        worker.set_total(ids.len());
+                        worker.set_message("");
+                        if pending.is_empty() {
+                            worker.finish_from(&Ok(()));
+                            return;
+                        }
                         let holder =
                             HolderInfo::new(worker.id(), "重建缩略图").with_path_note("正在读取");
                         let mut consecutive_failures = 0_usize;
-                        for image_id in ids {
+                        for image_id in pending {
                             if worker.should_cancel() {
                                 break;
                             }
@@ -2036,6 +2057,8 @@ impl AppState {
                     let operation_id = operation.id();
                     worker.set_operation_id(Some(operation_id));
                     worker.set_total(count as usize);
+                    // 实际耗时从真正进入编码开始算，排除排队、复核与准备。
+                    worker.mark_work_started();
                     let result = crate::library::optimize::optimize(
                         &database,
                         &root,
@@ -2121,6 +2144,17 @@ impl AppState {
             .iter()
             .find(|(id, _)| id == task_id)
             .map(|(_, estimate)| estimate.clone())
+    }
+
+    /// 批量任务开始前的只读预览；只取读连接，不建任务、不占资源表。
+    pub fn preview_batch_task(
+        &self,
+        request: BatchTaskPreviewRequest,
+    ) -> AppResult<BatchTaskPreview> {
+        let (database, _, _) = self
+            .library_handles()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        batch_preview::preview(&database, &request)
     }
 
     pub fn tasks_snapshot(&self) -> Vec<TaskSnapshot> {

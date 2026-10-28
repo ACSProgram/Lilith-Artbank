@@ -10,6 +10,7 @@ use crate::{
         SimilarityGroupsResult, SimilarityPage,
     },
     app::{
+        batch_preview::{BatchTaskPreview, BatchTaskPreviewRequest},
         error::{AppError, AppResult},
         settings::Settings,
         state::AppState,
@@ -815,6 +816,14 @@ pub fn start_batch_task(
 }
 
 #[tauri::command]
+pub async fn preview_batch_task(
+    app: AppHandle,
+    request: BatchTaskPreviewRequest,
+) -> Result<BatchTaskPreview, String> {
+    run_blocking(app, move |state| state.preview_batch_task(request)).await
+}
+
+#[tauri::command]
 pub fn list_tasks(state: State<'_, AppState>) -> Vec<TaskSnapshot> {
     state.tasks_snapshot()
 }
@@ -1030,6 +1039,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ai_start_service,
         ai_stop_service,
         start_batch_task,
+        preview_batch_task,
         list_tasks,
         cancel_task,
         get_similarity_groups_result,

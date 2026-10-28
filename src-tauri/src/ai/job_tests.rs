@@ -254,6 +254,23 @@ fn never_overwrites_handwritten_description() {
 }
 
 #[test]
+fn deleted_selection_is_not_counted_as_pending() {
+    let (_temp, session, root, store) = setup();
+    session
+        .db
+        .with_writer(|connection| {
+            connection.execute("UPDATE images SET deleted_at = 9 WHERE id = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let server = mock_server();
+    let context = context(&session, &root, store, server.url());
+    let job = task("embed", AiJobKind::Embedding, "选中 1 张");
+    execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
+    assert_eq!(job.snapshot().total, 0);
+}
+
+#[test]
 fn rejects_long_prompt_and_bad_tokens() {
     let request = AiJobRequest {
         prompt: Some("a".repeat(2_001)),

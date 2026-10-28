@@ -7,16 +7,19 @@ import { Spinner } from "../shared/components/Spinner";
 import { DEFAULT_DESCRIPTION_PROMPT, type AiStatus } from "../modules/ai/types";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { errorMessage } from "../shared/errors";
+import { formatDuration, formatRate } from "../shared/format";
 import {
   aiTaskAvailability,
   type ActionAvailability,
 } from "../shared/capability";
-import { useTaskCenter } from "./taskContext";
+import { useTaskCenter, useTaskData } from "./taskContext";
+import { taskApi } from "./taskApi";
 import {
   TASK_PHASE_LABELS,
   taskPercent,
   isTaskActive,
   type BatchTaskKind,
+  type BatchTaskPreview,
   type BatchTaskRequest,
 } from "./taskTypes";
 import { ScopePicker } from "../shared/components/ScopePicker";
@@ -24,8 +27,15 @@ import {
   buildScope,
   defaultScopeChoice,
   scopeAvailability,
+  scopeCountValue,
   type ScopeChoice,
 } from "../shared/scope";
+import {
+  batchPreviewKey,
+  canStartBatchTask,
+  createBatchPreviewCache,
+  previewSummary,
+} from "./batchPreview";
 
 interface BatchTaskDialogProps {
   open: boolean;
@@ -33,6 +43,8 @@ interface BatchTaskDialogProps {
   context: BatchTaskContextInfo | null;
   status: AiStatus | null;
   onRefreshStatus: () => Promise<AiStatus | null>;
+  /** 当前图库标识；换库后不显示上一个图库的预览。 */
+  libraryId: string;
 }
 
 const KIND_LABELS: Record<BatchTaskKind, string> = {
@@ -55,14 +67,19 @@ const AI_CAPABILITY: Partial<Record<BatchTaskKind, string>> = {
   aiDescription: "description",
 };
 
+/** 预览查询在 20 万行上约百毫秒级；去抖只用来吸收连续切换。 */
+const PREVIEW_DEBOUNCE_MS = 250;
+
 export function BatchTaskDialog({
   open,
   onClose,
   context,
   status,
   onRefreshStatus,
+  libraryId,
 }: BatchTaskDialogProps) {
   const { start, cancel, find } = useTaskCenter();
+  const { dataVersion } = useTaskData();
   const [kind, setKind] = useState<BatchTaskKind>("thumbnail");
   const [scope, setScope] = useState<ScopeChoice>("library");
   const [overwrite, setOverwrite] = useState(false);
@@ -72,7 +89,13 @@ export function BatchTaskDialog({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
+  const [preview, setPreview] = useState<BatchTaskPreview | null>(null);
+  const [previewStatus, setPreviewStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const wasOpenRef = useRef(open);
+  const previewCache = useRef(createBatchPreviewCache<BatchTaskPreview>()).current;
+  const previewRequestKey = useRef<string | null>(null);
 
   const online = status?.online === true;
 
@@ -121,6 +144,43 @@ export function BatchTaskDialog({
   const capabilityInfo = capability ? status?.health?.capabilities[capability] : undefined;
   const capabilityReady = capabilityInfo?.ready === true;
 
+  const previewCapability = useMemo(() => {
+    if (kind !== "aiEmbedding") return null;
+    const model = capabilityInfo?.model?.trim();
+    const dim = capabilityInfo?.dim ?? 0;
+    return model && dim > 0 ? { model, dim } : null;
+  }, [kind, capabilityInfo?.model, capabilityInfo?.dim]);
+
+  const previewScope = useMemo(
+    () => (context ? buildScope(scope, context) : null),
+    [context, scope],
+  );
+
+  const previewKey = useMemo(() => {
+    if (!open || !previewScope) return null;
+    return batchPreviewKey({
+      libraryId,
+      kind,
+      scope: previewScope,
+      overwrite,
+      capability: previewCapability,
+      dataVersion,
+    });
+  }, [
+    open,
+    libraryId,
+    kind,
+    previewScope,
+    overwrite,
+    previewCapability,
+    dataVersion,
+  ]);
+
+  // 键里已经带数据版本与图库，旧数字本来就不会命中；这里只是顺手释放内存。
+  useEffect(() => {
+    previewCache.clear();
+  }, [libraryId, dataVersion, previewCache]);
+
   const launch = async () => {
     if (!context) return;
     const builtScope = buildScope(scope, context);
@@ -154,6 +214,79 @@ export function BatchTaskDialog({
   const activeTask = task && isTaskActive(task) ? task : null;
   const percent = task ? taskPercent(task) : 0;
 
+  const previewOffline = kind !== "thumbnail" && !online;
+  const previewDimMissing = kind === "aiEmbedding" && online && !previewCapability;
+
+  useEffect(() => {
+    if (!open || activeTask || !previewKey || !previewScope) {
+      if (!open) {
+        setPreview(null);
+        setPreviewStatus("idle");
+      }
+      return;
+    }
+    if (previewOffline || previewDimMissing) {
+      setPreview(null);
+      setPreviewStatus("idle");
+      return;
+    }
+    const cached = previewCache.get(previewKey);
+    if (cached) {
+      setPreview(cached);
+      setPreviewStatus("ready");
+      return;
+    }
+    setPreview(null);
+    setPreviewStatus("loading");
+    previewRequestKey.current = previewKey;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void taskApi
+        .previewBatch({
+          kind,
+          scope: previewScope,
+          overwrite,
+          capability: kind === "aiEmbedding" ? previewCapability : null,
+        })
+        .then((result) => {
+          if (cancelled || previewRequestKey.current !== previewKey) return;
+          previewCache.set(previewKey, result);
+          setPreview(result);
+          setPreviewStatus("ready");
+        })
+        .catch(() => {
+          if (cancelled || previewRequestKey.current !== previewKey) return;
+          setPreviewStatus("error");
+        });
+    }, PREVIEW_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    open,
+    activeTask,
+    previewKey,
+    previewScope,
+    kind,
+    overwrite,
+    previewCapability,
+    previewOffline,
+    previewDimMissing,
+    previewCache,
+  ]);
+
+  const fallbackTotal = scopeCountValue(scope, context);
+  const previewLoading = previewStatus === "loading";
+  const startDecision = canStartBatchTask({
+    kindEnabled: kindAvailability[kind].enabled,
+    scopeEnabled: scopeOptions[scope].enabled,
+    embeddingDimMissing: previewDimMissing,
+    previewLoading,
+    willProcess: preview?.willProcess ?? null,
+    previewFailed: previewStatus === "error",
+  });
+
   const footer = activeTask ? (
     <>
       <Button variant="ghost" onClick={onClose}>
@@ -176,7 +309,8 @@ export function BatchTaskDialog({
         variant="primary"
         icon={<Play size={13} />}
         loading={starting}
-        disabled={!kindAvailability[kind].enabled || !scopeOptions[scope].enabled}
+        disabled={!startDecision.enabled}
+        title={startDecision.reason ?? undefined}
         onClick={() => void launch()}
       >
         开始任务
@@ -224,6 +358,22 @@ export function BatchTaskDialog({
             availability={scopeOptions}
           />
         </Field>
+
+        {context && !activeTask ? (
+          <div className="batch-task-preview">
+            <span>
+              {previewSummary({
+                total: preview?.total ?? fallbackTotal,
+                willProcess: preview?.willProcess ?? null,
+                loading: previewLoading,
+                offline: previewOffline,
+                dimMissing: previewDimMissing,
+                failed: previewStatus === "error",
+              })}
+            </span>
+            {previewLoading ? <Spinner size={12} /> : null}
+          </div>
+        ) : null}
 
         {kind !== "thumbnail" ? (
           <div className="batch-task-service">
@@ -342,6 +492,26 @@ export function BatchTaskDialog({
               </span>
               {task.failed > 0 ? <span>失败 {task.failed.toLocaleString()} 张</span> : null}
             </div>
+            {task.ratePerSecond != null ||
+            task.etaSeconds != null ||
+            task.currentFile ||
+            task.currentImageId ? (
+              <div className="batch-task-facts">
+                {task.ratePerSecond != null ? (
+                  <span>{formatRate(task.ratePerSecond)} 张/秒</span>
+                ) : null}
+                {task.etaSeconds != null ? (
+                  <span>预计还需 {formatDuration(task.etaSeconds)}</span>
+                ) : null}
+                {task.currentFile ? (
+                  <span className="batch-task-current" title={task.currentFile}>
+                    当前：{task.currentFile}
+                  </span>
+                ) : task.currentImageId ? (
+                  <span>当前：#{task.currentImageId}</span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : null}
 

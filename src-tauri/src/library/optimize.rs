@@ -489,6 +489,14 @@ fn settled_count(report: &OptimizeReport) -> usize {
         + report.failed) as usize
 }
 
+/// 累计跳过张数；原图缺失也计入跳过，与最终报告口径一致。
+fn skipped_count(report: &OptimizeReport) -> usize {
+    (report.prefilter_skipped
+        + report.candidate_skipped
+        + report.duplicate_skipped
+        + report.source_missing) as usize
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn optimize_with_batch_size(
     database: &LibraryDb,
@@ -530,6 +538,7 @@ pub(crate) fn optimize_with_batch_size(
         meter.enter_phase(0, 90);
     }
     reporter.report(0, total_all);
+    reporter.skipped_count(report.prefilter_skipped as usize);
 
     let report = Arc::new(Mutex::new(report));
     let encoding_done = Arc::new(AtomicBool::new(false));
@@ -552,6 +561,8 @@ pub(crate) fn optimize_with_batch_size(
                     continue;
                 }
                 reporter.message(&format!("正在写入第 {} 批", batch.index + 1));
+                // 一批开始写入时不再对应某一张图，避免界面停在上一张。
+                reporter.current(None, None);
                 let outcome =
                     match commit_batch(database, commit_paths, thumbs, operation_id, batch.items) {
                         Ok(outcome) => outcome,
@@ -561,7 +572,7 @@ pub(crate) fn optimize_with_batch_size(
                         }
                     };
                 let published = outcome.published.len();
-                let (processed_before, settled) = {
+                let (processed_before, settled, failed_now, skipped_now, original, saved) = {
                     let mut report = commit_report.lock();
                     let before = report.processed as usize;
                     report.publish_ms += outcome.write_ms;
@@ -572,8 +583,18 @@ pub(crate) fn optimize_with_batch_size(
                         report.old_bytes += item.old_size;
                         report.new_bytes += item.new_size;
                     }
-                    (before, settled_count(&report))
+                    (
+                        before,
+                        settled_count(&report),
+                        report.failed as usize,
+                        skipped_count(&report),
+                        report.old_bytes,
+                        report.old_bytes.saturating_sub(report.new_bytes),
+                    )
                 };
+                reporter.bytes(original, saved);
+                reporter.failed_count(failed_now);
+                reporter.skipped_count(skipped_now);
                 commit_batches.fetch_add(1, Ordering::Relaxed);
                 // 已完成只统计真正入库的图片；批次内逐张上报，进度不按批跳跃。
                 for step in 1..=published {
@@ -615,6 +636,12 @@ pub(crate) fn optimize_with_batch_size(
                             Ok(permit) => permit,
                             Err(BudgetError::Cancelled) => return Ok(None),
                         };
+                        let relative = content::relative_display_path(
+                            &row.folder_path,
+                            &row.content_hash,
+                            &row.file_ext,
+                        );
+                        reporter.current(Some(row.id), Some(&relative));
                         let result = encode_one(&paths, row, options);
                         drop(permit);
                         if let Some(meter) = reporter.meter() {
@@ -626,7 +653,7 @@ pub(crate) fn optimize_with_batch_size(
             });
 
             let mut items = Vec::new();
-            {
+            let (failed_now, skipped_now) = {
                 let mut report = report.lock();
                 for (row, result) in batch.iter().zip(results) {
                     match result {
@@ -676,7 +703,10 @@ pub(crate) fn optimize_with_batch_size(
                         }
                     }
                 }
-            }
+                (report.failed as usize, skipped_count(&report))
+            };
+            reporter.failed_count(failed_now);
+            reporter.skipped_count(skipped_now);
 
             if !items.is_empty()
                 && sender
@@ -711,11 +741,13 @@ pub(crate) fn optimize_with_batch_size(
     if reporter.cancelled() {
         report.cancelled = true;
     }
-    report.skipped = report.prefilter_skipped
-        + report.candidate_skipped
-        + report.duplicate_skipped
-        + report.source_missing;
+    report.skipped = skipped_count(&report) as u64;
     report.savings_bytes = report.old_bytes.saturating_sub(report.new_bytes);
+    // 收尾再对一次，保证取消/失败时面板与最终报告一致。
+    reporter.bytes(report.old_bytes, report.savings_bytes);
+    reporter.failed_count(report.failed as usize);
+    reporter.skipped_count(report.skipped as usize);
+    reporter.current(None, None);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     if let Some(meter) = reporter.meter()
         && !report.cancelled

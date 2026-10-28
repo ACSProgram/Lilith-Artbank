@@ -697,6 +697,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             context={batchContext}
             status={aiStatus}
             onRefreshStatus={refreshAi}
+            libraryId={current.id}
           />
           <OptimizeDialog
             open={optimizeContext !== null}

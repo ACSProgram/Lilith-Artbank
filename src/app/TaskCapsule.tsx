@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Square, X } from "lucide-react";
 import { Button, IconButton } from "../shared/components/Button";
 import { Spinner } from "../shared/components/Spinner";
+import { formatDuration } from "../shared/format";
 import { useTaskCenter } from "./taskContext";
 import {
   TASK_PHASE_LABELS,
@@ -10,7 +11,8 @@ import {
   type TaskSnapshot,
 } from "./taskTypes";
 
-function formatDuration(startedAt: number, finishedAt: number | null): string {
+/** 已运行时长；与 ETA 的“还剩多久”分开，一个带秒、一个取整到分钟。 */
+function formatElapsed(startedAt: number, finishedAt: number | null): string {
   const end = finishedAt ?? Date.now();
   const seconds = Math.max(0, Math.round((end - startedAt) / 1000));
   if (seconds < 60) return `${seconds} 秒`;
@@ -56,8 +58,11 @@ function TaskRow({
             : task.message || "—"}
           {task.failed > 0 ? ` · 失败 ${task.failed.toLocaleString()}` : ""}
           {task.skipped > 0 ? ` · 跳过 ${task.skipped.toLocaleString()}` : ""}
+          {active && task.etaSeconds != null
+            ? ` · 还需 ${formatDuration(task.etaSeconds)}`
+            : ""}
         </span>
-        <span>{formatDuration(task.startedAt, task.finishedAt)}</span>
+        <span>{formatElapsed(task.startedAt, task.finishedAt)}</span>
       </div>
 
       {active && task.message && task.total > 0 ? (

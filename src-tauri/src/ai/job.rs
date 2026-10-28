@@ -1,10 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
-use rusqlite::{params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -21,7 +16,8 @@ use crate::{
         content,
         db::LibraryDb,
         history::{self, HistoryKind, NewOperation},
-        metadata, placeholders,
+        metadata,
+        query::{self, PendingFilter},
         thumbs::ThumbPack,
     },
 };
@@ -35,7 +31,6 @@ use super::{
 
 /// 连续失败达到该数量即判定服务不可用，停止任务，避免把整库都记成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
-const CHUNK: usize = 400;
 
 /// 描述长度未指定时使用的上限，与服务端 `/v1/describe` 的 `maxTokens` 约定一致。
 pub const DEFAULT_DESCRIBE_TOKENS: u32 = 160;
@@ -127,13 +122,25 @@ pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) 
             AppError::message(format!("无法加载{}模型：{error}", request.kind.label()))
         })?;
 
-    let ids = filter_missing(
-        &context.database,
-        request.image_ids.clone(),
-        request,
-        request.kind,
-        &capability,
-    )?;
+    let ids = {
+        let filter = match (request.kind, request.overwrite) {
+            (AiJobKind::Embedding, false) => {
+                let dim = capability.dim.ok_or_else(|| {
+                    AppError::message("health 没有返回 embedding 维度，无法判断缺失项")
+                })?;
+                PendingFilter::Embedding {
+                    model: capability.model.clone(),
+                    dim,
+                }
+            }
+            (AiJobKind::Pose, false) => PendingFilter::Pose,
+            (AiJobKind::Description, false) => PendingFilter::Description { overwrite: false },
+            (AiJobKind::Description, true) => PendingFilter::Description { overwrite: true },
+            _ => PendingFilter::All,
+        };
+        task.set_message("正在统计待处理图片…");
+        query::selected_pending_ids(&context.database, &request.image_ids, &filter)?
+    };
     task.set_total(ids.len());
     task.set_phase(TaskPhase::Running);
     task.set_message("");
@@ -197,6 +204,7 @@ fn run_job(
         task.set_current(Some(image_id));
         let result = process_one(
             context,
+            task,
             request.kind,
             client,
             capability,
@@ -238,6 +246,7 @@ enum Outcome {
 #[allow(clippy::too_many_arguments)]
 fn process_one(
     context: &JobContext,
+    task: &TaskHandle,
     kind: AiJobKind,
     client: &AiClient,
     capability: &Capability,
@@ -251,6 +260,8 @@ fn process_one(
     if row.deleted_at.is_some() {
         return Ok(Outcome::Skipped);
     }
+    let path = row.relative_display_path();
+    task.set_current_file(Some(&path));
     match kind {
         AiJobKind::Embedding => {
             let bytes = input::small_bytes(
@@ -374,137 +385,6 @@ pub(crate) fn ensure_capability(
         retryable: false,
         transport: false,
     })
-}
-
-fn filter_missing(
-    database: &LibraryDb,
-    ids: Vec<i64>,
-    request: &AiJobRequest,
-    kind: AiJobKind,
-    capability: &Capability,
-) -> AppResult<Vec<i64>> {
-    if request.overwrite {
-        return Ok(match kind {
-            AiJobKind::Description => filter_user_descriptions(database, ids)?,
-            _ => ids,
-        });
-    }
-    let existing = match kind {
-        AiJobKind::Embedding => {
-            let dim = capability.dim.ok_or_else(|| {
-                AppError::message("health 没有返回 embedding 维度，无法判断缺失项")
-            })?;
-            existing_features(database, &ids, "embedding", Some((&capability.model, dim)))?
-        }
-        AiJobKind::Pose => existing_features(database, &ids, "pose", None)?,
-        AiJobKind::Description => described_ids(database, &ids)?,
-    };
-    Ok(ids
-        .into_iter()
-        .filter(|id| !existing.contains(id))
-        .collect())
-}
-
-fn filter_user_descriptions(database: &LibraryDb, ids: Vec<i64>) -> AppResult<Vec<i64>> {
-    let states = description_states(database, &ids)?;
-    Ok(ids
-        .into_iter()
-        .filter(|id| !states.get(id).is_some_and(|state| state.is_user))
-        .collect())
-}
-
-fn existing_features(
-    database: &LibraryDb,
-    ids: &[i64],
-    kind: &str,
-    model_dim: Option<(&str, u32)>,
-) -> AppResult<HashSet<i64>> {
-    let mut found = HashSet::new();
-    for chunk in ids.chunks(CHUNK) {
-        let rows = database.with_reader(|connection| {
-            let placeholders = placeholders(chunk.len());
-            let (sql, mut params) = match model_dim {
-                Some((model, dim)) => (
-                    format!(
-                        "SELECT image_id FROM feature_blobs
-                         WHERE kind = ?1 AND model = ?2 AND dim = ?3
-                           AND image_id IN ({placeholders})"
-                    ),
-                    vec![
-                        Value::Text(kind.to_owned()),
-                        Value::Text(model.to_owned()),
-                        Value::Integer(i64::from(dim)),
-                    ],
-                ),
-                None => (
-                    format!(
-                        "SELECT image_id FROM feature_blobs
-                         WHERE kind = ?1 AND image_id IN ({placeholders})"
-                    ),
-                    vec![Value::Text(kind.to_owned())],
-                ),
-            };
-            params.extend(chunk.iter().map(|id| Value::Integer(*id)));
-            let mut statement = connection.prepare(&sql)?;
-            let rows = statement
-                .query_map(params_from_iter(params.iter()), |row| row.get::<_, i64>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })?;
-        found.extend(rows);
-    }
-    Ok(found)
-}
-
-/// 描述文本与来源；来源为 `user` 时 AI 不得覆盖。
-struct DescriptionState {
-    text: String,
-    is_user: bool,
-}
-
-fn described_ids(database: &LibraryDb, ids: &[i64]) -> AppResult<HashSet<i64>> {
-    Ok(description_states(database, ids)?
-        .into_iter()
-        .filter(|(_, state)| !state.text.trim().is_empty())
-        .map(|(id, _)| id)
-        .collect())
-}
-
-fn description_states(
-    database: &LibraryDb,
-    ids: &[i64],
-) -> AppResult<HashMap<i64, DescriptionState>> {
-    let mut states = HashMap::new();
-    for chunk in ids.chunks(CHUNK) {
-        let placeholders = placeholders(chunk.len());
-        let sql = format!(
-            "SELECT id, description, description_source FROM images WHERE id IN ({placeholders})"
-        );
-        let values: Vec<Value> = chunk.iter().map(|id| Value::Integer(*id)).collect();
-        database.with_reader(|connection| {
-            let mut statement = connection.prepare(&sql)?;
-            let rows = statement
-                .query_map(params_from_iter(values.iter()), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (id, text, source) in rows {
-                states.insert(
-                    id,
-                    DescriptionState {
-                        text,
-                        is_user: source == "user",
-                    },
-                );
-            }
-            Ok(())
-        })?;
-    }
-    Ok(states)
 }
 
 #[cfg(test)]

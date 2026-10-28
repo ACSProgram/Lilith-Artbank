@@ -47,6 +47,13 @@ pub trait BatchReporter: Send + Sync {
     fn meter(&self) -> Option<&crate::concurrency::meter::WorkMeter> {
         None
     }
+    /// 当前处理的图片与相对路径；压缩会用它显示“正在处理哪张”。
+    fn current(&self, _image_id: Option<i64>, _path: Option<&str>) {}
+    /// 已提交批次的原图字节与节省字节。
+    fn bytes(&self, _original: u64, _saved: u64) {}
+    /// 运行中的累计跳过与失败张数。
+    fn skipped_count(&self, _skipped: usize) {}
+    fn failed_count(&self, _failed: usize) {}
 }
 
 /// 指定线程数建池；基准与测试用它比较不同线程数的吞吐。

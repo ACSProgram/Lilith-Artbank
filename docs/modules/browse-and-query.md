@@ -87,6 +87,7 @@ tags: string[]
 - 前端在 `src/modules/library/StatsProvider.tsx` 提供 store 与 `useStats`；`FolderInspector.tsx` 与 `FilterPanel.tsx` 都通过它读取，不直接调用命令。
 - 标签管理器提供标签搜索、计数、重命名、删除与合并；删除与合并前在确认框显示影响数量。无查询时载入图片最多的 500 个标签；输入查询后改走后端 `search_tags`（最多 200），不再只过滤本地列表。合并目标与改名建议同样走后端搜索（最多 50），建议列表展示前 12 个。
 - 合并把源标签的全部图片关系迁到目标标签（已存在的关系只去重），然后删除源标签行；一次操作一条 `tagMerge` 记录，撤销按原 id 重建源标签并插回关系。
+- 批量任务的“将处理 M 张”复用同一套可见性与筛选：`query::PendingFilter` 按任务类型给出待处理条件，`pending_stats` 用一条范围聚合同时得到范围 N 与将处理 M；选择集走 `json_each`，因为读连接是 `query_only`，不能建临时表，逐块 `IN` 在几十万张时会退化成上千条语句。口径见 [AI 服务](ai-service.md) 与 [维护与批量工作流](maintenance.md)。
 
 ## 文件夹概览
 

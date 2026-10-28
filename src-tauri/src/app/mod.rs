@@ -1,3 +1,4 @@
+pub mod batch_preview;
 pub mod commands;
 pub mod error;
 pub mod img_protocol;

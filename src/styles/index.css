@@ -5853,6 +5853,45 @@ body.is-drag-sorting * {
   white-space: nowrap;
 }
 
+.batch-task-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-preview span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-task-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-facts span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.batch-task-current {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------------ */
 /* 图片空间优化估算                                                   */
 /* ------------------------------------------------------------------ */
@@ -6331,6 +6370,96 @@ body.is-drag-sorting * {
   fill: var(--text-muted);
   font-size: 9.5px;
   font-weight: 600;
+}
+
+.optimize-chart-line.is-actual {
+  stroke: var(--success);
+}
+
+.optimize-chart-line.is-estimate {
+  stroke: var(--text-faint);
+}
+
+.optimize-execution {
+  gap: 8px;
+}
+
+.optimize-compare-hint {
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-compare {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10.5px;
+}
+
+.optimize-compare th,
+.optimize-compare td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+}
+
+.optimize-compare th:first-child,
+.optimize-compare td:first-child {
+  text-align: left;
+  color: var(--text-muted);
+}
+
+.optimize-compare thead th {
+  color: var(--text-faint);
+  font-weight: 600;
+}
+
+.optimize-estimate-details {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+}
+
+.optimize-estimate-details > summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-estimate-details > .optimize-result {
+  padding: 0 10px 10px;
+}
+
+.optimize-runtime-curve,
+.optimize-progress-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.optimize-progress-legend {
+  display: flex;
+  gap: 14px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.optimize-progress-legend span::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+  background: var(--accent);
+}
+
+.optimize-progress-legend .is-actual::before {
+  background: var(--success);
+}
+
+.optimize-progress-legend .is-estimate::before {
+  background: var(--text-faint);
 }
 
 .optimize-curve-side {

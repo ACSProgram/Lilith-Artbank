@@ -155,6 +155,16 @@ export interface TaskSnapshot {
   progressPercent: number | null;
   message: string;
   currentImageId: number | null;
+  /** 第一次真正开始运行的时间；排队与准备阶段为空。 */
+  runStartedAt: number | null;
+  /** 当前处理的相对路径；没有时回退为 #图片id。 */
+  currentFile: string | null;
+  /** 已提交批次的原图字节；只有压缩任务非 0。 */
+  originalBytes: number;
+  /** 已提交批次节省的字节；只有压缩任务非 0。 */
+  savedBytes: number;
+  ratePerSecond: number | null;
+  etaSeconds: number | null;
   startedAt: number;
   finishedAt: number | null;
   failures: TaskFailure[];
@@ -190,6 +200,24 @@ export interface BatchTaskRequest {
   estimateId?: string | null;
   estimateSampleSize?: number | null;
   conflict: ConflictPolicy;
+}
+
+export interface BatchTaskPreviewCapability {
+  model: string;
+  dim: number;
+}
+
+export interface BatchTaskPreviewRequest {
+  kind: BatchTaskKind;
+  scope: TaskScope;
+  overwrite: boolean;
+  capability: BatchTaskPreviewCapability | null;
+}
+
+export interface BatchTaskPreview {
+  total: number;
+  /** 缺少模型维度或离线时为空。 */
+  willProcess: number | null;
 }
 
 export type TaskStartResult =

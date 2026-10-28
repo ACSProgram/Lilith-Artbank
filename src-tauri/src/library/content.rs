@@ -29,9 +29,30 @@ pub struct ContentRow {
     pub deleted_at: Option<i64>,
 }
 
+/// 任务面板里展示的相对路径：根目录下只有文件名，其余带文件夹前缀。
+///
+/// 只拼图库内的相对片段，不解析绝对路径；任务进度与失败清单都用它。
+pub(crate) fn relative_display_path(
+    folder_path: &str,
+    content_hash: &str,
+    file_ext: &str,
+) -> String {
+    let file = format!("{content_hash}.{file_ext}");
+    if folder_path.is_empty() {
+        file
+    } else {
+        format!("{folder_path}/{file}")
+    }
+}
+
 impl ContentRow {
     pub fn pixel_count(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// 任务面板里的相对路径；见 [`relative_display_path`]。
+    pub fn relative_display_path(&self) -> String {
+        relative_display_path(&self.folder_path, &self.content_hash, &self.file_ext)
     }
 
     pub fn path(&self, paths: &LibraryPaths) -> AppResult<PathBuf> {

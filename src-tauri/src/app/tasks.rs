@@ -12,7 +12,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -43,7 +43,6 @@ use crate::{
 pub const MAX_TASKS: usize = 50;
 const MAX_FAILURES: usize = 200;
 const EMIT_INTERVAL: Duration = Duration::from_millis(150);
-const MAX_SCOPE_IDS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,6 +169,18 @@ pub struct TaskSnapshot {
     pub progress_percent: Option<u8>,
     pub message: String,
     pub current_image_id: Option<i64>,
+    /// 第一次真正进入 `Running` 的时间；排队与准备阶段为空。
+    pub run_started_at: Option<i64>,
+    /// 当前处理的相对路径；没有时前端回退为 `#图片id`。
+    pub current_file: Option<String>,
+    /// 已提交批次的原图字节；只有压缩任务非 0。
+    pub original_bytes: u64,
+    /// 已提交批次节省的字节；只有压缩任务非 0。
+    pub saved_bytes: u64,
+    /// 运行以来的平均完成张数/秒；未开始或还没有完成项时为空。
+    pub rate_per_second: Option<f64>,
+    /// 预计剩余秒数；终态为空。
+    pub eta_seconds: Option<u64>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub failures: Vec<TaskFailure>,
@@ -204,6 +215,10 @@ pub struct TaskHandle {
     /// 加权进度；任务不提供单位时退回 `completed / total`。
     meter: WorkMeter,
     current: Mutex<Option<i64>>,
+    current_file: Mutex<Option<String>>,
+    original_bytes: AtomicU64,
+    saved_bytes: AtomicU64,
+    run_started_at: Mutex<Option<i64>>,
     message: Mutex<String>,
     failures: Mutex<Vec<TaskFailure>>,
     started_at: i64,
@@ -226,6 +241,10 @@ impl TaskHandle {
             skipped: AtomicUsize::new(0),
             meter: WorkMeter::new(),
             current: Mutex::new(None),
+            current_file: Mutex::new(None),
+            original_bytes: AtomicU64::new(0),
+            saved_bytes: AtomicU64::new(0),
+            run_started_at: Mutex::new(None),
             message: Mutex::new(String::new()),
             failures: Mutex::new(Vec::new()),
             started_at: now_ms(),
@@ -280,7 +299,17 @@ impl TaskHandle {
     pub fn set_phase(&self, phase: TaskPhase) {
         let mut current = self.phase.lock();
         if !current.is_terminal() {
+            if phase == TaskPhase::Running {
+                self.run_started_at.lock().get_or_insert_with(now_ms);
+            }
             *current = phase;
+        }
+    }
+
+    /// 从“真正开始干活”重新计时；压缩用它排除执行前的逐张复核。
+    pub fn mark_work_started(&self) {
+        if !self.is_finished() {
+            *self.run_started_at.lock() = Some(now_ms());
         }
     }
 
@@ -322,6 +351,15 @@ impl TaskHandle {
         *self.current.lock() = image_id;
     }
 
+    pub fn set_current_file(&self, path: Option<&str>) {
+        *self.current_file.lock() = path.map(str::to_owned);
+    }
+
+    pub fn set_bytes(&self, original: u64, saved: u64) {
+        self.original_bytes.store(original, Ordering::Relaxed);
+        self.saved_bytes.store(saved, Ordering::Relaxed);
+    }
+
     pub fn set_message(&self, message: impl Into<String>) {
         *self.message.lock() = message.into();
     }
@@ -354,6 +392,7 @@ impl TaskHandle {
         *self.phase.lock() = phase;
         *self.finished_at.lock() = Some(now_ms());
         *self.current.lock() = None;
+        *self.current_file.lock() = None;
     }
 
     /// 按取消标记与执行结果决定终态；这是 runner 的统一收尾。
@@ -373,22 +412,56 @@ impl TaskHandle {
     }
 
     pub fn snapshot(&self) -> TaskSnapshot {
+        let phase = self.phase();
+        let total = self.total.load(Ordering::Relaxed);
+        let completed = self.completed.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let skipped = self.skipped.load(Ordering::Relaxed);
+        let finished_at = *self.finished_at.lock();
+        let run_started_at = *self.run_started_at.lock();
+
+        // 排队与准备阶段没有开始时间，不拿构造时间凑速度。
+        let rate_per_second = run_started_at.and_then(|start| {
+            let elapsed = (finished_at.unwrap_or_else(now_ms) - start) as f64 / 1000.0;
+            let worked = completed + failed;
+            (worked > 0 && elapsed >= 0.5).then(|| worked as f64 / elapsed)
+        });
+        let eta_seconds = if phase.is_terminal() {
+            None
+        } else {
+            run_started_at.and_then(|_| {
+                if let Some(eta) = self.meter.eta() {
+                    return Some(eta.as_secs().max(1));
+                }
+                let remaining = total.saturating_sub(completed + failed + skipped);
+                let rate = rate_per_second?;
+                (remaining > 0 && rate > 0.0)
+                    .then(|| ((remaining as f64 / rate).ceil() as u64).max(1))
+            })
+        };
+
         TaskSnapshot {
             task_id: self.id.clone(),
             kind: self.kind,
             label: self.kind.label().to_owned(),
             scope: self.scope.clone(),
             lane: self.lane(),
-            phase: self.phase(),
-            total: self.total.load(Ordering::Relaxed),
-            completed: self.completed.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
-            skipped: self.skipped.load(Ordering::Relaxed),
+            phase,
+            total,
+            completed,
+            failed,
+            skipped,
             progress_percent: self.meter.percent(),
             message: self.message.lock().clone(),
             current_image_id: *self.current.lock(),
+            run_started_at,
+            current_file: self.current_file.lock().clone(),
+            original_bytes: self.original_bytes.load(Ordering::Relaxed),
+            saved_bytes: self.saved_bytes.load(Ordering::Relaxed),
+            rate_per_second,
+            eta_seconds,
             started_at: self.started_at,
-            finished_at: *self.finished_at.lock(),
+            finished_at,
             failures: self.failures.lock().clone(),
             cancellable: self.is_cancellable(),
             operation_id: *self.operation_id.lock(),
@@ -464,6 +537,23 @@ impl BatchReporter for TaskHandle {
 
     fn meter(&self) -> Option<&WorkMeter> {
         Some(&self.meter)
+    }
+
+    fn current(&self, image_id: Option<i64>, path: Option<&str>) {
+        self.set_current(image_id);
+        self.set_current_file(path);
+    }
+
+    fn bytes(&self, original: u64, saved: u64) {
+        self.set_bytes(original, saved);
+    }
+
+    fn skipped_count(&self, skipped: usize) {
+        self.set_skipped(skipped);
+    }
+
+    fn failed_count(&self, failed: usize) {
+        self.set_failed(failed);
     }
 }
 
@@ -849,7 +939,7 @@ impl TaskBus {
                     handle.set_phase(TaskPhase::Preparing);
                     self.run_immediate(handle.clone(), &name, LaneGuard::from_resource(guard), run);
                     Ok(TaskStartResult::Started {
-                        task: handle.snapshot(),
+                        task: Box::new(handle.snapshot()),
                     })
                 }
                 Err(conflicts) => Ok(TaskStartResult::Conflict {
@@ -864,7 +954,7 @@ impl TaskBus {
                 handle.set_phase(TaskPhase::Preparing);
                 self.run_immediate(handle.clone(), &name, LaneGuard::from_resource(guard), run);
                 return Ok(TaskStartResult::Started {
-                    task: handle.snapshot(),
+                    task: Box::new(handle.snapshot()),
                 });
             }
 
@@ -894,7 +984,9 @@ impl TaskBus {
             );
             launched?;
 
-            Ok(TaskStartResult::Started { task: snapshot })
+            Ok(TaskStartResult::Started {
+                task: Box::new(snapshot),
+            })
         }
     }
 }
@@ -918,7 +1010,7 @@ fn spawn_pump(app: AppHandle, handle: Arc<TaskHandle>) {
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum TaskStartResult {
     Started {
-        task: TaskSnapshot,
+        task: Box<TaskSnapshot>,
     },
     /// 只有 `Fail` 策略会返回：所需资源被占用或已有等待者，调用方据此提示稍后重试。
     Conflict {
@@ -985,22 +1077,8 @@ impl TaskScope {
 
     pub fn resolve(&self, database: &LibraryDb) -> AppResult<Vec<i64>> {
         match self {
-            Self::Selected { image_ids } => {
-                let mut ids = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for id in image_ids {
-                    if *id <= 0 {
-                        return Err(AppError::message("图片 id 无效"));
-                    }
-                    if seen.insert(*id) {
-                        ids.push(*id);
-                    }
-                }
-                if ids.len() > MAX_SCOPE_IDS {
-                    return Err(AppError::message("单次任务最多处理 100 万张图片"));
-                }
-                Ok(ids)
-            }
+            // 选择集只做去重与校验，不查行是否仍存在；已删除或已被清掉的行交给任务逐张处理。
+            Self::Selected { image_ids } => query::normalize_scope_ids(image_ids),
             Self::Folder {
                 folder_id,
                 include_subfolders,
@@ -1055,6 +1133,47 @@ impl TaskScope {
             ),
             Self::Library => query::query_ids(database, LibraryQuery::default()),
         }
+    }
+
+    /// 预览用的范围映射：`Selected` 返回 `None`，由调用方走选择集查询。
+    ///
+    /// 只读且不改范围语义；任务开始仍先 `resolve` 再按 id 过滤。
+    pub fn to_library_query(&self) -> AppResult<Option<LibraryQuery>> {
+        Ok(match self {
+            Self::Selected { .. } => None,
+            Self::Folder {
+                folder_id,
+                include_subfolders,
+            } => {
+                if *folder_id <= 0 {
+                    return Err(AppError::message("文件夹 id 无效"));
+                }
+                Some(LibraryQuery {
+                    filters: crate::library::query::LibraryFilters {
+                        folder_ids: vec![*folder_id],
+                        folder_direct: !*include_subfolders,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            }
+            Self::Collection { collection_id } => {
+                if *collection_id <= 0 {
+                    return Err(AppError::message("集合 id 无效"));
+                }
+                Some(LibraryQuery {
+                    view: LibraryView::Collection,
+                    collection_id: Some(*collection_id),
+                    ..Default::default()
+                })
+            }
+            Self::View { query } => Some(query.as_ref().clone()),
+            Self::Temp => Some(LibraryQuery {
+                view: LibraryView::Temp,
+                ..Default::default()
+            }),
+            Self::Library => Some(LibraryQuery::default()),
+        })
     }
 }
 
@@ -1265,6 +1384,36 @@ mod tests {
         wait_terminal(&handle);
         assert_eq!(handle.phase(), TaskPhase::Failed);
         assert!(handle.snapshot().message.contains("未报告终态"));
+    }
+
+    #[test]
+    fn snapshot_reports_run_time_rate_and_eta() {
+        let handle = TaskHandle::new("timed", TaskKind::Thumbnail, "选中 10 张");
+        assert!(handle.snapshot().run_started_at.is_none());
+        assert!(handle.snapshot().rate_per_second.is_none());
+        assert!(handle.snapshot().eta_seconds.is_none());
+
+        handle.set_total(10);
+        handle.set_phase(TaskPhase::Queued);
+        assert!(
+            handle.snapshot().run_started_at.is_none(),
+            "排队时间不应算进运行时长"
+        );
+        handle.set_phase(TaskPhase::Running);
+        assert!(handle.snapshot().run_started_at.is_some());
+
+        handle.set_completed(2);
+        handle.set_current_file(Some("人物/a.jpg"));
+        std::thread::sleep(Duration::from_millis(600));
+        let snapshot = handle.snapshot();
+        assert!(snapshot.rate_per_second.is_some());
+        assert!(snapshot.eta_seconds.is_some());
+        assert_eq!(snapshot.current_file.as_deref(), Some("人物/a.jpg"));
+
+        handle.finish(TaskPhase::Completed);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.current_file, None);
+        assert_eq!(snapshot.eta_seconds, None);
     }
 
     #[test]

@@ -654,6 +654,208 @@ pub fn query_total(database: &LibraryDb, query: LibraryQuery) -> AppResult<u64> 
     })
 }
 
+/// 批量任务开始前的“是否仍待处理”条件。
+///
+/// 预览与任务启动共用这一份 SQL，避免“开始前的数字”和任务 `total` 各算一套。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingFilter {
+    /// 重做类任务：只要行未删除就处理。
+    All,
+    Thumbnail,
+    Embedding {
+        model: String,
+        dim: u32,
+    },
+    Pose,
+    Description {
+        overwrite: bool,
+    },
+}
+
+impl PendingFilter {
+    /// 返回条件并把它用到的参数按 SQL 文本顺序追加上去。
+    ///
+    /// 调用方必须把这里的参数放在 join 与筛选参数之前：条件出现在 SELECT 列表，
+    /// 在 SQL 文本里早于 `WHERE`。
+    fn clause(&self, params: &mut Vec<Value>) -> String {
+        let active = "images.deleted_at IS NULL";
+        match self {
+            Self::All => active.to_owned(),
+            Self::Thumbnail => {
+                format!("{active} AND (images.thumb_segment = 0 OR images.thumb_length <= 0)")
+            }
+            Self::Embedding { model, dim } => {
+                params.push(Value::Text(model.clone()));
+                params.push(Value::Integer(i64::from(*dim)));
+                format!(
+                    "{active} AND NOT EXISTS (
+                         SELECT 1 FROM feature_blobs pending_features
+                         WHERE pending_features.image_id = images.id
+                           AND pending_features.kind = 'embedding'
+                           AND pending_features.model = ?
+                           AND pending_features.dim = ?)"
+                )
+            }
+            Self::Pose => format!(
+                "{active} AND NOT EXISTS (
+                     SELECT 1 FROM feature_blobs pending_features
+                     WHERE pending_features.image_id = images.id
+                       AND pending_features.kind = 'pose')"
+            ),
+            Self::Description { overwrite: false } => {
+                format!("{active} AND length(trim(images.description)) = 0")
+            }
+            Self::Description { overwrite: true } => {
+                format!("{active} AND images.description_source <> 'user'")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingStats {
+    /// 范围在浏览口径下的行数，可能包含回收站里的图片。
+    pub total: u64,
+    /// 范围里未删除且确实待处理的行数。
+    pub will_process: u64,
+}
+
+/// 非选择范围的待处理统计：一条聚合扫过范围内的所有行。
+pub fn pending_stats(
+    database: &LibraryDb,
+    query: LibraryQuery,
+    filter: &PendingFilter,
+) -> AppResult<PendingStats> {
+    let (query, _) = normalize(query)?;
+    database.with_reader(|connection| {
+        let folder_paths = folder_scope_paths(connection, &query.filters.folder_ids)?;
+        let prepared = PreparedQuery::new(&query, None, SearchMode::Count, &folder_paths);
+        let mut params = Vec::new();
+        let pending = filter.clause(&mut params);
+        params.extend(prepared.join_params.iter().cloned());
+        params.extend(prepared.filters.params.iter().cloned());
+        let filters = if prepared.filters.clauses.is_empty() {
+            "1".to_owned()
+        } else {
+            prepared.filters.clauses.join(" AND ")
+        };
+        let sql = format!(
+            "WITH scope AS (
+                 SELECT images.id AS id,
+                        CASE WHEN {pending} THEN 1 ELSE 0 END AS pending
+                 FROM images {}
+                 WHERE {filters}
+             )
+             SELECT count(*), coalesce(sum(pending), 0) FROM scope",
+            prepared.join_sql
+        );
+        let stats = connection.query_row(&sql, params_from_iter(params.iter()), |row| {
+            Ok(PendingStats {
+                total: row.get::<_, i64>(0)? as u64,
+                will_process: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        Ok(stats)
+    })
+}
+
+/// 选择集查询的公共外壳：`selected_ids` 由 `json_each` 展开，`tail` 决定是聚合还是取 id。
+///
+/// 参数顺序固定为 JSON 数组在前、`pending` 的模型与维度在后，与 SQL 文本顺序一致。
+fn selected_pending_sql(json: &str, filter: &PendingFilter, tail: &str) -> (String, Vec<Value>) {
+    let mut params = vec![Value::Text(json.to_owned())];
+    let pending = filter.clause(&mut params);
+    let sql = format!(
+        "WITH selected_ids AS (
+             SELECT DISTINCT value AS id FROM json_each(?)
+         ),
+         scope AS (
+             SELECT images.id AS id,
+                    CASE WHEN {pending} THEN 1 ELSE 0 END AS pending
+             FROM images
+             JOIN selected_ids ON selected_ids.id = images.id
+         )
+         {tail}"
+    );
+    (sql, params)
+}
+
+/// 选择集的待处理统计；id 通过 `json_each` 传入。
+///
+/// 读连接是 `query_only`，不能建临时表；逐块 `IN` 在几十万张时会退化成上千条语句。
+pub fn selected_pending_stats(
+    database: &LibraryDb,
+    ids: &[i64],
+    filter: &PendingFilter,
+) -> AppResult<PendingStats> {
+    let ids = normalize_scope_ids(ids)?;
+    if ids.is_empty() {
+        return Ok(PendingStats {
+            total: 0,
+            will_process: 0,
+        });
+    }
+    let json = serde_json::to_string(&ids)
+        .map_err(|error| AppError::message(format!("选择集编码失败：{error}")))?;
+    let (sql, params) = selected_pending_sql(
+        &json,
+        filter,
+        "SELECT count(*), coalesce(sum(pending), 0) FROM scope",
+    );
+    database.with_reader(|connection| {
+        let stats = connection.query_row(&sql, params_from_iter(params.iter()), |row| {
+            Ok(PendingStats {
+                total: row.get::<_, i64>(0)? as u64,
+                will_process: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        Ok(stats)
+    })
+}
+
+/// 选择集里仍待处理的 id，按输入顺序返回；重复 id 只保留一次。
+pub fn selected_pending_ids(
+    database: &LibraryDb,
+    ids: &[i64],
+    filter: &PendingFilter,
+) -> AppResult<Vec<i64>> {
+    let ids = normalize_scope_ids(ids)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(&ids)
+        .map_err(|error| AppError::message(format!("选择集编码失败：{error}")))?;
+    let (sql, params) =
+        selected_pending_sql(&json, filter, "SELECT id FROM scope WHERE pending = 1");
+    let found: HashSet<i64> = database.with_reader(|connection| {
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(params.iter()), |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().collect())
+    })?;
+    Ok(ids.into_iter().filter(|id| found.contains(id)).collect())
+}
+
+/// 选择集 id 的公共校验：正整数、去重、数量上限；任务范围解析与待处理统计共用。
+pub(crate) fn normalize_scope_ids(ids: &[i64]) -> AppResult<Vec<i64>> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for id in ids {
+        if *id <= 0 {
+            return Err(AppError::message("图片 id 无效"));
+        }
+        if seen.insert(*id) {
+            result.push(*id);
+        }
+    }
+    if result.len() > MAX_IDS {
+        return Err(AppError::message("单次任务最多处理 100 万张图片"));
+    }
+    Ok(result)
+}
+
 /// 选中文件夹的概览统计；应用全部筛选，始终排除回收站与临时区。
 pub fn folder_stats(database: &LibraryDb, query: LibraryQuery) -> AppResult<FolderStats> {
     let (mut query, _) = normalize(query)?;
@@ -4056,5 +4258,383 @@ mod tests {
 
         query.filters.description = PresenceFilter::Has;
         assert!(!pin_stats_indexes(&query));
+    }
+
+    fn set_thumbnail(fixture: &Fixture, id: i64, segment: i64, length: i64) {
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET thumb_segment = ?1, thumb_length = ?2 WHERE id = ?3",
+                    params![segment, length, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn insert_feature(connection: &Connection, image_id: i64, kind: &str, model: &str, dim: u32) {
+        connection
+            .execute(
+                "INSERT INTO feature_blobs(
+                    image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'test.pack', 0, 0, 0)",
+                params![image_id, kind, model, dim],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_stats_follow_scope_and_thumbnail_pointer() {
+        let fixture = fixture();
+        let database = &fixture.session.db;
+
+        // 全库：5 行里 1 行在回收站；回收站视图的“将处理”必须是 0。
+        let stats = pending_stats(database, LibraryQuery::default(), &PendingFilter::All).unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 4,
+                will_process: 4
+            }
+        );
+        let trash = pending_stats(
+            database,
+            LibraryQuery {
+                view: LibraryView::Trash,
+                ..Default::default()
+            },
+            &PendingFilter::All,
+        )
+        .unwrap();
+        assert_eq!(
+            trash,
+            PendingStats {
+                total: 1,
+                will_process: 0
+            }
+        );
+
+        let stats =
+            pending_stats(database, LibraryQuery::default(), &PendingFilter::Thumbnail).unwrap();
+        assert_eq!(stats.will_process, 4);
+
+        // 指针判定与 `thumbs::load_pointer` 一致：segment 与 length 都必须有值。
+        set_thumbnail(&fixture, 1, 1, 100);
+        set_thumbnail(&fixture, 2, 1, 0);
+        set_thumbnail(&fixture, 3, 0, 50);
+        let stats =
+            pending_stats(database, LibraryQuery::default(), &PendingFilter::Thumbnail).unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.will_process, 3, "只有 id=1 同时有 segment 与 length");
+
+        let direct = LibraryQuery {
+            filters: LibraryFilters {
+                folder_ids: vec![fixture.folder_people],
+                folder_direct: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stats = pending_stats(database, direct, &PendingFilter::All).unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 2,
+                will_process: 2
+            }
+        );
+
+        let subtree = LibraryQuery {
+            filters: LibraryFilters {
+                folder_ids: vec![fixture.folder_scenery],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stats = pending_stats(database, subtree, &PendingFilter::All).unwrap();
+        assert_eq!(stats.total, 2);
+    }
+
+    #[test]
+    fn pending_embedding_binds_model_and_dim_in_order() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                insert_feature(connection, 1, "embedding", "alpha", 4);
+                insert_feature(connection, 2, "embedding", "alpha", 8);
+                insert_feature(connection, 3, "embedding", "beta", 4);
+                Ok(())
+            })
+            .unwrap();
+        let database = &fixture.session.db;
+
+        let alpha = pending_stats(
+            database,
+            LibraryQuery::default(),
+            &PendingFilter::Embedding {
+                model: "alpha".into(),
+                dim: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            alpha,
+            PendingStats {
+                total: 4,
+                will_process: 3
+            }
+        );
+        let alpha8 = pending_stats(
+            database,
+            LibraryQuery::default(),
+            &PendingFilter::Embedding {
+                model: "alpha".into(),
+                dim: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(alpha8.will_process, 3);
+        let beta = pending_stats(
+            database,
+            LibraryQuery::default(),
+            &PendingFilter::Embedding {
+                model: "beta".into(),
+                dim: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(beta.will_process, 3);
+
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                insert_feature(connection, 2, "pose", "any-model", 33);
+                Ok(())
+            })
+            .unwrap();
+        let pose = pending_stats(database, LibraryQuery::default(), &PendingFilter::Pose).unwrap();
+        assert_eq!(pose.will_process, 3, "姿势不按模型判断");
+    }
+
+    #[test]
+    fn pending_description_respects_trim_and_source() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE images SET description = '手写描述', description_source = 'user'
+                     WHERE id = 1",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE images SET description = '导入描述', description_source = 'import'
+                     WHERE id = 2",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE images SET description = '', description_source = 'ai' WHERE id = 3",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE images SET description = '   ', description_source = 'user'
+                     WHERE id = 4",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let database = &fixture.session.db;
+
+        let fill = pending_stats(
+            database,
+            LibraryQuery::default(),
+            &PendingFilter::Description { overwrite: false },
+        )
+        .unwrap();
+        assert_eq!(fill.will_process, 2, "只补空描述");
+        let redo = pending_stats(
+            database,
+            LibraryQuery::default(),
+            &PendingFilter::Description { overwrite: true },
+        )
+        .unwrap();
+        assert_eq!(redo.will_process, 2, "重做时跳过手写描述");
+    }
+
+    #[test]
+    fn selected_pending_excludes_deleted_and_keeps_input_order() {
+        let fixture = fixture();
+        let database = &fixture.session.db;
+        // id=5 在回收站；999 不存在；3 重复。
+        let ids = [3, 1, 3, 999, 5];
+        let stats = selected_pending_stats(database, &ids, &PendingFilter::All).unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 3,
+                will_process: 2
+            }
+        );
+        let pending = selected_pending_ids(database, &ids, &PendingFilter::All).unwrap();
+        assert_eq!(pending, vec![3, 1]);
+
+        assert_eq!(
+            selected_pending_stats(database, &[], &PendingFilter::All).unwrap(),
+            PendingStats {
+                total: 0,
+                will_process: 0
+            }
+        );
+        assert!(selected_pending_ids(database, &[0], &PendingFilter::All).is_err());
+    }
+
+    #[test]
+    fn selected_pending_embedding_binds_json_before_model_and_dim() {
+        let fixture = fixture();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                insert_feature(connection, 1, "embedding", "alpha", 4);
+                Ok(())
+            })
+            .unwrap();
+        let stats = selected_pending_stats(
+            &fixture.session.db,
+            &[1, 2],
+            &PendingFilter::Embedding {
+                model: "alpha".into(),
+                dim: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 2,
+                will_process: 1
+            }
+        );
+        let pending = selected_pending_ids(
+            &fixture.session.db,
+            &[2, 1],
+            &PendingFilter::Embedding {
+                model: "alpha".into(),
+                dim: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(pending, vec![2]);
+    }
+
+    #[test]
+    fn selected_and_scope_pending_agree() {
+        let fixture = fixture();
+        set_thumbnail(&fixture, 1, 1, 100);
+        let query = LibraryQuery {
+            filters: LibraryFilters {
+                folder_ids: vec![fixture.folder_people],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let database = &fixture.session.db;
+        let ids = query_ids(database, query.clone()).unwrap();
+        let stats = pending_stats(database, query, &PendingFilter::Thumbnail).unwrap();
+        let selected = selected_pending_ids(database, &ids, &PendingFilter::Thumbnail).unwrap();
+        assert_eq!(stats.total as usize, ids.len());
+        assert_eq!(stats.will_process as usize, selected.len());
+    }
+
+    fn insert_collection(fixture: &Fixture, image_ids: &[i64]) -> i64 {
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO collections(name, created_at, updated_at) VALUES ('测试', 0, 0)",
+                    [],
+                )?;
+                let id = connection.last_insert_rowid();
+                for (position, image_id) in image_ids.iter().enumerate() {
+                    connection.execute(
+                        "INSERT INTO collection_items(collection_id, image_id, position)
+                         VALUES (?1, ?2, ?3)",
+                        params![id, image_id, position as i64],
+                    )?;
+                }
+                Ok(id)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn pending_stats_support_collection_scope() {
+        let fixture = fixture();
+        let collection_id = insert_collection(&fixture, &[4, 2]);
+        let stats = pending_stats(
+            &fixture.session.db,
+            LibraryQuery {
+                view: LibraryView::Collection,
+                collection_id: Some(collection_id),
+                ..Default::default()
+            },
+            &PendingFilter::All,
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 2,
+                will_process: 2
+            }
+        );
+    }
+
+    #[test]
+    fn pending_stats_bind_pending_join_and_filter_params_in_order() {
+        let fixture = fixture();
+        let collection_id = insert_collection(&fixture, &[1, 2]);
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                insert_feature(connection, 1, "embedding", "alpha", 4);
+                Ok(())
+            })
+            .unwrap();
+        // 集合里 id=1（评分 3、已有 embedding）与 id=2（评分 5）；评分筛选只要 3。
+        // 三组参数按 SQL 文本顺序拼接：pending 的模型与维度、集合 id、评分筛选。
+        let stats = pending_stats(
+            &fixture.session.db,
+            LibraryQuery {
+                view: LibraryView::Collection,
+                collection_id: Some(collection_id),
+                filters: LibraryFilters {
+                    scores: vec![3],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &PendingFilter::Embedding {
+                model: "alpha".into(),
+                dim: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stats,
+            PendingStats {
+                total: 1,
+                will_process: 0
+            }
+        );
     }
 }

@@ -193,6 +193,8 @@ Content-Type: application/octet-stream
 
 - 批量任务挂在 `app/tasks.rs` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
 - 范围由 `TaskScope` 在 Rust 侧解析成 id 集合（选中 / 文件夹 / 集合 / 当前视图 / 临时文件夹 / 全库）；`AiJobRequest` 只接收已解析的 id，不再有“id 与 query 都为空就退回全库”的隐式分支。
+- 开始前预览：`preview_batch_task` 只读返回“范围 N 张 / 将处理 M 张”。待处理条件与任务启动共用 `query::PendingFilter`：embedding 按当前模型与维度、pose 按任意模型、描述按空描述或非手写来源；已删除与待释放行不计入 M。AI 离线或 embedding 缺模型维度时 M 显示“—”，任务不可开始；服务恢复后由状态轮询触发重算。
+- 快照字段：除张数与百分比外，`TaskSnapshot` 还带 `runStartedAt`（第一次进入 `running` 的时间，排队与准备不算）、`currentFile`（图库内相对路径）、`ratePerSecond` 与 `etaSeconds`；压缩任务另有 `originalBytes` / `savedBytes`，只统计已提交并替换的图片。速度为运行以来的平均完成张数，压缩的 ETA 优先用像素吞吐；终态不返回 ETA。
 - 冲突：AI 任务占 `ai.service` 与内容写者，同一时间只运行一个 AI 批量任务，不会与导入、移动、编辑、压缩等内容写任务同时运行；描述任务还占时间线读与元数据写。每张读原图时再按文件夹加短读锁并拿图像预算许可，因此文件夹维护不必等整个 AI 任务结束。默认自动排队：`start_batch_task` 直接返回 `queued` 快照，任务在 `queued` 阶段等待，不需要前端选择排队或取消现有任务。排队中的任务在任务中心可取消；取消排队任务只把它从等待队列移除，不触碰正在运行的任务。
 - 先到先得：同一资源上的等待者按申请顺序启动；路径锁写者优先，避免文件夹改名被持续的读图请求饿死。短写只申请短期资源，不排在长任务后面。
 - 取消：停止调度新请求；在途请求允许完成并保存结果；已保存结果不回滚。
@@ -271,6 +273,7 @@ Content-Type: application/octet-stream
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
 | `find_similar_images` | 参考图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，`targetIds` 支持单张或最多 100 张平均（多张只允许 color4/color8/embedding）；可选 `threshold`、`limit`（默认 2000，上限 10000）与 `scope` |
 | `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、全库相似分组；立即返回 `{ status: "started", task }`，`task.phase` 为 `queued`（已排队）或 `preparing`（已拿到资源） |
+| `preview_batch_task` | 只读预览：返回 `{ total, willProcess }`（“范围 N 张 / 将处理 M 张”）；`kind` 只接受缩略图与三类 AI 任务，缺模型维度时 `willProcess` 为 `null`。与任务启动共用 `query::PendingFilter` 的同一套待处理条件，异步执行以免阻塞窗口事件循环 |
 | `list_tasks` / `cancel_task` | 任务列表与取消；进度通过 `task-progress` / `task-finished` 推送 |
 | `get_similarity_groups_result` | 按 taskId 取回相似分组结果 |
 | `get_similarity_page` / `get_similarity_ids` | 相似结果分页与全选（语义搜索与找相似共用） |
@@ -293,7 +296,7 @@ Content-Type: application/octet-stream
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
 - `src-tauri/src/ai/pose_similarity.rs`：原程序姿势相似度 1:1 移植，附 golden 值测试。
 - `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、全库 pHash 分组。
-- `src-tauri/src/ai/job.rs`：批量任务、缺失项过滤、取消、失败清单。
+- `src-tauri/src/ai/job.rs`：批量任务、待处理过滤（与预览共用 `PendingFilter`）、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
 - `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/modules/library/FindSimilarPanel.tsx`：参考图、指标、阈值、数量与范围（工具栏下拉面板）；`src/shared/similarity.ts`：kind 与中文标签；`src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`：批量任务、空间优化与找相似共用的范围语义与单选框。
 
