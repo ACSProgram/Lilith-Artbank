@@ -2009,10 +2009,11 @@ impl AppState {
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
         let images = self.images();
-        let resource_request = ResourceRequest::session_read()
+        // 压缩只替换图片内容、不改变文件夹结构与文件名，所以用“原地替换”而不是写锁：
+        // 查看器在压缩期间仍能读原图，移动/删除/导入/另一个压缩照旧互斥。
+        let resource_request = ResourceRequest::path_replace("")
             .with_timeline(Access::Read)
             .with_content_writer()
-            .with_paths(vec![PathScope::write("")])
             .with_path_note("正在处理图库内容");
         self.tasks.launch(
             app,
@@ -2024,6 +2025,8 @@ impl AppState {
                     let _guard: LaneGuard = guard;
                     worker.set_phase(TaskPhase::Running);
 
+                    // 复核段要逐张 stat 原图，几十万张时很久；给一句话说明在等什么。
+                    worker.set_message("正在核对原图…");
                     let prepared = recheck_optimize_scope(
                         &database,
                         &root,
@@ -2059,6 +2062,7 @@ impl AppState {
                     worker.set_total(count as usize);
                     // 实际耗时从真正进入编码开始算，排除排队、复核与准备。
                     worker.mark_work_started();
+                    worker.set_message("正在编码…");
                     let result = crate::library::optimize::optimize(
                         &database,
                         &root,

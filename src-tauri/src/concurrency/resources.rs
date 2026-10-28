@@ -17,6 +17,12 @@ use parking_lot::{Condvar, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Read,
+    /// 原地替换原有内容：发布走“临时文件 + 原子重命名”，读者只会看到旧内容或新内容，
+    /// 所以不与读互斥；与移动、删除、导入这些会改变路径的写仍然互斥。
+    ///
+    /// 读者正持着句柄也能替换：Rust 的 `File::open` 带 `FILE_SHARE_DELETE`，
+    /// Windows 的重命名会成功，旧文件在最后一个句柄关闭后才真正消失。
+    Replace,
     Write,
 }
 
@@ -31,6 +37,14 @@ impl PathScope {
         Self {
             path: normalize_path(path.as_ref()),
             access: Access::Read,
+        }
+    }
+
+    /// 原地替换图片内容，不改变文件夹结构与文件名。
+    pub fn replace(path: impl AsRef<str>) -> Self {
+        Self {
+            path: normalize_path(path.as_ref()),
+            access: Access::Replace,
         }
     }
 
@@ -112,6 +126,14 @@ impl ResourceRequest {
         Self {
             session_read: true,
             paths: vec![PathScope::write(path)],
+            ..Self::default()
+        }
+    }
+
+    pub fn path_replace(path: impl AsRef<str>) -> Self {
+        Self {
+            session_read: true,
+            paths: vec![PathScope::replace(path)],
             ..Self::default()
         }
     }
@@ -201,10 +223,20 @@ fn timeline_conflicts(left: Option<Access>, right: Option<Access>) -> bool {
 }
 
 fn path_scopes_conflict(left: &PathScope, right: &PathScope) -> bool {
-    if left.access == Access::Read && right.access == Access::Read {
+    if !accesses_conflict(left.access, right.access) {
         return false;
     }
     is_prefix(&left.path, &right.path) || is_prefix(&right.path, &left.path)
+}
+
+/// 访问级之间的互斥：读与读、读与原地替换都不互斥，其余都互斥。
+fn accesses_conflict(left: Access, right: Access) -> bool {
+    !matches!(
+        (left, right),
+        (Access::Read, Access::Read)
+            | (Access::Read, Access::Replace)
+            | (Access::Replace, Access::Read)
+    )
 }
 
 fn is_prefix(prefix: &str, path: &str) -> bool {
@@ -500,6 +532,12 @@ fn describe(
             None if scope.access == Access::Read && !scope.path.is_empty() => {
                 format!("正在读取「{}」中的图片", scope.path)
             }
+            None if scope.access == Access::Replace && scope.path.is_empty() => {
+                "正在替换图库中的原图".to_owned()
+            }
+            None if scope.access == Access::Replace => {
+                format!("正在替换「{}」文件夹中的原图", scope.path)
+            }
             None if scope.path.is_empty() => "正在处理图库内容".to_owned(),
             None => format!("正在写入「{}」文件夹", scope.path),
         },
@@ -555,6 +593,40 @@ mod tests {
                 .is_err()
         );
         assert!(table.try_acquire(&read("其他"), &holder("other")).is_ok());
+    }
+
+    #[test]
+    fn replace_lets_readers_through_but_blocks_writers() {
+        let table = ResourceTable::new();
+        // 全库原地替换：查看器与 MCP 读图照常。
+        let held = table
+            .try_acquire(&ResourceRequest::path_replace(""), &holder("optimize"))
+            .unwrap();
+        let viewer = table
+            .try_acquire(&read("人体/素体"), &holder("viewer"))
+            .unwrap();
+        let _other = table
+            .try_acquire(&read("画作"), &holder("viewer-2"))
+            .unwrap();
+        // 移动、导入、删除这类会改路径的写仍然挡住。
+        assert!(
+            table
+                .try_acquire(&write("人体/素体"), &holder("move"))
+                .is_err()
+        );
+        // 两个替换之间也互斥。
+        assert!(
+            table
+                .try_acquire(&ResourceRequest::path_replace(""), &holder("optimize-2"))
+                .is_err()
+        );
+        drop(viewer);
+        drop(held);
+        assert!(
+            table
+                .try_acquire(&write("人体/素体"), &holder("move"))
+                .is_ok()
+        );
     }
 
     #[test]

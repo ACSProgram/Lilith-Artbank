@@ -3,7 +3,12 @@ import { Folder, HardDrive, Images } from "lucide-react";
 import { Spinner } from "../../shared/components/Spinner";
 import { formatBytes } from "../../shared/format";
 import { hasActiveFilters } from "./model";
-import { scoreBars, topValueCounts, type StatBarItem } from "./folderStats";
+import {
+  DONUT_OTHER_KEY,
+  donutSegments,
+  scoreSegments,
+  type DonutSegment,
+} from "./folderStats";
 import { useStats } from "./StatsProvider";
 import type { LibraryQuery, StatsTag } from "./types";
 
@@ -33,8 +38,8 @@ export function FolderInspector({ query }: FolderInspectorProps) {
     );
   }
 
-  const extensionBars = topValueCounts(data.extensions, 6);
-  const scores = scoreBars(data.scores);
+  const extensions = donutSegments(data.extensions, 5);
+  const scores = scoreSegments(data.scores);
   const multipleFolders = query.filters.folderIds.length > 1;
   const emptyText =
     query.search.trim().length > 0 || hasActiveFilters(query.filters)
@@ -90,15 +95,15 @@ export function FolderInspector({ query }: FolderInspectorProps) {
           <>
             <section className="inspector-section">
               <h4>类型</h4>
-              {extensionBars.length === 0 ? (
+              {extensions.length === 0 ? (
                 <span className="inspector-empty">没有匹配的图片</span>
               ) : (
-                <StatBars items={extensionBars} total={data.imageCount} />
+                <StatDonut segments={extensions} />
               )}
             </section>
             <section className="inspector-section">
               <h4>评分</h4>
-              <StatBars items={scores} total={data.imageCount} />
+              <StatDonut segments={scores} />
             </section>
             <section className="inspector-section">
               <h4>常见标签</h4>
@@ -133,28 +138,85 @@ function FolderStatTile({
   );
 }
 
-function StatBars({ items, total }: { items: StatBarItem[]; total: number }) {
+const DONUT_SIZE = 96;
+const DONUT_RADIUS = 38;
+const DONUT_STROKE = 12;
+const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
+
+/** 合并出来的“其他”用灰段，其余按位置取分类色。 */
+function segmentColor(segment: DonutSegment, index: number): string {
+  if (segment.key === DONUT_OTHER_KEY) return "var(--chart-other)";
+  return `var(--chart-${(index % 6) + 1})`;
+}
+
+/** 类型与评分的环图：分段 + 两列图例，中心是占比最大那一段。 */
+function StatDonut({ segments }: { segments: DonutSegment[] }) {
+  const sum = segments.reduce((acc, segment) => acc + segment.value, 0);
+  const center = DONUT_SIZE / 2;
+  const top = segments.reduce(
+    (best, segment) => (segment.value > best.value ? segment : best),
+    segments[0],
+  );
+  let passed = 0;
+  const arcs = segments.map((segment, index) => {
+    const length = sum > 0 ? (segment.value / sum) * DONUT_CIRCUMFERENCE : 0;
+    const arc = { segment, index, length, offset: passed };
+    passed += length;
+    return arc;
+  });
+
   return (
-    <div className="folder-stat-rows">
-      {items.map((item) => {
-        const share = total > 0 ? item.count / total : 0;
-        return (
-          <div className="folder-stat-row" key={item.label}>
-            <span className="folder-stat-label" title={item.label}>
-              {item.label}
-            </span>
-            <span className="folder-stat-track">
-              <span
-                className="folder-stat-fill"
-                style={{ width: `${Math.round(share * 100)}%` }}
-              />
-            </span>
-            <span className="folder-stat-value">
-              {item.count.toLocaleString()} · {Math.round(share * 100)}%
-            </span>
+    <div className="folder-stat-donut">
+      <svg
+        viewBox={`0 0 ${DONUT_SIZE} ${DONUT_SIZE}`}
+        role="img"
+        aria-label={segments
+          .map((segment) => `${segment.label} ${segment.value.toLocaleString()} 张`)
+          .join("，")}
+      >
+        <circle
+          className="folder-stat-donut-track"
+          cx={center}
+          cy={center}
+          r={DONUT_RADIUS}
+          strokeWidth={DONUT_STROKE}
+        />
+        {arcs.map(({ segment, index, length, offset }) =>
+          length <= 0 ? null : (
+            <circle
+              key={segment.key}
+              className="folder-stat-donut-arc"
+              cx={center}
+              cy={center}
+              r={DONUT_RADIUS}
+              strokeWidth={DONUT_STROKE}
+              stroke={segmentColor(segment, index)}
+              strokeDasharray={`${length} ${DONUT_CIRCUMFERENCE - length}`}
+              strokeDashoffset={-offset}
+              transform={`rotate(-90 ${center} ${center})`}
+            />
+          ),
+        )}
+        <text x={center} y={center - 2} textAnchor="middle" className="folder-stat-donut-value">
+          {sum > 0 ? `${Math.round((top.value / sum) * 100)}%` : "—"}
+        </text>
+        <text x={center} y={center + 12} textAnchor="middle" className="folder-stat-donut-name">
+          {sum > 0 ? top.label : ""}
+        </text>
+      </svg>
+
+      <div className="folder-stat-donut-legend">
+        {segments.map((segment, index) => (
+          <div className="folder-stat-donut-item" key={segment.key}>
+            <i style={{ background: segmentColor(segment, index) }} />
+            <span title={segment.label}>{segment.label}</span>
+            <em>
+              {segment.value.toLocaleString()} ·{" "}
+              {sum > 0 ? `${Math.round((segment.value / sum) * 100)}%` : "0%"}
+            </em>
           </div>
-        );
-      })}
+        ))}
+      </div>
     </div>
   );
 }

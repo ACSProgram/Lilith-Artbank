@@ -5,6 +5,7 @@ import { Spinner } from "../shared/components/Spinner";
 import { formatDuration } from "../shared/format";
 import { useTaskCenter } from "./taskContext";
 import {
+  CANCEL_PENDING_NOTE,
   TASK_PHASE_LABELS,
   isTaskActive,
   taskPercent,
@@ -29,6 +30,7 @@ function TaskRow({
 }) {
   const [showFailures, setShowFailures] = useState(false);
   const active = isTaskActive(task);
+  const cancelling = task.phase === "cancelling";
   const percent = taskPercent(task);
   const done = task.completed + task.failed + task.skipped;
 
@@ -46,7 +48,7 @@ function TaskRow({
       </div>
 
       {task.total > 0 || task.progressPercent !== null ? (
-        <div className="task-progress">
+        <div className={`task-progress${cancelling ? " is-cancelling" : ""}`}>
           <span style={{ width: `${percent}%` }} />
         </div>
       ) : null}
@@ -65,7 +67,9 @@ function TaskRow({
         <span>{formatElapsed(task.startedAt, task.finishedAt)}</span>
       </div>
 
-      {active && task.message && task.total > 0 ? (
+      {cancelling ? (
+        <div className="task-row-note">{CANCEL_PENDING_NOTE}</div>
+      ) : active && task.message && task.total > 0 ? (
         <div className="task-row-message">{task.message}</div>
       ) : null}
 
@@ -85,6 +89,7 @@ function TaskRow({
             size="sm"
             variant="danger"
             icon={<Square size={11} />}
+            disabled={cancelling}
             onClick={() => onCancel(task.taskId)}
           >
             取消任务

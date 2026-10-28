@@ -1,8 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  actualAtCoverage,
+  actualCurvePoints,
   appendRuntimePoint,
   compareOptimizeEstimate,
+  curveAt,
+  earlySavingsHint,
   type RuntimeOptimizePoint,
 } from "./optimizeProgress.ts";
 
@@ -69,7 +73,7 @@ test("超过上限时隔点丢弃且保留最后一点", () => {
   }
 });
 
-test("预计与实际对照给出差异", () => {
+test("预计与实际对照按三项给出实际与预计", () => {
   const comparison = compareOptimizeEstimate(
     { savingsBytes: 1_000, estimatedSeconds: 60, processCount: 50 },
     {
@@ -81,11 +85,11 @@ test("预计与实际对照给出差异", () => {
   );
   assert.equal(comparison.completed, true);
   assert.deepEqual(
-    comparison.rows.map((row) => [row.key, row.estimated, row.actual, row.delta]),
+    comparison.rows.map((row) => [row.key, row.estimated, row.actual]),
     [
-      ["savings", 1_000, 900, -100],
-      ["duration", 60, 70, 10],
-      ["count", 50, 48, -2],
+      ["savings", 1_000, 900],
+      ["duration", 60, 70],
+      ["count", 50, 48],
     ],
   );
 });
@@ -97,11 +101,93 @@ test("取消或缺失字段时不崩", () => {
   );
   assert.equal(comparison.completed, false);
   assert.equal(comparison.rows[0].actual, 0);
-  assert.equal(comparison.rows[1].delta, -60);
+  assert.equal(comparison.rows[1].actual, 0);
   const empty = compareOptimizeEstimate(
     { savingsBytes: 0, estimatedSeconds: 0, processCount: 0 },
     {},
   );
   assert.equal(empty.rows.length, 3);
   assert.equal(empty.completed, false);
+});
+
+test("actualCurvePoints 按候选体积折算覆盖率且不回退", () => {
+  const points: RuntimeOptimizePoint[] = [
+    { elapsedSeconds: 2, savingsBytes: 0, processed: 0, originalBytes: 0 },
+    { elapsedSeconds: 4, savingsBytes: 100, processed: 10, originalBytes: 250 },
+    { elapsedSeconds: 6, savingsBytes: 260, processed: 20, originalBytes: 500 },
+    // 覆盖率回退的采样丢掉。
+    { elapsedSeconds: 8, savingsBytes: 900, processed: 30, originalBytes: 200 },
+    { elapsedSeconds: 10, savingsBytes: 400, processed: 40, originalBytes: 1_000 },
+  ];
+  assert.deepEqual(actualCurvePoints(points, 1_000), [
+    { coverage: 0, savingsBytes: 0 },
+    { coverage: 0.25, savingsBytes: 100 },
+    { coverage: 0.5, savingsBytes: 260 },
+    { coverage: 1, savingsBytes: 400 },
+  ]);
+  // 没有候选体积时算不出覆盖率，不画实际线。
+  assert.deepEqual(actualCurvePoints(points, 0), []);
+  assert.deepEqual(actualCurvePoints([], 1_000), []);
+});
+
+test("actualAtCoverage 只在走到该覆盖率后给值", () => {
+  const points = actualCurvePoints(
+    [
+      { elapsedSeconds: 2, savingsBytes: 120, processed: 5, originalBytes: 200 },
+      { elapsedSeconds: 4, savingsBytes: 300, processed: 12, originalBytes: 600 },
+    ],
+    1_000,
+  );
+  // 里程碑取值用「已经走过的最后一个采样」，不外插。
+  assert.equal(actualAtCoverage(points, 0.2), 120);
+  assert.equal(actualAtCoverage(points, 0.5), 120);
+  assert.equal(actualAtCoverage(points, 0.6), 300);
+  assert.equal(actualAtCoverage(points, 0.9), null);
+  assert.equal(actualAtCoverage([], 0.2), null);
+});
+
+test("curveAt 在里程碑之间线性插值", () => {
+  const curve = [
+    { coverage: 0, savingsBytes: 0, elapsedSeconds: 0 },
+    { coverage: 0.4, savingsBytes: 400, elapsedSeconds: 40 },
+    { coverage: 1, savingsBytes: 1_000, elapsedSeconds: 100 },
+  ];
+  assert.equal(curveAt(curve, 0.2).savingsBytes, 200);
+  assert.equal(curveAt(curve, 0.4).savingsBytes, 400);
+  // 超出末点就停在末点，不外插。
+  assert.equal(curveAt(curve, 1.5).savingsBytes, 1_000);
+  assert.deepEqual(curveAt([], 0.3), {
+    coverage: 0.3,
+    savingsBytes: 0,
+    elapsedSeconds: 0,
+  });
+});
+
+test("前期收益偏小时给一句话预告", () => {
+  const earlyHeavy = [
+    { coverage: 0, savingsBytes: 0, elapsedSeconds: 0 },
+    { coverage: 0.2, savingsBytes: 100, elapsedSeconds: 20 },
+    { coverage: 1, savingsBytes: 1_000, elapsedSeconds: 100 },
+  ];
+  // 前 20% 只有 10% 收益（份额的一半）算正常，不提示。
+  assert.equal(earlySavingsHint(earlyHeavy, 1_000), null);
+
+  const backHeavy = [
+    { coverage: 0, savingsBytes: 0, elapsedSeconds: 0 },
+    { coverage: 0.2, savingsBytes: 40, elapsedSeconds: 20 },
+    { coverage: 1, savingsBytes: 1_000, elapsedSeconds: 100 },
+  ];
+  const hint = earlySavingsHint(backHeavy, 1_000);
+  assert.ok(hint && hint.includes("4%"), `{hint}`);
+
+  const noneEarly = [
+    { coverage: 0, savingsBytes: 0, elapsedSeconds: 0 },
+    { coverage: 0.2, savingsBytes: 0, elapsedSeconds: 20 },
+    { coverage: 1, savingsBytes: 1_000, elapsedSeconds: 100 },
+  ];
+  assert.ok(earlySavingsHint(noneEarly, 1_000)?.includes("没有可压缩的空间"));
+
+  // 只有一个点、或者总收益为 0 时不提示。
+  assert.equal(earlySavingsHint([{ coverage: 0, savingsBytes: 0, elapsedSeconds: 0 }], 1_000), null);
+  assert.equal(earlySavingsHint(backHeavy, 0), null);
 });

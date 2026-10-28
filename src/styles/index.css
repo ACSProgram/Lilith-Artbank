@@ -2896,14 +2896,12 @@ textarea:focus-visible {
   padding-top: 10px;
 }
 
-.folder-stat-rows,
 .folder-stat-tag-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.folder-stat-row,
 .folder-stat-tag {
   display: grid;
   grid-template-columns: 52px minmax(0, 1fr) auto;
@@ -2938,6 +2936,83 @@ textarea:focus-visible {
   color: var(--text-faint);
   font-size: 9.5px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 类型与评分：环图 96 px + 两列图例，正好放进 296 px 的详情面板。 */
+.folder-stat-donut {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.folder-stat-donut svg {
+  width: 96px;
+  height: 96px;
+  flex: none;
+}
+
+.folder-stat-donut-track {
+  fill: none;
+  stroke: var(--border-strong);
+}
+
+.folder-stat-donut-arc {
+  fill: none;
+}
+
+.folder-stat-donut-value {
+  fill: var(--text);
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.folder-stat-donut-name {
+  fill: var(--text-faint);
+  font-size: 9px;
+}
+
+.folder-stat-donut-legend {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
+  gap: 5px 8px;
+  align-content: center;
+  min-width: 0;
+}
+
+.folder-stat-donut-item {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr);
+  align-items: center;
+  gap: 1px 5px;
+  min-width: 0;
+}
+
+.folder-stat-donut-item i {
+  grid-row: span 2;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.folder-stat-donut-item span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-stat-donut-item em {
+  grid-column: 2;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -5591,6 +5666,10 @@ body.is-drag-sorting * {
   color: var(--success);
 }
 
+.task-phase-cancelling {
+  color: var(--warning);
+}
+
 .task-progress {
   height: 6px;
   overflow: hidden;
@@ -5604,6 +5683,15 @@ body.is-drag-sorting * {
   border-radius: inherit;
   background: var(--accent-fill);
   transition: width 160ms ease;
+}
+
+/* 取消中：进度不再推进，用静态斜纹表示“在等收尾”，不做无限动画。 */
+.task-progress.is-cancelling > span {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--warning) 0 4px,
+    transparent 4px 8px
+  );
 }
 
 .task-row-meta,
@@ -5622,6 +5710,12 @@ body.is-drag-sorting * {
   font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.task-row-note {
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.4;
 }
 
 .task-row-actions {
@@ -6176,8 +6270,20 @@ body.is-drag-sorting * {
   stroke: var(--border-strong);
 }
 
-.optimize-donut-arc {
+.optimize-donut-arc.is-process {
   stroke: var(--accent);
+}
+
+.optimize-donut-arc.is-skip {
+  stroke: var(--border-strong);
+}
+
+.optimize-donut-arc.is-fail {
+  stroke: var(--danger);
+}
+
+.optimize-donut-arc.is-pending {
+  stroke: var(--border);
 }
 
 .optimize-donut-value {
@@ -6201,6 +6307,11 @@ body.is-drag-sorting * {
   font-size: 10.5px;
 }
 
+/* 执行中的实际计数没有逐段体积，图例只留张数一列。 */
+.optimize-legend.is-compact {
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+}
+
 .optimize-legend i {
   width: 9px;
   height: 9px;
@@ -6213,6 +6324,14 @@ body.is-drag-sorting * {
 
 .optimize-legend i.is-skip {
   background: var(--border-strong);
+}
+
+.optimize-legend i.is-fail {
+  background: var(--danger);
+}
+
+.optimize-legend i.is-pending {
+  background: var(--border);
 }
 
 .optimize-legend i.is-sub {
@@ -6321,16 +6440,24 @@ body.is-drag-sorting * {
   white-space: nowrap;
 }
 
+/* 执行中在数值后面跟一句“预计 …”，弱化到不抢数值。 */
+.optimize-outcome-row strong em {
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-style: normal;
+  font-weight: 400;
+}
+
 .optimize-curve {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-/* 左：曲线；右：里程碑表，耗时写在曲线旁边。 */
+/* 左：曲线；右：里程碑表，耗时与实际写在曲线旁边。 */
 .optimize-curve-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 176px;
+  grid-template-columns: minmax(0, 1fr) 208px;
   gap: 10px;
   align-items: start;
 }
@@ -6339,6 +6466,18 @@ body.is-drag-sorting * {
   display: block;
   width: 100%;
   height: auto;
+}
+
+/* 前期收益偏小的一句话预告：跟曲线一起看，做成浅黄提示块，别让人滑过去。 */
+.optimize-curve-hint {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--warning-border);
+  border-radius: 7px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.55;
 }
 
 .optimize-chart-grid {
@@ -6384,82 +6523,18 @@ body.is-drag-sorting * {
   gap: 8px;
 }
 
-.optimize-compare-hint {
+/* 取消中：说明在等什么，不当成错误。 */
+.optimize-cancel-note {
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+/* 完成后的实际 / 预计对照，一行写完。 */
+.optimize-compare-line {
   color: var(--text-muted);
   font-size: 10.5px;
-}
-
-.optimize-compare {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 10.5px;
-}
-
-.optimize-compare th,
-.optimize-compare td {
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--border);
-  text-align: right;
-}
-
-.optimize-compare th:first-child,
-.optimize-compare td:first-child {
-  text-align: left;
-  color: var(--text-muted);
-}
-
-.optimize-compare thead th {
-  color: var(--text-faint);
-  font-weight: 600;
-}
-
-.optimize-estimate-details {
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--panel);
-}
-
-.optimize-estimate-details > summary {
-  padding: 8px 10px;
-  cursor: pointer;
-  color: var(--text-muted);
-  font-size: 10.5px;
-}
-
-.optimize-estimate-details > .optimize-result {
-  padding: 0 10px 10px;
-}
-
-.optimize-runtime-curve,
-.optimize-progress-chart {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.optimize-progress-legend {
-  display: flex;
-  gap: 14px;
-  color: var(--text-muted);
-  font-size: 10.5px;
-}
-
-.optimize-progress-legend span::before {
-  content: "";
-  display: inline-block;
-  width: 14px;
-  height: 2px;
-  margin-right: 6px;
-  vertical-align: middle;
-  background: var(--accent);
-}
-
-.optimize-progress-legend .is-actual::before {
-  background: var(--success);
-}
-
-.optimize-progress-legend .is-estimate::before {
-  background: var(--text-faint);
+  line-height: 1.5;
 }
 
 .optimize-curve-side {
@@ -6475,7 +6550,7 @@ body.is-drag-sorting * {
 
 .optimize-curve-row {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 32px minmax(0, 1fr) auto auto;
   gap: 6px;
   align-items: baseline;
 }

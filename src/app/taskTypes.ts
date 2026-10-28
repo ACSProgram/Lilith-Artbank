@@ -24,6 +24,7 @@ export type TaskPhase =
   | "queued"
   | "preparing"
   | "running"
+  | "cancelling"
   | "completed"
   | "cancelled"
   | "failed";
@@ -228,10 +229,14 @@ export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
   queued: "排队中",
   preparing: "准备中",
   running: "进行中",
+  cancelling: "取消中",
   completed: "已完成",
   cancelled: "已取消",
   failed: "失败",
 };
+
+/** 取消中要等当前批次收尾；取消不回退已经做完的部分。 */
+export const CANCEL_PENDING_NOTE = "等当前批次提交完成，已执行的部分不会撤销。";
 
 export function isTaskActive(task: TaskSnapshot): boolean {
   return task.phase !== "completed" && task.phase !== "cancelled" && task.phase !== "failed";

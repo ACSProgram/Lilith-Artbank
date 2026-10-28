@@ -8,6 +8,7 @@
  * - 强调：--accent（文字/描边）/ --accent-fill（带白字的实心块）/ --accent-strong /
  *   --accent-hover / --accent-soft / --accent-border
  * - 状态：--danger / --success / --warning；实心块用 --danger-fill，另带 -soft / -border
+ * - 分类：--chart-1…--chart-6（环图分段，第六色给「未评分」）/ --chart-other（合并出来的“其他”，灰段）
  * - 叠加：--scrim / --scrim-strong / --scrim-soft（盖在图片或内容上的半透明层）
  * - 画布：--canvas（查看器背景）/ --checker（棋盘格）/ --thumb-*（缩略图占位）
  * - 阴影：--shadow-sm（小徽标）/ --shadow-md（浮起的提示）/ --shadow-lg（对话框、弹层）
@@ -57,6 +58,16 @@
   --scrim: rgba(18, 22, 19, 0.42);
   --scrim-strong: rgba(20, 28, 22, 0.62);
   --scrim-soft: rgba(10, 14, 11, 0.5);
+
+  /* 分类色只用于概览环图：同亮度、低彩度的一族，避免和金/紫抢眼。 */
+  --chart-1: #2f7d5c;
+  --chart-2: #47799f;
+  --chart-3: #a9853d;
+  --chart-4: #77689e;
+  --chart-5: #a9675a;
+  /* 第六色专给「未评分」：暖中性，不与分类色抢位置。 */
+  --chart-6: #b9bdb0;
+  --chart-other: #cdd3cd;
 
   --selection-bg: rgba(31, 114, 83, 0.2);
   --scrollbar-thumb: #c9cfc9;
@@ -129,6 +140,14 @@ html[data-theme="dark"] {
   --scrim: rgba(0, 0, 0, 0.6);
   --scrim-strong: rgba(0, 0, 0, 0.72);
   --scrim-soft: rgba(0, 0, 0, 0.55);
+
+  --chart-1: #56b58c;
+  --chart-2: #7aabcc;
+  --chart-3: #d6b26e;
+  --chart-4: #ab9bd0;
+  --chart-5: #d4887a;
+  --chart-6: #6f7669;
+  --chart-other: #464d47;
 
   --selection-bg: rgba(84, 190, 148, 0.28);
   --scrollbar-thumb: #3b433c;

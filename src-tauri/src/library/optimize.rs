@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Instant,
@@ -52,6 +52,8 @@ use crate::{
 /// 256 张是双缓冲下的默认切分；字节上限避免少量超大图撑爆一批的内存峰值。
 pub(crate) const BATCH_SIZE: usize = 256;
 const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// 批内每编码这么多张更新一次 message；256 张一批时分 16 次，5 张/秒也约 3 秒一跳。
+const MESSAGE_STEP: usize = 16;
 /// 连续失败达到这个数就停止，避免磁盘或解码器故障时把整库刷成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const MAX_REPORTED_FAILURES: usize = 50;
@@ -479,22 +481,31 @@ fn batch_slices(jobs: &[CandidateRow], max_count: usize, max_bytes: u64) -> Vec<
     slices
 }
 
-/// 已经有结论的张数：已提交、跳过、失败与缺失都算解决，用于写入阶段 90–98。
+/// 候选内已经有结论的张数：已提交、跳过、失败与缺失都算解决，用于写入阶段 90–98。
+///
+/// 不含执行前就被排除的图片：那部分不进候选池，也不该推进进度。
 fn settled_count(report: &OptimizeReport) -> usize {
-    (report.prefilter_skipped
-        + report.processed
+    (report.processed
         + report.candidate_skipped
         + report.duplicate_skipped
         + report.source_missing
         + report.failed) as usize
 }
 
-/// 累计跳过张数；原图缺失也计入跳过，与最终报告口径一致。
+/// 全部跳过张数（含执行前排除的图片）；原图缺失也计入，用于最终报告。
 fn skipped_count(report: &OptimizeReport) -> usize {
     (report.prefilter_skipped
         + report.candidate_skipped
         + report.duplicate_skipped
         + report.source_missing) as usize
+}
+
+/// 报给进度用的跳过数：只算候选池内的跳过，不含执行前被排除的图片。
+///
+/// 执行前就拦下的那些（已处理过、bpp 太低、超出 WebP 尺寸）在估算里单独列出，
+/// 它们不需要任何工作；算进“已跳过”会让进度条开局就冲到六成，之后半天不动。
+fn progress_skipped_count(report: &OptimizeReport) -> usize {
+    (report.candidate_skipped + report.duplicate_skipped + report.source_missing) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -527,18 +538,18 @@ pub(crate) fn optimize_with_batch_size(
     jobs.sort_by(|left, right| right.bpp().total_cmp(&left.bpp()));
 
     let total = jobs.len();
-    let total_all = report.prefilter_skipped as usize + total;
-    let total_units = jobs
-        .iter()
-        .map(|row| row.pixels().max(1))
-        .sum::<u64>()
-        .max(1);
+    // 进度按张计，且只在候选池里算：
+    // - 按像素计权会被 bpp 降序抵消——排在前面的都是「像素少、细节高」的小图，
+    //   前几千张推不动进度条；按张计与 embedding 同口径，速度与 ETA 也一起对齐。
+    // - 执行前被排除的图片（已处理过、bpp 太低、超出 WebP 尺寸）不需要任何工作，
+    //   算进分母会让进度条开局就六成；它们在估算视图的「未纳入候选」里单独列出。
+    let total_units = total.max(1) as u64;
     if let Some(meter) = reporter.meter() {
         meter.set_total_units(total_units);
         meter.enter_phase(0, 90);
     }
-    reporter.report(0, total_all);
-    reporter.skipped_count(report.prefilter_skipped as usize);
+    reporter.report(0, total);
+    reporter.skipped_count(0);
 
     let report = Arc::new(Mutex::new(report));
     let encoding_done = Arc::new(AtomicBool::new(false));
@@ -587,7 +598,7 @@ pub(crate) fn optimize_with_batch_size(
                         before,
                         settled_count(&report),
                         report.failed as usize,
-                        skipped_count(&report),
+                        progress_skipped_count(&report),
                         report.old_bytes,
                         report.old_bytes.saturating_sub(report.new_bytes),
                     )
@@ -598,13 +609,13 @@ pub(crate) fn optimize_with_batch_size(
                 commit_batches.fetch_add(1, Ordering::Relaxed);
                 // 已完成只统计真正入库的图片；批次内逐张上报，进度不按批跳跃。
                 for step in 1..=published {
-                    reporter.report(processed_before + step, total_all);
+                    reporter.report(processed_before + step, total);
                 }
                 // 编码阶段结束后才进入 90–98 的写入段，避免提交先行把进度条推到 90。
                 if commit_done.load(Ordering::Relaxed)
                     && let Some(meter) = reporter.meter()
                 {
-                    meter.set_percent((90 + settled * 8 / total_all.max(1)) as u8);
+                    meter.set_percent((90 + settled * 8 / total.max(1)) as u8);
                 }
                 // 提交已持久化，才允许删旧图；删除不持数据库写锁，失败只记日志。
                 let mut report = commit_report.lock();
@@ -624,7 +635,13 @@ pub(crate) fn optimize_with_batch_size(
             if reporter.cancelled() || stopped.load(Ordering::Relaxed) {
                 break;
             }
-            reporter.message("正在编码…");
+            reporter.message(&format!(
+                "正在编码… 第 {} 批 0/{}",
+                batch_index + 1,
+                batch.len()
+            ));
+            // 已提交张数只在批次结束时跳一次；批内计数走 message，让界面持续有变化。
+            let encoded = AtomicUsize::new(0);
             let results = pool.install(|| {
                 batch
                     .par_iter()
@@ -645,7 +662,15 @@ pub(crate) fn optimize_with_batch_size(
                         let result = encode_one(&paths, row, options);
                         drop(permit);
                         if let Some(meter) = reporter.meter() {
-                            meter.advance_units(row.pixels().max(1));
+                            meter.advance_units(1);
+                        }
+                        let step = encoded.fetch_add(1, Ordering::Relaxed) + 1;
+                        if step.is_multiple_of(MESSAGE_STEP) || step == batch.len() {
+                            reporter.message(&format!(
+                                "正在编码… 第 {} 批 {step}/{}",
+                                batch_index + 1,
+                                batch.len()
+                            ));
                         }
                         result.map(Some)
                     })
@@ -703,7 +728,7 @@ pub(crate) fn optimize_with_batch_size(
                         }
                     }
                 }
-                (report.failed as usize, skipped_count(&report))
+                (report.failed as usize, progress_skipped_count(&report))
             };
             reporter.failed_count(failed_now);
             reporter.skipped_count(skipped_now);
@@ -727,7 +752,7 @@ pub(crate) fn optimize_with_batch_size(
             encoding_done.store(true, Ordering::Relaxed);
             if let Some(meter) = reporter.meter() {
                 let settled = settled_count(&report.lock());
-                meter.set_percent((90 + settled * 8 / total_all.max(1)) as u8);
+                meter.set_percent((90 + settled * 8 / total.max(1)) as u8);
             }
         }
         drop(sender);
@@ -746,7 +771,8 @@ pub(crate) fn optimize_with_batch_size(
     // 收尾再对一次，保证取消/失败时面板与最终报告一致。
     reporter.bytes(report.old_bytes, report.savings_bytes);
     reporter.failed_count(report.failed as usize);
-    reporter.skipped_count(report.skipped as usize);
+    // 最终报告里的 skipped 含执行前被排除的图片，进度只认候选池内的跳过。
+    reporter.skipped_count(progress_skipped_count(&report));
     reporter.current(None, None);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     if let Some(meter) = reporter.meter()
@@ -1279,15 +1305,27 @@ mod tests {
     #[derive(Default)]
     struct CountingReporter {
         calls: AtomicUsize,
+        total: AtomicUsize,
+        skipped: AtomicUsize,
+        meter: crate::concurrency::meter::WorkMeter,
     }
 
     impl crate::library::BatchReporter for CountingReporter {
-        fn report(&self, _completed: usize, _total: usize) {
+        fn report(&self, _completed: usize, total: usize) {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.total.store(total, Ordering::Relaxed);
         }
 
         fn cancelled(&self) -> bool {
             false
+        }
+
+        fn meter(&self) -> Option<&crate::concurrency::meter::WorkMeter> {
+            Some(&self.meter)
+        }
+
+        fn skipped_count(&self, skipped: usize) {
+            self.skipped.store(skipped, Ordering::Relaxed);
         }
     }
 
@@ -1560,7 +1598,7 @@ mod tests {
         .unwrap();
         let candidates = collect_candidates(&fixture.session.db, &ids).unwrap();
         let reporter = CountingReporter::default();
-        optimize(
+        let report = optimize(
             &fixture.session.db,
             &fixture.root,
             &fixture.session.thumbs,
@@ -1578,6 +1616,17 @@ mod tests {
             reporter.calls.load(Ordering::Relaxed),
             candidates.len() + 1,
             "进度没有按张上报"
+        );
+        // 进度分母是候选张数，不是像素总量；每张推进一格，跑完正好等于分母。
+        let jobs = candidates.len() - report.prefilter_skipped as usize;
+        assert_eq!(reporter.meter.total_units(), jobs as u64);
+        assert_eq!(reporter.meter.done_units(), jobs as u64);
+        // 任务快照的分母同样是候选池：执行前被排除的图片不进进度，否则开局就六成。
+        assert_eq!(reporter.total.load(Ordering::Relaxed), jobs);
+        assert_eq!(
+            reporter.skipped.load(Ordering::Relaxed),
+            report.skipped as usize - report.prefilter_skipped as usize,
+            "任务里报的跳过数不该包含执行前被排除的图片"
         );
     }
 

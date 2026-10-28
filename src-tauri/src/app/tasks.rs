@@ -133,6 +133,8 @@ pub enum TaskPhase {
     Queued,
     Preparing,
     Running,
+    /// 已收到取消请求，正在等当前批次收尾；不是终态。
+    Cancelling,
     Completed,
     Cancelled,
     Failed,
@@ -280,6 +282,8 @@ impl TaskHandle {
     pub fn request_cancel(&self) {
         if self.is_cancellable() {
             self.cancel.store(true, Ordering::SeqCst);
+            // 只做显示：任务体还要等当前批次提交完才会落到 `Cancelled`。
+            self.set_phase(TaskPhase::Cancelling);
         }
     }
 
@@ -1332,6 +1336,26 @@ mod tests {
         bus.cancel("u1").unwrap();
         assert!(handle.should_cancel());
         assert!(handle.snapshot().cancellable);
+    }
+
+    #[test]
+    fn cancel_request_marks_phase_cancelling_until_terminal() {
+        let handle = TaskHandle::new("c1", TaskKind::Thumbnail, "选中 3 张");
+        handle.set_phase(TaskPhase::Running);
+        handle.request_cancel();
+        assert!(handle.should_cancel());
+        assert_eq!(handle.phase(), TaskPhase::Cancelling);
+        // 取消中不是终态：任务仍在跑，前端要继续轮询进度。
+        assert!(!TaskPhase::Cancelling.is_terminal());
+        assert!(handle.is_running());
+
+        handle.finish(TaskPhase::Cancelled);
+        handle.request_cancel();
+        assert_eq!(
+            handle.phase(),
+            TaskPhase::Cancelled,
+            "终态之后相位不应再被改写"
+        );
     }
 
     #[test]
