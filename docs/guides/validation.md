@@ -85,7 +85,7 @@ npm run tauri dev
 # 确认进度、取消、失败清单；搜索框切到“语义”输入英文短语并 Enter，首次搜索应提示正在加载文本模型
 # 查看器无 pose 时点击“生成姿势骨架”
 # 右键图片“设为相似参考” → 工具栏“相似”打开面板 → 查找相似 → 点击结果条里的比较图文件名打开查看器
-# 描述本轮未实现：批量任务里的描述项应置灰
+# 描述未实现：批量任务里的描述项应置灰
 ```
 
 MCP 真实客户端：
@@ -181,10 +181,10 @@ cargo build --manifest-path src-tauri/Cargo.toml
 python tools/perf/pe_imports.py src-tauri/target/debug/lilith-artbank.exe
 ```
 
-脚本列出 PE 的 import 与 delay-import DLL。当前只包含系统 DLL，没有 `WebView2Loader.dll`、`vcruntime140.dll` 或 `webp.dll`；release 产物的最终核对留在 S9。
+脚本列出 PE 的 import 与 delay-import DLL。当前只包含系统 DLL，没有 `WebView2Loader.dll`、`vcruntime140.dll` 或 `webp.dll`；release 产物的最终核对还没做。
 
 ## 收尾
 
-- 未完成与待验收事项写 `docs/planning/todo.md`；当前能力与基线写 `docs/planning/current-handoff.md`；后续阶段写 `docs/planning/roadmap.md`。
-- 批次记录与通过验收的计划移入 `docs/planning/archive/`。不要把“计划实现”写成“已验收”。
+- 未完成与待验收事项写 `docs/planning/todo.md`（唯一未完成清单）；当前能力与基线写 `docs/planning/current-handoff.md`。
+- 批次记录与结束的计划移入 `docs/planning/archive/`，并更新其 README 索引；不新建阶段计划文件。不要把“计划实现”写成“已验收”。
 - 性能门槛以[性能基准](performance.md)为准；未达门槛先解决，再继续堆功能。

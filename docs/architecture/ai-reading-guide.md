@@ -16,7 +16,7 @@
 | 清理、缩略图重建、描述导入导出、图片空间优化（估算与执行） | `docs/modules/maintenance.md`（图片空间优化） | `src-tauri/src/` 对应领域模块；空间优化在 `imageops/optimize.rs`、`library/optimize_estimate.rs`、`library/optimize.rs`、`src/app/OptimizeDialog.tsx` |
 | 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
 | 日志等级、行格式、命令记录、轮换 | `docs/guides/logging.md` | `src-tauri/src/app/trace.rs`、`src-tauri/src/lib.rs` |
-| 当前阶段/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |
+| 当前状态/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |
 
 ## 读序
 
@@ -37,8 +37,8 @@
 - MCP 只做适配：工具在 `src-tauri/src/mcp/`，拼图像素在 `imageops/contact_sheet.rs`；不复制 `library/`、`ai/` 的逻辑，也不另起图库写进程。
 - 任何全量载入/全量扫描方案先对照 `docs/guides/performance.md`。
 - 真实仓库 `G:\Lilith Image Library` 只读；测试用临时目录。
-- 不做 PinBoard/PasteBoard/调色盘/色彩测试/截屏，不建版本/CHANGELOG/法务文件。
+- 不建版本号/CHANGELOG/法务文件。
 
 ## 变更规则
 
-入口或契约变化时更新 `docs/architecture/` 或 `docs/modules/` 的对应段落；未完成工作写 `todo.md`，当前批次状态写 `current-handoff.md`。不再有效的计划移入 `planning/archive/`。
+入口或契约变化时更新 `docs/architecture/` 或 `docs/modules/` 的对应段落；未完成工作写 `todo.md`，当前能力与基线写 `current-handoff.md`。不再有效的计划与批次记录移入 `planning/archive/`，不新建阶段计划文件。

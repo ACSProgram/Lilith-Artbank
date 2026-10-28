@@ -53,7 +53,7 @@ Python 环境与模型文件不打包、不下载；`server/` 代码随便携包
   - 503 服务忙/模型加载中。
 - 超时：embedding 60s，pose 60s，description 300s，`/v1/models/ensure` 600s；连接超时 5s。
 - 重试：网络错误与 5xx 最多 2 次（250ms、1s 退避）；4xx 不重试。
-- 并发：S6 客户端固定串行（1 个在途推理）；模型通常串行，先保证进度、取消与失败清单正确，后续需要时再加并发设置。
+- 并发：客户端固定串行（1 个在途推理）；模型通常串行，先保证进度、取消与失败清单正确，需要时再加并发设置。
 - 请求体上限：建议 64 MiB；description 输入应使用降采样预览而不是 100MP 原图。
 
 ## 能力
@@ -86,7 +86,7 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
 - 未加载的模型 `ready=false`；应用可调用 `/v1/models/ensure` 再试。
 - CLIP 能力在未加载时仍必须返回 `model` 与 `dim`，语义搜索据此校验向量，不必为了拿维度去加载图片塔。
 - 图片塔与文本塔同一时间最多一个 `ready=true`；空闲卸载后两个都为 false。
-- 没有该能力时整个字段可省略。本轮服务端不提供 `description`，`/v1/describe` 返回 404；没有可读的 CLIP 模型目录时，两个 CLIP 能力也整体缺省，此时客户端报“没有图像 embedding 能力”。
+- 没有该能力时整个字段可省略。服务端不提供 `description`，`/v1/describe` 返回 404；没有可读的 CLIP 模型目录时，两个 CLIP 能力也整体缺省，此时客户端报“没有图像 embedding 能力”。
 
 ### POST /v1/models/ensure
 
@@ -178,7 +178,7 @@ Content-Type: application/octet-stream
 
 - 同步返回；长任务由客户端队列控制并发。
 - 服务端可对图片做内部缩放，但输入已由客户端尽量控制在 1536px 以内。
-- 本轮服务端不实现描述，`/v1/describe` 返回 404；批量任务里的描述项置灰。
+- 服务端不实现描述，`/v1/describe` 返回 404；批量任务里的描述项置灰。
 
 ## 应用侧任务
 
@@ -186,7 +186,7 @@ Content-Type: application/octet-stream
 
 - `embedding`：为选中/当前视图/全库缺失的图片生成 image embedding。
 - `pose`：为选中/当前视图/全库缺失的图片生成 pose。
-- `description`：为选中/当前视图/描述为空的图片生成描述；默认只填空，可选覆盖。本轮服务端没有描述模型，界面置灰。
+- `description`：为选中/当前视图/描述为空的图片生成描述；默认只填空，可选覆盖。服务端没有描述模型，界面置灰。
 - `textSearch`：只做一次 text embedding，然后本地扫描。
 
 ### 队列与进度
@@ -230,7 +230,7 @@ Content-Type: application/octet-stream
 - `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；解码失败返回 422。
 - 运行环境为 Python 3.11 + torch 2.5.1+cu121 + transformers 4.57.6 + mediapipe 0.10.14，依赖已在 `python_embeded` 内，不做运行时下载。
 - 日志写 `logs/ai-server.log`；只记录启动参数、模型加载/卸载、耗时与错误，不记录图片内容或向量。
-- 描述能力本轮未实现；`/v1/describe` 返回 404，批量任务里的描述项置灰。
+- 描述能力未实现；`/v1/describe` 返回 404，批量任务里的描述项置灰。
 
 ## 本地检索
 
@@ -245,7 +245,7 @@ Content-Type: application/octet-stream
 - **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做加权 k-means（初始质心按权重最高、随后每次取最远点，不用随机种子），保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
 - **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
 - **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。
-- **姿势相似**：按原程序 `MediaPipePoseData::similarity` 1:1 移植（`ai/pose_similarity.rs`），33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。原实现源码见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md` 的记录路径。
+- **姿势相似**：`ai/pose_similarity.rs`，33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。移植自旧程序 `MediaPipePoseData::similarity`，现在按本仓库自己的算法维护，权重与索引可以为精度或性能调整（`pose_similarity.rs` 的 golden 值测试要随改动一起更新）。移植来历见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md`。
 - **全库相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。
 - **扫描实现**：feature pack mmap + rayon 分块顺序扫描，收集分数后用部分选择取 top-K（不整体排序）。不把 30 万-50 万条向量读进堆，也不逐条查 SQLite。20 万条 1536 维的查询预算由本机基准记录在 `docs/guides/performance.md`。
 - **结果缓存**：语义搜索与找相似共用**一个**结果槽（token + 图库代次 + 图库 id），后一次查询覆盖前一次；`get_similarity_page` / `get_similarity_ids` 代次不符时报“相似结果已失效，请重新搜索”。切换图库、编辑、回收站操作、AI 任务结束都会清空它。
@@ -294,7 +294,7 @@ Content-Type: application/octet-stream
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
-- `src-tauri/src/ai/pose_similarity.rs`：原程序姿势相似度 1:1 移植，附 golden 值测试。
+- `src-tauri/src/ai/pose_similarity.rs`：姿势相似度与 golden 值测试。
 - `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、全库 pHash 分组。
 - `src-tauri/src/ai/job.rs`：批量任务、待处理过滤（与预览共用 `PendingFilter`）、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
@@ -315,7 +315,7 @@ Content-Type: application/octet-stream
 - 图片塔与文本塔同一时间只驻留一个；切换任务类型需要重新加载（tokenizer 0.9 s + 首次 forward 2.4 s），最后一次使用后空闲 5 分钟自动卸载。塔未加载时 `/v1/embed/*` 返回 503，下一次任务开始前的 ensure 会重新加载。
 - 依赖预热让被托管的服务进程常驻约 420 MB；只有整场会话完全不用 AI 时才是净浪费，可在设置里关掉。
 - 语义搜索依赖 health 在 `ready=false` 时仍返回图片模型名与维度；外部服务实现必须遵守这一点。
-- 描述能力本轮未实现；批量任务中的描述项按缺少能力置灰。
+- 描述能力未实现；批量任务中的描述项按缺少能力置灰。
 - 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。
 - 便携包只包含 exe、`server/` 与资源清单，不包含 `python_embeded/`、`resources/models/`；不生成 NSIS 安装器。
 - 真实服务、真实模型与 WebView2 界面待用户手工验收，清单见[待办](../planning/todo.md)。

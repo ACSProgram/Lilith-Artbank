@@ -96,6 +96,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 文档按读者分层，完整索引见 [docs/README.md](docs/README.md)。
 
-- 想了解怎么用：本文件的功能介绍 + [当前阶段状态](docs/planning/current-handoff.md)（现在有哪些能力、规模基线）。
+- 想了解怎么用：本文件的功能介绍 + [当前状态](docs/planning/current-handoff.md)（现在有哪些能力、规模基线）。
 - 要改代码：先看 [AI 阅读引导](docs/architecture/ai-reading-guide.md) 选路由，再进[系统架构](docs/architecture/overview.md)或对应[模块文档](docs/README.md)。
-- 要知道还差什么：[待办与待决策](docs/planning/todo.md) 是唯一的未完成清单，[路线图](docs/planning/roadmap.md) 写剩余阶段。
+- 要知道还差什么：[待办与待决策](docs/planning/todo.md) 是唯一的未完成清单，含待验收项与待决策项。
