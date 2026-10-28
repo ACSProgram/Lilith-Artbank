@@ -19,6 +19,7 @@ import {
   cropToOriginal,
   formatBytes,
   formatDimensions,
+  gifStaticPreview,
   normalizeResize,
   outputSize,
   resizeFromHeight,
@@ -204,7 +205,11 @@ export function ViewerTools({
             图片超过 {(source.maxEditPixels / 1_000_000).toLocaleString()} 百万像素，仅支持查看。
           </p>
         ) : null}
-        {source.downsampled ? (
+        {gifStaticPreview(source) ? (
+          <p className="viewer-tool-note">
+            已生成静态预览，动画不可用；保存仍读取原图。
+          </p>
+        ) : source.downsampled ? (
           <p className="viewer-tool-note">
             大图按最长边 4096 像素预览；保存仍读取原图。
           </p>

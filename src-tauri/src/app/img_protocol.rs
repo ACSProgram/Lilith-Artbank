@@ -64,7 +64,8 @@ fn route(app: &AppHandle<Wry>, path: &str) -> Result<Response<Vec<u8>>, ImageErr
             .parse::<i64>()
             .map_err(|_| ImageError::BadRequest("图片 id 无效"))?;
         let row = load_row(&database, image_id)?;
-        let target = viewer::preview_path(&paths, image_id, &row.content_hash);
+        let target = viewer::ensure_preview_file(&paths, &row)
+            .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
         let bytes = std::fs::read(&target)
             .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
         return Ok(image_response(

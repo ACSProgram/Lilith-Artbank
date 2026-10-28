@@ -261,6 +261,11 @@ export function extensionLabel(extension: string): string {
   return extension.toUpperCase();
 }
 
+/** 以导入时按魔数识别的 format 为准，不用可能被改名的扩展名判断。 */
+export function isGifImage(image: Pick<ImageRow, "format">): boolean {
+  return image.format.toLowerCase() === "gif";
+}
+
 export interface TagFilterRequest {
   tagId: number;
   action: TagFilterAction;

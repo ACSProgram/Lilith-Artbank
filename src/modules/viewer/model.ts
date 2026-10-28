@@ -268,13 +268,14 @@ export function normalizeResize(
   return resize.width === base.width && resize.height === base.height ? null : resize;
 }
 
-export function fitZoom(
-  source: ViewerSource,
+export function fitZoomForSize(
+  width: number,
+  height: number,
   rotate: number,
   viewportWidth: number,
   viewportHeight: number,
 ): number {
-  const size = transformedSize(source.displayWidth, source.displayHeight, rotate);
+  const size = transformedSize(width, height, rotate);
   if (size.width <= 0 || size.height <= 0 || viewportWidth <= 0 || viewportHeight <= 0) {
     return 1;
   }
@@ -287,6 +288,39 @@ export function fitZoom(
     0.02,
     1,
   );
+}
+
+/** 占位阶段直接传会话项的宽高，不依赖 `ViewerSource`。 */
+export function fitZoom(
+  source: ViewerSource,
+  rotate: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): number {
+  return fitZoomForSize(
+    source.displayWidth,
+    source.displayHeight,
+    rotate,
+    viewportWidth,
+    viewportHeight,
+  );
+}
+
+/** GIF 走 Rust 静态预览时，动画不可用。 */
+export function gifStaticPreview(
+  source: Pick<ViewerSource, "format" | "preview"> | null | undefined,
+): boolean {
+  return source?.format === "gif" && source.preview === true;
+}
+
+/** 占位按原图尺寸、高清按降采样尺寸时，用手动缩放保持屏幕上的实际大小。 */
+export function rescaleZoom(
+  zoom: number,
+  previousDisplayWidth: number,
+  nextDisplayWidth: number,
+): number {
+  if (previousDisplayWidth <= 0 || nextDisplayWidth <= 0) return zoom;
+  return clamp(zoom * (previousDisplayWidth / nextDisplayWidth), 0.02, 8);
 }
 
 export function rectBetween(

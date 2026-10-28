@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -26,20 +27,23 @@ import { useNotices } from "../../app/noticeContext";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import { errorMessage } from "../../shared/errors";
+import { thumbnailUrl } from "../../shared/thumbUrl";
 import type { ViewerSession, ViewerSessionItem } from "../../shared/viewerSession";
 import { viewerApi, withRetry } from "./api";
 import {
   buildEditRequest,
   clampCrop,
   cropToOriginal,
-  fitZoom,
+  fitZoomForSize,
   flipGeometry,
   formatBytes,
   formatDimensions,
+  gifStaticPreview,
   hasPixelChanges,
   initialGeometry,
   outputSize,
   rectBetween,
+  rescaleZoom,
   rotateGeometry,
   transformedSize,
   type GeometryState,
@@ -77,7 +81,21 @@ function initialPoseOpacity(): number {
   }
 }
 
-type SourceStatus = "loading" | "ready" | "error";
+type LoadState =
+  | { imageId: number; status: "loading" }
+  | { imageId: number; status: "error"; error: string }
+  | { imageId: number; status: "ready"; source: ViewerSource };
+
+interface MediaState {
+  imageId: number;
+  loaded: boolean;
+  failed: boolean;
+  thumbFailed: boolean;
+}
+
+function initialMedia(imageId: number): MediaState {
+  return { imageId, loaded: false, failed: false, thumbFailed: false };
+}
 
 function fallbackFor(
   imageId: number,
@@ -128,23 +146,39 @@ export function ImageViewer({
   const itemsRef = useRef(items);
   itemsRef.current = items;
   const history = useEditHistory();
-  const geometry = history.geometry;
   const resetHistory = history.reset;
 
   const [activeId, setActiveId] = useState(session.initialId);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
-  const [source, setSource] = useState<ViewerSource | null>(null);
-  const [sourceStatus, setSourceStatus] = useState<SourceStatus>("loading");
-  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [load, setLoad] = useState<LoadState>({
+    imageId: session.initialId,
+    status: "loading",
+  });
+  const activeLoad =
+    load.imageId === activeId
+      ? load
+      : ({ imageId: activeId, status: "loading" } as const);
+  const source = activeLoad.status === "ready" ? activeLoad.source : null;
+  const sourceError = activeLoad.status === "error" ? activeLoad.error : null;
+  const geometry = source ? history.geometry : null;
+
+  const [media, setMedia] = useState<MediaState>(() => initialMedia(session.initialId));
+  const activeMedia =
+    media.imageId === activeId ? media : initialMedia(activeId);
+  // 回调里只按 imageId 归属，不展开渲染时的 activeMedia，避免丢掉同帧之后的复位。
+  const patchMedia = (imageId: number, patch: Partial<MediaState>) => {
+    setMedia((current) => ({
+      ...(current.imageId === imageId ? current : initialMedia(imageId)),
+      ...patch,
+    }));
+  };
   const [pose, setPose] = useState<PoseData | null>(null);
   const [poseOpen, setPoseOpen] = useState(false);
   const [poseBusy, setPoseBusy] = useState(false);
   const [poseOpacity, setPoseOpacity] = useState(initialPoseOpacity);
   const [reloadToken, setReloadToken] = useState(0);
   const [retry, setRetry] = useState(0);
-  const [imageLoaded, setImageLoaded] = useState(false);
-  const [imageFailed, setImageFailed] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const [zoom, setZoom] = useState(1);
@@ -152,6 +186,7 @@ export function ImageViewer({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [dragging, setDragging] = useState(false);
+  const [slow, setSlow] = useState(false);
 
   const [cropMode, setCropMode] = useState(false);
   const [cropDraft, setCropDraft] = useState<CropRect | null>(null);
@@ -165,15 +200,29 @@ export function ImageViewer({
   const stageRef = useRef<HTMLDivElement>(null);
   const sourceRef = useRef(source);
   sourceRef.current = source;
+  const fitActiveRef = useRef(fitActive);
+  fitActiveRef.current = fitActive;
+  const showStageRef = useRef(false);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
   const panRef = useRef(pan);
   panRef.current = pan;
 
   const index = items.findIndex((item) => item.id === activeId);
+  const item = index >= 0 ? items[index] : undefined;
 
   const hasChanges = source && geometry ? hasPixelChanges(source, geometry) : false;
   const hasPose = hasVisiblePose(pose);
+  const thumbItem = item != null && !activeMedia.thumbFailed ? item : null;
+  const hasThumb = thumbItem != null;
+  const showStage =
+    (source != null || hasThumb) &&
+    activeLoad.status !== "error" &&
+    !activeMedia.failed;
+  showStageRef.current = showStage;
+  const cropping = source != null && cropMode;
+  const poseVisible = source != null && poseOpen && pose != null && hasPose;
+  const imageHasPose = source != null && hasPose;
 
   const applyHistoryGeometry = useCallback((next: GeometryState | null) => {
     if (!next) return;
@@ -196,18 +245,25 @@ export function ImageViewer({
   // 源图加载：过期请求直接丢弃；大图预览由 Rust 生成并缓存。
   useEffect(() => {
     let disposed = false;
-    setSourceStatus("loading");
-    setSourceError(null);
-    setImageLoaded(false);
-    setImageFailed(false);
+    const fromPlaceholder = sourceRef.current == null;
+    const placeholderWidth = fromPlaceholder
+      ? (itemsRef.current.find((item) => item.id === activeId)?.width ?? 0)
+      : 0;
+
+    setLoad({ imageId: activeId, status: "loading" });
+    // 只在切到另一张图时复位；同一张图的复位由重试与保存入口先行完成。
+    setMedia((current) =>
+      current.imageId === activeId ? current : initialMedia(activeId),
+    );
     setPose(null);
     setPoseOpen(false);
     setCropMode(false);
     setCropDraft(null);
     setPendingStep(0);
-    setFitActive(true);
-    setPan({ x: 0, y: 0 });
-    setSource(null);
+    setDragging(false);
+    setCropDragging(false);
+    cropStart.current = null;
+    dragRef.current = null;
     resetHistory(null);
 
     viewerApi
@@ -220,14 +276,15 @@ export function ImageViewer({
       )
       .then((next) => {
         if (disposed) return;
-        setSource(next);
+        if (!fitActiveRef.current && placeholderWidth > 0) {
+          setZoom((value) => rescaleZoom(value, placeholderWidth, next.displayWidth));
+        }
+        setLoad({ imageId: activeId, status: "ready", source: next });
         resetHistory(initialGeometry(next));
-        setSourceStatus("ready");
       })
       .catch((cause: unknown) => {
         if (disposed) return;
-        setSourceStatus("error");
-        setSourceError(errorMessage(cause));
+        setLoad({ imageId: activeId, status: "error", error: errorMessage(cause) });
       });
 
     viewerApi
@@ -264,7 +321,15 @@ export function ImageViewer({
     overlayRef.current?.focus();
   }, []);
 
-  // 视口尺寸用于“适应窗口”。
+  // 视口尺寸用于“适应窗口”。首次测量放在 layout effect，避免占位层先按 100% 画一帧。
+  useLayoutEffect(() => {
+    const element = canvasRef.current;
+    if (!element) return;
+    const width = element.clientWidth;
+    const height = element.clientHeight;
+    if (width > 0 && height > 0) setViewport({ width, height });
+  }, []);
+
   useEffect(() => {
     const element = canvasRef.current;
     if (!element) return;
@@ -276,14 +341,44 @@ export function ImageViewer({
     return () => observer.disconnect();
   }, []);
 
-  const fit = source ? fitZoom(source, geometry?.rotate ?? 0, viewport.width, viewport.height) : 1;
+  const displayWidth = source?.displayWidth ?? item?.width ?? 0;
+  const displayHeight = source?.displayHeight ?? item?.height ?? 0;
+  const rotate = source && geometry ? geometry.rotate : 0;
+  const fit = fitZoomForSize(
+    displayWidth,
+    displayHeight,
+    rotate,
+    viewport.width,
+    viewport.height,
+  );
 
-  useEffect(() => {
-    if (fitActive && source) {
+  useLayoutEffect(() => {
+    setFitActive(true);
+    setPan({ x: 0, y: 0 });
+  }, [activeId]);
+
+  useLayoutEffect(() => {
+    if (fitActive) {
       setZoom(fit);
       setPan({ x: 0, y: 0 });
     }
-  }, [fit, fitActive, source]);
+  }, [fitActive, fit]);
+
+  const waitingForSource = activeLoad.status === "loading" && hasThumb;
+  const waitingForHighRes =
+    source != null && !activeMedia.loaded && !activeMedia.failed;
+  const delayable = waitingForSource || (waitingForHighRes && hasThumb);
+
+  useEffect(() => {
+    setSlow(false);
+    if (!delayable) return;
+    const timer = window.setTimeout(() => setSlow(true), 150);
+    return () => window.clearTimeout(timer);
+  }, [delayable, activeId, retry]);
+
+  // 有缩略图时先展示占位；没有占位才立即显示小 spinner。
+  const showSmallSpinner =
+    waitingForHighRes && !hasThumb ? true : delayable && slow;
 
   const zoomBy = useCallback((factor: number) => {
     setFitActive(false);
@@ -306,7 +401,7 @@ export function ImageViewer({
     const element = canvasRef.current;
     if (!element) return;
     const onWheel = (event: WheelEvent) => {
-      if (!sourceRef.current) return;
+      if (!showStageRef.current) return;
       event.preventDefault();
       const factor = Math.exp(-event.deltaY * 0.0015);
       const previous = zoomRef.current;
@@ -378,10 +473,10 @@ export function ImageViewer({
       switch (event.key) {
         case "Escape":
           event.preventDefault();
-          if (cropMode) {
+          if (cropping) {
             setCropMode(false);
             setCropDraft(geometry?.crop ?? null);
-          } else if (poseOpen) {
+          } else if (poseVisible) {
             setPoseOpen(false);
           } else if (fullscreen) {
             onToggleFullscreen();
@@ -427,13 +522,13 @@ export function ImageViewer({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     actualSize,
-    cropMode,
+    cropping,
     fitView,
     fullscreen,
     geometry?.crop,
     onClose,
     onToggleFullscreen,
-    poseOpen,
+    poseVisible,
     redoHistory,
     step,
     undoHistory,
@@ -533,7 +628,9 @@ export function ImageViewer({
           thumbVersion: result.thumbVersion,
         });
       }
-      // 重新载入查看器源图并清空撤销栈；列表本身已就地更新，不重置查询与滚动位置。
+      // 重新载入查看器源图、回到适应窗口并清空撤销栈；列表本身已就地更新，不重置查询与滚动位置。
+      setMedia(initialMedia(activeId));
+      setFitActive(true);
       setReloadToken((value) => value + 1);
       onSaved?.(activeId);
     } catch (cause) {
@@ -544,7 +641,7 @@ export function ImageViewer({
   };
 
   const togglePose = async () => {
-    if (hasPose) {
+    if (imageHasPose) {
       setPoseOpen((value) => !value);
       return;
     }
@@ -577,6 +674,12 @@ export function ImageViewer({
     }
   };
 
+  const retryLoad = useCallback(() => {
+    setLoad({ imageId: activeId, status: "loading" });
+    setMedia(initialMedia(activeId));
+    setRetry((value) => value + 1);
+  }, [activeId]);
+
   const stagePoint = (event: ReactPointerEvent) => {
     const rect = stageRef.current?.getBoundingClientRect();
     if (!rect) return null;
@@ -587,8 +690,8 @@ export function ImageViewer({
   };
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!source) return;
-    if (cropMode && event.button === 0) {
+    if (!showStage) return;
+    if (cropping && event.button === 0) {
       const point = stagePoint(event);
       if (!point) return;
       event.preventDefault();
@@ -640,16 +743,13 @@ export function ImageViewer({
     setDragging(false);
   };
 
-  const rotate = geometry?.rotate ?? 0;
   const flipH = geometry?.flipHorizontal ?? false;
   const flipV = geometry?.flipVertical ?? false;
-  const fullSize = source
-    ? transformedSize(source.displayWidth, source.displayHeight, rotate)
-    : { width: 0, height: 0 };
-  const appliedCrop = !cropMode ? geometry?.crop ?? null : null;
+  const fullSize = transformedSize(displayWidth, displayHeight, rotate);
+  const appliedCrop = !cropping ? geometry?.crop ?? null : null;
   const clipWidth = (appliedCrop ? appliedCrop.width : fullSize.width) * zoom;
   const clipHeight = (appliedCrop ? appliedCrop.height : fullSize.height) * zoom;
-  const overlayRect = cropMode ? cropDraft ?? geometry?.crop ?? null : null;
+  const overlayRect = cropping ? cropDraft ?? geometry?.crop ?? null : null;
   const overlayOriginal =
     overlayRect && source ? cropToOriginal(overlayRect, rotate, source) : null;
   const imageTransform = `translate(-50%, -50%) rotate(${rotate * 90}deg) scaleX(${
@@ -741,14 +841,14 @@ export function ImageViewer({
               label={
                 poseBusy
                   ? "正在识别姿势…"
-                  : hasPose
+                  : imageHasPose
                     ? poseOpen
                       ? "隐藏姿势骨架"
                       : "显示姿势骨架"
                     : "生成姿势骨架"
               }
-              className={poseOpen ? "is-active" : ""}
-              disabled={poseBusy || (!hasPose && !onGeneratePose)}
+              className={poseVisible ? "is-active" : ""}
+              disabled={poseBusy || (!imageHasPose && !onGeneratePose)}
               onClick={() => void togglePose()}
             >
               {poseBusy ? <Spinner size={14} /> : <PersonStanding size={15} />}
@@ -802,7 +902,7 @@ export function ImageViewer({
         <div className="viewer-canvas-wrap">
           <div
             ref={canvasRef}
-            className={`viewer-canvas${cropMode ? " is-cropping" : ""}${
+            className={`viewer-canvas${cropping ? " is-cropping" : ""}${
               dragging ? " is-dragging" : ""
             }${cropDragging ? " is-crop-dragging" : ""}`}
             onPointerDown={handlePointerDown}
@@ -812,7 +912,7 @@ export function ImageViewer({
             onDoubleClick={() => (fitActive ? actualSize() : fitView())}
             onContextMenu={(event) => event.preventDefault()}
           >
-            {sourceStatus === "loading" ? (
+            {activeLoad.status === "loading" && !hasThumb ? (
               <div className="viewer-state">
                 <Spinner size={22} />
                 <strong>正在读取原图</strong>
@@ -820,7 +920,7 @@ export function ImageViewer({
               </div>
             ) : null}
 
-            {sourceStatus === "error" ? (
+            {activeLoad.status === "error" ? (
               <div className="viewer-state viewer-state-error">
                 <AlertTriangle size={24} />
                 <strong>无法打开图片</strong>
@@ -829,14 +929,14 @@ export function ImageViewer({
                   size="sm"
                   variant="primary"
                   icon={<RefreshCw size={13} />}
-                  onClick={() => setRetry((value) => value + 1)}
+                  onClick={retryLoad}
                 >
                   重试
                 </Button>
               </div>
             ) : null}
 
-            {source && sourceStatus === "ready" ? (
+            {showStage ? (
               <div
                 className="viewer-pan"
                 style={{
@@ -858,29 +958,53 @@ export function ImageViewer({
                     }}
                   >
                     <div
-                      className="viewer-image-wrap"
+                      className={`viewer-image-wrap${source?.hasAlpha ? " is-alpha" : ""}`}
                       style={{
-                        width: source.displayWidth * zoom,
-                        height: source.displayHeight * zoom,
+                        width: displayWidth * zoom,
+                        height: displayHeight * zoom,
                         transform: imageTransform,
                       }}
                     >
-                      <img
-                        src={withRetry(source.url, retry)}
-                        alt=""
-                        draggable={false}
-                        style={{ imageOrientation: "from-image" }}
-                        onLoad={() => setImageLoaded(true)}
-                        onError={() => {
-                          setImageLoaded(false);
-                          setImageFailed(true);
-                        }}
-                      />
-                      {poseOpen && pose && hasPose ? (
+                      {thumbItem ? (
+                        <img
+                          className={`viewer-thumb-layer${
+                            activeMedia.loaded ? " is-retired" : ""
+                          }`}
+                          src={thumbnailUrl(thumbItem.id, thumbItem.thumbVersion)}
+                          alt=""
+                          draggable={false}
+                          onError={() => {
+                            if (activeIdRef.current !== activeId) return;
+                            patchMedia(activeId, { thumbFailed: true });
+                          }}
+                        />
+                      ) : null}
+
+                      {source ? (
+                        <img
+                          className={`viewer-image${
+                            activeMedia.loaded ? " is-loaded" : ""
+                          }`}
+                          src={withRetry(source.url, retry)}
+                          alt=""
+                          draggable={false}
+                          style={{ imageOrientation: "from-image" }}
+                          onLoad={() => {
+                            if (activeIdRef.current !== activeId) return;
+                            patchMedia(activeId, { loaded: true, failed: false });
+                          }}
+                          onError={() => {
+                            if (activeIdRef.current !== activeId) return;
+                            patchMedia(activeId, { loaded: false, failed: true });
+                          }}
+                        />
+                      ) : null}
+
+                      {poseVisible && pose ? (
                         <PoseOverlay
                           pose={pose}
-                          width={source.displayWidth}
-                          height={source.displayHeight}
+                          width={source?.displayWidth ?? displayWidth}
+                          height={source?.displayHeight ?? displayHeight}
                           zoom={zoom}
                           opacity={poseOpacity}
                         />
@@ -909,13 +1033,13 @@ export function ImageViewer({
               </div>
             ) : null}
 
-            {source && !imageLoaded && sourceStatus === "ready" && !imageFailed ? (
+            {showSmallSpinner ? (
               <div className="viewer-image-loading">
                 <Spinner size={18} />
               </div>
             ) : null}
 
-            {source && imageFailed ? (
+            {source && activeMedia.failed ? (
               <div className="viewer-state viewer-state-error">
                 <AlertTriangle size={24} />
                 <strong>这张图片打不开</strong>
@@ -924,10 +1048,7 @@ export function ImageViewer({
                   size="sm"
                   variant="primary"
                   icon={<RefreshCw size={13} />}
-                  onClick={() => {
-                    setImageFailed(false);
-                    setRetry((value) => value + 1);
-                  }}
+                  onClick={retryLoad}
                 >
                   重新加载
                 </Button>
@@ -935,7 +1056,7 @@ export function ImageViewer({
             ) : null}
           </div>
 
-          {!fullscreen && poseOpen && pose && hasPose ? (
+          {!fullscreen && poseVisible && pose ? (
             <div className="viewer-pose-panel">
               <span>姿势 {visiblePoseCount(pose)}/33</span>
               <label>
@@ -976,7 +1097,15 @@ export function ImageViewer({
                 <>
                   <span>{formatDimensions(source.width, source.height)}</span>
                   <span>{formatBytes(source.fileSize)}</span>
-                  <span>{source.downsampled ? "降采样预览" : source.preview ? "转换预览" : "原图"}</span>
+                  <span>
+                    {gifStaticPreview(source)
+                      ? "静态预览 · 动画不可用"
+                      : source.downsampled
+                        ? "降采样预览"
+                        : source.preview
+                          ? "转换预览"
+                          : "原图"}
+                  </span>
                   <span className="mono">{source.contentHash.slice(0, 16)}…</span>
                   {dimensions ? (
                     <span>

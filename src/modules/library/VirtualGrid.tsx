@@ -15,6 +15,7 @@ import {
   extensionLabel,
   formatBytes,
   formatDimensions,
+  isGifImage,
 } from "./model";
 import type { ImageRow } from "./types";
 import type { ThumbFit } from "../../app/types";
@@ -277,7 +278,9 @@ export const VirtualGrid = forwardRef<VirtualViewHandle, VirtualGridProps>(funct
             }}
             title={`${formatDimensions(item.width, item.height)} · ${extensionLabel(
               item.fileExt,
-            )} · ${formatBytes(item.fileSize)}`}
+            )} · ${formatBytes(item.fileSize)}${
+              isGifImage(item) ? " · GIF 动图，仅在查看器中播放" : ""
+            }`}
             onClick={(event) => {
               containerRef.current?.focus({ preventScroll: true });
               onItemClick(item, event);

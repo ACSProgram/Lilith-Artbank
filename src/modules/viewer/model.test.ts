@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  fitZoom,
+  fitZoomForSize,
   flipGeometry,
+  gifStaticPreview,
   hasPixelChanges,
   initialGeometry,
+  rescaleZoom,
   resizeForNewBase,
   rotateGeometry,
   type GeometryState,
@@ -111,4 +115,50 @@ test("quality change counts as a pixel change only for lossy formats", () => {
     hasPixelChanges(jpeg, { ...jpegBase, outputFormat: "png" }),
     true,
   );
+});
+
+test("fitZoomForSize keeps the displayed size when the preview is proportional", () => {
+  const placeholder = fitZoomForSize(4000, 3000, 0, 1000, 800);
+  const preview = fitZoomForSize(4096, 3072, 0, 1000, 800);
+  assert.ok(Math.abs(4000 * placeholder - 4096 * preview) < 1e-6);
+  assert.ok(Math.abs(3000 * placeholder - 3072 * preview) < 1e-6);
+});
+
+test("fitZoomForSize swaps dimensions for odd rotations", () => {
+  assert.equal(
+    fitZoomForSize(3000, 4000, 1, 1000, 800),
+    fitZoomForSize(4000, 3000, 0, 1000, 800),
+  );
+});
+
+test("fitZoomForSize falls back to 1 and clamps the result", () => {
+  assert.equal(fitZoomForSize(0, 100, 0, 1000, 800), 1);
+  assert.equal(fitZoomForSize(100, 100, 0, 0, 800), 1);
+  assert.equal(fitZoomForSize(100_000, 100, 0, 1000, 800), 0.02);
+  assert.equal(fitZoomForSize(10, 10, 0, 1000, 800), 1);
+});
+
+test("fitZoom reads the source display size", () => {
+  const image = source({ displayWidth: 3000, displayHeight: 4000 });
+  assert.equal(
+    fitZoom(image, 0, 1000, 800),
+    fitZoomForSize(3000, 4000, 0, 1000, 800),
+  );
+});
+
+test("rescaleZoom keeps the on-screen width when the display size changes", () => {
+  const zoom = rescaleZoom(0.1, 8000, 4096);
+  assert.ok(Math.abs(zoom - 0.1953125) < 1e-6);
+  assert.ok(Math.abs(8000 * 0.1 - 4096 * zoom) < 1e-6);
+  assert.equal(rescaleZoom(0.5, 0, 4096), 0.5);
+  assert.equal(rescaleZoom(0.5, 4096, 0), 0.5);
+  assert.equal(rescaleZoom(0.0001, 1, 8000), 0.02);
+  assert.equal(rescaleZoom(8, 8000, 1), 8);
+});
+
+test("gifStaticPreview only matches GIFs with a generated preview", () => {
+  assert.equal(gifStaticPreview({ format: "gif", preview: true }), true);
+  assert.equal(gifStaticPreview({ format: "gif", preview: false }), false);
+  assert.equal(gifStaticPreview({ format: "png", preview: true }), false);
+  assert.equal(gifStaticPreview(null), false);
 });

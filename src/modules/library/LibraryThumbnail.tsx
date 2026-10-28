@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import { ImageOff, RefreshCw } from "lucide-react";
 import { hasDecodedThumb, rememberThumb } from "../../shared/thumbCache";
 import { thumbnailUrl } from "../../shared/thumbUrl";
+import { isGifImage } from "./model";
 import type { ImageRow } from "./types";
 
 interface LibraryThumbnailProps {
@@ -72,6 +73,11 @@ export function LibraryThumbnail({ image, className }: LibraryThumbnailProps) {
           }}
         />
       )}
+      {!failed && isGifImage(image) ? (
+        <span className="thumb-format-badge" aria-hidden="true">
+          GIF
+        </span>
+      ) : null}
     </span>
   );
 }

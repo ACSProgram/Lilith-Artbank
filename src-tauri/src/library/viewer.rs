@@ -142,6 +142,20 @@ pub fn preview_path(paths: &LibraryPaths, image_id: i64, content_hash: &str) -> 
         .join(format!("{image_id}-{content_hash}.webp"))
 }
 
+/// 供 `img://preview` 使用：已有文件直接返回，缺失时按当前行重新生成。
+pub(crate) fn ensure_preview_file(paths: &LibraryPaths, row: &ContentRow) -> AppResult<PathBuf> {
+    let target = preview_path(paths, row.id, &row.content_hash);
+    if target.is_file() {
+        return Ok(target);
+    }
+    let source = row.path(paths)?;
+    if !source.is_file() {
+        return Err(AppError::message("原图文件不存在，可能已被外部移动或删除"));
+    }
+    ensure_preview(paths, row, &source)?;
+    Ok(target)
+}
+
 fn ensure_preview(paths: &LibraryPaths, row: &ContentRow, source: &Path) -> AppResult<(u32, u32)> {
     let target = preview_path(paths, row.id, &row.content_hash);
     let expected = thumbnail::fit_within(row.width, row.height, PREVIEW_MAX_EDGE);
@@ -400,6 +414,46 @@ mod tests {
         let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
         fs::remove_file(row.path(&LibraryPaths::new(&fixture.root)).unwrap()).unwrap();
         assert!(source(&fixture.session.db, &fixture.root, fixture.image_id).is_err());
+    }
+
+    #[test]
+    fn regenerates_missing_preview_file() {
+        let fixture = fixture(false);
+        let source =
+            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
+                .unwrap();
+        let paths = LibraryPaths::new(&fixture.root);
+        let preview = preview_path(&paths, fixture.image_id, &source.content_hash);
+        assert!(preview.is_file());
+        fs::remove_file(&preview).unwrap();
+
+        let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
+        let regenerated = ensure_preview_file(&paths, &row).unwrap();
+        assert_eq!(regenerated, preview);
+        let decoded = image::load_from_memory(&fs::read(&preview).unwrap()).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (fixture.width, fixture.height)
+        );
+    }
+
+    #[test]
+    fn cached_preview_survives_missing_original() {
+        let fixture = fixture(false);
+        let source =
+            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
+                .unwrap();
+        let paths = LibraryPaths::new(&fixture.root);
+        let preview = preview_path(&paths, fixture.image_id, &source.content_hash);
+        let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
+        fs::remove_file(row.path(&paths).unwrap()).unwrap();
+
+        assert_eq!(ensure_preview_file(&paths, &row).unwrap(), preview);
+        assert!(preview.is_file());
+
+        fs::remove_file(&preview).unwrap();
+        assert!(ensure_preview_file(&paths, &row).is_err());
+        assert!(!preview.exists());
     }
 
     fn jpeg_with_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {

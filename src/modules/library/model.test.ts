@@ -8,6 +8,7 @@ import {
   effectiveSort,
   emptyFilters,
   imageActions,
+  isGifImage,
   normalizeFilters,
   rowInTagScope,
   sortForViewChange,
@@ -257,4 +258,11 @@ test("rowInTagScope matches folder subtrees and trash state", () => {
     rowInTagScope(item, "view", { ...context, similarityActive: true }),
     false,
   );
+});
+
+test("isGifImage follows the imported format, not the extension", () => {
+  assert.equal(isGifImage(row({ format: "gif" })), true);
+  assert.equal(isGifImage(row({ format: "GIF" })), true);
+  assert.equal(isGifImage(row({ format: "png", fileExt: "gif" })), false);
+  assert.equal(isGifImage(row({ format: "webp", fileExt: "webp" })), false);
 });

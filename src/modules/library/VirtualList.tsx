@@ -18,6 +18,7 @@ import {
   formatDate,
   formatDimensions,
   formatScore,
+  isGifImage,
 } from "./model";
 import type { ImageRow, SortKey, SortSpec } from "./types";
 import type { MoreStatus } from "./useImageQuery";
@@ -278,7 +279,9 @@ export const VirtualList = forwardRef<VirtualViewHandle, VirtualListProps>(funct
               <LibraryThumbnail image={item} />
             </span>
             <span className="list-numeric">{formatDimensions(item.width, item.height)}</span>
-            <span>{extensionLabel(item.fileExt)}</span>
+            <span title={isGifImage(item) ? "GIF 动图，仅在查看器中播放" : undefined}>
+              {extensionLabel(item.fileExt)}
+            </span>
             <span className="list-numeric">{formatBytes(item.fileSize)}</span>
             <span className="list-score">{formatScore(item.score)}</span>
             <span className="list-tags">{item.tags.length > 0 ? item.tags.join(", ") : "—"}</span>
