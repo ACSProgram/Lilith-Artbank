@@ -14,6 +14,7 @@ use crate::{
         settings::McpMode,
         state::AppState,
     },
+    concurrency::resources::PathScope,
     library::{
         db::LibraryDb,
         folders,
@@ -110,6 +111,13 @@ fn run_folders_modify(
             if input.dry_run {
                 return Ok(dry_run_outcome(plan));
             }
+            let _guard = state.begin_folder_change(
+                "新建文件夹",
+                vec![
+                    PathScope::write(parent_path(&path)),
+                    PathScope::write(&path),
+                ],
+            )?;
             let (list, operation_id) = folders::create_with_id(&database, &root, &path)?;
             Ok(ToolOutcome::value(finish(
                 state,
@@ -155,6 +163,10 @@ fn run_folders_modify(
             if input.dry_run {
                 return Ok(dry_run_outcome(plan));
             }
+            let _guard = state.begin_folder_change(
+                "重命名文件夹",
+                vec![PathScope::write(&current.path), PathScope::write(&new_path)],
+            )?;
             let (list, operation_id) = folders::rename_with_id(&database, &root, target, &name)?;
             Ok(ToolOutcome::value(finish(
                 state,
@@ -218,6 +230,14 @@ fn run_folders_modify(
                     plan,
                 );
             }
+            let _guard = state.begin_folder_change(
+                "移动文件夹",
+                vec![
+                    PathScope::write(&current.path),
+                    PathScope::write(&new_path),
+                    PathScope::write(&parent.path),
+                ],
+            )?;
             let (list, operation_id) =
                 folders::move_to_with_id(&database, &root, target, parent.id)?;
             Ok(ToolOutcome::value(finish(
@@ -259,6 +279,8 @@ fn run_folders_modify(
                     plan,
                 );
             }
+            let _guard =
+                state.begin_folder_change("删除文件夹", vec![PathScope::write(&current.path)])?;
             let (_, operation_id) = folders::delete_with_id(&database, &root, target)?;
             Ok(ToolOutcome::value(finish(
                 state,

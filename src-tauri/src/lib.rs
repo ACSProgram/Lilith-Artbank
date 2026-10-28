@@ -1,5 +1,6 @@
 mod ai;
 mod app;
+mod concurrency;
 mod imageops;
 mod import;
 mod library;

@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -23,7 +23,13 @@ use crate::{
         settings::SettingsStore,
         tasks::{
             BatchTaskKind, BatchTaskRequest, ConflictPolicy, LaneGuard, TaskBus, TaskHandle,
-            TaskKind, TaskLane, TaskPhase, TaskScope, TaskSnapshot, TaskStartResult, TaskSummary,
+            TaskKind, TaskPhase, TaskScope, TaskSnapshot, TaskStartResult, TaskSummary,
+        },
+    },
+    concurrency::{
+        budget::ImageBudget,
+        resources::{
+            Access, Conflict, HolderInfo, PathScope, ResourceGuard, ResourceRequest, WaitError,
         },
     },
     imageops::optimize::OptimizeOptions,
@@ -44,6 +50,7 @@ use crate::{
             self, DeleteReport, ImageDetails, ImageState, MoveReport, SelectionTags, TagRef,
         },
         optimize_estimate::{self, OptimizeEstimate},
+        paths::{join_folder, normalize_folder, normalize_folder_name, parent_path},
         query::{self, FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
         service::{self, LibraryCounts, LibraryInfo, LibrarySession},
         stats::{self, StatsRequest, StatsSnapshot},
@@ -93,10 +100,15 @@ const MAX_CONSECUTIVE_FAILURES: usize = 5;
 impl AppState {
     pub fn new(settings: SettingsStore, app: AppHandle) -> Self {
         let mcp_approvals = Arc::new(ApprovalQueue::new(app.clone()));
+        let images = Arc::new(ImageBudget::from_setting(
+            settings.snapshot().performance.worker_threads,
+        ));
+        let tasks = TaskBus::with_images(images.clone());
+        let ai = AiRuntime::with_runtime(tasks.resources(), images);
         Self {
             settings,
-            ai: AiRuntime::new(),
-            tasks: TaskBus::new(),
+            ai,
+            tasks,
             mcp: McpRuntime::new(),
             app,
             library: Mutex::new(None),
@@ -193,14 +205,33 @@ impl AppState {
         request: ImportRequest,
         from_mcp: bool,
     ) -> AppResult<(ImportSnapshot, Option<i64>)> {
-        let mut request = request.normalized()?;
-        request.worker_threads = self.settings.snapshot().performance.worker_threads;
+        let request = request.normalized()?;
 
         let (database, thumbs, root) = self
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
 
         let temp_target = request.target == ImportTarget::Temp;
+        let target_path = if temp_target {
+            database
+                .with_reader(crate::library::temp::path)?
+                .ok_or_else(|| AppError::message("临时文件夹不存在"))?
+        } else {
+            request.folder.clone()
+        };
+        let resource_request = if temp_target {
+            // 临时导入不写操作记录，也不占用时间线，撤销/重做无需等它。
+            ResourceRequest::session_read()
+                .with_content_writer()
+                .with_paths(vec![PathScope::read(&target_path)])
+                .with_path_note("正在导入到")
+        } else {
+            ResourceRequest::session_read()
+                .with_timeline(Access::Read)
+                .with_content_writer()
+                .with_paths(vec![PathScope::read(&target_path)])
+                .with_path_note("正在导入到")
+        };
         let scope = if temp_target {
             format!("{} 个路径 · 临时", request.paths.len())
         } else {
@@ -246,12 +277,21 @@ impl AppState {
             thumbs,
             root,
             operation_id,
+            resources: self.resources(),
+            images: self.images(),
+            holder: HolderInfo::new(job.id(), "导入")
+                .with_reason("正在导入")
+                .with_path_note("正在导入到"),
         };
-        let started = self
-            .tasks
-            .launch(app, handle, ConflictPolicy::Queue, move |guard| {
+        let started = self.tasks.launch(
+            app,
+            handle,
+            resource_request,
+            ConflictPolicy::Queue,
+            move |guard| {
                 crate::import::start(runner_app, source, runner_job, request, guard, operation);
-            })?;
+            },
+        )?;
         if let TaskStartResult::Conflict { active } = started {
             return Err(conflict_error(&active));
         }
@@ -315,27 +355,104 @@ impl AppState {
             .map(|job| job.snapshot())
     }
 
-    fn ensure_no_activity(&self) -> AppResult<()> {
-        if self.tasks.is_idle() {
-            return Ok(());
-        }
-        if let Some(task) = self.tasks.active().into_iter().next() {
-            let state = if task.phase == TaskPhase::Queued {
-                "正在排队"
-            } else {
-                "正在进行"
-            };
-            return Err(AppError::message(format!(
-                "「{}」{state}，请等待完成或取消",
-                task.label
-            )));
-        }
-        Err(AppError::message("有操作正在进行，请等待完成"))
+    pub(crate) fn resources(&self) -> Arc<crate::concurrency::resources::ResourceTable> {
+        self.tasks.resources()
     }
 
-    fn begin_maintenance(&self) -> AppResult<LaneGuard> {
-        self.ensure_no_activity()?;
-        self.tasks.acquire_immediate(TaskLane::Write)
+    pub(crate) fn images(&self) -> Arc<ImageBudget> {
+        self.tasks.images()
+    }
+
+    pub(crate) fn move_task_request(
+        &self,
+        image_ids: &[i64],
+        folder_path: &str,
+    ) -> AppResult<ResourceRequest> {
+        let (database, _) = self.query_source()?;
+        move_resource_request(&database, image_ids, folder_path)
+    }
+
+    fn short_holder(label: &str, reason: impl Into<String>) -> HolderInfo {
+        HolderInfo::new(uuid::Uuid::new_v4().to_string(), label).with_reason(reason)
+    }
+
+    fn wait_error(error: WaitError, action: &str) -> AppError {
+        match error {
+            WaitError::Cancelled => AppError::message("操作已取消"),
+            WaitError::Timeout(conflicts) => AppError::message(format!(
+                "{}，请等待完成或取消后再{action}",
+                conflict_sentence(&conflicts)
+            )),
+        }
+    }
+
+    /// 文件夹结构改动用：会话读 + 时间线共享 + 路径写，最多等 10 秒。
+    pub(crate) fn begin_folder_change(
+        &self,
+        label: &str,
+        paths: Vec<PathScope>,
+    ) -> AppResult<ResourceGuard> {
+        let holder = Self::short_holder(label, "正在维护文件夹");
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_paths(paths);
+        self.resources()
+            .acquire(
+                &request,
+                &holder,
+                Some(Instant::now() + Duration::from_secs(10)),
+                &|| false,
+            )
+            .map_err(|error| Self::wait_error(error, "重试"))
+    }
+
+    /// 打开/创建/关闭图库：要求没有任务、短操作与排队任务。
+    fn begin_session_write(
+        &self,
+        label: &str,
+        action: &str,
+        wait: Option<Duration>,
+    ) -> AppResult<ResourceGuard> {
+        let holder = Self::short_holder(label, "正在切换图库");
+        let request = ResourceRequest::session_write();
+        let table = self.resources();
+        match wait {
+            Some(wait) => table
+                .acquire(&request, &holder, Some(Instant::now() + wait), &|| false)
+                .map_err(|error| Self::wait_error(error, action)),
+            None => table.try_acquire(&request, &holder).map_err(|conflicts| {
+                AppError::message(format!(
+                    "{}，请等待完成或取消后再{action}",
+                    conflict_sentence(&conflicts)
+                ))
+            }),
+        }
+    }
+
+    pub(crate) fn begin_metadata_write(&self, label: &str) -> AppResult<ResourceGuard> {
+        let holder = Self::short_holder(label, "正在修改图片信息");
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_metadata_writer();
+        self.tasks
+            .acquire_immediate(&request, &holder)
+            .map(|guard| guard.into_resource())
+    }
+
+    /// 编辑保存等短内容写：会话读 + 时间线共享 + 内容写 + 路径写，立即失败。
+    pub(crate) fn begin_content_write(
+        &self,
+        label: &str,
+        paths: Vec<PathScope>,
+    ) -> AppResult<ResourceGuard> {
+        let holder = Self::short_holder(label, "正在写入图库内容");
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_content_writer()
+            .with_paths(paths);
+        self.tasks
+            .acquire_immediate(&request, &holder)
+            .map(|guard| guard.into_resource())
     }
 
     /// `application.manage(state)` 之后调用：启动时打开的库要等状态注册完再安排恢复任务。
@@ -374,17 +491,14 @@ impl AppState {
             info,
             settings: self.settings.snapshot(),
             sheets: self.mcp_sheets.clone(),
+            resources: self.resources(),
+            images: self.images(),
         })
     }
 
     /// MCP 写入在本进程内串行；与任务总线无关，只保护多个客户端同时调用。
     pub(crate) fn lock_mcp_writes(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.mcp_write.lock()
-    }
-
-    /// 短写入立即占用 write lane；任何在跑的任务（导入、移动、编辑、优化、撤销/重做）都会拒绝。
-    pub(crate) fn acquire_write_lane(&self) -> AppResult<LaneGuard> {
-        self.tasks.acquire_immediate(TaskLane::Write)
     }
 
     /// MCP 同步写入后的统一收尾：失效页面缓存与相似结果，裁剪记录，再通知前端刷新。
@@ -520,6 +634,7 @@ impl AppState {
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
         let scope = format!("{} 张", image_ids.len());
+        let request = move_resource_request(&database, &image_ids, &folder_path)?;
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             TaskKind::FolderMove,
@@ -532,6 +647,7 @@ impl AppState {
         let launched = self.tasks.launch(
             self.app.clone(),
             handle,
+            request,
             ConflictPolicy::Queue,
             move |guard| {
                 let database = database.clone();
@@ -599,7 +715,7 @@ impl AppState {
     }
 
     pub fn create_library(&self, path: &Path, name: &str) -> AppResult<LibraryInfo> {
-        self.ensure_no_activity()?;
+        let _session = self.begin_session_write("创建图库", "创建图库", None)?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let (session, _manifest) = service::create(path, name, read_connections)?;
         let info = session.info.clone();
@@ -623,7 +739,7 @@ impl AppState {
     }
 
     pub fn open_library(&self, path: &Path) -> AppResult<LibraryInfo> {
-        self.ensure_no_activity()?;
+        let _session = self.begin_session_write("打开图库", "打开图库", None)?;
         let read_connections = self.settings.snapshot().performance.reader_connections;
         let session = service::open(path, read_connections)?;
         let plan = history::recover_on_open(&session.db)?;
@@ -651,6 +767,7 @@ impl AppState {
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        drop(_session);
         if self.managed.load(Ordering::SeqCst) {
             self.after_library_open();
         }
@@ -680,24 +797,27 @@ impl AppState {
     }
 
     pub fn close_library(&self) -> AppResult<()> {
-        // 写任务不能中途关库；排队中的写任务也算，不能等关库时再启动。
-        let write_task = self
+        // 内容写任务不能中途关库；排队中的写任务也算，不能等关库时再启动。
+        if let Some(task) = self
             .tasks
             .active()
             .into_iter()
-            .find(|task| task.lane == TaskLane::Write);
-        if self.tasks.lane_busy(TaskLane::Write) || write_task.is_some() {
-            let label = write_task
-                .map(|task| task.label)
-                .unwrap_or_else(|| "文件任务".to_owned());
+            .find(|task| !task.kind.can_cancel_for_close())
+        {
+            let state = if task.phase == TaskPhase::Queued {
+                "正在排队"
+            } else {
+                "正在进行"
+            };
             return Err(AppError::message(format!(
-                "「{label}」正在进行或排队，请等待完成或取消后再关闭图库"
+                "「{}」{state}，请等待完成或取消后再关闭图库",
+                task.label
             )));
         }
-        self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
-        if !self.tasks.wait_idle(Duration::from_secs(10)) {
-            return Err(AppError::message("任务正在停止，请稍后再关闭图库"));
-        }
+        self.tasks.cancel_for_close();
+        // 可取消任务与短操作释放资源后再关库；超时会点名占用者。
+        let _session =
+            self.begin_session_write("关闭图库", "关闭图库", Some(Duration::from_secs(10)))?;
         if let Some((database, _, root)) = self.library_handles()
             && let Err(error) = temp::clear(&database, &root)
         {
@@ -718,17 +838,27 @@ impl AppState {
 
     /// 应用退出：没有写任务时尽量清空临时区；来不及清的下次打开图库会补清。
     pub fn shutdown(&self) {
-        if self.tasks.lane_busy(TaskLane::Write) {
+        if self
+            .tasks
+            .active()
+            .iter()
+            .any(|task| !task.kind.can_cancel_for_close())
+        {
             log::warn!("退出时仍有写任务，临时文件夹留到下次打开图库时清空");
             return;
         }
-        // 排队任务还没占 lane，退出前直接取消，避免关闭过程中突然启动。
+        // 排队任务还没占资源，退出前直接取消，避免关闭过程中突然启动。
         self.tasks.cancel_queued();
-        self.tasks.cancel_lanes(&[TaskLane::Ai, TaskLane::Scan]);
+        self.tasks.cancel_for_close();
         if !self.tasks.wait_idle(Duration::from_secs(2)) {
             log::warn!("退出时任务未停止，临时文件夹留到下次打开图库时清空");
             return;
         }
+        let Ok(_session) = self.begin_session_write("退出", "退出", Some(Duration::from_secs(2)))
+        else {
+            log::warn!("退出时图库仍被占用，临时文件夹留到下次打开图库时清空");
+            return;
+        };
         if let Some((database, _, root)) = self.library_handles()
             && let Err(error) = temp::clear(&database, &root)
         {
@@ -794,24 +924,71 @@ impl AppState {
     }
 
     pub fn create_folder(&self, path: &str) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
+        let normalized = normalize_folder(path)?;
+        // 父级一起锁：新建会更新同级顺序，两个新文件夹并发创建时不能读到同一个末尾序号。
+        let parent = parent_path(&normalized);
+        let _guard = self.begin_folder_change(
+            "新建文件夹",
+            vec![PathScope::write(parent), PathScope::write(&normalized)],
+        )?;
         let (database, root) = self.query_source()?;
         self.mutate(|| folder_service::create(&database, &root, path))
             .map(folder_change)
     }
 
     pub fn rename_folder(&self, folder_id: i64, name: &str) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
+        let name = normalize_folder_name(name)?;
         let (database, root) = self.query_source()?;
-        self.mutate(|| folder_service::rename(&database, &root, folder_id, name))
-            .map(folder_change)
+        for _ in 0..2 {
+            let current = folder_service::info(&database, folder_id)?;
+            if current.path.is_empty() {
+                return Err(AppError::message("不能重命名图库根目录"));
+            }
+            let new_path = join_folder(parent_path(&current.path), &name);
+            let _guard = self.begin_folder_change(
+                "重命名文件夹",
+                vec![PathScope::write(&current.path), PathScope::write(&new_path)],
+            )?;
+            let latest = folder_service::info(&database, folder_id)?;
+            if latest.path.eq_ignore_ascii_case(&current.path) {
+                return self
+                    .mutate(|| folder_service::rename(&database, &root, folder_id, &name))
+                    .map(folder_change);
+            }
+        }
+        Err(AppError::message("文件夹已变化，请重试"))
     }
 
     pub fn move_folder(&self, folder_id: i64, parent_id: i64) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
-        self.mutate(|| folder_service::move_to(&database, &root, folder_id, parent_id))
-            .map(folder_change)
+        for _ in 0..2 {
+            let current = folder_service::info(&database, folder_id)?;
+            if current.path.is_empty() {
+                return Err(AppError::message("不能移动图库根目录"));
+            }
+            let parent = folder_service::info(&database, parent_id)?;
+            let leaf = current
+                .path
+                .rsplit_once('/')
+                .map_or(current.path.as_str(), |(_, leaf)| leaf);
+            let new_path = join_folder(&parent.path, leaf);
+            let _guard = self.begin_folder_change(
+                "移动文件夹",
+                vec![
+                    PathScope::write(&current.path),
+                    PathScope::write(&new_path),
+                    // 移动会把目标同级序号追加到末尾，同一父级下的并发移动要串行。
+                    PathScope::write(&parent.path),
+                ],
+            )?;
+            let latest = folder_service::info(&database, folder_id)?;
+            if latest.path.eq_ignore_ascii_case(&current.path) {
+                return self
+                    .mutate(|| folder_service::move_to(&database, &root, folder_id, parent_id))
+                    .map(folder_change);
+            }
+        }
+        Err(AppError::message("文件夹已变化，请重试"))
     }
 
     pub fn place_folders(
@@ -820,8 +997,19 @@ impl AppState {
         parent_id: i64,
         sort_index: Option<i64>,
     ) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
+        let parent = folder_service::info(&database, parent_id)?;
+        let mut paths = vec![PathScope::write(&parent.path)];
+        for id in folder_ids {
+            let current = folder_service::info(&database, *id)?;
+            let leaf = current
+                .path
+                .rsplit_once('/')
+                .map_or(current.path.as_str(), |(_, leaf)| leaf);
+            paths.push(PathScope::write(&current.path));
+            paths.push(PathScope::write(join_folder(&parent.path, leaf)));
+        }
+        let _guard = self.begin_folder_change("整理文件夹", paths)?;
         self.mutate(|| {
             folder_service::place_many(&database, &root, folder_ids, parent_id, sort_index)
         })
@@ -836,8 +1024,10 @@ impl AppState {
         recursive: bool,
         orders: &[(i64, Vec<i64>)],
     ) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
         let (database, _) = self.query_source()?;
+        let current = folder_service::info(&database, folder_id)?;
+        let _guard =
+            self.begin_folder_change("文件夹排序", vec![PathScope::write(&current.path)])?;
         self.mutate(|| {
             folder_service::apply_order(&database, folder_id, key, descending, recursive, orders)
         })
@@ -850,15 +1040,19 @@ impl AppState {
         parent_id: i64,
         sort_index: i64,
     ) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
         let (database, _) = self.query_source()?;
+        let parent = folder_service::info(&database, parent_id)?;
+        let _guard =
+            self.begin_folder_change("文件夹排序", vec![PathScope::write(&parent.path)])?;
         self.mutate(|| folder_service::reorder(&database, folder_ids, parent_id, sort_index))
             .map(folder_change)
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
-        let _guard = self.begin_maintenance()?;
         let (database, root) = self.query_source()?;
+        let current = folder_service::info(&database, folder_id)?;
+        let _guard =
+            self.begin_folder_change("删除文件夹", vec![PathScope::write(&current.path)])?;
         self.mutate(|| folder_service::delete(&database, &root, folder_id))?;
         Ok(FolderChange {
             folders: Vec::new(),
@@ -892,46 +1086,55 @@ impl AppState {
     }
 
     pub fn update_image_score(&self, image_id: i64, score: i64) -> AppResult<()> {
+        let _guard = self.begin_metadata_write("修改评分")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::update_score(&database, image_id, score))
     }
 
     pub fn set_images_score(&self, image_ids: &[i64], score: i64) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("修改评分")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::set_scores(&database, image_ids, score))
     }
 
     pub fn update_image_description(&self, image_id: i64, description: &str) -> AppResult<()> {
+        let _guard = self.begin_metadata_write("修改描述")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::update_description(&database, image_id, description))
     }
 
     pub fn set_image_tags(&self, image_id: i64, tag_names: &[String]) -> AppResult<Vec<TagRef>> {
+        let _guard = self.begin_metadata_write("修改标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::set_image_tags(&database, image_id, tag_names))
     }
 
     pub fn add_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("修改标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::add_tags(&database, image_ids, tag_names))
     }
 
     pub fn remove_tags(&self, image_ids: &[i64], tag_names: &[String]) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("修改标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::remove_tags(&database, image_ids, tag_names))
     }
 
     pub fn rename_tag(&self, tag_id: i64, name: &str) -> AppResult<()> {
+        let _guard = self.begin_metadata_write("重命名标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::rename_tag(&database, tag_id, name))
     }
 
     pub fn delete_tag(&self, tag_id: i64) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("删除标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| metadata::delete_tag(&database, tag_id))
     }
 
     pub fn merge_tags(&self, source_id: i64, target_id: i64) -> AppResult<metadata::MergeReport> {
+        let _guard = self.begin_metadata_write("合并标签")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| {
             metadata::merge_tags_with_id(&database, source_id, target_id).map(|(r, _)| r)
@@ -949,6 +1152,7 @@ impl AppState {
     }
 
     pub fn trash_images(&self, image_ids: &[i64]) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("移入回收站")?;
         let (database, _) = self.query_source()?;
         let changed = self.mutate(|| metadata::set_trashed(&database, image_ids, true))?;
         self.ai.invalidate_similarity();
@@ -956,6 +1160,7 @@ impl AppState {
     }
 
     pub fn restore_images(&self, image_ids: &[i64]) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("恢复图片")?;
         let (database, _) = self.query_source()?;
         let changed = self.mutate(|| metadata::set_trashed(&database, image_ids, false))?;
         self.ai.invalidate_similarity();
@@ -986,21 +1191,25 @@ impl AppState {
     }
 
     pub fn create_collection(&self, name: &str) -> AppResult<CollectionInfo> {
+        let _guard = self.begin_metadata_write("新建集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::create(&database, name))
     }
 
     pub fn rename_collection(&self, collection_id: i64, name: &str) -> AppResult<()> {
+        let _guard = self.begin_metadata_write("重命名集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::rename(&database, collection_id, name))
     }
 
     pub fn delete_collection(&self, collection_id: i64) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("删除集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::delete(&database, collection_id))
     }
 
     pub fn reorder_collections(&self, collection_ids: &[i64]) -> AppResult<()> {
+        let _guard = self.begin_metadata_write("整理集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::reorder(&database, collection_ids))
     }
@@ -1010,6 +1219,7 @@ impl AppState {
         collection_id: i64,
         image_ids: &[i64],
     ) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("修改集合成员")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::add_images(&database, collection_id, image_ids))
     }
@@ -1019,6 +1229,7 @@ impl AppState {
         collection_id: i64,
         image_ids: &[i64],
     ) -> AppResult<u64> {
+        let _guard = self.begin_metadata_write("修改集合成员")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::remove_images(&database, collection_id, image_ids))
     }
@@ -1029,6 +1240,7 @@ impl AppState {
         collection_ids: &[i64],
         name: &str,
     ) -> AppResult<CollectionInfo> {
+        let _guard = self.begin_metadata_write("合并集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::combine(&database, mode, collection_ids, name))
     }
@@ -1038,6 +1250,7 @@ impl AppState {
         groups: &[Vec<i64>],
         base_name: &str,
     ) -> AppResult<Vec<CollectionInfo>> {
+        let _guard = self.begin_metadata_write("新建集合")?;
         let (database, _) = self.query_source()?;
         self.mutate(|| collections::create_groups(&database, groups, base_name))
     }
@@ -1054,7 +1267,7 @@ impl AppState {
             .any(|task| matches!(task.kind, TaskKind::Undo | TaskKind::Redo));
         // 有中断标记但撤销/重做任务正在跑，说明是本次运行中的中间态，不算遗留。
         let recovery_needed = !history_task_active && history::has_interrupted_run(&database)?;
-        // 撤销与重做都要独占 write lane，任何在跑的任务（包括 AI 与扫描）都会让它排队或失败。
+        // 撤销与重做要独占时间线、内容写、元数据写与根路径；界面在仍有运行中任务时直接置灰。
         let blocked_reason = if recovery_needed {
             Some("上次撤销或重做异常中断，请重新打开图库恢复".to_owned())
         } else {
@@ -1187,8 +1400,16 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
-        self.tasks
-            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+        self.tasks.launch(
+            app,
+            handle,
+            ResourceRequest::session_read()
+                .with_timeline(Access::Write)
+                .with_content_writer()
+                .with_paths(vec![PathScope::write("")])
+                .with_path_note("正在清空操作记录"),
+            ConflictPolicy::Fail,
+            move |guard| {
                 let database = database.clone();
                 let root = root.clone();
                 let task = worker.clone();
@@ -1207,10 +1428,11 @@ impl AppState {
                         task.finish_from(&result);
                     },
                 );
-            })
+            },
+        )
     }
 
-    /// 图库可用后的收尾：先续做中断的撤销（撤销不可排队，要先占 write lane），再按上限裁剪。
+    /// 图库可用后的收尾：先续做中断的撤销（撤销不排队，要先拿到写资源），再按上限裁剪。
     fn after_library_open(&self) {
         self.schedule_recovery();
         self.after_history_write();
@@ -1337,8 +1559,14 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Write)
+            .with_content_writer()
+            .with_metadata_writer()
+            .with_paths(vec![PathScope::write("")])
+            .with_path_note("正在撤销操作");
         self.tasks
-            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+            .launch(app, handle, request, ConflictPolicy::Fail, move |guard| {
                 let database = database.clone();
                 let thumbs = thumbs.clone();
                 let root = root.clone();
@@ -1371,8 +1599,14 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
+        let request = ResourceRequest::session_read()
+            .with_timeline(Access::Write)
+            .with_content_writer()
+            .with_metadata_writer()
+            .with_paths(vec![PathScope::write("")])
+            .with_path_note("正在重做操作");
         self.tasks
-            .launch(app, handle, ConflictPolicy::Fail, move |guard| {
+            .launch(app, handle, request, ConflictPolicy::Fail, move |guard| {
                 let database = database.clone();
                 let thumbs = thumbs.clone();
                 let root = root.clone();
@@ -1407,32 +1641,48 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
-        self.tasks.launch(app, handle, policy, move |guard| {
-            let database = database.clone();
-            let root = root.clone();
-            let task = worker.clone();
-            let tasks = tasks.clone();
-            let ai = ai.clone();
-            let _ = tasks.spawn_worker("release-garbage".to_owned(), task.clone(), move || {
-                let _guard: LaneGuard = guard;
-                task.set_phase(TaskPhase::Running);
-                let result = history::run_release(&database, &root, task.clone());
-                query::clear_page_cache();
-                ai.invalidate_similarity();
-                task.finish_from(&result);
-            });
-        })
+        let request = ResourceRequest::session_read()
+            .with_content_writer()
+            .with_paths(vec![PathScope::write("")])
+            .with_path_note("正在释放删除文件");
+        self.tasks
+            .launch(app, handle, request, policy, move |guard| {
+                let database = database.clone();
+                let root = root.clone();
+                let task = worker.clone();
+                let tasks = tasks.clone();
+                let ai = ai.clone();
+                let _ = tasks.spawn_worker("release-garbage".to_owned(), task.clone(), move || {
+                    let _guard: LaneGuard = guard;
+                    task.set_phase(TaskPhase::Running);
+                    let result = history::run_release(&database, &root, task.clone());
+                    query::clear_page_cache();
+                    ai.invalidate_similarity();
+                    task.finish_from(&result);
+                });
+            })
     }
 
     pub fn image_pose(&self, image_id: i64) -> AppResult<Option<PoseData>> {
         self.ai.read_pose(image_id)
     }
 
-    pub(crate) fn begin_edit(&self) -> AppResult<LaneGuard> {
-        let guard = self.begin_maintenance()?;
-        self.ai.invalidate_similarity();
-        query::clear_page_cache();
-        Ok(guard)
+    pub(crate) fn begin_edit(&self, image_id: i64) -> AppResult<ResourceGuard> {
+        let (database, _) = self.query_source()?;
+        for _ in 0..3 {
+            let row = content::load(&database, image_id)?;
+            let guard =
+                self.begin_content_write("保存编辑", vec![PathScope::write(&row.folder_path)])?;
+            let latest = content::load(&database, image_id)?;
+            if latest.folder_path.eq_ignore_ascii_case(&row.folder_path)
+                && latest.content_hash == row.content_hash
+            {
+                self.ai.invalidate_similarity();
+                query::clear_page_cache();
+                return Ok(guard);
+            }
+        }
+        Err(AppError::message("图片位置正在变化，请稍后重试"))
     }
 
     pub(crate) fn edit_handles(&self) -> AppResult<(Arc<LibraryDb>, Arc<ThumbPack>, PathBuf)> {
@@ -1440,9 +1690,13 @@ impl AppState {
             .ok_or_else(|| AppError::message("尚未打开图库"))
     }
 
-    pub(crate) fn copy_source(&self, image_id: i64) -> AppResult<PathBuf> {
+    pub(crate) fn copy_source(&self, image_id: i64) -> AppResult<(PathBuf, ResourceGuard)> {
         let (database, root) = self.query_source()?;
-        content::original_path(&database, &root, image_id)
+        let holder = Self::short_holder("复制图片", "正在读取图片");
+        let (row, guard) =
+            content::try_lock_original(&database, &self.resources(), image_id, &holder)?;
+        let path = row.path(&crate::library::paths::LibraryPaths::new(&root))?;
+        Ok((path, guard))
     }
 
     pub fn cancel_task(&self, task_id: &str) -> AppResult<()> {
@@ -1459,7 +1713,7 @@ impl AppState {
         capability::feature_summary(&database)
     }
 
-    /// 临时区特征生成：只接受已校验的临时图片 id，占用 write lane，不写操作记录。
+    /// 临时区特征生成：只接受已校验的临时图片 id，占用 AI 服务资源，不写操作记录。
     pub fn start_temp_features(
         &self,
         kind: crate::ai::job::AiJobKind,
@@ -1547,14 +1801,25 @@ impl AppState {
         );
         let tasks = self.tasks.clone();
         let worker = handle.clone();
-        self.tasks
-            .launch(app, handle, request.conflict, move |guard| {
+        let resources = self.resources();
+        let images = self.images();
+        self.tasks.launch(
+            app,
+            handle,
+            // 缩略图重建会读旧原图再更新缩略图指针，必须避开编辑/压缩等内容写者。
+            ResourceRequest::session_read()
+                .with_content_writer()
+                .with_path_note("正在读取"),
+            request.conflict,
+            move |guard| {
                 let _ =
                     tasks.spawn_worker("thumbnail-rebuild".to_owned(), worker.clone(), move || {
-                        // 写入 lane 由这个线程持有，直到所有图片处理结束。
+                        // 内容写者由这个线程持有，直到所有图片处理结束。
                         let _guard: LaneGuard = guard;
                         worker.set_phase(TaskPhase::Running);
                         worker.set_total(ids.len());
+                        let holder =
+                            HolderInfo::new(worker.id(), "重建缩略图").with_path_note("正在读取");
                         let mut consecutive_failures = 0_usize;
                         for image_id in ids {
                             if worker.should_cancel() {
@@ -1568,6 +1833,10 @@ impl AppState {
                                 image_id,
                                 only_missing,
                                 recalc_visuals,
+                                &resources,
+                                &holder,
+                                &|| worker.should_cancel(),
+                                &images,
                             ) {
                                 Ok(true) => {
                                     worker.inc_completed();
@@ -1590,7 +1859,8 @@ impl AppState {
                         }
                         worker.finish_from(&Ok(()));
                     });
-            })
+            },
+        )
     }
 
     /// 空间优化估算：只读扫描与抽样编码，结果按任务 id 缓存在内存里。
@@ -1636,12 +1906,20 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let estimates = self.optimize_estimates.clone();
-        self.tasks
-            .launch(app, handle, request.conflict, move |guard| {
+        let resources = self.resources();
+        let images = self.images();
+        self.tasks.launch(
+            app,
+            handle,
+            ResourceRequest::session_read(),
+            request.conflict,
+            move |guard| {
                 let _ =
                     tasks.spawn_worker("optimize-estimate".to_owned(), worker.clone(), move || {
                         let _guard: LaneGuard = guard;
                         worker.set_phase(TaskPhase::Running);
+                        let holder = HolderInfo::new(task_id.clone(), "估算压缩空间")
+                            .with_path_note("正在读取");
                         let result = optimize_estimate::estimate(
                             &database,
                             &root,
@@ -1651,6 +1929,9 @@ impl AppState {
                             sample_size,
                             &fingerprint,
                             &*worker,
+                            &resources,
+                            &images,
+                            &holder,
                         );
                         match result {
                             Ok(Some(mut estimate)) => {
@@ -1669,10 +1950,11 @@ impl AppState {
                             }
                         }
                     });
-            })
+            },
+        )
     }
 
-    /// 空间优化执行：先按估算凭证核对范围与参数，再在写入 lane 上编码并发布。
+    /// 空间优化执行：先按估算凭证核对范围与参数，再拿到写资源后编码并发布。
     fn start_optimize_task(
         &self,
         app: AppHandle,
@@ -1705,8 +1987,18 @@ impl AppState {
         let worker = handle.clone();
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
-        self.tasks
-            .launch(app, handle, request.conflict, move |guard| {
+        let images = self.images();
+        let resource_request = ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_content_writer()
+            .with_paths(vec![PathScope::write("")])
+            .with_path_note("正在处理图库内容");
+        self.tasks.launch(
+            app,
+            handle,
+            resource_request,
+            request.conflict,
+            move |guard| {
                 let _ = tasks.spawn_worker("optimize".to_owned(), worker.clone(), move || {
                     let _guard: LaneGuard = guard;
                     worker.set_phase(TaskPhase::Running);
@@ -1752,6 +2044,7 @@ impl AppState {
                         &options,
                         operation_id,
                         &*worker,
+                        &images,
                     );
                     // 已提交的批次会改变文件、大小与可选特征；成功或中途出错都要刷新缓存。
                     query::clear_page_cache();
@@ -1772,6 +2065,8 @@ impl AppState {
                             if let Err(error) = operation.finish(&error) {
                                 log::warn!("收尾空间优化记录失败：{error}");
                             }
+                            worker.set_failed(report.failed as usize);
+                            worker.set_skipped(report.skipped as usize);
                             let mut summary = format!(
                                 "处理 {} 张，省 {}",
                                 report.processed,
@@ -1816,7 +2111,8 @@ impl AppState {
                         }
                     }
                 });
-            })
+            },
+        )
     }
 
     pub fn optimize_estimate(&self, task_id: &str) -> Option<OptimizeEstimate> {
@@ -1834,6 +2130,51 @@ impl AppState {
     pub fn similarity_groups_result(&self, task_id: &str) -> Option<SimilarityGroupsResult> {
         self.ai.groups_result(task_id)
     }
+}
+
+fn conflict_sentence(conflicts: &[Conflict]) -> String {
+    conflicts
+        .first()
+        .map(Conflict::sentence)
+        .unwrap_or_else(|| "有操作正在进行".to_owned())
+}
+
+/// 移动图片的任务级路径写：源文件夹与目标文件夹；源文件夹过多时退化为根写。
+fn move_resource_request(
+    database: &LibraryDb,
+    image_ids: &[i64],
+    target: &str,
+) -> AppResult<ResourceRequest> {
+    let mut sources = std::collections::HashSet::new();
+    for chunk in image_ids.chunks(400) {
+        let sql = format!(
+            "SELECT DISTINCT folders.path FROM images
+             JOIN folders ON folders.id = images.folder_id
+             WHERE images.id IN ({})",
+            crate::library::placeholders(chunk.len())
+        );
+        database.with_reader(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for path in rows {
+                sources.insert(path?);
+            }
+            Ok(())
+        })?;
+    }
+    let mut paths = if sources.is_empty() || sources.len() > 64 {
+        vec![PathScope::write("")]
+    } else {
+        sources.into_iter().map(PathScope::write).collect()
+    };
+    paths.push(PathScope::write(normalize_folder(target)?));
+    Ok(ResourceRequest::session_read()
+        .with_timeline(Access::Read)
+        .with_content_writer()
+        .with_paths(paths)
+        .with_path_note("正在移动图片"))
 }
 
 fn store_estimate(store: &Mutex<VecDeque<(String, OptimizeEstimate)>>, estimate: OptimizeEstimate) {

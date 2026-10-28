@@ -16,6 +16,10 @@ use serde::Serialize;
 
 use crate::{
     app::{error::AppResult, tasks::TaskScope},
+    concurrency::{
+        budget::{BudgetError, ImageBudget},
+        resources::{HolderInfo, ResourceTable},
+    },
     imageops::{
         colors,
         optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SkipReason, SourceInfo},
@@ -25,10 +29,9 @@ use crate::{
     library::{
         BatchReporter,
         calibration::{CONSERVATIVE as CONSERVATIVE_CALIBRATION, OptimizeCalibration},
+        content,
         db::LibraryDb,
-        encode_pool, metadata,
         optimize::{CandidateRow, collect_candidates},
-        paths::LibraryPaths,
         service::now_ms,
     },
 };
@@ -453,6 +456,9 @@ pub fn estimate(
     sample_budget: usize,
     options_fingerprint: &str,
     reporter: &dyn BatchReporter,
+    resources: &ResourceTable,
+    images: &ImageBudget,
+    holder: &HolderInfo,
 ) -> AppResult<Option<OptimizeEstimate>> {
     options.validate()?;
     let sample_budget = sample_budget.clamp(1, SAMPLE_MAX);
@@ -591,7 +597,7 @@ pub fn estimate(
         .map(|row| (row.id, row))
         .collect();
 
-    let pool = encode_pool("估算")?;
+    let pool = images.pool("估算")?;
     let threads = pool.current_num_threads();
 
     reporter.message("正在编码样本…");
@@ -607,7 +613,16 @@ pub fn estimate(
                 let row = sample_rows.get(&task.id);
                 let (outcome, error) = match row {
                     Some(row) => {
-                        let outcome = sample_one(root, row, options);
+                        let outcome = sample_one(
+                            database,
+                            root,
+                            row,
+                            options,
+                            resources,
+                            images,
+                            holder,
+                            &|| reporter.cancelled(),
+                        );
                         let error = outcome.error.clone();
                         (outcome, error)
                     }
@@ -876,29 +891,39 @@ fn failed_outcome(pixels: u64, bytes: u64, read_secs: f64, error: String) -> Sam
 }
 
 /// 编码一个样本；失败也返回 `SampleOutcome`，把已经发生的读取/编码耗时带回去。
-fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> SampleOutcome {
-    let paths = LibraryPaths::new(root);
-    let path =
-        match metadata::content_path(&paths, &row.folder_path, &row.content_hash, &row.file_ext) {
-            Ok(path) => path,
+#[allow(clippy::too_many_arguments)]
+fn sample_one(
+    database: &LibraryDb,
+    root: &Path,
+    row: &CandidateRow,
+    options: &OptimizeOptions,
+    resources: &ResourceTable,
+    images: &ImageBudget,
+    holder: &HolderInfo,
+    cancel: &dyn Fn() -> bool,
+) -> SampleOutcome {
+    let read_started = Instant::now();
+    let (current, source_bytes) =
+        match content::read_original(database, resources, root, row.id, holder, cancel) {
+            Ok(value) => value,
             Err(error) => {
                 return failed_outcome(
                     row.pixels(),
                     row.file_size.max(0) as u64,
-                    0.0,
-                    error.to_string(),
+                    read_started.elapsed().as_secs_f64(),
+                    format!("无法读取图片：{error}"),
                 );
             }
         };
-    let read_started = Instant::now();
-    let source_bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    // 路径读锁已在 `read_original` 返回前释放，再拿预算做解码与编码。
+    let _permit = match images.acquire(cancel) {
+        Ok(permit) => permit,
+        Err(BudgetError::Cancelled) => {
             return failed_outcome(
                 row.pixels(),
                 row.file_size.max(0) as u64,
                 read_started.elapsed().as_secs_f64(),
-                format!("无法读取图片：{error}"),
+                "估算已取消".to_owned(),
             );
         }
     };
@@ -920,16 +945,16 @@ fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> Sam
         recalc_secs: 0.0,
         bad_pixel_ratio: 0.0,
     };
-    if optimize::multiframe_guard(&source_bytes, &row.format).is_err() {
+    if optimize::multiframe_guard(&source_bytes, &current.format).is_err() {
         return skip_now(SkipReason::AnimatedOrMultipage);
     }
-    if optimize::color_profile_guard(&source_bytes, &row.format, options).is_err() {
+    if optimize::color_profile_guard(&source_bytes, &current.format, options).is_err() {
         return skip_now(SkipReason::ColorProfile);
     }
 
     let encode_started = Instant::now();
     // 已经读过一次盘：解码直接用这份字节，不再按路径读第二遍。
-    let decoded = match decode::decode_bytes(&source_bytes, Some(&row.file_ext)) {
+    let decoded = match decode::decode_bytes(&source_bytes, Some(&current.file_ext)) {
         Ok(decoded) => decoded,
         Err(error) => {
             return failed_outcome(row.pixels(), old_bytes, read_secs, error.to_string());
@@ -937,11 +962,11 @@ fn sample_one(root: &Path, row: &CandidateRow, options: &OptimizeOptions) -> Sam
     };
 
     let source = SourceInfo {
-        format: row.format.clone(),
+        format: current.format.clone(),
         file_size: source_bytes.len() as i64,
         width: decoded.width,
         height: decoded.height,
-        has_alpha: row.has_alpha || decoded.has_alpha,
+        has_alpha: current.has_alpha || decoded.has_alpha,
         optimized_at: row.optimized_at,
         bit_depth: optimize::bit_depth(&decoded.image),
     };
@@ -2003,6 +2028,9 @@ mod tests {
             50,
             "fingerprint",
             &reporter,
+            &crate::concurrency::resources::ResourceTable::new(),
+            &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::resources::HolderInfo::new("estimate-test", "估算"),
         )
         .unwrap()
         .unwrap();
@@ -2133,6 +2161,9 @@ mod tests {
             10,
             "fingerprint",
             &reporter,
+            &crate::concurrency::resources::ResourceTable::new(),
+            &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::resources::HolderInfo::new("estimate-test", "估算"),
         )
         .unwrap()
         .unwrap();

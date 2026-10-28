@@ -108,7 +108,7 @@ MCP 真实客户端：
 16. 把 3 张已在库内的图（其中 1 张在回收站）重新导入一次，`tasks_get(includePairs=true)` 返回 3 条 `duplicatePairs`，`imageId` 指向首次入库的图，回收站那张 `trashed=true`。
 17. 对同样 3 张改用 `duplicatePolicy=merge` 重跑，`mergedImageIds` 与上一步的 3 个 id 一致，`images_get` 能看到标签并集与较高评分。
 18. 同一目录放 2 份完全相同的图导入，`batchDuplicatePairs` 给出一对 `keptPath` / `sourcePath`，`duplicates=1`。
-19. 临时区导入 5 张图后调用 `temp_features_generate(kind=embedding)`：询问档出现确认卡，批准后任务用 write lane 运行；完成后 `library_info.features.embeddings` 不变、`tempEmbeddings=5`。
+19. 临时区导入 5 张图后调用 `temp_features_generate(kind=embedding)`：询问档出现确认卡，批准后任务占 `ai.service` 运行；完成后 `library_info.features.embeddings` 不变、`tempEmbeddings=5`。
 20. 以临时图为参考、`scope=temp` 搜语义能命中临时区内的图；改成 `scope=library` 后结果里不出现任何临时图。清空临时区后再搜语义不报错。
 21. `ids` 里混入一张普通库图片，`temp_features_generate` 整批拒绝并列出 `invalidIds`；生成中途取消后已完成张数保留、任务为 `cancelled`。
 22. `tags_list` 不带 `limit`：返回 100 条 + `total` + `nextCursor`；把 `nextCursor` 传给 `cursor` 再调一次，拿到剩余标签且没有重复 id。

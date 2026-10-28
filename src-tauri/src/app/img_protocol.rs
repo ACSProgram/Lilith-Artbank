@@ -18,7 +18,6 @@ const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 enum ImageError {
     BadRequest(&'static str),
     NotFound(String),
-    Internal(String),
 }
 
 /// `img://` 协议：原文表现为 `http://img.localhost/<id>?v=<hash>`，
@@ -44,17 +43,13 @@ fn respond(app: &AppHandle<Wry>, path: &str, responder: UriSchemeResponder) {
             log::debug!("原图 {path} 不可用：{reason}");
             empty(StatusCode::NOT_FOUND)
         }
-        Err(ImageError::Internal(reason)) => {
-            log::warn!("原图 {path} 读取失败：{reason}");
-            empty(StatusCode::INTERNAL_SERVER_ERROR)
-        }
     };
     responder.respond(response);
 }
 
 fn route(app: &AppHandle<Wry>, path: &str) -> Result<Response<Vec<u8>>, ImageError> {
-    let (database, root) = app
-        .state::<AppState>()
+    let state = app.state::<AppState>();
+    let (database, root) = state
         .current_library()
         .ok_or_else(|| ImageError::NotFound("图库未打开".into()))?;
     let paths = LibraryPaths::new(&root);
@@ -64,26 +59,39 @@ fn route(app: &AppHandle<Wry>, path: &str) -> Result<Response<Vec<u8>>, ImageErr
             .parse::<i64>()
             .map_err(|_| ImageError::BadRequest("图片 id 无效"))?;
         let row = load_row(&database, image_id)?;
-        let target = viewer::ensure_preview_file(&paths, &row)
-            .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
+        let (target, content_hash) = viewer::ensure_preview_file(
+            &database,
+            &paths,
+            &row,
+            &state.resources(),
+            &state.images(),
+        )
+        .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
         let bytes = std::fs::read(&target)
             .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
         return Ok(image_response(
             bytes,
             "image/webp",
-            &format!("{}-preview", row.content_hash),
+            &format!("{content_hash}-preview"),
         ));
     }
 
     let image_id = path
         .parse::<i64>()
         .map_err(|_| ImageError::BadRequest("图片 id 无效"))?;
-    let row = load_row(&database, image_id)?;
-    let source = row
-        .path(&paths)
-        .map_err(|error| ImageError::Internal(error.to_string()))?;
-    let bytes = std::fs::read(&source)
-        .map_err(|error| ImageError::NotFound(format!("原图文件不可用：{error}")))?;
+    let holder = crate::concurrency::resources::HolderInfo::new(
+        format!("img-protocol-{image_id}"),
+        "查看器",
+    )
+    .with_path_note("正在读取");
+    let (row, bytes) = crate::library::content::try_read_original(
+        &database,
+        &state.resources(),
+        &root,
+        image_id,
+        &holder,
+    )
+    .map_err(|error| ImageError::NotFound(format!("原图文件不可用：{error}")))?;
     Ok(image_response(
         bytes,
         content_type(&row.file_ext),

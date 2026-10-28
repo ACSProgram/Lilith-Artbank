@@ -307,7 +307,7 @@ export function SettingsDialog({
         value.performance.workerThreads < 1 ||
         value.performance.workerThreads > 128)
     ) {
-      return "工作线程数必须在 1-128 之间，或留空使用自动值";
+      return "后台图像工作线程数必须在 1-128 之间，或留空使用自动值";
     }
     if (
       !Number.isInteger(value.ui.gridThumbPx) ||
@@ -825,7 +825,7 @@ export function SettingsDialog({
                         }
                       />
                     </Field>
-                    <Field label="工作线程">
+                    <Field label="后台图像工作线程">
                       <input
                         className="input"
                         type="number"
@@ -847,7 +847,7 @@ export function SettingsDialog({
                   </div>
                   <div className="settings-note">
                     <Gauge size={13} />
-                    改动在下次打开图库后生效。
+                    图像工作线程改动对之后开始的工作生效；读取连接数在下次打开图库后生效。
                   </div>
                 </Panel>
               ) : null}

@@ -163,10 +163,14 @@ pub struct ImportSource {
     pub root: PathBuf,
     /// 本次导入的操作记录 id；为 `Some` 时新增行写入 `origin_operation_id` 并追加逆数据。
     pub operation_id: Option<i64>,
+    /// 运行中的短路径锁（删临时区重复文件）与图像预算。
+    pub resources: Arc<crate::concurrency::resources::ResourceTable>,
+    pub images: Arc<crate::concurrency::budget::ImageBudget>,
+    pub holder: crate::concurrency::resources::HolderInfo,
 }
 
 /// 启动后台导入；立即返回，进度与最终结果通过事件推送。
-/// `guard` 是任务总线上的 write lane 占用权，随导入线程一起释放；
+/// `guard` 是任务总线上的资源占用权，随导入线程一起释放；
 /// `live` 是本次导入的操作记录守卫，线程结束（含 panic）时由它收尾。
 pub fn start(
     app: AppHandle,

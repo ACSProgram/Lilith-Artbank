@@ -70,6 +70,8 @@ fn context(
             base_url,
             ..AiSettings::default()
         },
+        resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
+        images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
     }
 }
 

@@ -22,6 +22,10 @@ use crate::{
             TaskStartResult,
         },
     },
+    concurrency::{
+        budget::ImageBudget,
+        resources::{Access, Conflict, HolderInfo, ResourceGuard, ResourceRequest, ResourceTable},
+    },
     imageops,
     library::{
         db::LibraryDb,
@@ -307,6 +311,8 @@ struct Inner {
     groups_results: Mutex<HashMap<String, SimilarityGroupsResult>>,
     store: Arc<FeatureStore>,
     library: RwLock<Option<LibraryHandles>>,
+    resources: Arc<ResourceTable>,
+    images: Arc<ImageBudget>,
     generation: AtomicU64,
     supervisor_generation: AtomicU64,
     supervising: AtomicBool,
@@ -326,6 +332,13 @@ impl Default for AiRuntime {
 
 impl AiRuntime {
     pub fn new() -> Self {
+        Self::with_runtime(
+            Arc::new(ResourceTable::new()),
+            Arc::new(ImageBudget::default()),
+        )
+    }
+
+    pub fn with_runtime(resources: Arc<ResourceTable>, images: Arc<ImageBudget>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 process: Mutex::new(AiProcess::default()),
@@ -335,6 +348,8 @@ impl AiRuntime {
                 groups_results: Mutex::new(HashMap::new()),
                 store: Arc::new(FeatureStore::new()),
                 library: RwLock::new(None),
+                resources,
+                images,
                 generation: AtomicU64::new(0),
                 supervisor_generation: AtomicU64::new(0),
                 supervising: AtomicBool::new(false),
@@ -489,6 +504,39 @@ impl AiRuntime {
         }
     }
 
+    fn acquire_ai_short(
+        &self,
+        label: &str,
+        metadata: bool,
+    ) -> AppResult<(HolderInfo, ResourceGuard)> {
+        let holder = HolderInfo::new(uuid::Uuid::new_v4().to_string(), label)
+            .with_reason("正在使用 AI 服务")
+            .with_path_note("正在读取");
+        let request = if metadata {
+            ResourceRequest::session_read()
+                .with_ai_service()
+                .with_content_writer()
+                .with_timeline(Access::Read)
+                .with_metadata_writer()
+        } else {
+            ResourceRequest::session_read()
+                .with_ai_service()
+                .with_content_writer()
+        };
+        match self.inner.resources.try_acquire(&request, &holder) {
+            Ok(guard) => Ok((holder, guard)),
+            Err(conflicts) => {
+                let detail = conflicts
+                    .first()
+                    .map(Conflict::sentence)
+                    .unwrap_or_else(|| "AI 服务正在被其他任务使用".to_owned());
+                Err(AppError::message(format!(
+                    "{detail}，请等待完成或取消后再试"
+                )))
+            }
+        }
+    }
+
     pub fn describe_image(
         &self,
         settings: &AiSettings,
@@ -497,13 +545,22 @@ impl AiRuntime {
         max_tokens: Option<u32>,
     ) -> AppResult<AiDescriptionResult> {
         let handles = self.handles()?;
+        let (holder, _guard) = self.acquire_ai_short("AI 描述", true)?;
         let client = AiClient::new(&settings.base_url);
         let health = client
             .health()
             .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
         job::ensure_capability(&client, &health, "description")
             .map_err(|error| AppError::message(format!("无法加载描述模型：{error}")))?;
-        let bytes = super::input::description_bytes(&handles.database, &handles.root, image_id)?;
+        let bytes = super::input::description_bytes(
+            &handles.database,
+            &handles.root,
+            image_id,
+            &self.inner.resources,
+            &self.inner.images,
+            &holder,
+            &|| false,
+        )?;
         let result = client
             .describe(
                 prompt.unwrap_or(""),
@@ -532,14 +589,23 @@ impl AiRuntime {
 
     pub fn generate_pose(&self, settings: &AiSettings, image_id: i64) -> AppResult<PoseData> {
         let handles = self.handles()?;
+        let (holder, _guard) = self.acquire_ai_short("AI 姿势", false)?;
         let client = AiClient::new(&settings.base_url);
         let health = client
             .health()
             .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
         let capability = job::ensure_capability(&client, &health, "pose")
             .map_err(|error| AppError::message(format!("无法加载姿势模型：{error}")))?;
-        let bytes =
-            super::input::small_bytes(&handles.database, &handles.thumbs, &handles.root, image_id)?;
+        let bytes = super::input::small_bytes(
+            &handles.database,
+            &handles.thumbs,
+            &handles.root,
+            image_id,
+            &self.inner.resources,
+            &self.inner.images,
+            &holder,
+            &|| false,
+        )?;
         let result = client
             .pose(&capability.model, &bytes)
             .map_err(|error| AppError::message(error.to_string()))?;
@@ -574,7 +640,7 @@ impl AiRuntime {
     }
 
     /// 临时区特征生成：只写入 feature_blobs，不产生操作记录；
-    /// 任务占用 write lane，跑完让语义结果与均值失效。
+    /// 任务占用 AI 服务资源，跑完让语义结果与均值失效。
     pub fn start_temp_features(
         &self,
         app: AppHandle,
@@ -625,6 +691,8 @@ impl AiRuntime {
             root: handles.root.clone(),
             store: self.inner.store.clone(),
             settings: settings.clone(),
+            resources: self.inner.resources.clone(),
+            images: self.inner.images.clone(),
         };
         let writes_history = request.kind == AiJobKind::Description;
         let temp_features = task_kind == Some(TaskKind::TempFeatures);
@@ -637,11 +705,26 @@ impl AiRuntime {
         let runtime = self.clone();
         let bus_worker = bus.clone();
         let state_app = app.clone();
-        bus.launch(app, handle, policy, move |guard| {
+        let resource_request = if writes_history {
+            ResourceRequest::session_read()
+                .with_ai_service()
+                .with_content_writer()
+                .with_timeline(Access::Read)
+                .with_metadata_writer()
+                .with_path_note("正在读取")
+        } else {
+            // 即使 embedding/pose 通常只读缩略图，也要避开内容写者：
+            // 编辑/压缩会在任务运行期间替换原图与缩略图，旧缩略图算出的特征不能留到新内容上。
+            ResourceRequest::session_read()
+                .with_ai_service()
+                .with_content_writer()
+                .with_path_note("正在读取")
+        };
+        bus.launch(app, handle, resource_request, policy, move |guard| {
             let name = format!("ai-job-{}", worker_handle.id());
             let task = worker_handle.clone();
             let _ = bus_worker.spawn_worker(name, worker_handle, move || {
-                // AI lane 由任务线程持有，直到批量执行结束。
+                // 资源由任务线程持有，直到批量执行结束。
                 let _guard: LaneGuard = guard;
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     job::execute(&context, &task, &request)
@@ -1036,27 +1119,41 @@ impl AiRuntime {
         let worker = handle.clone();
         let runtime = self.clone();
         let bus_worker = bus.clone();
-        bus.launch(app, handle, policy, move |guard| {
-            let _ = bus_worker.spawn_worker(
-                "similarity-groups".to_owned(),
-                worker.clone(),
-                move || {
-                    let _guard: LaneGuard = guard;
-                    worker.set_phase(TaskPhase::Running);
-                    worker.set_total(1000);
-                    let progress = TaskProgress::new(worker.clone());
-                    match runtime.find_similar_groups_with(options, &progress) {
-                        Ok(result) => {
-                            runtime.store_groups(worker.id(), result);
-                            worker.set_message("");
-                            worker.set_completed(1000);
-                            worker.finish_from(&Ok(()));
+        bus.launch(
+            app,
+            handle,
+            ResourceRequest::session_read(),
+            policy,
+            move |guard| {
+                let _ = bus_worker.spawn_worker(
+                    "similarity-groups".to_owned(),
+                    worker.clone(),
+                    move || {
+                        let _guard: LaneGuard = guard;
+                        worker.set_phase(TaskPhase::Running);
+                        worker.set_total(1000);
+                        let _permit = match runtime.inner.images.acquire(&|| worker.should_cancel())
+                        {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                worker.finish(TaskPhase::Cancelled);
+                                return;
+                            }
+                        };
+                        let progress = TaskProgress::new(worker.clone());
+                        match runtime.find_similar_groups_with(options, &progress) {
+                            Ok(result) => {
+                                runtime.store_groups(worker.id(), result);
+                                worker.set_message("");
+                                worker.set_completed(1000);
+                                worker.finish_from(&Ok(()));
+                            }
+                            Err(error) => worker.finish_from::<()>(&Err(error)),
                         }
-                        Err(error) => worker.finish_from::<()>(&Err(error)),
-                    }
-                },
-            );
-        })
+                    },
+                );
+            },
+        )
     }
 
     fn store_groups(&self, task_id: &str, result: SimilarityGroupsResult) {

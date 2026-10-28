@@ -1264,7 +1264,10 @@ fn perf_encode_threads() {
             output / 1024
         );
     }
-    println!("[perf] cores={cores} policy={}", super::encode_threads());
+    println!(
+        "[perf] cores={cores} default_budget={}",
+        crate::concurrency::budget::default_limit()
+    );
 }
 
 /// 批次大小基准：500 / 1000 / 2000 张一批，比较总耗时与提交耗时占比。
@@ -1350,6 +1353,9 @@ fn perf_optimize_batch_size() {
             operation,
             &NoopReporter,
             batch_size,
+            &crate::concurrency::budget::ImageBudget::new(
+                crate::concurrency::budget::default_limit(),
+            ),
         )
         .expect("optimize");
         let elapsed = started.elapsed().as_secs_f64();
@@ -1438,6 +1444,9 @@ fn perf_estimate_vs_actual() {
         200,
         "fingerprint",
         &NoopReporter,
+        &crate::concurrency::resources::ResourceTable::new(),
+        &crate::concurrency::budget::ImageBudget::new(crate::concurrency::budget::default_limit()),
+        &crate::concurrency::resources::HolderInfo::new("perf-estimate", "估算"),
     )
     .expect("estimate")
     .expect("estimate not cancelled");
@@ -1458,6 +1467,7 @@ fn perf_estimate_vs_actual() {
         &options,
         operation,
         &NoopReporter,
+        &crate::concurrency::budget::ImageBudget::new(crate::concurrency::budget::default_limit()),
     )
     .expect("optimize");
     let actual = started.elapsed().as_secs_f64();
@@ -1572,6 +1582,11 @@ fn perf_estimate_sampling_spread() {
             budget,
             "fingerprint",
             &NoopReporter,
+            &crate::concurrency::resources::ResourceTable::new(),
+            &crate::concurrency::budget::ImageBudget::new(
+                crate::concurrency::budget::default_limit(),
+            ),
+            &crate::concurrency::resources::HolderInfo::new("perf-spread", "估算"),
         )
         .expect("estimate")
         .expect("not cancelled")

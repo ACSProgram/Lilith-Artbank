@@ -266,13 +266,25 @@ fn load_thumbnail(
     pointer: Option<ThumbPointer>,
 ) -> Option<image::DynamicImage> {
     let pointer = pointer?;
+    let _permit = context.images.acquire(&|| false).ok()?;
     let bytes = context.thumbs.read(pointer.location).ok()?;
     contact_sheet::decode_thumbnail(&bytes).ok()
 }
 
 fn load_original(context: &ReadContext, image_id: i64) -> Option<image::DynamicImage> {
-    let path = content::original_path(&context.database, &context.root, image_id).ok()?;
-    crate::import::decode::decode(&path)
+    let holder =
+        crate::concurrency::resources::HolderInfo::new(format!("mcp-sheet-{image_id}"), "MCP 拼图")
+            .with_path_note("正在读取");
+    let (row, bytes) = content::try_read_original(
+        &context.database,
+        &context.resources,
+        &context.root,
+        image_id,
+        &holder,
+    )
+    .ok()?;
+    let _permit = context.images.acquire(&|| false).ok()?;
+    crate::import::decode::decode_bytes(&bytes, Some(&row.file_ext))
         .ok()
         .map(|decoded| decoded.image)
 }
@@ -328,6 +340,8 @@ mod tests {
             info: session.info.clone(),
             settings: crate::app::settings::Settings::default(),
             sheets,
+            resources: std::sync::Arc::new(crate::concurrency::resources::ResourceTable::new()),
+            images: std::sync::Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
         }
     }
 }

@@ -99,7 +99,7 @@ fn run_tags_modify(
                     plan,
                 );
             }
-            let lane = state.acquire_write_lane()?;
+            let lane = state.begin_metadata_write("修改图片信息")?;
             let (affected, operation_id) = metadata::delete_tag_with_id(&database, tag_id)?;
             drop(lane);
             Ok(ToolOutcome::value(write::finish_write(
@@ -141,7 +141,7 @@ fn run_tags_modify(
                     plan,
                 );
             }
-            let lane = state.acquire_write_lane()?;
+            let lane = state.begin_metadata_write("修改图片信息")?;
             let (report, operation_id) =
                 metadata::merge_tags_with_id(&database, tag_id, target_id)?;
             drop(lane);
@@ -202,7 +202,7 @@ fn rename_tag(
             "consequences": ["只改标签名称，图片关系不变；可以撤销"],
         })));
     }
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let operation_id = metadata::rename_tag_with_id(database, tag_id, name)?;
     drop(lane);
     Ok(ToolOutcome::value(write::finish_write(

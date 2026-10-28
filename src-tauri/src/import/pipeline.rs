@@ -3,7 +3,11 @@ use std::{
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -14,6 +18,10 @@ use uuid::Uuid;
 
 use crate::{
     app::error::{AppError, AppResult},
+    concurrency::{
+        budget::ImageBudget,
+        resources::{HolderInfo, ResourceTable},
+    },
     imageops::{
         colors,
         optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SourceInfo},
@@ -39,7 +47,7 @@ use crate::{
 
 const BATCH_SIZE: usize = 64;
 const DUPLICATE_BATCH: usize = 128;
-const CHANNEL_DEPTH: usize = 256;
+const CHANNEL_DEPTH: usize = 128;
 const READ_BUFFER: usize = 1024 * 1024;
 
 /// 库内 pHash 索引：`(image_id, 4×u64)`，按 id 追加，供感知重复线性扫描。
@@ -64,6 +72,10 @@ struct WriterOptions {
     replace_temp_duplicate: bool,
     /// 临时文件夹的物理目录；丢弃临时行后用它清掉原图副本。
     temp_content_dir: Option<PathBuf>,
+    /// 临时文件夹相对路径，用于丢弃临时行时短暂申请路径写锁。
+    temp_folder: String,
+    resources: Arc<ResourceTable>,
+    holder: HolderInfo,
 }
 
 struct Staged {
@@ -129,6 +141,7 @@ struct WorkerContext {
     inflight: Arc<Mutex<HashMap<String, PathBuf>>>,
     index: Arc<RwLock<PhashIndex>>,
     sender: mpsc::SyncSender<Outcome>,
+    images: Arc<ImageBudget>,
     #[cfg(test)]
     cancel_after: Option<usize>,
 }
@@ -200,6 +213,10 @@ fn run_inner(
             .collect::<Vec<_>>(),
     ));
 
+    let temp_folder = source
+        .database
+        .with_reader(crate::library::temp::path)?
+        .unwrap_or_default();
     let (folder, folder_id, temp_content_dir) = match request.target {
         ImportTarget::Library => {
             // 图库导入也可能要丢弃临时区的同内容行，提前拿到临时目录好清理副本。
@@ -226,6 +243,9 @@ fn run_inner(
         folder_id,
         replace_temp_duplicate: request.target == ImportTarget::Library,
         temp_content_dir,
+        temp_folder,
+        resources: source.resources.clone(),
+        holder: source.holder.clone(),
     };
 
     let writer = {
@@ -238,15 +258,10 @@ fn run_inner(
         })
     };
 
-    let threads = request
-        .worker_threads
-        .filter(|threads| (1..=128).contains(threads))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|count| count.get().saturating_sub(1))
-                .unwrap_or(1)
-                .max(1)
-        });
+    let threads = source
+        .images
+        .current_limit()
+        .min(scanned.files.len().max(1));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("import-{index}"))
@@ -267,18 +282,30 @@ fn run_inner(
             inflight,
             index,
             sender,
+            images: source.images.clone(),
             #[cfg(test)]
             cancel_after: request.cancel_after,
         };
+        let files = &scanned.files;
+        let next = AtomicUsize::new(0);
         pool.install(|| {
-            scanned
-                .files
-                .par_iter()
-                .for_each(|file| process_one(&file.path, &file.relative_folder, &context));
+            (0..threads).into_par_iter().for_each(|_| {
+                loop {
+                    if job.should_cancel() {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else {
+                        break;
+                    };
+                    process_one(&file.path, &file.relative_folder, &context);
+                }
+            });
         });
     }
 
     job.set_phase(ImportPhase::Finishing);
+    job.set_current("正在写入最后一批…");
     match writer.join() {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -305,7 +332,13 @@ fn process_one(path: &Path, relative_folder: &str, context: &WorkerContext) {
         context.job.set_current(name.to_string_lossy());
     }
 
-    match process_file(path, relative_folder, context) {
+    let result = {
+        let Ok(_permit) = context.images.acquire(&|| context.job.should_cancel()) else {
+            return;
+        };
+        process_file(path, relative_folder, context)
+    };
+    match result {
         Ok(Some(outcome)) => {
             context.job.inc_processed();
             if context.sender.send(outcome).is_err() {
@@ -664,6 +697,10 @@ fn write_loop(
                 flush(&database, &pack, &options, &job, &index, &mut buffer);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                job.set_current(format!(
+                    "正在写入最后一批（{} 张）",
+                    buffer.prepared.len() + buffer.duplicates.len()
+                ));
                 flush(&database, &pack, &options, &job, &index, &mut buffer);
                 break;
             }
@@ -927,9 +964,25 @@ fn flush(
             job.inc_temp_replaced(stats.temp_replaced);
             job.inc_optimized(stats.optimized, stats.optimized_bytes);
             // 行已经删掉，原图随临时区清空也会消失；这里只是提前省下磁盘。
-            for file in stats.orphan_temp_files {
-                if let Err(error) = std::fs::remove_file(&file) {
-                    log::debug!("清理临时区重复图失败：{error}；文件位于 {}", file.display());
+            if !stats.orphan_temp_files.is_empty() {
+                match options.resources.acquire_path_write(
+                    &options.temp_folder,
+                    &options.holder,
+                    &|| job.should_cancel(),
+                ) {
+                    Ok(_guard) => {
+                        for file in stats.orphan_temp_files {
+                            if let Err(error) = std::fs::remove_file(&file) {
+                                log::debug!(
+                                    "清理临时区重复图失败：{error}；文件位于 {}",
+                                    file.display()
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!("放弃提前清理临时区重复图：{error:?}");
+                    }
                 }
             }
             for (source, kept) in stats.batch_duplicate_pairs {
@@ -985,6 +1038,7 @@ fn flush(
             }
         }
     }
+    job.inc_written(batch.len() + dups.len());
 }
 
 /// 内容哈希已存在时的统一出口：按策略合并元数据，否则计入重复跳过。
@@ -1095,6 +1149,9 @@ mod tests {
             thumbs: session.thumbs.clone(),
             root: root.to_path_buf(),
             operation_id: None,
+            resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
+            images: Arc::new(crate::concurrency::budget::ImageBudget::new(4)),
+            holder: crate::concurrency::resources::HolderInfo::new("import-test", "导入"),
         }
     }
 
@@ -1376,9 +1433,12 @@ mod tests {
         let job = run_import(&session, &library_root, &source_dir);
         let snapshot = job.snapshot();
         assert_eq!(snapshot.progress.imported, 8, "{snapshot:?}");
+        assert_eq!(snapshot.progress.written, 8, "{snapshot:?}");
         assert_eq!(snapshot.progress.failed, 0, "{snapshot:?}");
         assert_eq!(snapshot.progress.total, 8);
         assert_eq!(snapshot.preview_ids.len(), 8);
+        let unique: std::collections::HashSet<_> = snapshot.preview_ids.iter().collect();
+        assert_eq!(unique.len(), 8, "同一文件被处理了不止一次");
 
         session
             .db
@@ -1694,6 +1754,11 @@ mod tests {
         job.finish(ImportPhase::Cancelled);
         let snapshot = job.snapshot();
         assert!(snapshot.progress.processed < snapshot.progress.total);
+        assert_eq!(
+            snapshot.progress.written, snapshot.progress.imported,
+            "已入库数量必须与 written 一致：{snapshot:?}"
+        );
+        assert!(snapshot.progress.written <= snapshot.progress.processed);
 
         let rows: i64 = session
             .db

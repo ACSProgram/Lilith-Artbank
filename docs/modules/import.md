@@ -104,22 +104,22 @@
 
 ### 并发、进度与取消
 
-- 像素工作走 rayon 工作池；线程数取设置里的 `workerThreads`，为空时使用 CPU 并行度 - 1。
-- 结果通过有界通道送入唯一写线程；每 64 张或 250ms 批量提交；重复项最多攒 128 条。
-- 每张图的阶段：读取/哈希 → 解码/特征 → 发布 → 入库。界面显示当前文件名与总进度。
+- 像素工作走全局图像预算：线程数取设置里的 `workerThreads`，为空时使用逻辑核数 - 1；每处理一张前拿一个许可，导入、压缩、估算、缩略图、查看器、AI 解码与 MCP 拼图共用同一个上限。
+- 结果是深度 128 的有界通道送入唯一写线程；每 64 张或 250ms 批量提交；重复项最多攒 128 条。工作线程用原子索引动态取下一个文件，每个文件恰好处理一次。
+- 每张图的阶段：读取/哈希 → 解码/特征 → 发布 → 入库。进度按文件数加权：处理阶段 0–90；工作线程结束后进入收尾，按写线程已处理（成功、重复或失败）的条数推进 90–99，`phase=completed` 才 100%。
 - `import-progress` 事件每 150ms 推送一次；`import-finished` 在结束时推送完整快照。导入同时挂在任务总线上，右下角任务中心也能看到它与取消入口。
-- 默认排队：`start_import` 立即返回快照，`phase` 为 `queued`（排队等待）或 `scanning`（write lane 空闲时紧跟其后开始）；排队中的导入要等 lane 空闲且前面的等待者都启动后才进入 `scanning`。可以同时排队多个导入，但运行中的导入仍只有一个。
-- 取消：工作线程在文件边界检查标记；已入库图片保留，未完成临时文件清理；写线程继续把已准备好的批次落库。
-- 运行中的导入只允许一个，后续导入排队；有其他排队/运行任务时禁止关闭、创建或切换图库。
+- 默认排队：`start_import` 立即返回快照，`phase` 为 `queued`（等待资源）或 `scanning`；图库导入申请会话读、时间线读、内容写者与目标文件夹子树读，临时导入不占时间线。其他导入、压缩、AI 批量任务与目标子树内的文件夹写会等待，其他子树的文件夹操作可以并行。可以同时排队多个导入，但运行中的导入仍只有一个。
+- 取消：工作线程在文件边界停止取新文件；已准备好的批次继续由写线程落库，临时文件清理后结束，终态为已取消。
+- 运行中的导入只允许一个，后续导入排队；关闭、创建或切换图库要等导入与写任务结束。
 - 写线程按文件夹路径缓存 `folder_id`，同一批次重复进入同一目录时只解析/插入一次。
 - 失败清单最多保留 200 条；每条包含路径与原因。
 - 结果快照保留最近 24 个新增图片 id，用于导入完成后的缩略图预览。
-- 内存峰值约为工作线程数 × 单图解码内存；默认 CPU 并行度 - 1，超大图多张并发时可在设置里降低 `workerThreads`。
+- 内存峰值约为并发度 × 单图解码内存；默认逻辑核数 - 1，超大图多张并发时可在设置里降低 `workerThreads`。工作线程全部处理完后显示“正在写入最后一批（N 张）”。
 
 ### 操作记录与导入撤销
 
 - 导入开始前建一条 `pending` 操作记录（`HistoryKind::Import`）；记录 id 随 `ImportSource` / `WriterOptions` 进入写线程。记录由 `history::LiveOperation` 守卫：线程启动失败、panic 或提前返回时在 Drop 里删除空记录；已有内容则保留为可撤销。已有的灰色撤销记录不受影响。
-- 只有确实写入内容的批次才清空灰色（可重做）记录：导入被 write lane 冲突拒绝、或整批都是重复跳过时，重做分支必须保留。
+- 只有确实写入内容的批次才清空灰色（可重做）记录：导入因资源冲突被拒绝、或整批都是重复跳过时，重做分支必须保留。
 - 每批事务里：新增行写 `origin_operation_id`；`affected` 累加新增与合并数量；新建文件夹/标签与合并快照按批追加 JSON chunk。不在内存里累积整次导入。
 - 任务结束（完成、取消、失败或 panic）由 `LiveOperation` 收尾；有任一已提交内容就转为可撤销，否则删除空记录。取消后已完成部分仍可撤销。
 - 崩溃留下的 `pending` 导入记录在下次打开图库时按 `origin_operation_id` 或已有 chunk 判断转 `applied`，没有内容则删除。
@@ -155,9 +155,9 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
                             勾选导入时压缩才传对象；null 表示不压缩
 ```
 
-`workerThreads` 不由前端传入：`start_import` 一律用设置里的 `performance.workerThreads` 覆盖请求值，为空时取 CPU 并行度 - 1（上限 128）。
+`workerThreads` 不由前端传入：导入的工作线程数取全局图像预算（设置里的 `performance.workerThreads`，为空时取逻辑核数 - 1，上限 128）；请求里的 `workerThreads` 字段仅为反序列化兼容保留，不再生效。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
 
 `tempReplaced` 只统计图库导入时被丢弃的临时区同内容行（见上面的“重复策略”），临时导入恒为 0。
 

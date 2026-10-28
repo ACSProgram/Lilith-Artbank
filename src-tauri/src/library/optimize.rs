@@ -9,16 +9,22 @@ use std::{
     collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use rusqlite::params;
 use serde::Serialize;
 
 use crate::{
     app::error::{AppError, AppResult},
+    concurrency::budget::{BudgetError, ImageBudget},
     imageops::{
         colors,
         optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SkipReason, SourceInfo},
@@ -30,7 +36,7 @@ use crate::{
         calibration::{OptimizeCalibration, RunSample},
         content,
         db::LibraryDb,
-        encode_pool, import as repository,
+        import as repository,
         metadata::{self, ContentRemover},
         optimize_estimate::OptimizeEstimate,
         paths::LibraryPaths,
@@ -43,9 +49,9 @@ use crate::{
 
 /// 每批编码完成后在同一事务里发布，限制内存峰值与事务时长。
 ///
-/// 500 / 1000 / 2000 三档在临时库上对比过：更大的批次少提交几次，但事务持有
-/// 写锁更久、失败回滚范围更大；1000 是当前吞吐与回滚成本的折中。
-pub(crate) const BATCH_SIZE: usize = 1000;
+/// 256 张是双缓冲下的默认切分；字节上限避免少量超大图撑爆一批的内存峰值。
+pub(crate) const BATCH_SIZE: usize = 256;
+const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 /// 连续失败达到这个数就停止，避免磁盘或解码器故障时把整库刷成失败。
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 const MAX_REPORTED_FAILURES: usize = 50;
@@ -424,6 +430,7 @@ struct CommitOutcome {
 }
 
 /// 执行入口；`candidates` 由调用方按同一范围与参数收集，`operation_id` 是 live 记录。
+#[allow(clippy::too_many_arguments)]
 pub fn optimize(
     database: &LibraryDb,
     root: &Path,
@@ -432,6 +439,7 @@ pub fn optimize(
     options: &OptimizeOptions,
     operation_id: i64,
     reporter: &dyn BatchReporter,
+    images: &ImageBudget,
 ) -> AppResult<OptimizeReport> {
     optimize_with_batch_size(
         database,
@@ -442,7 +450,43 @@ pub fn optimize(
         operation_id,
         reporter,
         BATCH_SIZE,
+        images,
     )
+}
+
+struct EncodedBatch {
+    index: usize,
+    items: Vec<EncodedItem>,
+}
+
+fn batch_slices(jobs: &[CandidateRow], max_count: usize, max_bytes: u64) -> Vec<&[CandidateRow]> {
+    let mut slices = Vec::new();
+    let mut start = 0;
+    while start < jobs.len() {
+        let mut end = start;
+        let mut bytes = 0_u64;
+        while end < jobs.len() && end - start < max_count {
+            let size = jobs[end].file_size.max(1) as u64;
+            if end > start && bytes.saturating_add(size) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            end += 1;
+        }
+        slices.push(&jobs[start..end]);
+        start = end;
+    }
+    slices
+}
+
+/// 已经有结论的张数：已提交、跳过、失败与缺失都算解决，用于写入阶段 90–98。
+fn settled_count(report: &OptimizeReport) -> usize {
+    (report.prefilter_skipped
+        + report.processed
+        + report.candidate_skipped
+        + report.duplicate_skipped
+        + report.source_missing
+        + report.failed) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -455,6 +499,7 @@ pub(crate) fn optimize_with_batch_size(
     operation_id: i64,
     reporter: &dyn BatchReporter,
     batch_size: usize,
+    images: &ImageBudget,
 ) -> AppResult<OptimizeReport> {
     options.validate()?;
     let started = Instant::now();
@@ -474,121 +519,216 @@ pub(crate) fn optimize_with_batch_size(
     jobs.sort_by(|left, right| right.bpp().total_cmp(&left.bpp()));
 
     let total = jobs.len();
-    let pool = encode_pool("压缩")?;
+    let total_all = report.prefilter_skipped as usize + total;
+    let total_units = jobs
+        .iter()
+        .map(|row| row.pixels().max(1))
+        .sum::<u64>()
+        .max(1);
+    if let Some(meter) = reporter.meter() {
+        meter.set_total_units(total_units);
+        meter.enter_phase(0, 90);
+    }
+    reporter.report(0, total_all);
 
-    reporter.report(0, total);
-    // 按张上报：整批并行编码时也持续前进，用户能看到真实停在哪一张。
-    let done = AtomicUsize::new(0);
-    let mut consecutive_failures = 0_usize;
-    let mut stopped = false;
-    let mut batches_committed = 0_u64;
+    let report = Arc::new(Mutex::new(report));
+    let encoding_done = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let error_slot: Arc<Mutex<Option<AppError>>> = Arc::new(Mutex::new(None));
+    let batches_committed = Arc::new(AtomicU64::new(0));
+    let pool = Arc::new(images.pool("压缩")?);
+    let (sender, receiver) = mpsc::sync_channel::<EncodedBatch>(1);
 
-    for (batch_index, batch) in jobs.chunks(batch_size.max(1)).enumerate() {
-        if reporter.cancelled() {
-            report.cancelled = true;
-            break;
-        }
-        reporter.message("正在编码…");
-        let results = pool.install(|| {
-            batch
-                .par_iter()
-                .map(|row| {
-                    // 取消后剩余的图不再编码，也不再计入进度：进度条停在真实张数。
-                    if reporter.cancelled() {
-                        return Ok(None);
+    std::thread::scope(|scope| {
+        let commit_report = report.clone();
+        let commit_error = error_slot.clone();
+        let commit_batches = batches_committed.clone();
+        let commit_done = encoding_done.clone();
+        let commit_pool = pool.clone();
+        let commit_paths = &paths;
+        let committer = scope.spawn(move || {
+            while let Ok(batch) = receiver.recv() {
+                if batch.items.is_empty() {
+                    continue;
+                }
+                reporter.message(&format!("正在写入第 {} 批", batch.index + 1));
+                let outcome =
+                    match commit_batch(database, commit_paths, thumbs, operation_id, batch.items) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            *commit_error.lock() = Some(error);
+                            return;
+                        }
+                    };
+                let published = outcome.published.len();
+                let (processed_before, settled) = {
+                    let mut report = commit_report.lock();
+                    let before = report.processed as usize;
+                    report.publish_ms += outcome.write_ms;
+                    report.commit_ms += outcome.commit_ms;
+                    report.duplicate_skipped += outcome.duplicates;
+                    report.processed += published as u64;
+                    for item in &outcome.published {
+                        report.old_bytes += item.old_size;
+                        report.new_bytes += item.new_size;
                     }
-                    let result = encode_one(&paths, row, options);
-                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    reporter.report(completed, total);
-                    result.map(Some)
-                })
-                .collect::<Vec<AppResult<Option<EncodeOutcome>>>>()
+                    (before, settled_count(&report))
+                };
+                commit_batches.fetch_add(1, Ordering::Relaxed);
+                // 已完成只统计真正入库的图片；批次内逐张上报，进度不按批跳跃。
+                for step in 1..=published {
+                    reporter.report(processed_before + step, total_all);
+                }
+                // 编码阶段结束后才进入 90–98 的写入段，避免提交先行把进度条推到 90。
+                if commit_done.load(Ordering::Relaxed)
+                    && let Some(meter) = reporter.meter()
+                {
+                    meter.set_percent((90 + settled * 8 / total_all.max(1)) as u8);
+                }
+                // 提交已持久化，才允许删旧图；删除不持数据库写锁，失败只记日志。
+                let mut report = commit_report.lock();
+                delete_replaced(
+                    &commit_pool,
+                    root,
+                    commit_paths,
+                    &outcome.published,
+                    &mut report,
+                );
+            }
         });
 
-        let mut items = Vec::new();
-        for (row, result) in batch.iter().zip(results) {
-            match result {
-                Ok(Some(EncodeOutcome::Encoded(item))) => {
-                    report.encode_ms += item.encode_ms;
-                    report.hash_ms += item.hash_ms;
-                    report.recalc_ms += item.recalc_ms;
-                    report.write_ms += item.write_ms;
-                    report.fsync_ms += item.fsync_ms;
-                    items.push(*item);
-                    consecutive_failures = 0;
-                }
-                Ok(Some(EncodeOutcome::Skipped(reason))) => {
-                    log::debug!("跳过 image={}：{reason:?}", row.id);
-                    report.candidate_skipped += 1;
-                    consecutive_failures = 0;
-                }
-                Ok(Some(EncodeOutcome::SourceMissing(reason))) => {
-                    // 原图缺失是外部改动，不是系统性故障：单独计数，不触发停止。
-                    log::debug!("原图缺失 image={}：{reason}", row.id);
-                    report.source_missing += 1;
-                    if report.failures.len() < MAX_REPORTED_FAILURES {
-                        report.failures.push(OptimizeFailure {
-                            image_id: row.id,
-                            path: display_path(&paths, row),
-                            reason,
-                        });
-                    }
-                }
-                Ok(None) => {
-                    // 取消后没编码的图既不算处理也不算跳过：进度停在真实张数。
-                    consecutive_failures = 0;
-                }
-                Err(error) => {
-                    report.failed += 1;
-                    consecutive_failures += 1;
-                    if report.failures.len() < MAX_REPORTED_FAILURES {
-                        report.failures.push(OptimizeFailure {
-                            image_id: row.id,
-                            path: display_path(&paths, row),
-                            reason: error.to_string(),
-                        });
-                    }
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        report.stop_reason = Some("连续多张图片处理失败，任务已停止".to_owned());
-                        stopped = true;
+        let slices = batch_slices(&jobs, batch_size.max(1), MAX_BATCH_BYTES);
+        let mut consecutive_failures = 0_usize;
+        for (batch_index, batch) in slices.into_iter().enumerate() {
+            if reporter.cancelled() || stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            reporter.message("正在编码…");
+            let results = pool.install(|| {
+                batch
+                    .par_iter()
+                    .map(|row| {
+                        if reporter.cancelled() {
+                            return Ok(None);
+                        }
+                        let permit = match images.acquire(&|| reporter.cancelled()) {
+                            Ok(permit) => permit,
+                            Err(BudgetError::Cancelled) => return Ok(None),
+                        };
+                        let result = encode_one(&paths, row, options);
+                        drop(permit);
+                        if let Some(meter) = reporter.meter() {
+                            meter.advance_units(row.pixels().max(1));
+                        }
+                        result.map(Some)
+                    })
+                    .collect::<Vec<AppResult<Option<EncodeOutcome>>>>()
+            });
+
+            let mut items = Vec::new();
+            {
+                let mut report = report.lock();
+                for (row, result) in batch.iter().zip(results) {
+                    match result {
+                        Ok(Some(EncodeOutcome::Encoded(item))) => {
+                            report.encode_ms += item.encode_ms;
+                            report.hash_ms += item.hash_ms;
+                            report.recalc_ms += item.recalc_ms;
+                            report.write_ms += item.write_ms;
+                            report.fsync_ms += item.fsync_ms;
+                            items.push(*item);
+                            consecutive_failures = 0;
+                        }
+                        Ok(Some(EncodeOutcome::Skipped(reason))) => {
+                            log::debug!("跳过 image={}：{reason:?}", row.id);
+                            report.candidate_skipped += 1;
+                            consecutive_failures = 0;
+                        }
+                        Ok(Some(EncodeOutcome::SourceMissing(reason))) => {
+                            log::debug!("原图缺失 image={}：{reason}", row.id);
+                            report.source_missing += 1;
+                            if report.failures.len() < MAX_REPORTED_FAILURES {
+                                report.failures.push(OptimizeFailure {
+                                    image_id: row.id,
+                                    path: display_path(&paths, row),
+                                    reason,
+                                });
+                            }
+                        }
+                        Ok(None) => {
+                            consecutive_failures = 0;
+                        }
+                        Err(error) => {
+                            report.failed += 1;
+                            consecutive_failures += 1;
+                            if report.failures.len() < MAX_REPORTED_FAILURES {
+                                report.failures.push(OptimizeFailure {
+                                    image_id: row.id,
+                                    path: display_path(&paths, row),
+                                    reason: error.to_string(),
+                                });
+                            }
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                report.stop_reason =
+                                    Some("连续多张图片处理失败，任务已停止".to_owned());
+                                stopped.store(true, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        if !items.is_empty() {
-            reporter.message(&format!("正在写入第 {} 批", batch_index + 1));
-            let outcome = commit_batch(database, &paths, thumbs, operation_id, items)?;
-            batches_committed += 1;
-            report.publish_ms += outcome.write_ms;
-            report.commit_ms += outcome.commit_ms;
-            report.duplicate_skipped += outcome.duplicates;
-            report.processed += outcome.published.len() as u64;
-            for item in &outcome.published {
-                report.old_bytes += item.old_size;
-                report.new_bytes += item.new_size;
+            if !items.is_empty()
+                && sender
+                    .send(EncodedBatch {
+                        index: batch_index,
+                        items,
+                    })
+                    .is_err()
+            {
+                break;
             }
-            // 提交已持久化，才允许删旧图；删除不持数据库写锁，失败只记日志。
-            delete_replaced(&pool, root, &paths, &outcome.published, &mut report);
+            if stopped.load(Ordering::Relaxed) || reporter.cancelled() {
+                break;
+            }
         }
+        let finished_normally = !reporter.cancelled() && !stopped.load(Ordering::Relaxed);
+        if finished_normally {
+            encoding_done.store(true, Ordering::Relaxed);
+            if let Some(meter) = reporter.meter() {
+                let settled = settled_count(&report.lock());
+                meter.set_percent((90 + settled * 8 / total_all.max(1)) as u8);
+            }
+        }
+        drop(sender);
+        let _ = committer.join();
+    });
 
-        if reporter.cancelled() {
-            report.cancelled = true;
-        }
-        if report.cancelled || stopped {
-            break;
-        }
+    let mut report = std::mem::take(&mut *report.lock());
+    if let Some(error) = error_slot.lock().take() {
+        return Err(error);
     }
-
-    report.skipped = report.prefilter_skipped + report.candidate_skipped + report.duplicate_skipped;
+    if reporter.cancelled() {
+        report.cancelled = true;
+    }
+    report.skipped = report.prefilter_skipped
+        + report.candidate_skipped
+        + report.duplicate_skipped
+        + report.source_missing;
     report.savings_bytes = report.old_bytes.saturating_sub(report.new_bytes);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
+    if let Some(meter) = reporter.meter()
+        && !report.cancelled
+        && report.stop_reason.is_none()
+    {
+        meter.set_percent(99);
+    }
 
     // 用本次实测覆盖本库校准值，供下次估算替换保守常数；样本太少时保留旧值。
     let sample = RunSample {
         processed: report.processed,
         output_bytes: report.new_bytes,
-        batches: batches_committed,
+        batches: batches_committed.load(Ordering::Relaxed),
         write_secs: (report.write_ms + report.publish_ms) as f64 / 1000.0,
         fsync_secs: report.fsync_ms as f64 / 1000.0,
         commit_secs: report.commit_ms as f64 / 1000.0,
@@ -1028,7 +1168,7 @@ fn delete_replaced(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, path::PathBuf};
+    use std::{fs, io::Cursor, path::PathBuf, sync::atomic::AtomicUsize};
 
     use image::{DynamicImage, Rgb, RgbImage};
     use tempfile::tempdir;
@@ -1137,6 +1277,7 @@ mod tests {
             options,
             operation,
             &NoopReporter,
+            &crate::concurrency::budget::ImageBudget::new(2),
         )
         .unwrap();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
@@ -1395,6 +1536,7 @@ mod tests {
             &OptimizeOptions::default(),
             operation,
             &reporter,
+            &crate::concurrency::budget::ImageBudget::new(2),
         )
         .unwrap();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
@@ -1547,6 +1689,7 @@ mod tests {
             &OptimizeOptions::default(),
             operation,
             &NoopReporter,
+            &crate::concurrency::budget::ImageBudget::new(2),
         )
         .unwrap_err();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();

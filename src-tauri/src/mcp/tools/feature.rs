@@ -4,7 +4,7 @@
 //! embedding 或姿势特征，再通过 `find_similar(scope=temp)` 判断库里有没有相近的图。
 //!
 //! 边界：只接受临时图片 id，混入普通图片或已删除 id 时整批拒绝；单次最多 100 张；
-//! 不生成描述、不写操作记录；任务占用 write lane，询问档每次都要确认。
+//! 不生成描述、不写操作记录；任务占用 AI 服务资源，询问档每次都要确认。
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};

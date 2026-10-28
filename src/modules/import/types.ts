@@ -43,6 +43,10 @@ export interface ImportProgress {
   target: ImportTarget;
   total: number;
   processed: number;
+  /** 已被写线程提交（成功、重复或失败）的条数。 */
+  written: number;
+  /** 处理阶段 0–90、写入阶段 90–100；完成前不超过 99。 */
+  percent: number;
   imported: number;
   duplicates: number;
   merged: number;

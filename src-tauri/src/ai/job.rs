@@ -13,6 +13,10 @@ use crate::{
         settings::AiSettings,
         tasks::{TaskHandle, TaskKind, TaskPhase},
     },
+    concurrency::{
+        budget::ImageBudget,
+        resources::{HolderInfo, ResourceTable},
+    },
     library::{
         content,
         db::LibraryDb,
@@ -104,6 +108,8 @@ pub struct JobContext {
     pub root: PathBuf,
     pub store: Arc<FeatureStore>,
     pub settings: AiSettings,
+    pub resources: Arc<ResourceTable>,
+    pub images: Arc<ImageBudget>,
 }
 
 /// 任务主流程：探活并确保能力 → 过滤缺失项 → 逐张处理。
@@ -181,9 +187,11 @@ fn run_job(
     ids: Vec<i64>,
     operation_id: Option<i64>,
 ) -> AppResult<()> {
+    let holder = HolderInfo::new(task.id(), request.kind.label()).with_path_note("正在读取");
+    let cancel = || task.should_cancel();
     let mut consecutive_failures = 0_usize;
     for image_id in ids {
-        if task.should_cancel() {
+        if cancel() {
             return Ok(());
         }
         task.set_current(Some(image_id));
@@ -195,6 +203,8 @@ fn run_job(
             request,
             image_id,
             operation_id,
+            &holder,
+            &cancel,
         );
         match result {
             Ok(Outcome::Done) => {
@@ -225,6 +235,7 @@ enum Outcome {
     Skipped,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_one(
     context: &JobContext,
     kind: AiJobKind,
@@ -233,6 +244,8 @@ fn process_one(
     request: &AiJobRequest,
     image_id: i64,
     operation_id: Option<i64>,
+    holder: &HolderInfo,
+    cancel: &dyn Fn() -> bool,
 ) -> AppResult<Outcome> {
     let row = content::load(&context.database, image_id)?;
     if row.deleted_at.is_some() {
@@ -240,8 +253,16 @@ fn process_one(
     }
     match kind {
         AiJobKind::Embedding => {
-            let bytes =
-                input::small_bytes(&context.database, &context.thumbs, &context.root, image_id)?;
+            let bytes = input::small_bytes(
+                &context.database,
+                &context.thumbs,
+                &context.root,
+                image_id,
+                &context.resources,
+                &context.images,
+                holder,
+                cancel,
+            )?;
             let result = client
                 .embed_image(&capability.model, &bytes)
                 .map_err(|error| AppError::message(error.to_string()))?;
@@ -262,8 +283,16 @@ fn process_one(
             Ok(Outcome::Done)
         }
         AiJobKind::Pose => {
-            let bytes =
-                input::small_bytes(&context.database, &context.thumbs, &context.root, image_id)?;
+            let bytes = input::small_bytes(
+                &context.database,
+                &context.thumbs,
+                &context.root,
+                image_id,
+                &context.resources,
+                &context.images,
+                holder,
+                cancel,
+            )?;
             let result = client
                 .pose(&capability.model, &bytes)
                 .map_err(|error| AppError::message(error.to_string()))?;
@@ -274,7 +303,15 @@ fn process_one(
             Ok(Outcome::Done)
         }
         AiJobKind::Description => {
-            let bytes = input::description_bytes(&context.database, &context.root, image_id)?;
+            let bytes = input::description_bytes(
+                &context.database,
+                &context.root,
+                image_id,
+                &context.resources,
+                &context.images,
+                holder,
+                cancel,
+            )?;
             let result = client
                 .describe(
                     request.prompt.as_deref().unwrap_or(""),

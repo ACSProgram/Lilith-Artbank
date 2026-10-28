@@ -321,10 +321,11 @@ export function ImportDialog({
     onClose();
   };
 
-  const percent =
-    progress && progress.total > 0
-      ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
-      : 0;
+  const percent = progress
+    ? progress.phase === "completed"
+      ? 100
+      : progress.percent
+    : 0;
 
   const footer =
     view === "options" ? (

@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     app::settings::Settings,
+    concurrency::{budget::ImageBudget, resources::ResourceTable},
     library::{db::LibraryDb, service::LibraryInfo, thumbs::ThumbPack},
 };
 
@@ -15,4 +16,6 @@ pub struct ReadContext {
     pub info: LibraryInfo,
     pub settings: Settings,
     pub sheets: Arc<parking_lot::Mutex<SheetCache>>,
+    pub resources: Arc<ResourceTable>,
+    pub images: Arc<ImageBudget>,
 }

@@ -13,7 +13,7 @@ use crate::{
     app::error::{AppError, AppResult},
     imageops::{colors, phash, thumbnail},
     import::decode,
-    library::{content, db::LibraryDb, import as repository, paths::LibraryPaths, service::now_ms},
+    library::{content, db::LibraryDb, import as repository, service::now_ms},
 };
 
 const HEADER_MAGIC: &[u8; 8] = b"ARTBTHM1";
@@ -266,6 +266,7 @@ pub fn load_pointer(database: &LibraryDb, image_id: i64) -> AppResult<Option<Thu
 ///
 /// 返回 `false` 表示跳过（回收站图片，或已有缩略图且只补缺失项）。
 /// 追加写入，旧 blob 留给后续整理，不在这里回收。
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild(
     database: &LibraryDb,
     pack: &ThumbPack,
@@ -273,6 +274,10 @@ pub fn rebuild(
     image_id: i64,
     only_missing: bool,
     recalc_visuals: bool,
+    resources: &crate::concurrency::resources::ResourceTable,
+    holder: &crate::concurrency::resources::HolderInfo,
+    cancel: &dyn Fn() -> bool,
+    images: &crate::concurrency::budget::ImageBudget,
 ) -> AppResult<bool> {
     let row = content::load(database, image_id)?;
     if row.deleted_at.is_some() {
@@ -282,8 +287,12 @@ pub fn rebuild(
         return Ok(false);
     }
 
-    let source = row.path(&LibraryPaths::new(root))?;
-    let decoded = decode::decode(&source)?;
+    // 先读原图（路径锁在返回前已释放），再拿图像预算做解码与编码。
+    let (row, bytes) = content::read_original(database, resources, root, image_id, holder, cancel)?;
+    let _permit = images
+        .acquire(cancel)
+        .map_err(|_| AppError::message("图像预算等待已取消"))?;
+    let decoded = decode::decode_bytes(&bytes, Some(&row.file_ext))?;
     let thumb = thumbnail::encode(&decoded.image)?;
     let visuals = recalc_visuals.then(|| {
         (
@@ -560,7 +569,21 @@ mod tests {
             })
             .unwrap();
 
-        assert!(rebuild(&session.db, &session.thumbs, &root, image_id, true, true).unwrap());
+        assert!(
+            rebuild(
+                &session.db,
+                &session.thumbs,
+                &root,
+                image_id,
+                true,
+                true,
+                &crate::concurrency::resources::ResourceTable::new(),
+                &crate::concurrency::resources::HolderInfo::new("test", "test"),
+                &|| false,
+                &crate::concurrency::budget::ImageBudget::new(2)
+            )
+            .unwrap()
+        );
         let pointer = load_pointer(&session.db, image_id).unwrap().unwrap();
         assert_eq!(pointer.format, "webp");
         assert_eq!((pointer.width, pointer.height), (120, 80));
@@ -570,8 +593,36 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (120, 80));
 
         // 只补缺失项时，已有缩略图的图片直接跳过。
-        assert!(!rebuild(&session.db, &session.thumbs, &root, image_id, true, false).unwrap());
-        assert!(rebuild(&session.db, &session.thumbs, &root, image_id, false, false).unwrap());
+        assert!(
+            !rebuild(
+                &session.db,
+                &session.thumbs,
+                &root,
+                image_id,
+                true,
+                false,
+                &crate::concurrency::resources::ResourceTable::new(),
+                &crate::concurrency::resources::HolderInfo::new("test", "test"),
+                &|| false,
+                &crate::concurrency::budget::ImageBudget::new(2)
+            )
+            .unwrap()
+        );
+        assert!(
+            rebuild(
+                &session.db,
+                &session.thumbs,
+                &root,
+                image_id,
+                false,
+                false,
+                &crate::concurrency::resources::ResourceTable::new(),
+                &crate::concurrency::resources::HolderInfo::new("test", "test"),
+                &|| false,
+                &crate::concurrency::budget::ImageBudget::new(2)
+            )
+            .unwrap()
+        );
         assert_eq!(
             load_pointer(&session.db, image_id)
                 .unwrap()

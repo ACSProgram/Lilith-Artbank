@@ -327,7 +327,7 @@ impl Settings {
         if let Some(threads) = self.performance.worker_threads
             && !(1..=128).contains(&threads)
         {
-            return Err(AppError::message("工作线程数必须在 1-128 之间"));
+            return Err(AppError::message("后台图像工作线程数必须在 1-128 之间"));
         }
         if !(MIN_HISTORY_STEPS..=MAX_HISTORY_STEPS).contains(&self.history.max_steps) {
             return Err(AppError::message(format!(

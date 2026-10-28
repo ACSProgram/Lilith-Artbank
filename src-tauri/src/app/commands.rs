@@ -18,6 +18,7 @@ use crate::{
             TaskSnapshot, TaskStartResult,
         },
     },
+    concurrency::resources::{Access, ResourceRequest},
     import::{ImportRequest, job::ImportSnapshot},
     library::{
         BatchReporter,
@@ -52,6 +53,11 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
     }
     if previous.mcp != saved.mcp {
         state.apply_mcp_settings(&saved.mcp);
+    }
+    if previous.performance.worker_threads != saved.performance.worker_threads {
+        state
+            .images()
+            .update_from_setting(saved.performance.worker_threads);
     }
     state.after_history_write();
     Ok(saved)
@@ -509,11 +515,12 @@ where
     .map_err(|error| error.to_string())?
 }
 
-/// 在 write lane 上跑一个有进度的批量操作：占用、排队、进度、终态都交给任务总线。
+/// 跑一个有进度的批量写操作：资源准入、排队、进度与终态都交给任务总线。
 async fn run_write_task<T, F>(
     app: AppHandle,
     kind: TaskKind,
     scope: String,
+    request: ResourceRequest,
     work: F,
 ) -> Result<T, String>
 where
@@ -525,7 +532,7 @@ where
         let state = app.state::<AppState>();
         let guard = state
             .tasks
-            .begin_queued(&app, handle.clone())
+            .begin_queued(&app, handle.clone(), request)
             .map_err(|error| error.to_string())?;
         let _guard: LaneGuard = guard;
         handle.set_phase(TaskPhase::Running);
@@ -555,9 +562,17 @@ pub async fn move_images_to_folder(
     folder_path: String,
 ) -> Result<MoveReport, String> {
     let scope = format!("{} 张", image_ids.len());
-    run_write_task(app, TaskKind::FolderMove, scope, move |state, reporter| {
-        state.move_images(&image_ids, &folder_path, reporter)
-    })
+    let request = app
+        .state::<AppState>()
+        .move_task_request(&image_ids, &folder_path)
+        .map_err(|error| error.to_string())?;
+    run_write_task(
+        app,
+        TaskKind::FolderMove,
+        scope,
+        request,
+        move |state, reporter| state.move_images(&image_ids, &folder_path, reporter),
+    )
     .await
 }
 
@@ -581,6 +596,9 @@ pub async fn delete_images_permanently(
         app,
         TaskKind::PermanentDelete,
         scope,
+        ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_metadata_writer(),
         move |state, reporter| state.delete_images(&image_ids, reporter),
     )
     .await
@@ -592,6 +610,9 @@ pub async fn empty_trash(app: AppHandle) -> Result<DeleteReport, String> {
         app,
         TaskKind::EmptyTrash,
         "回收站".to_owned(),
+        ResourceRequest::session_read()
+            .with_timeline(Access::Read)
+            .with_metadata_writer(),
         |state, reporter| state.empty_trash(reporter),
     )
     .await
@@ -703,10 +724,14 @@ pub async fn get_viewer_source(
     let (database, root) = state
         .current_library()
         .ok_or_else(|| "尚未打开图库".to_owned())?;
-    tauri::async_runtime::spawn_blocking(move || viewer::source(&database, &root, image_id))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let resources = state.resources();
+    let images = state.images();
+    tauri::async_runtime::spawn_blocking(move || {
+        viewer::source(&database, &root, image_id, &resources, &images)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -714,10 +739,16 @@ pub async fn save_image_edit(
     state: State<'_, AppState>,
     request: EditRequest,
 ) -> Result<EditResult, String> {
-    let guard = state.begin_edit().map_err(|error| error.to_string())?;
+    let guard = state
+        .begin_edit(request.image_id)
+        .map_err(|error| error.to_string())?;
+    let images = state.images();
     let (database, thumbs, root) = state.edit_handles().map_err(|error| error.to_string())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
+        let _permit = images
+            .acquire(&|| false)
+            .map_err(|_| AppError::message("图像预算等待已取消"))?;
         edit::save(&database, &root, &thumbs, &request)
     })
     .await
@@ -914,10 +945,11 @@ pub fn get_similarity_ids(state: State<'_, AppState>, token: String) -> Result<V
 
 #[tauri::command]
 pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(), String> {
-    let path = state
+    let (path, guard) = state
         .copy_source(image_id)
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
         crate::platform::clipboard::copy_image(&path).map_err(|error| error.to_string())
     })
     .await

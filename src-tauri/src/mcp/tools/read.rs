@@ -870,6 +870,8 @@ mod tests {
             info: session.info,
             settings: Settings::default(),
             sheets: Arc::new(parking_lot::Mutex::new(SheetCache::default())),
+            resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
+            images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
         };
         Fixture {
             _temp: temp,

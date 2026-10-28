@@ -145,7 +145,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - v5 → v6：新增 `mcp`（默认 `enabled=false`、`port=18767`、`mode=ask`）；MCP 服务的实际能力见 [MCP 图库控制](mcp.md)。
 - `ui.detailPanelMode` 已删除：详情面板只有“挤压画布 + 列数变化锚定”一种实现。旧设置文件里的该字段由 serde 忽略，不报错、不回写。
 - 图库路径必须绝对；保存时去掉尾部路径分隔符，但保留盘符根（`G:\`）。
-- `readerConnections` 1-16；`workerThreads` 为空表示自动。
+- `readerConnections` 1-16；`workerThreads` 1-128，为空表示自动（逻辑核数 − 1）。它是全局后台图像工作预算，导入、压缩、估算、缩略图、查看器预览、AI 解码与 MCP 拼图共用；保存后对之后开始的工作立即生效。
 - `history.maxSteps` 10-500；历史保存在各图库自己的 SQLite 中，上限是全局设置，换库后仍使用同一上限。
 - `mcp.port` 1-65535；`mcp.mode` 只能是 `readOnly` / `ask` / `full`，工具按当前档位实时判定。
 - `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
@@ -244,8 +244,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 
 - 元数据写入都走单写连接；批量操作按 400 个 id 分块。
 - 图片移动逐张 `rename` + 更新 `folder_id`，数据库失败时回滚文件；永久删除与清空回收站只标记 `purge_operation_id`，真正删行删文件由 `ReleaseGarbage` 任务按 400 张一块执行。
-- 文件操作（图片移动、永久删除、清空回收站、释放）与导入等长任务挂任务总线的 write lane，冲突时自动排队；同 lane 先来先得，队列里出现 write 等待者后不再放行新的 ai/scan，避免写任务被持续插队。短写（评分、标签、描述、集合/文件夹元数据、编辑保存、回收站）仍立即占 lane，冲突直接失败。撤销/重做/清空记录依赖当前操作时间线，不进入队列；任务忙时直接拒绝或按钮禁用。
-- 创建/打开图库要求任务总线完全空闲（含排队任务）；关闭图库拒绝运行或排队的 write 任务，ai/scan 任务会被取消并等待退出。单条记录的撤销与释放任务不可中途取消；多条记录的撤销只在记录之间检查取消。任务线程 panic 由框架捕获、写日志并标为失败，lane 随 guard 释放；正常返回但没有写终态同样标为失败。运行中/排队任务不会被 50 条任务历史裁剪。
+- 任务准入由资源表决定（`src-tauri/src/concurrency/resources.rs`），不再是一条全局 write lane：导入占内容写者 + 时间线读 + 目标文件夹子树读，压缩占内容写者 + 根路径写，估算只占会话读并逐张拿文件夹读锁，缩略图重建占内容写者（避免用旧原图算出的缩略图覆盖新内容），移动/编辑保存/释放占内容写者与对应文件夹路径，永久删除/清空回收站占元数据写 + 时间线读，文件夹操作占对应子树路径（新建与移动还锁父级，避免同级序号并发），AI 任务占 `ai.service` 与内容写者，并在读原图时按文件夹加短读锁。冲突时长任务除撤销/重做/清空记录外自动排队，文件夹维护最多等当前一次读图 10 秒、超时报冲突；同一资源先来先得，路径锁写者优先。短写（评分、标签、描述、集合成员、回收站）只占元数据写，冲突直接失败。
+- 创建/打开图库要求资源表完全空闲（含等待者）；关闭图库拒绝所有不可中途取消的写任务（导入、移动、永久删除、清空回收站、压缩、撤销/重做、释放），AI/估算/缩略图/相似分组任务会被取消并等待退出。单条记录的撤销与释放任务不可中途取消；多条记录的撤销只在记录之间检查取消。任务线程 panic 由框架捕获、写日志并标为失败，资源随 guard 释放；正常返回但没有写终态同样标为失败。运行中/排队任务不会被 50 条任务历史裁剪。
 - 集合只引用图片 id；集合运算新建集合，不修改源集合。
 
 ## 文件夹
@@ -260,6 +260,8 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - `place_folders` 一次把多个文件夹移动到同一父级，可插入到指定同级位置；父子同时选中只保留最外层父。先校验全部目录与名称冲突，再依次 rename，任一失败反向搬回；整次操作一条 `FolderMove` 记录。
 - 删除只允许空文件夹：没有子文件夹、没有任何图片（包括回收站图片）、物理目录为空。删除先移除空目录，再删数据库行；数据库失败时重建目录。
 - 文件夹命令都返回完整 `FolderInfo[]`，前端用返回值整体刷新树，不做本地路径推算。
+- 文件夹写操作在改磁盘或数据库前先申请该子树路径写；读图任务（AI 描述/embedding/姿势、缩略图重建、估算、查看器）只在读原图期间持有短读锁，因此文件夹改名最多等当前这一张读完，不会被整个长任务挡住。读者拿到锁后按 id 重新读取数据库行，路径已变就重试，不会继续写旧路径。
+- 读原图的固定顺序是“先拿文件夹读锁并读字节，释放后再拿图像预算做解码/编码”，不会拿着预算许可去等文件夹锁。查看器、MCP 拼图与复制这类交互式读取在文件夹正忙时直接返回可重试错误，不排在长时间任务后面。
 - 文件夹计数由 `get_folders` 用一条直接计数查询在内存中沿路径前缀累加到祖先，结果随命令返回。
 - `folders.sort_index` 在新建、移动与排序时维护：新建与移动追加到同级末尾；`reorder_folders` 只接受同一父级的子文件夹，在事务里插入到指定位置并重新编号同级。
 - 文件夹树始终按 `sort_index`、id 显示，不再提供常驻的名称/图片数显示模式。右键文件夹（含“全部图片”根行）可做一次性排序：依据为名称或图片数（含子文件夹），可升降序，可勾选“包含所有后代”逐层排序；前端算好每个父级的完整同级顺序，`apply_folder_order` 校验集合后一次写回，只产生一条 `FolderReorder` 记录。
@@ -293,7 +295,7 @@ S3 的编辑/集合/回收站命令细节、返回结构与失败语义见 [浏�
 - 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
 - `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；可重复执行，不可取消。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件。
 - 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有任务占用 write lane 且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有运行中的任务且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
 - `HistoryStorage`：`{ recordCount, chunkCount, chunkBytes, undoFiles, undoBytes, totalBytes }`。逆数据用 `sum(length(data))` 统计，不读 BLOB 内容；`undo*` 递归统计 `.artbank/undo/` 的普通文件并跳过符号链接。操作记录面板显示记录数与占用；清空只删除记录与暂存，不对 SQLite 执行 `VACUUM`，数据库文件不会立即缩小。
 - `recoveryNeeded` 为真表示存在 `undoing` / `redoing` 记录且没有对应撤销/重做任务在跑；此时 `blockedReason` 提示重新打开图库恢复。
 - 待释放行对查询不可见：回收站视图与“全库搜索”显式加 `images.purge_operation_id IS NULL`；普通视图与集合视图靠 `deleted_at IS NULL` 挡住（待释放行一定有 `deleted_at`）；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。

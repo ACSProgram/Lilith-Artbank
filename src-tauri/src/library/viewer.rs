@@ -5,12 +5,16 @@ use serde::Serialize;
 
 use crate::{
     app::error::{AppError, AppResult},
+    concurrency::{
+        budget::ImageBudget,
+        resources::{HolderInfo, ResourceTable},
+    },
     imageops::{
         edit::{self, MAX_EDIT_PIXELS, OutputFormat},
         thumbnail,
     },
     import::decode,
-    library::{content::ContentRow, db::LibraryDb, paths::LibraryPaths},
+    library::{content, content::ContentRow, db::LibraryDb, paths::LibraryPaths},
 };
 
 /// 超过此像素数时查看器使用降采样预览；编辑保存仍读取原图。
@@ -71,8 +75,14 @@ pub struct PoseData {
     pub landmarks: Vec<PoseLandmark>,
 }
 
-pub fn source(database: &LibraryDb, root: &Path, image_id: i64) -> AppResult<ViewerSource> {
-    source_with_threshold(database, root, image_id, PREVIEW_PIXELS)
+pub fn source(
+    database: &LibraryDb,
+    root: &Path,
+    image_id: i64,
+    resources: &ResourceTable,
+    images: &ImageBudget,
+) -> AppResult<ViewerSource> {
+    source_with_threshold(database, root, image_id, PREVIEW_PIXELS, resources, images)
 }
 
 fn source_with_threshold(
@@ -80,9 +90,14 @@ fn source_with_threshold(
     root: &Path,
     image_id: i64,
     preview_threshold: u64,
+    resources: &ResourceTable,
+    images: &ImageBudget,
 ) -> AppResult<ViewerSource> {
-    let row = crate::library::content::load(database, image_id)?;
     let paths = LibraryPaths::new(root);
+    let holder = HolderInfo::new(format!("viewer-{image_id}"), "查看器").with_path_note("正在读取");
+    // 查看器是交互式读取：文件夹正忙时直接报可重试错误，不排在长时间任务后面。
+    let (row, guard) = content::try_lock_original(database, resources, image_id, &holder)?;
+
     let path = row.path(&paths)?;
     if !path.is_file() {
         return Err(AppError::message("原图文件不存在，可能已被外部移动或删除"));
@@ -95,8 +110,15 @@ fn source_with_threshold(
     let oriented = browser_native && has_exif_orientation(&path);
     let needs_preview = !browser_native || pixel_count > preview_threshold || oriented;
     let (display_width, display_height) = if needs_preview {
-        ensure_preview(&paths, &row, &path)?
+        // 读字节在路径读锁内完成；解码与写预览缓存放到预算之后。
+        let bytes = std::fs::read(&path)?;
+        drop(guard);
+        let _permit = images
+            .acquire(&|| false)
+            .map_err(|_| AppError::message("图像预算等待已取消"))?;
+        ensure_preview_bytes(&paths, &row, &bytes)?
     } else {
+        drop(guard);
         (row.width, row.height)
     };
 
@@ -143,27 +165,43 @@ pub fn preview_path(paths: &LibraryPaths, image_id: i64, content_hash: &str) -> 
 }
 
 /// 供 `img://preview` 使用：已有文件直接返回，缺失时按当前行重新生成。
-pub(crate) fn ensure_preview_file(paths: &LibraryPaths, row: &ContentRow) -> AppResult<PathBuf> {
+/// 返回预览路径与生成它时对应的内容哈希，调用方用作缓存键。
+pub(crate) fn ensure_preview_file(
+    database: &LibraryDb,
+    paths: &LibraryPaths,
+    row: &ContentRow,
+    resources: &ResourceTable,
+    images: &ImageBudget,
+) -> AppResult<(PathBuf, String)> {
     let target = preview_path(paths, row.id, &row.content_hash);
     if target.is_file() {
-        return Ok(target);
+        return Ok((target, row.content_hash.clone()));
     }
-    let source = row.path(paths)?;
-    if !source.is_file() {
-        return Err(AppError::message("原图文件不存在，可能已被外部移动或删除"));
-    }
-    ensure_preview(paths, row, &source)?;
-    Ok(target)
+    let holder = HolderInfo::new(format!("viewer-{}", row.id), "查看器").with_path_note("正在读取");
+    let (latest, bytes) =
+        content::try_read_original(database, resources, &paths.root, row.id, &holder)?;
+    let _permit = images
+        .acquire(&|| false)
+        .map_err(|_| AppError::message("图像预算等待已取消"))?;
+    ensure_preview_bytes(paths, &latest, &bytes)?;
+    Ok((
+        preview_path(paths, latest.id, &latest.content_hash),
+        latest.content_hash,
+    ))
 }
 
-fn ensure_preview(paths: &LibraryPaths, row: &ContentRow, source: &Path) -> AppResult<(u32, u32)> {
+fn ensure_preview_bytes(
+    paths: &LibraryPaths,
+    row: &ContentRow,
+    bytes: &[u8],
+) -> AppResult<(u32, u32)> {
     let target = preview_path(paths, row.id, &row.content_hash);
     let expected = thumbnail::fit_within(row.width, row.height, PREVIEW_MAX_EDGE);
     if target.is_file() {
         return Ok(expected);
     }
 
-    let decoded = decode::decode(source)?;
+    let decoded = decode::decode_bytes(bytes, Some(&row.file_ext))?;
     let (width, height) = thumbnail::fit_within(decoded.width, decoded.height, PREVIEW_MAX_EDGE);
     let image = if (width, height) == (decoded.width, decoded.height) {
         decoded.image
@@ -316,7 +354,14 @@ mod tests {
     #[test]
     fn serves_small_browser_formats_directly() {
         let fixture = fixture(false);
-        let source = source(&fixture.session.db, &fixture.root, fixture.image_id).unwrap();
+        let source = source(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(!source.preview);
         assert!(!source.downsampled);
         assert!(source.editable);
@@ -328,11 +373,38 @@ mod tests {
     }
 
     #[test]
+    fn reports_busy_instead_of_waiting_for_a_folder_writer() {
+        let fixture = fixture(false);
+        let resources = ResourceTable::new();
+        let _held = resources
+            .try_acquire(
+                &crate::concurrency::resources::ResourceRequest::path_write(""),
+                &HolderInfo::new("folder-writer", "重命名文件夹"),
+            )
+            .unwrap();
+        let error = source(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            &resources,
+            &ImageBudget::new(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("文件夹正忙"));
+    }
+
+    #[test]
     fn generates_and_reuses_preview() {
         let fixture = fixture(false);
-        let source =
-            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
-                .unwrap();
+        let source = source_with_threshold(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            100,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(source.preview);
         assert!(!source.downsampled);
         assert_eq!(
@@ -347,9 +419,15 @@ mod tests {
         assert!(preview.is_file());
         let modified = fs::metadata(&preview).unwrap().modified().unwrap();
 
-        let again =
-            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
-                .unwrap();
+        let again = source_with_threshold(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            100,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(again.preview);
         assert_eq!(
             fs::metadata(&preview).unwrap().modified().unwrap(),
@@ -391,7 +469,15 @@ mod tests {
             })
             .unwrap();
 
-        let source = source_with_threshold(&session.db, &root, image_id, 1).unwrap();
+        let source = source_with_threshold(
+            &session.db,
+            &root,
+            image_id,
+            1,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(source.preview);
         assert!(source.downsampled);
         assert_eq!((source.display_width, source.display_height), (4096, 8));
@@ -403,7 +489,14 @@ mod tests {
     #[test]
     fn trashed_images_are_read_only() {
         let fixture = fixture(true);
-        let source = source(&fixture.session.db, &fixture.root, fixture.image_id).unwrap();
+        let source = source(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(source.deleted);
         assert!(!source.editable);
     }
@@ -413,23 +506,46 @@ mod tests {
         let fixture = fixture(false);
         let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
         fs::remove_file(row.path(&LibraryPaths::new(&fixture.root)).unwrap()).unwrap();
-        assert!(source(&fixture.session.db, &fixture.root, fixture.image_id).is_err());
+        assert!(
+            source(
+                &fixture.session.db,
+                &fixture.root,
+                fixture.image_id,
+                &ResourceTable::new(),
+                &ImageBudget::new(2)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn regenerates_missing_preview_file() {
         let fixture = fixture(false);
-        let source =
-            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
-                .unwrap();
+        let source = source_with_threshold(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            100,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         let paths = LibraryPaths::new(&fixture.root);
         let preview = preview_path(&paths, fixture.image_id, &source.content_hash);
         assert!(preview.is_file());
         fs::remove_file(&preview).unwrap();
 
         let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
-        let regenerated = ensure_preview_file(&paths, &row).unwrap();
-        assert_eq!(regenerated, preview);
+        let regenerated = ensure_preview_file(
+            &fixture.session.db,
+            &paths,
+            &row,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
+        assert_eq!(regenerated.0, preview);
+        assert_eq!(regenerated.1, row.content_hash);
         let decoded = image::load_from_memory(&fs::read(&preview).unwrap()).unwrap();
         assert_eq!(
             (decoded.width(), decoded.height()),
@@ -440,19 +556,45 @@ mod tests {
     #[test]
     fn cached_preview_survives_missing_original() {
         let fixture = fixture(false);
-        let source =
-            source_with_threshold(&fixture.session.db, &fixture.root, fixture.image_id, 100)
-                .unwrap();
+        let source = source_with_threshold(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            100,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         let paths = LibraryPaths::new(&fixture.root);
         let preview = preview_path(&paths, fixture.image_id, &source.content_hash);
         let row = crate::library::content::load(&fixture.session.db, fixture.image_id).unwrap();
         fs::remove_file(row.path(&paths).unwrap()).unwrap();
 
-        assert_eq!(ensure_preview_file(&paths, &row).unwrap(), preview);
+        assert_eq!(
+            ensure_preview_file(
+                &fixture.session.db,
+                &paths,
+                &row,
+                &ResourceTable::new(),
+                &ImageBudget::new(2)
+            )
+            .unwrap()
+            .0,
+            preview
+        );
         assert!(preview.is_file());
 
         fs::remove_file(&preview).unwrap();
-        assert!(ensure_preview_file(&paths, &row).is_err());
+        assert!(
+            ensure_preview_file(
+                &fixture.session.db,
+                &paths,
+                &row,
+                &ResourceTable::new(),
+                &ImageBudget::new(2)
+            )
+            .is_err()
+        );
         assert!(!preview.exists());
     }
 
@@ -514,7 +656,14 @@ mod tests {
             })
             .unwrap();
 
-        let source = source(&session.db, &root, image_id).unwrap();
+        let source = source(
+            &session.db,
+            &root,
+            image_id,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+        )
+        .unwrap();
         assert!(source.preview);
         assert!(!source.downsampled);
         assert_eq!((source.display_width, source.display_height), (16, 24));

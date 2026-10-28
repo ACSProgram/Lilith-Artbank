@@ -781,7 +781,7 @@ pub fn write_with_id_mode<T>(
 
 /// 长任务先建 `pending` 记录，再在每批写入时追加逆数据；任务结束后 `finish_live`。
 ///
-/// 这里不结束重做分支：导入可能因为 write lane 冲突根本没启动，或者整批都是重复跳过。
+/// 这里不结束重做分支：导入可能因为资源冲突根本没启动，或者整批都是重复跳过。
 /// 只有真正写入内容的批次（`discard_redo_in_tx`）才算开启新时间线。
 pub fn begin_live(database: &LibraryDb, op: NewOperation<'_>) -> AppResult<i64> {
     database.with_writer(|connection| {
@@ -4979,7 +4979,7 @@ mod tests {
         assert_eq!(entries[0].id, entry.id + 1);
     }
 
-    /// 导入被 write lane 冲突拒绝时会先建一条 `pending` 记录再收掉；
+    /// 导入被资源冲突拒绝时会先建一条 `pending` 记录再收掉；
     /// 这条空记录不能顺手清掉灰色（可重做）记录。
     #[test]
     fn pending_import_without_content_keeps_redo_branch() {
@@ -5373,6 +5373,9 @@ mod tests {
                 thumbs: fixture.session.thumbs.clone(),
                 root: fixture.root.clone(),
                 operation_id: Some(operation_id),
+                resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
+                images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
+                holder: crate::concurrency::resources::HolderInfo::new("import-history", "导入"),
             };
             let job = Arc::new(ImportJob::new(
                 "import-history",

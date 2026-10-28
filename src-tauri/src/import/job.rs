@@ -89,6 +89,10 @@ pub struct ImportProgress {
     pub target: ImportTarget,
     pub total: usize,
     pub processed: usize,
+    /// 已被写线程提交（成功、重复或失败）的条数。
+    pub written: usize,
+    /// 加权进度：处理阶段 0–90，写入阶段 90–100；完成前不超过 99。
+    pub percent: u8,
     pub imported: usize,
     pub duplicates: usize,
     pub merged: usize,
@@ -166,6 +170,7 @@ pub struct ImportJob {
     phase: Mutex<ImportPhase>,
     total: AtomicUsize,
     processed: AtomicUsize,
+    written: AtomicUsize,
     imported: AtomicUsize,
     duplicates: AtomicUsize,
     merged: AtomicUsize,
@@ -208,6 +213,7 @@ impl ImportJob {
             phase: Mutex::new(ImportPhase::Queued),
             total: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
+            written: AtomicUsize::new(0),
             imported: AtomicUsize::new(0),
             duplicates: AtomicUsize::new(0),
             merged: AtomicUsize::new(0),
@@ -273,6 +279,15 @@ impl ImportJob {
         self.sync_task_progress();
     }
 
+    /// 写线程提交（或确认失败）后调用；`written` 才是真正离开缓冲区、落库的条数。
+    pub fn inc_written(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.written.fetch_add(count, Ordering::Relaxed);
+        self.sync_task_progress();
+    }
+
     pub fn inc_imported(&self, count: usize) {
         self.imported.fetch_add(count, Ordering::Relaxed);
     }
@@ -301,6 +316,27 @@ impl ImportJob {
         let processed = self.processed.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
         self.handle.set_completed(processed.saturating_sub(failed));
+        self.handle.set_percent(self.percent());
+    }
+
+    fn percent(&self) -> u8 {
+        let phase = self.effective_phase();
+        if phase == ImportPhase::Completed {
+            return 100;
+        }
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0;
+        }
+        let processed = self.processed.load(Ordering::Relaxed);
+        let written = self.written.load(Ordering::Relaxed);
+        let percent = if phase == ImportPhase::Finishing {
+            // 工作线程已结束，剩下的是写线程把缓冲区排空。
+            90 + written.min(total).saturating_mul(10) / total
+        } else {
+            processed.saturating_mul(90) / total
+        };
+        (percent as u8).min(99)
     }
 
     pub fn inc_similar(&self, count: usize) {
@@ -399,6 +435,8 @@ impl ImportJob {
             target: self.target,
             total: self.total.load(Ordering::Relaxed),
             processed: self.processed.load(Ordering::Relaxed),
+            written: self.written.load(Ordering::Relaxed),
+            percent: self.percent(),
             imported: self.imported.load(Ordering::Relaxed),
             duplicates: self.duplicates.load(Ordering::Relaxed),
             merged: self.merged.load(Ordering::Relaxed),
@@ -461,6 +499,33 @@ mod tests {
         assert!(value.get("finishedAt").is_some());
         assert!(value.get("previewIds").unwrap().is_array());
         assert!(value.get("progress").is_none());
+    }
+
+    #[test]
+    fn percent_uses_processing_band_until_finishing() {
+        let job = ImportJob::new("job-percent", "1 个路径", ImportTarget::Library);
+        job.set_total(10);
+        job.set_phase(ImportPhase::Processing);
+        assert_eq!(job.progress().percent, 0, "刚开始不能直接跳到写入段");
+
+        for _ in 0..5 {
+            job.inc_processed();
+        }
+        assert_eq!(job.progress().percent, 45);
+
+        // 写线程在解码阶段并行推进，不把处理阶段的进度推入 90–99。
+        job.inc_written(5);
+        assert_eq!(job.progress().percent, 45);
+
+        for _ in 0..5 {
+            job.inc_processed();
+        }
+        job.set_phase(ImportPhase::Finishing);
+        assert_eq!(job.progress().percent, 95);
+
+        job.inc_written(5);
+        job.set_phase(ImportPhase::Completed);
+        assert_eq!(job.progress().percent, 100);
     }
 
     #[test]

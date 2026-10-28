@@ -3,7 +3,7 @@
 //! 批量写入共用同一条规则：selector → id 集合 → `dryRun` 看数量 → 带 `confirmedCount`
 //! 正式执行。正式执行前重新解析一次，数量或状态变化就拒绝，不落库。
 //!
-//! 两处例外：移动是后台任务，重新解析后交给任务总线占用 write lane；集合重命名/删除
+//! 两处例外：移动是后台任务，重新解析后交给任务总线申请写资源；集合重命名/删除
 //! 没有 selector，只按 `expectedItems` 核对集合当前图片数。
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -776,8 +776,8 @@ fn run_update(
         );
     }
 
-    // 正式写入：先占 write lane，再重新解析，避免解析与写入之间被别的写操作插队。
-    let lane = state.acquire_write_lane()?;
+    // 正式写入：先占元数据写，再重新解析，避免解析与写入之间被别的写操作插队。
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
@@ -962,7 +962,7 @@ fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppR
         );
     }
 
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
@@ -1039,7 +1039,7 @@ fn run_restore(
         );
     }
 
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, false)?;
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
@@ -1161,7 +1161,7 @@ fn run_collection_create(
         );
     }
 
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = match &input.selector {
         Some(selector) => Some(inspect(state, selector, true)?),
         None => None,
@@ -1243,7 +1243,7 @@ pub fn collections_modify(
         })));
     }
 
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let (affected, operation_id, extra) = match input.action {
         CollectionModifyAction::Rename => {
             let name = input
@@ -1360,7 +1360,7 @@ fn run_collection_membership(
         );
     }
 
-    let lane = state.acquire_write_lane()?;
+    let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
     if let Some(outcome) =
         confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())

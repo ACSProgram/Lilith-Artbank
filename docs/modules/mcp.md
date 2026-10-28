@@ -91,7 +91,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 临时图片允许 `images_update`（评分、标签、描述），但不产生历史记录，结果里的 `operationId` 为 null；`images_move`、`images_trash` 与集合成员变更会同步拒绝临时图片（选择里有临时图就整批 `rejected`，不再先弹确认卡再让任务失败）。
 - `images_move` 的 `dryRun` 把「已经在目标文件夹」算进 `skipped`（另给 `alreadyInTarget`），全是这种情况直接 `noop`；任务快照的 `completed` 是已处理张数，`skipped` 是其中没有移动的张数，`failed` 与 `failures` 来自同一份移动报告。
 - `tags_modify` 三种动作都走操作记录、都能撤销：`rename` 只改名称，撞同名标签直接报错；`delete` 删除标签并从所有图片上移除它；`merge` 把 `tagId` 的图片全部并到 `targetId`（已存在的关系只去重），然后删除源标签行。`delete` / `merge` 可传 `expectedImages` 核对源标签当前图片数，不一致返回 `rejected`。三种动作不套 100 张阈值（范围是整个标签），询问档下 `delete` / `merge` 需确认、`rename` 直接执行。合并会删除源标签，撤销依赖操作记录。
-- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 只删「无子文件夹、无图片、磁盘目录为空」的文件夹。临时文件夹与根目录不能改名、移动或删除。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
+- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 只删「无子文件夹、无图片、磁盘目录为空」的文件夹。临时文件夹与根目录不能改名、移动或删除。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认；四种动作真正执行前都要申请该子树路径写资源（新建与移动还锁父级，避免同级序号并发）。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
 - `collections_create` 带 selector 时在同一事务里建集合并加入图片，只产生一条记录；撤销会删除整个集合，重做按原 id 与条目顺序恢复。
 - selector 可以解析到不存在、已在回收站或不在回收站的图片；出现这类 id 时整批拒绝并返回失败清单，不会静默少做。
 - 产生操作记录时在标题前加 `AI · `。一次 MCP 写入最多 100 万张（query / ids）；相似结果最多 10,000 张；拼图最多 25 格。
@@ -148,7 +148,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `temp_features_generate` | `ids`（≤100）、`kind: embedding/pose` | `taskId`；完成后在 `tasks_get` 看逐张结果与失败清单 |
 
 - 只接受临时文件夹里的图片 id；混入不存在、已删除或普通图库图片时整批拒绝（`status: "rejected"` + `invalidIds`），不做部分执行。
-- 只做 `embedding` 与 `pose`，不生成描述；不写操作记录，不需要 `confirmedCount`。任务占 `ai` lane：正在排队的其它 AI/扫描任务会按 FIFO 等待，短写操作优先通过。
+- 只做 `embedding` 与 `pose`，不生成描述；不写操作记录，不需要 `confirmedCount`。任务占 `ai.service` 与内容写者：其它 AI 任务与内容写任务排队等待，文件夹维护不必等整个任务结束。
 - 询问档每次确认；完全档直接执行；只读档拒绝。
 - 临时区导入时已经算好 pHash 与主色，粗筛不需要生成；这个工具只补语义与姿势。库内没有对应特征时，生成临时特征也搜不出结果，工具描述要求先看 `library_info.features`。
 - 特征写进 `feature_blobs`，临时区清空时随 `images` 行级联删除；feature pack 里的字节不会立刻回收，留待维护任务处理。
@@ -179,7 +179,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 正式写入必须带 `confirmedCount`，等于 selector 解析出的 id 数；缺失或不一致返回 `status: "rejected"` 与最新数量。
 - selector 解析为空返回 `status: "noop"`，不产生历史记录。`collections_create` 只在带 selector 时套用这条；不带 selector 时按用户意图创建空集合。`collections_membership` 会先核对集合是否存在，不存在直接报错，不进确认队列。
 - 部分 id 不存在、已在回收站或状态不符时返回 `status: "rejected"` 与失败清单，不执行任何一行。
-- MCP 写入在本进程内串行；短写入立即占用 write lane，导入、移动、编辑、优化、撤销/重做或 AI/扫描任务占用时直接拒绝，不排队。
+- MCP 写入在本进程内串行；短写入立即申请元数据写或对应文件夹路径，与导入、移动、编辑、压缩、撤销/重做或 AI 任务冲突时直接拒绝，不排队（文件夹工具最多等当前一次读图 10 秒，超时再报冲突）。文件夹工具在真正执行前申请该子树路径写资源；`dryRun` 与审批入队时不申请，审批执行时若资源冲突则确认单直接失败。
 - 长任务（`library_import`、`library_move`、`temp_features_generate`）默认排队：调用立即返回 `taskId`，任务可能处于 `queued` 阶段；`tasks_cancel` 可取消排队中的任务。撤销/重做与清空记录不排队，被占用时直接失败。
 - 一次工具调用对应一条历史记录；标签操作的历史 `affected` 是关系条数，工具结果同时给出 `selected`。
 
@@ -249,7 +249,7 @@ Rust：
 - `src-tauri/src/mcp/tools/feature.rs`：`temp_features_generate` 的临时区校验、100 张上限、确认预览与任务启动。
 - `src-tauri/src/library/history.rs`：`write_with_id`、`prefix_label`、`preview_undo` / `preview_redo`。
 - `src-tauri/src/library/metadata.rs`、`collections.rs`：带 `operationId` 的写入口、`merge_tags_with_id` / `merge_preview` 与 `create_with_images`。
-- `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀；`start_temp_features` 走 write lane。
+- `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀；`start_temp_features` 占 `ai.service`。
 - `src-tauri/src/app/commands.rs`：`list_mcp_approvals`、`approve_mcp_approval`、`reject_mcp_approval`。
 - `src-tauri/src/import/pipeline.rs`、`import/job.rs`：重复对、批内重复、合并目标与源文件映射的采集、上限与截断标记。
 - `src-tauri/src/imageops/contact_sheet.rs`：拼图布局、编号与 JPEG 编码。
