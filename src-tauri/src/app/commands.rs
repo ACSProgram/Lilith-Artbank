@@ -68,6 +68,16 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
 }
 
 #[tauri::command]
+pub fn set_import_optimize(
+    state: State<'_, AppState>,
+    option: Option<crate::import::ImportOptimize>,
+) -> Result<Option<crate::import::ImportOptimize>, String> {
+    trace::write("set_import_optimize", || {
+        AppError::command(state.settings.set_import_optimize(option))
+    })
+}
+
+#[tauri::command]
 pub fn get_mcp_status(state: State<'_, AppState>) -> crate::mcp::runtime::McpStatus {
     state.mcp_status()
 }
@@ -1164,6 +1174,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
     tauri::generate_handler![
         get_settings,
         save_settings,
+        set_import_optimize,
         inspect_library_path,
         create_library,
         open_library_path,

@@ -48,16 +48,19 @@
 - 解码上限：单边 65535、总像素 1 亿、解码分配 512 MiB。超限进入失败清单。
 - EXIF 方向由 `image` crate 的 `ImageDecoder::orientation()` 读取并 `apply_orientation`，只影响缩略图、pHash、主色与后续显示，不改原图字节。
 
-### 导入时压缩（默认关闭）
+### 导入时压缩（默认关闭，选项持久化）
 
 - `ImportRequest.optimize` 为 `null` 时不压缩，行为与以前完全一致；勾选后只选输出格式（JPG / WebP）与质量档位（极高 / 高 / 中），复用批量压缩的 `QualityTier`、阶梯编码与 PSNR 裁决。勾选框旁写明「原图不会保留，无法还原」，开始导入前再确认一次。
+- 选项持久化：打开对话框时读一次设置里的 `import.optimize`，回填开关、输出格式与档位；三个控件一改就写回去（关闭时存 `null`）。只记这三项，目标文件夹、目录层级、重复策略、评分与标签仍是每次现选。写失败只记 `console.warn`，不阻塞导入；临时导入（`target = temp`）既不读也不显示这一块。
+- 存储与命令：`Settings` 顶层新增 `import: ImportSettings { optimize: Option<ImportOptimize> }`，默认 `None`；窄命令 `set_import_optimize(option)` 只改这一个字段后落盘，设置页 `save_settings` 提交整份 `Settings` 时后端保留该字段，两条写路径不会互相覆盖。不升 `SETTINGS_VERSION`：容器级 `serde(default)` 让旧文件缺这个键时取默认值。
 - 位置在解码之后、发布之前；缩略图、pHash、主色都从同一张解码图计算，压缩前后像素相同，因此不需要重算。
 - 压缩成功时：内容文件改用压缩结果，`content_hash` 取压缩后字节的 BLAKE3，扩展名与 `format` 跟随输出格式，`file_size` 用新长度，`optimized_at` 写当前时间；以后跑全库压缩会跳过这些行。
-- 以下情形保留原图并照常导入（`optimized_at = 0`）：带透明通道但输出 JPEG、非 sRGB 色彩配置而输出装不下、单边超过 16383 且输出 WebP、16 位源、省不到 5%、编码失败。单张失败只写日志，不阻塞整批。
+- 以下情形保留原图并照常导入（`optimized_at = 0`）：动画 / 多帧 / 多页源（GIF、APNG、动画 WebP、多页 TIFF，与批量压缩同用 `optimize::multiframe_guard`）、带透明通道但输出 JPEG、非 sRGB 色彩配置而输出装不下、单边超过 16383 且输出 WebP、16 位源、省不到 5%。
+- 编码器异常与「判据不满足」分开计：编码报错按原图入库，同时累加 `optimizeFailed`，完成页显示「N 张压缩失败，已保留原图」；判据不满足不计数。两者都不阻塞整批。
 - 去重语义：内容哈希变成压缩后字节的哈希。同一源图用同样参数重复导入仍判重复（第二次会重新编码后在入库时命中同内容）；改档位或格式会变成两条记录。
 - 不生成独立的 `optimize` 操作记录；导入撤销仍按 `origin_operation_id` 处理，压缩结果与原图走同一条导入记录。
 - MCP 的 `import_start` 固定传 `optimize: null`，也不接受 `workerThreads`；`tasks_get` 的导入回执不返回 `optimized` / `optimizedBytes`，AI 不能触发或感知压缩。回执默认只给重复计数；`tasks_get(includePairs=true)` 才附带精确重复对、批内重复对、合并目标与源文件映射（各自上限 200，`similarPairs` 上限 100）。
-- 完成页在勾选过压缩时显示「其中 N 张已压缩，省 X」；`N` 只统计真正入库的压缩版本，重复项不计。
+- 完成页在勾选过压缩时显示「其中 N 张已压缩，省 X」；`N` 只统计真正入库的压缩版本，重复项不计。有编码失败时另起一行「N 张压缩失败，已保留原图」。
 
 ### pHash（256 位）
 
@@ -157,7 +160,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 `workerThreads` 不由前端传入：导入的工作线程数取全局图像预算（设置里的 `performance.workerThreads`，为空时取逻辑核数 - 1，上限 128）；请求里的 `workerThreads` 字段仅为反序列化兼容保留，不再生效。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`current`、`elapsedMs`。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`optimizeFailed`、`current`、`elapsedMs`。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
 
 `tempReplaced` 只统计图库导入时被丢弃的临时区同内容行（见上面的“重复策略”），临时导入恒为 0。
 

@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::app::error::{AppError, AppResult};
+use crate::import::ImportOptimize;
 
 pub const SETTINGS_VERSION: u32 = 7;
 /// 操作记录保留步数范围；下限保证撤销至少能回到上一步，上限限制历史库体积。
@@ -40,6 +41,7 @@ pub struct Settings {
     pub ai: AiSettings,
     pub performance: PerformanceSettings,
     pub history: HistorySettings,
+    pub import: ImportSettings,
     pub mcp: McpSettings,
     pub ui: UiSettings,
 }
@@ -52,10 +54,22 @@ impl Default for Settings {
             ai: AiSettings::default(),
             performance: PerformanceSettings::default(),
             history: HistorySettings::default(),
+            import: ImportSettings::default(),
             mcp: McpSettings::default(),
             ui: UiSettings::default(),
         }
     }
+}
+
+/// 导入偏好：目前只记住「导入时压缩」的开关与参数。
+///
+/// 目标文件夹、目录层级、重复策略、评分与标签都是每次导入现选的，不进设置；
+/// 组里只留一个字段，位置留给以后真正需要持久化的导入偏好。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ImportSettings {
+    /// `None` 表示关闭（默认）；打开时记住档位与输出格式。
+    pub optimize: Option<ImportOptimize>,
 }
 
 /// MCP 服务默认关闭，开启后使用询问档；批次 1 尚未注册写工具，实际能力为只读。
@@ -421,10 +435,28 @@ impl SettingsStore {
             let mut guard = self.value.lock();
             // 当前图库由后端维护；设置页提交不应覆盖成过期路径。
             settings.library_path = guard.library_path.clone();
+            // 导入压缩由导入对话框的窄命令维护，设置页提交整份 Settings 时保持原值，
+            // 否则保存一次主题就会把这里的开关抹掉。
+            settings.import = guard.import.clone();
             *guard = settings.clone();
         }
         self.persist()?;
         Ok(settings)
+    }
+
+    /// 只改「导入时压缩」这一个字段并落盘；返回落盘后的值。
+    ///
+    /// 不走 `replace`：设置页提交的是整份 `Settings`，两条写路径互相覆盖会丢用户刚选的档位。
+    pub fn set_import_optimize(
+        &self,
+        optimize: Option<ImportOptimize>,
+    ) -> AppResult<Option<ImportOptimize>> {
+        {
+            let mut guard = self.value.lock();
+            guard.import.optimize = optimize;
+        }
+        self.persist()?;
+        Ok(self.value.lock().import.optimize)
     }
 
     pub fn set_library_path(&self, path: Option<String>) -> AppResult<()> {
@@ -620,6 +652,56 @@ mod tests {
     #[test]
     fn sort_key_list_matches_query_limit() {
         assert_eq!(SORT_KEYS.len(), MAX_SORT_LEVELS);
+    }
+
+    /// 导入压缩默认关闭；存下来后重启仍在，取消勾选后回到 `None`。
+    #[test]
+    fn import_optimize_persists_and_defaults_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let store = SettingsStore::load_or_create(path.clone()).unwrap();
+        assert_eq!(store.snapshot().import, ImportSettings::default());
+        assert!(store.snapshot().import.optimize.is_none(), "默认关闭");
+
+        let option = ImportOptimize {
+            tier: crate::imageops::optimize::QualityTier::Medium,
+            output_format: crate::imageops::optimize::OptimizeFormat::WebP,
+        };
+        assert_eq!(
+            store.set_import_optimize(Some(option)).unwrap(),
+            Some(option)
+        );
+        let loaded = SettingsStore::load_or_create(path.clone())
+            .unwrap()
+            .snapshot();
+        assert_eq!(loaded.import.optimize, Some(option));
+        // 设置页保存整份 Settings 时不能把这个开关抹掉。
+        let replaced = store.replace(sample()).unwrap();
+        assert_eq!(replaced.import.optimize, Some(option));
+        assert_eq!(
+            SettingsStore::load_or_create(path.clone())
+                .unwrap()
+                .snapshot()
+                .import
+                .optimize,
+            Some(option)
+        );
+
+        assert_eq!(store.set_import_optimize(None).unwrap(), None);
+        let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
+        assert!(loaded.import.optimize.is_none());
+    }
+
+    /// 旧文件里没有 `import` 键时按默认（关闭）读进来，不需要升版本号。
+    #[test]
+    fn missing_import_group_falls_back_to_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("import");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = SettingsStore::load_or_create(path).unwrap().snapshot();
+        assert!(loaded.import.optimize.is_none());
     }
 
     #[test]

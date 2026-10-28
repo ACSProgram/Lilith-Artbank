@@ -1234,11 +1234,12 @@ fn benefit_curve(
 ) -> Vec<CurvePoint> {
     let rates = stratum_rates(totals, samples);
     let candidate_bytes: u64 = totals.iter().map(|stratum| stratum.bytes).sum();
-    if candidate_bytes == 0 {
-        return Vec::new();
-    }
     let candidate_pixels: u64 = totals.iter().map(|stratum| stratum.pixels).sum();
     let candidate_count: u64 = totals.iter().map(|stratum| stratum.count).sum();
+    // 横轴按张数走，张数为 0 时覆盖率没有意义。
+    if candidate_bytes == 0 || candidate_count == 0 {
+        return Vec::new();
+    }
     let output_bytes: u64 = totals
         .iter()
         .zip(rates.iter())
@@ -1263,13 +1264,11 @@ fn benefit_curve(
         savings_bytes: 0,
         elapsed_seconds: 0,
     }];
-    let mut processed = 0_u64;
     let mut pixels = 0_u64;
     let mut counts = 0_u64;
     let mut outputs = 0_u64;
     let mut savings = 0_u64;
     for index in order {
-        processed += totals[index].bytes;
         pixels += totals[index].pixels;
         counts += totals[index].count;
         savings += (totals[index].bytes as f64 * rates[index]).round() as u64;
@@ -1279,7 +1278,9 @@ fn benefit_curve(
         let write = share(write_seconds, outputs, output_bytes);
         let finish = share(finish_seconds, counts, candidate_count);
         points.push(CurvePoint {
-            coverage: processed as f64 / candidate_bytes as f64,
+            // 横轴是已处理的候选张数占比，与执行时的进度条同源；体积分布极不均匀
+            // （最高 bpp 那层 35% 的张数占七成体积），任何体积轴都会与进度错位。
+            coverage: counts as f64 / candidate_count as f64,
             savings_bytes: savings,
             elapsed_seconds: work + write + finish,
         });
@@ -1891,13 +1892,50 @@ mod tests {
         // 三段耗时都只由像素/输出字节/张数决定，这里给 60/30/10 便于断言。
         let curve = benefit_curve(&strata, &samples, 60, 30, 10);
         assert_eq!(curve.len(), 3);
-        assert_eq!(curve[1].coverage, 0.75);
+        // 横轴是张数：两层各 100 张，走完第一层是 50%，不是体积的 75%。
+        assert_eq!(curve[1].coverage, 0.5);
         assert_eq!(curve[1].savings_bytes, 300);
         assert_eq!(curve[2].coverage, 1.0);
         assert_eq!(curve[2].savings_bytes, 800);
         // 最后一点的耗时就是整次执行的总预计耗时。
         assert_eq!(curve[2].elapsed_seconds, 100);
         assert!(curve[1].elapsed_seconds > 0 && curve[1].elapsed_seconds < 100);
+    }
+
+    /// 横轴按张数累计：体积分布极不均匀时也走满 100%，中途点等于张数份额。
+    #[test]
+    fn curve_axis_accumulates_counts_not_bytes() {
+        let mut strata: [StratumTotals; STRATUM_COUNT] =
+            std::array::from_fn(|_| Default::default());
+        // 高层只有 10 张却占 900/1000 的体积，正是实测里「35% 张数占 72% 体积」的极端版。
+        strata[0] = totals(10, 900);
+        strata[1] = totals(90, 100);
+        let mut samples: [Vec<SampleOutcome>; STRATUM_COUNT] = std::array::from_fn(|_| Vec::new());
+        let sample = |old: u64, new: u64, weight_bytes: u64, weight_count: u64| SampleOutcome {
+            old_bytes: old,
+            new_bytes: new,
+            weight_bytes,
+            weight_count,
+            quality: Some(85),
+            skip: None,
+            failed: false,
+            error: None,
+            source_pixels: 1_000,
+            read_secs: 0.0,
+            encode_secs: 0.0,
+            hash_secs: 0.0,
+            recalc_secs: 0.0,
+            bad_pixel_ratio: 0.0,
+        };
+        samples[0].push(sample(900, 400, 900, 10));
+        samples[1].push(sample(100, 95, 100, 90));
+        let curve = benefit_curve(&strata, &samples, 0, 0, 0);
+        assert_eq!(curve.len(), 3);
+        // 先走完低 bpp 那层：90 张 / 100 张 = 90%，按体积只有 10%。
+        assert!((curve[1].coverage - 0.9).abs() < 1e-9, "{:?}", curve[1]);
+        assert_eq!(curve[2].coverage, 1.0);
+        // 末点就是全部节省。
+        assert_eq!(curve[2].savings_bytes, 500 + 5);
     }
 
     #[test]

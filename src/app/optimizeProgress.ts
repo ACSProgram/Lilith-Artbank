@@ -3,14 +3,13 @@ import type { OptimizeCurvePoint, OptimizeEstimate, TaskPhase } from "./taskType
 export interface RuntimeOptimizePoint {
   elapsedSeconds: number;
   savingsBytes: number;
+  /** 已结算张数（已替换 + 已跳过 + 失败）；曲线的横轴就是它。 */
   processed: number;
-  /** 已提交批次的原图字节；用来把采样折算到覆盖率轴。 */
-  originalBytes?: number;
 }
 
-/** 实际曲线的一个点：与预估共用覆盖率横轴。 */
+/** 实际曲线的一个点：与预估共用「已处理候选张数」横轴。 */
 export interface OptimizeActualPoint {
-  /** 已提交批次的原图字节 / 候选总体积。 */
+  /** 已结算张数 / 候选张数，与顶部进度条同一个式子。 */
   coverage: number;
   savingsBytes: number;
 }
@@ -55,7 +54,6 @@ export function appendRuntimePoint(
       elapsedSeconds: elapsed,
       savingsBytes: finite(sample.savingsBytes),
       processed: finite(sample.processed),
-      originalBytes: finite(sample.originalBytes),
     },
   ];
   if (next.length <= maxPoints) return next;
@@ -65,18 +63,18 @@ export function appendRuntimePoint(
 }
 
 /**
- * 把运行时采样折算到覆盖率轴：分母是候选总体积，与预估曲线同口径。
+ * 把运行时采样折算到横轴：分母是候选张数，与预估曲线、顶部进度条同源。
  *
  * 覆盖率只增不减；同一覆盖率的重复点丢掉，避免实际线出现回退。
  */
 export function actualCurvePoints(
   points: RuntimeOptimizePoint[],
-  candidateBytes: number,
+  total: number,
 ): OptimizeActualPoint[] {
-  if (!(candidateBytes > 0)) return [];
+  if (!(total > 0)) return [];
   const ordered: OptimizeActualPoint[] = [];
   for (const point of points) {
-    const coverage = Math.min(1, Math.max(0, finite(point.originalBytes) / candidateBytes));
+    const coverage = Math.min(1, Math.max(0, finite(point.processed) / total));
     const previous = ordered[ordered.length - 1];
     if (previous && coverage <= previous.coverage) continue;
     ordered.push({ coverage, savingsBytes: finite(point.savingsBytes) });
@@ -124,7 +122,7 @@ export function curveAt(
   return previous;
 }
 
-/** 前多少体积算“前期”。 */
+/** 前多少比例的图片算“前期”。 */
 const EARLY_COVERAGE = 0.2;
 
 /**
@@ -132,7 +130,7 @@ const EARLY_COVERAGE = 0.2;
  *
  * 执行顺序按 bpp 从高到低，排在前面的多是「像素少、细节高」的小图，本身可省的绝对
  * 字节不多；同一批里还混着会被跳过的图。所以开头可能很久看不到空间变少。
- * 前 20% 体积拿到的收益不到总收益的 10%（不到体积份额的一半）时，先把预期说在前面，
+ * 前 20% 的图片拿到的收益不到总收益的 10%（不到份额的一半）时，先把预期说在前面，
  * 省得盯着 0 以为卡住。
  */
 export function earlySavingsHint(
@@ -142,12 +140,12 @@ export function earlySavingsHint(
   if (curve.length < 2 || !(totalSavings > 0)) return null;
   const early = curveAt(curve, EARLY_COVERAGE).savingsBytes;
   if (!(early > 0)) {
-    return "前 20% 体积预计没有可压缩的空间，开始阶段进展可能较慢。";
+    return "前 20% 的图片预计没有可压缩的空间，开始阶段进展可能较慢。";
   }
   const share = Math.min(1, early / totalSavings);
   if (share >= 0.1) return null;
   const label = share * 100 < 1 ? "不到 1%" : `${Math.round(share * 100)}%`;
-  return `前 20% 体积预计只贡献 ${label} 的节省，开始阶段进展可能较慢。`;
+  return `前 20% 的图片预计只贡献 ${label} 的节省，开始阶段进展可能较慢。`;
 }
 
 export type OptimizeComparisonKey = "savings" | "duration" | "count";

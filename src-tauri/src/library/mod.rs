@@ -53,6 +53,8 @@ pub trait BatchReporter: Send + Sync {
     fn bytes(&self, _original: u64, _saved: u64) {}
     /// 运行中的累计跳过与失败张数。
     fn skipped_count(&self, _skipped: usize) {}
+    /// 候选内跳过按原因细分（key 与估算视图的图例一致）；只有压缩会调用。
+    fn skip_breakdown(&self, _buckets: &[(String, u64)]) {}
     fn failed_count(&self, _failed: usize) {}
 }
 

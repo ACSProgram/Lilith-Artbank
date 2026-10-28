@@ -194,7 +194,7 @@ Content-Type: application/octet-stream
 - 批量任务挂在 `app/tasks.rs` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
 - 范围由 `TaskScope` 在 Rust 侧解析成 id 集合（选中 / 文件夹 / 集合 / 当前视图 / 临时文件夹 / 全库）；`AiJobRequest` 只接收已解析的 id，不再有“id 与 query 都为空就退回全库”的隐式分支。
 - 开始前预览：`preview_batch_task` 只读返回“范围 N 张 / 将处理 M 张”。待处理条件与任务启动共用 `query::PendingFilter`：embedding 按当前模型与维度、pose 按任意模型、描述按空描述或非手写来源；已删除与待释放行不计入 M。AI 离线或 embedding 缺模型维度时 M 显示“—”，任务不可开始；服务恢复后由状态轮询触发重算。
-- 快照字段：除张数与百分比外，`TaskSnapshot` 还带 `runStartedAt`（第一次进入 `running` 的时间，排队与准备不算）、`currentFile`（图库内相对路径）、`ratePerSecond` 与 `etaSeconds`；压缩任务另有 `originalBytes` / `savedBytes`，只统计已提交并替换的图片。速度为运行以来的平均完成张数，压缩的 ETA 优先用像素吞吐；终态不返回 ETA。
+- 快照字段：除张数与百分比外，`TaskSnapshot` 还带 `runStartedAt`（第一次进入 `running` 的时间，排队与准备不算）、`currentFile`（图库内相对路径）、`ratePerSecond` 与 `etaSeconds`；压缩任务另有 `originalBytes` / `savedBytes`（只统计已提交并替换的图片）与 `skipBreakdown`（候选内跳过按 6 个原因细分）。速度是运行以来平均每秒结算的张数，含失败与跳过；压缩的 ETA 优先用滚动吞吐，百分比由「已结算 / 候选张数」派生（`progressPercent` 对压缩恒为 `null`）；终态不返回 ETA。
 - 冲突：AI 任务占 `ai.service` 与内容写者，同一时间只运行一个 AI 批量任务，不会与导入、移动、编辑、压缩等内容写任务同时运行；描述任务还占时间线读与元数据写。每张读原图时再按文件夹加短读锁并拿图像预算许可，因此文件夹维护不必等整个 AI 任务结束。默认自动排队：`start_batch_task` 直接返回 `queued` 快照，任务在 `queued` 阶段等待，不需要前端选择排队或取消现有任务。排队中的任务在任务中心可取消；取消排队任务只把它从等待队列移除，不触碰正在运行的任务。
 - 先到先得：同一资源上的等待者按申请顺序启动；路径锁写者优先，避免文件夹改名被持续的读图请求饿死。短写只申请短期资源，不排在长任务后面。
 - 取消：停止调度新请求；在途请求允许完成并保存结果；已保存结果不回滚。

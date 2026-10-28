@@ -2093,26 +2093,26 @@ impl AppState {
                                 log::warn!("收尾空间优化记录失败：{error}");
                             }
                             worker.set_failed(report.failed as usize);
-                            worker.set_skipped(report.skipped as usize);
+                            // 跳过只认候选池内的口径；执行前被排除的图片不算「已跳过」，
+                            // 否则跑完那一刻会从 1.7 万跳到 7 万，环图与进度一起翻车。
+                            worker.set_skipped(report.progress_skipped());
+                            worker.set_skip_breakdown(&report.skip_buckets());
                             let mut summary = format!(
-                                "处理 {} 张，省 {}",
+                                "已替换 {} 张 · 省 {}",
                                 report.processed,
                                 format_savings(report.savings_bytes)
                             );
-                            if report.skipped > 0 {
-                                summary.push_str(&format!("，跳过 {} 张", report.skipped));
+                            let skipped = report.progress_skipped();
+                            if skipped > 0 {
+                                summary.push_str(&format!(" · 已跳过 {skipped} 张"));
                             }
-                            if dropped > 0 {
-                                summary.push_str(&format!("，{dropped} 张原图缺失或已变化未纳入"));
-                            }
-                            if report.source_missing > 0 {
-                                summary.push_str(&format!(
-                                    "，{} 张原图缺失已跳过",
-                                    report.source_missing
-                                ));
+                            // 未纳入候选 = 前置判据排除 + 执行前复核剔除，与估算视图同名分组。
+                            let excluded = report.prefilter_skipped + dropped;
+                            if excluded > 0 {
+                                summary.push_str(&format!(" · 未纳入候选 {excluded} 张"));
                             }
                             if report.failed > 0 {
-                                summary.push_str(&format!("，失败 {} 张", report.failed));
+                                summary.push_str(&format!(" · 失败 {} 张", report.failed));
                             }
                             // 报告里的失败清单要进任务胶囊，否则用户只知道失败了几张。
                             for failure in &report.failures {

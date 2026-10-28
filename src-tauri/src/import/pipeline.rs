@@ -473,6 +473,8 @@ fn build_prepared(
             // 判据不满足：保留原图，导入照常成功。
             Ok(None) => {}
             Err(error) => {
+                // 编码器异常与「压不动」是两回事，单独计数并在完成页说出来。
+                context.job.inc_optimize_failed();
                 log::warn!(
                     "导入时压缩失败，保留原图：{}：{error}",
                     source_path.display()
@@ -509,7 +511,8 @@ fn build_prepared(
 
 /// 导入时的压缩：完整 PSNR 阶梯与批量压缩共用同一份实现。
 ///
-/// 返回 `Ok(None)` 表示按判据保留原图（透明/非 sRGB/超大/16 位/省不到 5%）。
+/// 返回 `Ok(None)` 表示按判据保留原图（动画/多页、非 sRGB、超大、16 位、省不到 5%）；
+/// 返回 `Err` 表示编码器真的出错，调用方要单独计数，不能当「压不动」静默吞掉。
 fn optimize_for_import(
     staged: &Path,
     decoded: &decode::DecodedImage,
@@ -518,6 +521,10 @@ fn optimize_for_import(
     // ICC 判据与 JPEG→JPEG 的 EXIF 搬运都要原始字节，所以这里再读一遍临时副本。
     let source_bytes = std::fs::read(staged)?;
     let source_size = source_bytes.len() as u64;
+    // 与批量压缩同序：动画 / 多帧 / 多页源先拦下，否则会被压成单帧且不可逆。
+    if optimize::multiframe_guard(&source_bytes, decoded.format).is_err() {
+        return Ok(None);
+    }
     if optimize::color_profile_guard(&source_bytes, decoded.format, options).is_err() {
         return Ok(None);
     }
@@ -1278,6 +1285,78 @@ mod tests {
                 .join(format!("{original_hash}.png"))
                 .exists()
         );
+    }
+
+    /// PNG 的 `acTL` 块表示这是 APNG；这里按块结构手工拼一份，CRC 必须算对，
+    /// 否则解码器会先报错，测到的就不是压缩判据了。
+    fn apng_bytes(image: &DynamicImage) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFF_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        // IHDR 紧跟在 8 字节签名后，长度固定 25 字节（长度 + 类型 + 13 数据 + CRC）。
+        let ihdr_end = 8 + 25;
+        let mut chunk = Vec::with_capacity(20);
+        chunk.extend_from_slice(&8_u32.to_be_bytes());
+        chunk.extend_from_slice(b"acTL");
+        chunk.extend_from_slice(&2_u32.to_be_bytes());
+        chunk.extend_from_slice(&0_u32.to_be_bytes());
+        chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+        let mut out = png[..ihdr_end].to_vec();
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&png[ihdr_end..]);
+        out
+    }
+
+    /// 动画 PNG 在导入压缩时必须保留原图：压成单帧会丢掉其余帧且不可逆。
+    #[test]
+    fn keeps_apng_source_when_import_optimize_is_enabled() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let bytes = apng_bytes(&smooth_image(11, 192, 128));
+        let path = source_dir.join("animated.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let original_hash = blake3::hash(&bytes).to_hex().to_string();
+
+        let library_root = temp.path().join("library");
+        let session = open_library(&library_root);
+        let snapshot = run_with(
+            &session,
+            &library_root,
+            optimized_request(&source_dir, QualityTier::High, OptimizeFormat::Jpeg),
+        );
+
+        assert_eq!(snapshot.progress.imported, 1, "{snapshot:?}");
+        assert_eq!(snapshot.progress.optimized, 0, "{snapshot:?}");
+        // 判据不满足不是编码失败，不该进失败计数。
+        assert_eq!(snapshot.progress.optimize_failed, 0, "{snapshot:?}");
+        let (hash, ext, size, optimized_at): (String, String, i64, i64) = session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT content_hash, file_ext, file_size, optimized_at FROM images",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(hash, original_hash, "入库的必须是原图字节");
+        assert_eq!(ext, "png");
+        assert_eq!(size, bytes.len() as i64);
+        assert_eq!(optimized_at, 0);
     }
 
     #[test]

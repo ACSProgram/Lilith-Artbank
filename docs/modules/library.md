@@ -122,6 +122,7 @@ ai                 { baseUrl, port, autoStart, pythonPath, serverScript,
                      modelPath, clipModelPath, prewarmImports }
 performance        { readerConnections, workerThreads }
 history            { maxSteps }  每个图库保留的操作记录步数，默认 100
+import             { optimize }  「导入时压缩」选项；null 表示关闭（默认）
 mcp                { enabled, port, mode }  MCP 服务；默认关闭、18767、ask
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
                      sort, sortProfiles, viewerFilmstrip }
@@ -136,7 +137,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
   - `clipModelPath` 是 CLIP 模型目录，默认 `siglip2-giant-opt-patch16-384`；相对 `modelPath`，也可填绝对路径。
   - `prewarmImports` 默认 true：启动托管的服务时加 `--prewarm-imports`，让服务在后台导入 torch/transformers。代价是服务进程常驻约 420 MB，收益是首次 AI 请求少等 7–8 s。
   - 相对路径一律以程序根目录解析；本机 `baseUrl` 的端口必须与 `port` 一致。
-- 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。
+- 设置页提交不会覆盖 `libraryPath`；它只由创建/打开/关闭图库更新。同理，`import` 组由导入对话框的窄命令 `set_import_optimize` 维护，设置页提交整份 `Settings` 时后端保留原值，改主题不会把导入压缩开关抹掉。
+- `import.optimize` 只记「导入时压缩」的开关与参数（`{ tier, outputFormat }`，`null` 为关闭）；没有这个键时按默认关闭读取，不需要升版本号。细节见[导入](import.md#导入时压缩默认关闭选项持久化)。
 - 保存启动相关 AI 设置后，应用会按新配置重启托管的 Python 服务。
 - v1 的 `libraries[]` 与 `lastLibraryId` 在读取时迁移为单个 `libraryPath`：优先 `lastLibraryId` 对应条目，否则取第一个条目。迁移后不再写回旧字段。
 - v2 → v3：删掉从未被任何代码读取的 `performance.thumbnailCacheMb`；新增的 `ui` 字段用默认值补齐（`thumbFit=cover`、`thumbCacheCount=1024`、`sort=[{key:"importedAt",descending:true}]`、`sortProfiles=[]`、`viewerFilmstrip=true`）；`theme` 增加 `system` 并成为默认值。`ai`、`performance`、`theme`、`gridThumbPx` 的旧值原样保留。

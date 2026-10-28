@@ -104,6 +104,8 @@ pub struct ImportProgress {
     pub optimized: usize,
     /// 这些图片省下的字节数。
     pub optimized_bytes: u64,
+    /// 压缩编码出错、已按原图入库的张数。
+    pub optimize_failed: usize,
     pub current: String,
     pub elapsed_ms: i64,
 }
@@ -179,6 +181,8 @@ pub struct ImportJob {
     similar: AtomicUsize,
     optimized: AtomicUsize,
     optimized_bytes: AtomicU64,
+    /// 勾选压缩后编码器报错、按原图入库的张数。
+    optimize_failed: AtomicUsize,
     current: Mutex<String>,
     failures: Mutex<Vec<ImportFailure>>,
     hints: Mutex<Vec<ImportHint>>,
@@ -222,6 +226,7 @@ impl ImportJob {
             similar: AtomicUsize::new(0),
             optimized: AtomicUsize::new(0),
             optimized_bytes: AtomicU64::new(0),
+            optimize_failed: AtomicUsize::new(0),
             current: Mutex::new(String::new()),
             failures: Mutex::new(Vec::new()),
             hints: Mutex::new(Vec::new()),
@@ -349,6 +354,11 @@ impl ImportJob {
             .fetch_add(saved_bytes, Ordering::Relaxed);
     }
 
+    /// 编码器异常而不是判据不满足：图片按原图入库，但要让人知道压缩没成功。
+    pub fn inc_optimize_failed(&self) {
+        self.optimize_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_current(&self, current: impl Into<String>) {
         let current = current.into();
         self.handle.set_message(current.clone());
@@ -445,6 +455,7 @@ impl ImportJob {
             similar: self.similar.load(Ordering::Relaxed),
             optimized: self.optimized.load(Ordering::Relaxed),
             optimized_bytes: self.optimized_bytes.load(Ordering::Relaxed),
+            optimize_failed: self.optimize_failed.load(Ordering::Relaxed),
             current: self.current.lock().clone(),
             elapsed_ms: now_ms().saturating_sub(self.started_at),
         }

@@ -1,4 +1,7 @@
-//! 任务进度计量：按工作量单位加权、单调递增、带滚动吞吐与 ETA。
+//! 任务进度计量：按工作量单位推进、单调递增、带滚动吞吐与 ETA。
+//!
+//! 阶段加权已去掉：需要「一个任务一个百分比」的地方直接用计数派生，避免同一个任务
+//! 在胶囊、进度条与图表上读出三个不同的数。
 
 use std::{
     collections::VecDeque,
@@ -13,8 +16,6 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 pub struct WorkMeter {
     total_units: AtomicU64,
     done_units: AtomicU64,
-    base: AtomicU8,
-    weight: AtomicU8,
     explicit_percent: AtomicU8,
     finished: AtomicBool,
     samples: Mutex<VecDeque<(Instant, u64)>>,
@@ -31,8 +32,6 @@ impl WorkMeter {
         Self {
             total_units: AtomicU64::new(0),
             done_units: AtomicU64::new(0),
-            base: AtomicU8::new(0),
-            weight: AtomicU8::new(100),
             explicit_percent: AtomicU8::new(255),
             finished: AtomicBool::new(false),
             samples: Mutex::new(VecDeque::new()),
@@ -63,12 +62,7 @@ impl WorkMeter {
         self.done_units.load(Ordering::Relaxed)
     }
 
-    /// 阶段区间：例如编码 0–90、提交 90–98。
-    pub fn enter_phase(&self, base: u8, weight: u8) {
-        self.base.store(base.min(100), Ordering::Relaxed);
-        self.weight.store(weight.min(100), Ordering::Relaxed);
-    }
-
+    /// 显式百分比（单调不减、上限 99）；用于没有单位、只知道大概进度的阶段。
     pub fn set_percent(&self, percent: u8) {
         let mut current = self.explicit_percent.load(Ordering::Relaxed);
         loop {
@@ -87,6 +81,7 @@ impl WorkMeter {
         }
     }
 
+    /// 当前百分比：显式值与「已完成单位 / 总单位」取较大者；两者都没有时为空。
     pub fn percent(&self) -> Option<u8> {
         if self.finished.load(Ordering::Relaxed) {
             return Some(100);
@@ -100,10 +95,7 @@ impl WorkMeter {
             None
         } else {
             let done = self.done_units().min(total);
-            let base = u64::from(self.base.load(Ordering::Relaxed));
-            let weight = u64::from(self.weight.load(Ordering::Relaxed));
-            let percent = base + done.saturating_mul(weight) / total;
-            Some(percent.min(99) as u8)
+            Some((done.saturating_mul(100) / total).min(99) as u8)
         };
         match (explicit, units) {
             (Some(left), Some(right)) => Some(left.max(right)),
@@ -162,18 +154,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn percent_is_weighted_monotonic_and_capped() {
+    fn percent_follows_units_is_monotonic_and_capped() {
         let meter = WorkMeter::new();
         meter.set_total_units(1_000);
-        meter.enter_phase(0, 90);
         meter.advance_units(500);
-        assert_eq!(meter.percent(), Some(45));
+        assert_eq!(meter.percent(), Some(50));
         meter.set_percent(60);
         meter.advance_units(100);
         assert_eq!(meter.percent(), Some(60));
-        meter.enter_phase(90, 8);
         meter.set_done_units(1_000);
-        assert_eq!(meter.percent(), Some(98));
+        assert_eq!(meter.percent(), Some(99));
         meter.set_percent(150);
         assert_eq!(meter.percent(), Some(99));
         meter.finish();

@@ -1,3 +1,4 @@
+import type { ImportOptimize } from "../modules/import/types";
 import type { SortSpec } from "../modules/library/types";
 
 export type ThemeMode = "light" | "dark" | "system";
@@ -27,6 +28,16 @@ export interface PerformanceSettings {
 /** 每个图库保留的操作记录步数。 */
 export interface HistorySettings {
   maxSteps: number;
+}
+
+/**
+ * 导入偏好：目前只有「导入时压缩」。
+ *
+ * 由导入对话框的窄命令维护，设置页提交整份设置时后端保持原值。
+ */
+export interface ImportSettings {
+  /** `null` 表示关闭（默认）；打开时记住档位与输出格式。 */
+  optimize: ImportOptimize | null;
 }
 
 export type McpMode = "readOnly" | "ask" | "full";
@@ -92,6 +103,7 @@ export interface Settings {
   ai: AiSettings;
   performance: PerformanceSettings;
   history: HistorySettings;
+  import: ImportSettings;
   mcp: McpSettings;
   ui: UiSettings;
 }

@@ -324,6 +324,14 @@ pub struct OptimizeReport {
     pub prefilter_skipped: u64,
     /// 解码或编码后才发现不处理的张数（色彩、16 位、画质、省得太少、动画/多页）。
     pub candidate_skipped: u64,
+    /// 候选内跳过按原因的六个桶；之和恒等于 `candidate_skipped`。
+    pub skip_color_profile: u64,
+    pub skip_not_smaller: u64,
+    pub skip_quality: u64,
+    pub skip_depth: u64,
+    pub skip_multiframe: u64,
+    /// 其余原因：解码后才发现 bpp 太低、带透明、超出 WebP 尺寸等。
+    pub skip_late: u64,
     /// 目标内容已被其他行占用而没有落盘的张数。
     pub duplicate_skipped: u64,
     pub failed: u64,
@@ -356,6 +364,47 @@ pub struct OptimizeReport {
     pub delete_ms: u64,
     pub deleted_files: u64,
     pub delete_failed: u64,
+}
+
+impl OptimizeReport {
+    /// 记一次候选内跳过：总数与细分桶一起加，两个数不会各说一套。
+    fn record_skip(&mut self, reason: SkipReason) {
+        match reason {
+            SkipReason::ColorProfile => self.skip_color_profile += 1,
+            SkipReason::NotSmallEnough => self.skip_not_smaller += 1,
+            SkipReason::QualityNotMet => self.skip_quality += 1,
+            SkipReason::SixteenBit => self.skip_depth += 1,
+            SkipReason::AnimatedOrMultipage => self.skip_multiframe += 1,
+            SkipReason::BppLow
+            | SkipReason::AlreadyOptimized
+            | SkipReason::Transparent
+            | SkipReason::TooLargeForWebp => self.skip_late += 1,
+        }
+        self.candidate_skipped += 1;
+    }
+
+    /// 候选内的跳过数（含内容重复与原图缺失），不含执行前被排除的图片。
+    ///
+    /// 这是任务、界面与曲线唯一的跳过口径；`skipped` 里那部分执行前排除的张数
+    /// 不属于候选池，混进来会让分母与分子对不上。
+    pub fn progress_skipped(&self) -> usize {
+        (self.candidate_skipped + self.duplicate_skipped + self.source_missing) as usize
+    }
+
+    /// 跳过细分的对外形状：只保留非 0 桶，按张数降序；key 与估算视图的图例一致。
+    pub fn skip_buckets(&self) -> Vec<(String, u64)> {
+        let mut buckets = vec![
+            ("color".to_owned(), self.skip_color_profile),
+            ("depth".to_owned(), self.skip_depth),
+            ("quality".to_owned(), self.skip_quality),
+            ("notSmaller".to_owned(), self.skip_not_smaller),
+            ("multiframe".to_owned(), self.skip_multiframe),
+            ("late".to_owned(), self.skip_late),
+        ];
+        buckets.retain(|(_, count)| *count > 0);
+        buckets.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        buckets
+    }
 }
 
 /// 临时文件句柄：作用域结束时自动删除，成功发布后 `disarm` 交给目标文件。
@@ -481,31 +530,12 @@ fn batch_slices(jobs: &[CandidateRow], max_count: usize, max_bytes: u64) -> Vec<
     slices
 }
 
-/// 候选内已经有结论的张数：已提交、跳过、失败与缺失都算解决，用于写入阶段 90–98。
-///
-/// 不含执行前就被排除的图片：那部分不进候选池，也不该推进进度。
-fn settled_count(report: &OptimizeReport) -> usize {
-    (report.processed
-        + report.candidate_skipped
-        + report.duplicate_skipped
-        + report.source_missing
-        + report.failed) as usize
-}
-
 /// 全部跳过张数（含执行前排除的图片）；原图缺失也计入，用于最终报告。
 fn skipped_count(report: &OptimizeReport) -> usize {
     (report.prefilter_skipped
         + report.candidate_skipped
         + report.duplicate_skipped
         + report.source_missing) as usize
-}
-
-/// 报给进度用的跳过数：只算候选池内的跳过，不含执行前被排除的图片。
-///
-/// 执行前就拦下的那些（已处理过、bpp 太低、超出 WebP 尺寸）在估算里单独列出，
-/// 它们不需要任何工作；算进“已跳过”会让进度条开局就冲到六成，之后半天不动。
-fn progress_skipped_count(report: &OptimizeReport) -> usize {
-    (report.candidate_skipped + report.duplicate_skipped + report.source_missing) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,16 +573,15 @@ pub(crate) fn optimize_with_batch_size(
     //   前几千张推不动进度条；按张计与 embedding 同口径，速度与 ETA 也一起对齐。
     // - 执行前被排除的图片（已处理过、bpp 太低、超出 WebP 尺寸）不需要任何工作，
     //   算进分母会让进度条开局就六成；它们在估算视图的「未纳入候选」里单独列出。
-    let total_units = total.max(1) as u64;
+    // 计量器只用来算滚动吞吐与 ETA：百分比一律由「已结算张数 / 候选张数」派生，
+    // 否则任务胶囊、进度条与环图会各自带着不同的权重系数。
     if let Some(meter) = reporter.meter() {
-        meter.set_total_units(total_units);
-        meter.enter_phase(0, 90);
+        meter.set_total_units(total.max(1) as u64);
     }
     reporter.report(0, total);
     reporter.skipped_count(0);
 
     let report = Arc::new(Mutex::new(report));
-    let encoding_done = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let error_slot: Arc<Mutex<Option<AppError>>> = Arc::new(Mutex::new(None));
     let batches_committed = Arc::new(AtomicU64::new(0));
@@ -563,7 +592,6 @@ pub(crate) fn optimize_with_batch_size(
         let commit_report = report.clone();
         let commit_error = error_slot.clone();
         let commit_batches = batches_committed.clone();
-        let commit_done = encoding_done.clone();
         let commit_pool = pool.clone();
         let commit_paths = &paths;
         let committer = scope.spawn(move || {
@@ -583,7 +611,7 @@ pub(crate) fn optimize_with_batch_size(
                         }
                     };
                 let published = outcome.published.len();
-                let (processed_before, settled, failed_now, skipped_now, original, saved) = {
+                let (processed_before, failed_now, skipped_now, buckets, original, saved) = {
                     let mut report = commit_report.lock();
                     let before = report.processed as usize;
                     report.publish_ms += outcome.write_ms;
@@ -596,9 +624,9 @@ pub(crate) fn optimize_with_batch_size(
                     }
                     (
                         before,
-                        settled_count(&report),
                         report.failed as usize,
-                        progress_skipped_count(&report),
+                        report.progress_skipped(),
+                        report.skip_buckets(),
                         report.old_bytes,
                         report.old_bytes.saturating_sub(report.new_bytes),
                     )
@@ -606,16 +634,11 @@ pub(crate) fn optimize_with_batch_size(
                 reporter.bytes(original, saved);
                 reporter.failed_count(failed_now);
                 reporter.skipped_count(skipped_now);
+                reporter.skip_breakdown(&buckets);
                 commit_batches.fetch_add(1, Ordering::Relaxed);
                 // 已完成只统计真正入库的图片；批次内逐张上报，进度不按批跳跃。
                 for step in 1..=published {
                     reporter.report(processed_before + step, total);
-                }
-                // 编码阶段结束后才进入 90–98 的写入段，避免提交先行把进度条推到 90。
-                if commit_done.load(Ordering::Relaxed)
-                    && let Some(meter) = reporter.meter()
-                {
-                    meter.set_percent((90 + settled * 8 / total.max(1)) as u8);
                 }
                 // 提交已持久化，才允许删旧图；删除不持数据库写锁，失败只记日志。
                 let mut report = commit_report.lock();
@@ -693,7 +716,7 @@ pub(crate) fn optimize_with_batch_size(
                         }
                         Ok(Some(EncodeOutcome::Skipped(reason))) => {
                             log::debug!("跳过 image={}：{reason:?}", row.id);
-                            report.candidate_skipped += 1;
+                            report.record_skip(reason);
                             consecutive_failures = 0;
                         }
                         Ok(Some(EncodeOutcome::SourceMissing(reason))) => {
@@ -728,7 +751,7 @@ pub(crate) fn optimize_with_batch_size(
                         }
                     }
                 }
-                (report.failed as usize, progress_skipped_count(&report))
+                (report.failed as usize, report.progress_skipped())
             };
             reporter.failed_count(failed_now);
             reporter.skipped_count(skipped_now);
@@ -745,14 +768,6 @@ pub(crate) fn optimize_with_batch_size(
             }
             if stopped.load(Ordering::Relaxed) || reporter.cancelled() {
                 break;
-            }
-        }
-        let finished_normally = !reporter.cancelled() && !stopped.load(Ordering::Relaxed);
-        if finished_normally {
-            encoding_done.store(true, Ordering::Relaxed);
-            if let Some(meter) = reporter.meter() {
-                let settled = settled_count(&report.lock());
-                meter.set_percent((90 + settled * 8 / total.max(1)) as u8);
             }
         }
         drop(sender);
@@ -772,15 +787,10 @@ pub(crate) fn optimize_with_batch_size(
     reporter.bytes(report.old_bytes, report.savings_bytes);
     reporter.failed_count(report.failed as usize);
     // 最终报告里的 skipped 含执行前被排除的图片，进度只认候选池内的跳过。
-    reporter.skipped_count(progress_skipped_count(&report));
+    reporter.skipped_count(report.progress_skipped());
+    reporter.skip_breakdown(&report.skip_buckets());
     reporter.current(None, None);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
-    if let Some(meter) = reporter.meter()
-        && !report.cancelled
-        && report.stop_reason.is_none()
-    {
-        meter.set_percent(99);
-    }
 
     // 用本次实测覆盖本库校准值，供下次估算替换保守常数；样本太少时保留旧值。
     let sample = RunSample {
@@ -1793,6 +1803,62 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(temp_files, 0, "临时文件应随守卫删除");
+    }
+
+    /// 六个桶之和恒等于 `candidate_skipped`，界面上的细项加起来不会多也不会少。
+    #[test]
+    fn skip_buckets_cover_every_reason() {
+        let reasons = [
+            SkipReason::ColorProfile,
+            SkipReason::NotSmallEnough,
+            SkipReason::QualityNotMet,
+            SkipReason::SixteenBit,
+            SkipReason::AnimatedOrMultipage,
+            SkipReason::BppLow,
+            SkipReason::AlreadyOptimized,
+            SkipReason::Transparent,
+            SkipReason::TooLargeForWebp,
+        ];
+        let mut report = OptimizeReport::default();
+        for reason in reasons {
+            report.record_skip(reason);
+        }
+        assert_eq!(report.candidate_skipped, reasons.len() as u64);
+        let buckets = report.skip_buckets();
+        assert_eq!(buckets.len(), 6, "{buckets:?}");
+        let sum: u64 = buckets.iter().map(|(_, count)| count).sum();
+        assert_eq!(sum, report.candidate_skipped);
+        // 四个「解码后才发现」的原因都落在 late，按张数降序排在最前。
+        assert_eq!(buckets[0], ("late".to_owned(), 4));
+        // key 与估算视图的图例同名，前端两张图例共用一套文案。
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "late",
+                "color",
+                "depth",
+                "quality",
+                "notSmaller",
+                "multiframe"
+            ]
+        );
+    }
+
+    /// 进度的跳过口径只认候选池：执行前被排除的图片不算「已跳过」。
+    #[test]
+    fn progress_skipped_excludes_prefiltered() {
+        let mut report = OptimizeReport {
+            prefilter_skipped: 61_401,
+            ..OptimizeReport::default()
+        };
+        report.record_skip(SkipReason::ColorProfile);
+        report.duplicate_skipped = 2;
+        report.source_missing = 1;
+        assert_eq!(report.progress_skipped(), 4);
+        assert_eq!(skipped_count(&report), 61_405);
     }
 
     /// 一次执行后校准值写进 meta，且数值落在合理量级内。

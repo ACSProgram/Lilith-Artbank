@@ -141,6 +141,12 @@ export interface TaskFailure {
   reason: string;
 }
 
+/** 候选内跳过的一类原因；`key` 与估算视图的图例一致。 */
+export interface TaskSkipBucket {
+  key: string;
+  count: number;
+}
+
 export interface TaskSnapshot {
   taskId: string;
   kind: TaskKind;
@@ -152,7 +158,9 @@ export interface TaskSnapshot {
   completed: number;
   failed: number;
   skipped: number;
-  /** 后端按阶段耗时加权的百分比；null 表示按 completed / total 计算。 */
+  /** 候选内跳过按原因细分；只有压缩任务非空，按张数降序。 */
+  skipBreakdown: TaskSkipBucket[];
+  /** 后端按阶段耗时加权的百分比；null 表示按「已结算 / 候选张数」计算（压缩固定如此）。 */
   progressPercent: number | null;
   message: string;
   currentImageId: number | null;
@@ -247,7 +255,16 @@ export function taskPercent(task: TaskSnapshot): number {
   if (task.progressPercent !== null) {
     return Math.min(100, Math.max(0, task.progressPercent));
   }
-  if (task.total <= 0) return isTaskActive(task) ? 0 : 100;
+  return Math.min(100, Math.round(settledRatio(task) * 100));
+}
+
+/**
+ * 已结算占比（0–1）：已替换 + 失败 + 已跳过 / 候选张数。
+ *
+ * 进度条、环图中心与曲线横轴都读它，压缩任务不再有第二套百分比。
+ */
+export function settledRatio(task: TaskSnapshot): number {
+  if (task.total <= 0) return isTaskActive(task) ? 0 : 1;
   const done = task.completed + task.failed + task.skipped;
-  return Math.min(100, Math.round((done / task.total) * 100));
+  return Math.min(1, Math.max(0, done / task.total));
 }

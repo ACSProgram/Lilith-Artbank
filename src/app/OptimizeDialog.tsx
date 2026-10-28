@@ -29,6 +29,7 @@ import {
   CANCEL_PENDING_NOTE,
   TASK_PHASE_LABELS,
   isTaskActive,
+  settledRatio,
   taskPercent,
   type BatchTaskRequest,
   type OptimizeEstimate,
@@ -165,14 +166,14 @@ function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number 
   );
 }
 
-/** 执行进度按张数直接算：候选十几万张时 1% 也要一千多张，低值段给一位小数才看得出在动。 */
-function executionPercent(task: TaskSnapshot): number {
-  if (task.total <= 0) return task.finishedAt != null ? 100 : 0;
-  const done = task.completed + task.failed + task.skipped;
-  return Math.min(100, (done / task.total) * 100);
-}
-
-function percentLabel(percent: number): string {
+/**
+ * 执行百分比文案：任务没结束就不写 100%，还差几十张时写 100% 会和「预计还需 9 秒」自相矛盾。
+ *
+ * ≥99% 给一位小数（`99.8%`），低于 10% 也给一位小数——候选十几万张时 1% 也要一千多张。
+ */
+function percentLabel(percent: number, finished: boolean): string {
+  if (finished) return "100%";
+  if (percent >= 99) return `${Math.min(99.9, percent).toFixed(1)}%`;
   return percent >= 10 ? `${Math.round(percent)}%` : `${percent.toFixed(1)}%`;
 }
 
@@ -190,16 +191,18 @@ function comparisonValue(key: OptimizeComparisonKey, value: number): string {
 }
 
 /**
- * 执行时只保留这一行状态：进度、已完成张数、已用/剩余时间、速度与当前文件。
+ * 执行时只保留这一行状态：进度、已结算张数、已用/剩余时间、速度与当前文件。
  *
- * 「已完成」= 已替换 + 已跳过 + 失败，分母是候选张数；环图里的「已替换」只算真正
- * 换掉原图的，所以两个数字本来就不同，文案上分开写。
- * 其余（环图、曲线、里程碑）都由估算视图按快照填充，不再有第二套界面。
+ * 「已完成」= 已替换 + 已跳过 + 失败，分母是候选张数；环图中心与曲线横轴读同一个数，
+ * 「已替换」只算真正换掉原图的，下沉为环图图例的第一行。
+ * 任务结束后换成一行结论，不再显示「预计还需」与速度。
  */
 function OptimizeExecutionStatus({ task }: { task: TaskSnapshot }) {
   const done = task.completed + task.failed + task.skipped;
-  const percent = executionPercent(task);
+  // 进度条宽度、百分比文案与环图中心读同一个比值。
+  const percent = settledRatio(task) * 100;
   const cancelling = task.phase === "cancelling";
+  const finished = task.finishedAt != null;
 
   return (
     <div className="batch-task-progress optimize-execution">
@@ -207,35 +210,44 @@ function OptimizeExecutionStatus({ task }: { task: TaskSnapshot }) {
         <strong>
           {task.label} · {TASK_PHASE_LABELS[task.phase]}
         </strong>
-        <span>{percentLabel(percent)}</span>
+        <span>{percentLabel(percent, finished)}</span>
       </div>
       <div className={`task-progress${cancelling ? " is-cancelling" : ""}`}>
         <span style={{ width: `${percent}%` }} />
       </div>
 
-      <div className="batch-task-facts">
-        <span>
-          已完成 {done.toLocaleString()} / {task.total.toLocaleString()}
-        </span>
-        <span>已用时 {formatDuration(elapsedSecondsOf(task))}</span>
-        {!cancelling && task.etaSeconds != null ? (
-          <span>预计还需 {formatDuration(task.etaSeconds)}</span>
-        ) : null}
-        {task.ratePerSecond != null ? (
-          <span>{formatRate(task.ratePerSecond)} 张/秒</span>
-        ) : null}
-        {task.currentFile ? (
-          <span className="batch-task-current" title={task.currentFile}>
-            当前：{task.currentFile}
+      {finished ? (
+        <div className="batch-task-facts">
+          <span>已替换 {task.completed.toLocaleString()} 张</span>
+          <span>省 {formatBytes(task.savedBytes)}</span>
+          <span>用时 {formatDuration(elapsedSecondsOf(task))}</span>
+        </div>
+      ) : (
+        <div className="batch-task-facts">
+          <span>
+            已完成 {done.toLocaleString()} / {task.total.toLocaleString()}
           </span>
-        ) : task.currentImageId ? (
-          <span>当前：#{task.currentImageId}</span>
-        ) : null}
-      </div>
+          <span>已用时 {formatDuration(elapsedSecondsOf(task))}</span>
+          {!cancelling && task.etaSeconds != null ? (
+            <span>预计还需 {formatDuration(task.etaSeconds)}</span>
+          ) : null}
+          {task.ratePerSecond != null ? (
+            <span>{formatRate(task.ratePerSecond)} 张/秒</span>
+          ) : null}
+          {task.currentFile ? (
+            <span className="batch-task-current" title={task.currentFile}>
+              当前：{task.currentFile}
+            </span>
+          ) : task.currentImageId ? (
+            <span>当前：#{task.currentImageId}</span>
+          ) : null}
+        </div>
+      )}
 
       {cancelling ? (
         <div className="optimize-cancel-note">{CANCEL_PENDING_NOTE}</div>
-      ) : task.message ? (
+      ) : task.message && !(finished && task.phase === "completed") ? (
+        // 成功结束时顶部已经是结论行，同一句话不再重复；取消与失败仍要说明原因。
         <div className="batch-task-progress-meta">
           <span>{task.message}</span>
         </div>
@@ -280,15 +292,25 @@ function prefilterSegments(estimate: OptimizeEstimate): OptimizeShareRow[] {
     .sort((left, right) => right.bytes - left.bytes);
 }
 
+/** 候选内跳过原因的中文名；估算与执行共用一套 key，两处图例不会各说一套。 */
+const SKIP_REASON_LABELS: Record<string, string> = {
+  color: "非 sRGB 色彩",
+  depth: "16 位源",
+  quality: "画质不达标",
+  notSmaller: "省得太少",
+  multiframe: "动画/多页",
+  late: "解码后判定",
+};
+
 /** 候选内跳过：解码后才发现不处理。 */
 function candidateSkipSegments(estimate: OptimizeEstimate): OptimizeShareRow[] {
   return [
-    { key: "color", label: "非 sRGB 色彩", ...estimate.skipColorProfile },
-    { key: "depth", label: "16 位源", ...estimate.skipDepth },
-    { key: "quality", label: "画质不达标", ...estimate.skipQuality },
-    { key: "notSmaller", label: "省得太少", ...estimate.skipNotSmaller },
-    { key: "multiframe", label: "动画/多页", ...estimate.skipMultiframe },
-    { key: "late", label: "解码后判定", ...estimate.skipLate },
+    { key: "color", label: SKIP_REASON_LABELS.color, ...estimate.skipColorProfile },
+    { key: "depth", label: SKIP_REASON_LABELS.depth, ...estimate.skipDepth },
+    { key: "quality", label: SKIP_REASON_LABELS.quality, ...estimate.skipQuality },
+    { key: "notSmaller", label: SKIP_REASON_LABELS.notSmaller, ...estimate.skipNotSmaller },
+    { key: "multiframe", label: SKIP_REASON_LABELS.multiframe, ...estimate.skipMultiframe },
+    { key: "late", label: SKIP_REASON_LABELS.late, ...estimate.skipLate },
     { key: "failed", label: "读取失败", count: estimate.failedCount, bytes: estimate.failedBytes },
   ]
     .filter((segment) => segment.count > 0)
@@ -500,17 +522,16 @@ export function OptimizeDialog({
       appendRuntimePoint(previous, {
         elapsedSeconds,
         savingsBytes: execution.savedBytes,
-        processed: execution.completed,
-        originalBytes: execution.originalBytes,
+        processed: execution.completed + execution.failed + execution.skipped,
       }),
     );
   }, [runtimeKey, execution]);
 
-  // 实际曲线沿覆盖率轴，与预估同分母；覆盖率不倒退。
+  // 实际曲线与进度条同一条横轴：已结算张数 / 候选张数。
   const actualPoints = useMemo(() => {
-    if (!execution || !estimate) return [];
-    return actualCurvePoints(runtimePoints, estimate.candidateBytes);
-  }, [execution, estimate, runtimePoints]);
+    if (!execution) return [];
+    return actualCurvePoints(runtimePoints, execution.total);
+  }, [execution, runtimePoints]);
 
   // 只依赖原始值：任务快照每 150ms 换一次对象，用对象做依赖会在请求在飞时
   // 触发 cleanup，把结果丢掉并永久停在「正在读取估算结果…」。
@@ -856,6 +877,9 @@ export function OptimizeDialog({
   // 执行时的分母只认任务自己报的候选张数：估算里的候选数与执行前复核可能差几张，
   // 混用会让“未处理”被夹成 0。
   const executedTotal = execution?.total ?? 0;
+  const executionSettled = execution
+    ? execution.completed + execution.skipped + execution.failed
+    : 0;
   const executionSegments: OptimizeShareSegment[] = execution
     ? (
         [
@@ -883,22 +907,37 @@ export function OptimizeDialog({
           {
             key: "pending",
             label: "未处理",
-            count: Math.max(
-              0,
-              executedTotal - execution.completed - execution.skipped - execution.failed,
-            ),
+            count: Math.max(0, executedTotal - executionSettled),
             bytes: null,
             tone: "pending",
           },
         ] satisfies OptimizeShareSegment[]
-      ).filter(
-        (segment) =>
-          segment.count > 0 || segment.key === "done" || segment.key === "pending",
-      )
+      ).filter((segment) => {
+        // 任务结束后不再留一个空的「未处理」段。
+        if (segment.key === "pending") {
+          return execution.finishedAt == null && segment.count > 0;
+        }
+        return segment.count > 0 || segment.key === "done";
+      })
     : [];
+  // 已跳过展开成原因子行；后端已按张数降序并滤掉 0 值。
+  const executionBreakdown: OptimizeShareSegment[] = (execution?.skipBreakdown ?? []).map(
+    (bucket) => ({
+      key: `skip-${bucket.key}`,
+      label: SKIP_REASON_LABELS[bucket.key] ?? bucket.key,
+      count: bucket.count,
+      bytes: null,
+      tone: "sub",
+    }),
+  );
+  // 任务结束后不再渲染任何「预计」类提示。
+  const executionActive = execution ? isTaskActive(execution) : false;
   const compare = execution && estimate ? comparisonLine(execution, estimate) : null;
   // 前期收益小就先说清楚，省得盯着“已替换 0”以为卡住。
-  const curveHint = estimate ? earlySavingsHint(estimate.curve, estimate.savingsBytes) : null;
+  const curveHint =
+    estimate && (!execution || executionActive)
+      ? earlySavingsHint(estimate.curve, estimate.savingsBytes)
+      : null;
   const qualityTotal = estimate
     ? estimate.qualityCounts.reduce((sum, entry) => sum + entry.count, 0)
     : 0;
@@ -1195,13 +1234,17 @@ export function OptimizeDialog({
               {execution ? (
                 <OptimizeShareChart
                   segments={executionSegments}
+                  breakdown={executionBreakdown}
+                  breakdownAfter="skipped"
                   centerKey="done"
-                  centerLabel="已替换"
+                  centerLabel="已处理"
+                  centerValue={settledRatio(execution)}
                 />
               ) : (
                 <OptimizeShareChart
                   segments={shareSegments}
                   breakdown={candidateBreakdown}
+                  breakdownAfter="skip"
                   centerKey="process"
                   centerLabel="会处理"
                 />
@@ -1227,7 +1270,7 @@ export function OptimizeDialog({
                 </div>
                 <div className="optimize-outcome-rows">
                   <div className="optimize-outcome-row">
-                    <span>体积</span>
+                    <span>{execution ? "已替换体积" : "体积"}</span>
                     <strong>
                       {execution
                         ? `${formatBytes(execution.originalBytes)} → ${formatBytes(
@@ -1237,7 +1280,7 @@ export function OptimizeDialog({
                             estimate.predictedBytes,
                           )}`}
                       {execution ? (
-                        <em>预计 {formatBytes(estimate.predictedBytes)}</em>
+                        <em>全范围预计 {formatBytes(estimate.predictedBytes)}</em>
                       ) : null}
                     </strong>
                   </div>
@@ -1258,7 +1301,9 @@ export function OptimizeDialog({
                         .join(" · ")}
                     </div>
                   ) : null}
-                  {estimate.savingsBytes > 0 && estimate.coverage < SHALLOW_COVERAGE ? (
+                  {estimate.savingsBytes > 0 &&
+                  estimate.coverage < SHALLOW_COVERAGE &&
+                  (!execution || executionActive) ? (
                     <div className="optimize-coverage-hint">
                       抽样只读取了 {coverageLabel(estimate.coverage)} 的候选体积，实际误差可能大于上面的 ± 值。
                     </div>

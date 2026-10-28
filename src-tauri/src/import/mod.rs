@@ -40,7 +40,9 @@ pub enum FolderMode {
 }
 
 /// 导入时顺带压缩：只选档位与输出格式，长边不缩放、重算开关全关。
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+///
+/// 同时是设置里的持久化形状（`settings.json` 的 `import.optimize`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ImportOptimize {
     pub tier: QualityTier,

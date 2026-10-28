@@ -154,6 +154,14 @@ pub struct TaskFailure {
     pub reason: String,
 }
 
+/// 候选内跳过的一类原因；`key` 与估算视图的图例一致，界面据此取文案。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSkipBucket {
+    pub key: String,
+    pub count: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
@@ -167,7 +175,10 @@ pub struct TaskSnapshot {
     pub completed: usize,
     pub failed: usize,
     pub skipped: usize,
-    /// 后端给出的加权百分比；`None` 表示按 `completed / total` 计算。
+    /// 候选内跳过按原因细分；只有压缩任务非空，按张数降序。
+    pub skip_breakdown: Vec<TaskSkipBucket>,
+    /// 后端给出的加权百分比；`None` 表示按「已完成 + 失败 + 已跳过 / 总数」计算。
+    /// 压缩固定为 `None`，它的百分比只由计数派生，与环图中心和曲线横轴同源。
     pub progress_percent: Option<u8>,
     pub message: String,
     pub current_image_id: Option<i64>,
@@ -179,7 +190,7 @@ pub struct TaskSnapshot {
     pub original_bytes: u64,
     /// 已提交批次节省的字节；只有压缩任务非 0。
     pub saved_bytes: u64,
-    /// 运行以来的平均完成张数/秒；未开始或还没有完成项时为空。
+    /// 运行以来平均每秒结算的张数（含失败与跳过）；未开始或还没有结算项时为空。
     pub rate_per_second: Option<f64>,
     /// 预计剩余秒数；终态为空。
     pub eta_seconds: Option<u64>,
@@ -214,6 +225,8 @@ pub struct TaskHandle {
     completed: AtomicUsize,
     failed: AtomicUsize,
     skipped: AtomicUsize,
+    /// 候选内跳过按原因细分；由压缩逐批整体替换，不做累加。
+    skip_breakdown: Mutex<Vec<TaskSkipBucket>>,
     /// 加权进度；任务不提供单位时退回 `completed / total`。
     meter: WorkMeter,
     current: Mutex<Option<i64>>,
@@ -241,6 +254,7 @@ impl TaskHandle {
             completed: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             skipped: AtomicUsize::new(0),
+            skip_breakdown: Mutex::new(Vec::new()),
             meter: WorkMeter::new(),
             current: Mutex::new(None),
             current_file: Mutex::new(None),
@@ -347,6 +361,17 @@ impl TaskHandle {
         self.skipped.store(skipped, Ordering::Relaxed);
     }
 
+    /// 整体替换跳过细分（调用方已经算好累计值，这里不做累加）。
+    pub fn set_skip_breakdown(&self, buckets: &[(String, u64)]) {
+        *self.skip_breakdown.lock() = buckets
+            .iter()
+            .map(|(key, count)| TaskSkipBucket {
+                key: key.clone(),
+                count: *count,
+            })
+            .collect();
+    }
+
     pub fn set_failed(&self, failed: usize) {
         self.failed.store(failed, Ordering::Relaxed);
     }
@@ -425,9 +450,10 @@ impl TaskHandle {
         let run_started_at = *self.run_started_at.lock();
 
         // 排队与准备阶段没有开始时间，不拿构造时间凑速度。
+        // 速度与「已完成」同一个和：跳过的图同样消耗了完整的编码工作量。
         let rate_per_second = run_started_at.and_then(|start| {
             let elapsed = (finished_at.unwrap_or_else(now_ms) - start) as f64 / 1000.0;
-            let worked = completed + failed;
+            let worked = completed + failed + skipped;
             (worked > 0 && elapsed >= 0.5).then(|| worked as f64 / elapsed)
         });
         let eta_seconds = if phase.is_terminal() {
@@ -455,7 +481,14 @@ impl TaskHandle {
             completed,
             failed,
             skipped,
-            progress_percent: self.meter.percent(),
+            skip_breakdown: self.skip_breakdown.lock().clone(),
+            // 压缩的百分比只由「已结算张数 / 候选张数」派生（前端与环图、曲线同源），
+            // 不再暴露计量器的加权百分比；其他任务沿用各自的阶段加权。
+            progress_percent: if self.kind == TaskKind::Optimize {
+                None
+            } else {
+                self.meter.percent()
+            },
             message: self.message.lock().clone(),
             current_image_id: *self.current.lock(),
             run_started_at,
@@ -554,6 +587,10 @@ impl BatchReporter for TaskHandle {
 
     fn skipped_count(&self, skipped: usize) {
         self.set_skipped(skipped);
+    }
+
+    fn skip_breakdown(&self, buckets: &[(String, u64)]) {
+        self.set_skip_breakdown(buckets);
     }
 
     fn failed_count(&self, failed: usize) {
@@ -1438,6 +1475,56 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.current_file, None);
         assert_eq!(snapshot.eta_seconds, None);
+    }
+
+    /// 全部跳过时速度同样有值：跳过的图也消耗了完整的工作量。
+    #[test]
+    fn rate_counts_skipped_work() {
+        let handle = TaskHandle::new("skips", TaskKind::Optimize, "选中 10 张");
+        handle.set_total(10);
+        handle.set_phase(TaskPhase::Running);
+        handle.set_skipped(4);
+        std::thread::sleep(Duration::from_millis(600));
+        let snapshot = handle.snapshot();
+        assert!(snapshot.completed == 0 && snapshot.failed == 0);
+        let rate = snapshot.rate_per_second.expect("全跳过时速度不能为空");
+        assert!(rate > 0.0, "{rate}");
+        // ETA 与速度同源：还剩 6 张没结算。
+        assert!(snapshot.eta_seconds.is_some());
+    }
+
+    /// 压缩不暴露计量器加权百分比，四个位置读同一个「已结算 / 候选张数」。
+    #[test]
+    fn optimize_snapshot_percent_comes_from_counters() {
+        let handle = TaskHandle::new("opt", TaskKind::Optimize, "整个图库");
+        handle.set_total(100);
+        handle.set_completed(40);
+        handle.set_skipped(22);
+        handle.set_failed(2);
+        handle.set_percent(73);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.progress_percent, None, "压缩不该带加权百分比");
+
+        // 其他任务仍用计量器的阶段加权。
+        let other = TaskHandle::new("imp", TaskKind::Import, "选中 100 张");
+        other.set_total(100);
+        other.set_percent(73);
+        assert_eq!(other.snapshot().progress_percent, Some(73));
+    }
+
+    /// 跳过细分整体替换，前一批的桶不会残留。
+    #[test]
+    fn skip_breakdown_replaces_previous_buckets() {
+        let handle = TaskHandle::new("buckets", TaskKind::Optimize, "整个图库");
+        handle.set_skip_breakdown(&[("quality".to_owned(), 3), ("depth".to_owned(), 1)]);
+        assert_eq!(handle.snapshot().skip_breakdown.len(), 2);
+        handle.set_skip_breakdown(&[("notSmaller".to_owned(), 7)]);
+        let breakdown = handle.snapshot().skip_breakdown;
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(
+            (breakdown[0].key.as_str(), breakdown[0].count),
+            ("notSmaller", 7)
+        );
     }
 
     #[test]

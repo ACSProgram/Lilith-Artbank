@@ -171,6 +171,40 @@ export function ImportDialog({
     finishedRef.current = false;
   }, [open, temp]);
 
+  // 打开时读一次上次的压缩选项；读不到就保持默认关闭，不弹错。临时导入不读也不写。
+  useEffect(() => {
+    if (!open || temp) return;
+    let disposed = false;
+    void importApi.readOptimizeOption().then((option) => {
+      if (disposed) return;
+      setOptimizeEnabled(option != null);
+      if (option) {
+        setOptimizeFormat(option.outputFormat);
+        setOptimizeTier(option.tier);
+      }
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [open, temp]);
+
+  /** 记住当前选项；写失败只记日志，不阻塞导入。 */
+  const persistOptimizeOption = useCallback(
+    (
+      enabled: boolean,
+      format: ImportOptimizeFormat,
+      tier: ImportOptimizeTier,
+    ): void => {
+      if (temp) return;
+      void importApi
+        .saveOptimizeOption(enabled ? { tier, outputFormat: format } : null)
+        .catch((cause: unknown) => {
+          console.warn("保存导入压缩选项失败", cause);
+        });
+    },
+    [temp],
+  );
+
   useEffect(() => {
     if (!open) return;
     let disposed = false;
@@ -509,7 +543,11 @@ export function ImportDialog({
                 <input
                   type="checkbox"
                   checked={optimizeEnabled}
-                  onChange={(event) => setOptimizeEnabled(event.target.checked)}
+                  onChange={(event) => {
+                    const next = event.target.checked;
+                    setOptimizeEnabled(next);
+                    persistOptimizeOption(next, optimizeFormat, optimizeTier);
+                  }}
                 />
                 <span>
                   <strong>导入时压缩</strong>
@@ -530,14 +568,20 @@ export function ImportDialog({
                       <button
                         type="button"
                         className={`optimize-choice${optimizeFormat === "jpeg" ? " is-active" : ""}`}
-                        onClick={() => setOptimizeFormat("jpeg")}
+                        onClick={() => {
+                          setOptimizeFormat("jpeg");
+                          persistOptimizeOption(optimizeEnabled, "jpeg", optimizeTier);
+                        }}
                       >
                         JPG
                       </button>
                       <button
                         type="button"
                         className={`optimize-choice${optimizeFormat === "webp" ? " is-active" : ""}`}
-                        onClick={() => setOptimizeFormat("webp")}
+                        onClick={() => {
+                          setOptimizeFormat("webp");
+                          persistOptimizeOption(optimizeEnabled, "webp", optimizeTier);
+                        }}
                       >
                         WebP
                       </button>
@@ -551,7 +595,10 @@ export function ImportDialog({
                           key={item.value}
                           type="button"
                           className={`optimize-choice${optimizeTier === item.value ? " is-active" : ""}`}
-                          onClick={() => setOptimizeTier(item.value)}
+                          onClick={() => {
+                            setOptimizeTier(item.value);
+                            persistOptimizeOption(optimizeEnabled, optimizeFormat, item.value);
+                          }}
                         >
                           {item.label}
                         </button>
@@ -632,6 +679,12 @@ export function ImportDialog({
               {summary.optimized > 0
                 ? `其中 ${summary.optimized} 张已压缩，省 ${formatBytes(summary.optimizedBytes)}。`
                 : "没有图片被压缩：都已足够紧凑，或不满足压缩条件。"}
+            </div>
+          ) : null}
+
+          {!temp && summary && summary.optimizeFailed > 0 ? (
+            <div className="import-note">
+              {summary.optimizeFailed} 张压缩失败，已保留原图。
             </div>
           ) : null}
 

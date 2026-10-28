@@ -53,7 +53,7 @@
 
 | 档 | 成功 | 失败 | 慢 |
 | --- | --- | --- | --- |
-| 写命令（51） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
+| 写命令（52） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
 | 读命令（30） | 不记录 | `WARN command failed` | 超过阈值记 `WARN command slow` |
 
 - **写命令**指会改变图库状态或有外部副作用的命令：设置与图库开关、导入、文件夹、标签、

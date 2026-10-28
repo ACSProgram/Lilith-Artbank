@@ -32,6 +32,9 @@ const defaultSettings: Settings = {
   history: {
     maxSteps: 100,
   },
+  import: {
+    optimize: null,
+  },
   mcp: {
     enabled: false,
     port: 18767,

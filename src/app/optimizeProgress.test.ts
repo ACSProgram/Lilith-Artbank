@@ -110,33 +110,54 @@ test("取消或缺失字段时不崩", () => {
   assert.equal(empty.completed, false);
 });
 
-test("actualCurvePoints 按候选体积折算覆盖率且不回退", () => {
+test("actualCurvePoints 按候选张数折算覆盖率且不回退", () => {
   const points: RuntimeOptimizePoint[] = [
-    { elapsedSeconds: 2, savingsBytes: 0, processed: 0, originalBytes: 0 },
-    { elapsedSeconds: 4, savingsBytes: 100, processed: 10, originalBytes: 250 },
-    { elapsedSeconds: 6, savingsBytes: 260, processed: 20, originalBytes: 500 },
+    { elapsedSeconds: 2, savingsBytes: 0, processed: 0 },
+    { elapsedSeconds: 4, savingsBytes: 100, processed: 10 },
+    { elapsedSeconds: 6, savingsBytes: 260, processed: 20 },
     // 覆盖率回退的采样丢掉。
-    { elapsedSeconds: 8, savingsBytes: 900, processed: 30, originalBytes: 200 },
-    { elapsedSeconds: 10, savingsBytes: 400, processed: 40, originalBytes: 1_000 },
+    { elapsedSeconds: 8, savingsBytes: 900, processed: 3 },
+    { elapsedSeconds: 10, savingsBytes: 400, processed: 40 },
   ];
-  assert.deepEqual(actualCurvePoints(points, 1_000), [
+  assert.deepEqual(actualCurvePoints(points, 40), [
     { coverage: 0, savingsBytes: 0 },
     { coverage: 0.25, savingsBytes: 100 },
     { coverage: 0.5, savingsBytes: 260 },
     { coverage: 1, savingsBytes: 400 },
   ]);
-  // 没有候选体积时算不出覆盖率，不画实际线。
+  // 没有候选张数时算不出覆盖率，不画实际线。
   assert.deepEqual(actualCurvePoints(points, 0), []);
-  assert.deepEqual(actualCurvePoints([], 1_000), []);
+  assert.deepEqual(actualCurvePoints([], 40), []);
+});
+
+test("全跳过的区间仍然产生点，末点覆盖率等于 settled / total", () => {
+  // 一批全被跳过：节省恒为 0，但横轴必须继续走到 100%。
+  const points: RuntimeOptimizePoint[] = [
+    { elapsedSeconds: 2, savingsBytes: 0, processed: 5 },
+    { elapsedSeconds: 4, savingsBytes: 0, processed: 12 },
+    { elapsedSeconds: 6, savingsBytes: 0, processed: 20 },
+  ];
+  const curve = actualCurvePoints(points, 20);
+  assert.equal(curve.length, 3);
+  assert.deepEqual(
+    curve.map((point) => point.coverage),
+    [0.25, 0.6, 1],
+  );
+  assert.ok(curve.every((point) => point.savingsBytes === 0));
+  // 覆盖率单调不减。
+  for (let index = 1; index < curve.length; index += 1) {
+    assert.ok(curve[index].coverage > curve[index - 1].coverage);
+  }
+  assert.equal(curve.at(-1)?.coverage, 1);
 });
 
 test("actualAtCoverage 只在走到该覆盖率后给值", () => {
   const points = actualCurvePoints(
     [
-      { elapsedSeconds: 2, savingsBytes: 120, processed: 5, originalBytes: 200 },
-      { elapsedSeconds: 4, savingsBytes: 300, processed: 12, originalBytes: 600 },
+      { elapsedSeconds: 2, savingsBytes: 120, processed: 10 },
+      { elapsedSeconds: 4, savingsBytes: 300, processed: 30 },
     ],
-    1_000,
+    50,
   );
   // 里程碑取值用「已经走过的最后一个采样」，不外插。
   assert.equal(actualAtCoverage(points, 0.2), 120);

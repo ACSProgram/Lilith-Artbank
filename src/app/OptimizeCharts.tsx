@@ -27,11 +27,15 @@ export interface OptimizeShareSegment {
 interface ShareChartProps {
   /** 环图分段，按顺序画弧；总张数就是分母。 */
   segments: OptimizeShareSegment[];
-  /** 只进图例、不画弧的细分项；调用方已按体积从大到小排好并滤掉 0 项。 */
+  /** 只进图例、不画弧的细分项；调用方已滤掉 0 项并排好序（估算按体积、执行按张数）。 */
   breakdown?: OptimizeShareSegment[];
-  /** 中心百分比取哪一段（按 key）。 */
+  /** 细分项插在哪一段之后；不给就排在图例末尾。 */
+  breakdownAfter?: string;
+  /** 中心百分比取哪一段（按 key）；给了 `centerValue` 时不用它。 */
   centerKey: string;
   centerLabel: string;
+  /** 中心直接显示的占比（0–1）；执行时传 `settled / total`，与进度条同源。 */
+  centerValue?: number;
 }
 
 const DONUT_SIZE = 132;
@@ -42,20 +46,32 @@ const DONUT_CIRCUMFERENCE = 2 * Math.PI * DONUT_RADIUS;
 /**
  * 分段环图 + 图例。
  *
- * 估算时是「处理 / 候选内跳过」，执行时换成「已处理 / 已跳过 / 失败 / 未处理」，
- * 中心都显示主段占比。
+ * 估算时是「处理 / 候选内跳过」，执行时换成「已替换 / 已跳过 / 失败 / 未处理」，
+ * 中心的百分比与顶部进度条同源（执行时由调用方直接给值）。
  */
 export function OptimizeShareChart({
   segments,
   breakdown = [],
+  breakdownAfter,
   centerKey,
   centerLabel,
+  centerValue,
 }: ShareChartProps) {
   const total = segments.reduce((sum, segment) => sum + segment.count, 0);
   const center = DONUT_SIZE / 2;
   const main = segments.find((segment) => segment.key === centerKey);
-  const share = main && total > 0 ? main.count / total : 0;
-  const rows = [...segments, ...breakdown];
+  const share =
+    centerValue != null
+      ? Math.min(1, Math.max(0, centerValue))
+      : main && total > 0
+        ? main.count / total
+        : 0;
+  // 细分行紧跟在它所属的那一段后面，否则读起来像挂在最后一段（未处理）下面。
+  const rows = breakdownAfter
+    ? segments.flatMap((segment) =>
+        segment.key === breakdownAfter ? [segment, ...breakdown] : [segment],
+      )
+    : [...segments, ...breakdown];
   const withBytes = rows.some((row) => row.bytes != null);
 
   let passed = 0;
@@ -124,12 +140,12 @@ export function OptimizeShareChart({
 
 interface CurveChartProps {
   points: OptimizeCurvePoint[];
-  /** 执行中的实际采样；与预估同一条覆盖率轴。 */
+  /** 执行中的实际采样；与预估同一条「已处理张数」横轴。 */
   actual?: OptimizeActualPoint[];
   totalSavings: number;
 }
 
-/** 里程碑：处理到这些体积占比时已拿到多少收益。 */
+/** 里程碑：处理到这些张数占比时已拿到多少收益；横轴刻度与它一一对齐。 */
 const MILESTONES = [0.2, 0.4, 0.6, 0.8, 1];
 
 const CURVE_WIDTH = 480;
@@ -145,7 +161,7 @@ const BASELINE = CURVE_TOP + PLOT_HEIGHT;
 /**
  * 累计节省曲线 + 里程碑表。
  *
- * 横轴是已处理的候选体积占比，纵轴是累计节省；预估是虚线，执行中的实际是实线，
+ * 横轴是已处理的候选张数占比，纵轴是累计节省；预估是虚线，执行中的实际是实线，
  * 两条线同轴，可以直接看出实际是不是沿着预估走。
  */
 export function OptimizeCurveChart({ points, actual = [], totalSavings }: CurveChartProps) {
@@ -184,7 +200,7 @@ export function OptimizeCurveChart({ points, actual = [], totalSavings }: CurveC
         role="img"
         aria-label={`收益曲线：${MILESTONES.map(
           (fraction) =>
-            `处理 ${Math.round(fraction * 100)}% 体积约省 ${formatBytes(
+            `处理 ${Math.round(fraction * 100)}% 图片约省 ${formatBytes(
               curveAt(ordered, fraction).savingsBytes,
             )}`,
         ).join("，")}`}
@@ -225,7 +241,8 @@ export function OptimizeCurveChart({ points, actual = [], totalSavings }: CurveC
           <path className="optimize-chart-line is-actual" d={actualLine} strokeWidth={2} />
         ) : null}
 
-        {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
+        {/* 刻度与里程碑点用同一套步长，否则点会落在标签之间，看起来像标错了。 */}
+        {[0, ...MILESTONES].map((tick) => (
           <text
             key={tick}
             x={x(tick)}
