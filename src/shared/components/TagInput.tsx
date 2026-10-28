@@ -6,9 +6,17 @@ import {
   useRef,
   useState,
 } from "react";
-import { Plus, X } from "lucide-react";
+import { Plus } from "lucide-react";
 import { IconButton } from "./Button";
-import { mergeTagNames, normalizeTagName } from "../tagNames";
+import { TagChip } from "./TagChip";
+import { TagSuggestions } from "./TagSuggestions";
+import {
+  filterTagSuggestions,
+  mergeTagNames,
+  normalizeTagName,
+  tagSuggestionRequest,
+  type TagSuggestion,
+} from "../tagNames";
 
 export interface TagInputHandle {
   /** 提交输入框里尚未回车的文本，返回提交后的完整 chip 列表。 */
@@ -24,7 +32,7 @@ export interface TagInputProps {
   disabled?: boolean;
   placeholder?: string;
   exclude?: string[];
-  searchSuggestions?: (query: string) => Promise<string[]>;
+  searchSuggestions?: (query: string) => Promise<TagSuggestion[]>;
   /** 草稿模式开启：点外部按钮前先提交未回车的文本，避免丢字。 */
   commitOnBlur?: boolean;
 }
@@ -48,10 +56,12 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
   ref,
 ) {
   const [text, setText] = useState("");
-  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<TagSuggestion[]>([]);
+  const [open, setOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const remaining = max == null ? Number.POSITIVE_INFINITY : Math.max(0, max - value.length);
   const inputDisabled = disabled || remaining <= 0;
+  const needle = text.trim();
 
   const commitName = useCallback(
     (raw: string): string[] => {
@@ -68,6 +78,7 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
     const next = commitName(text);
     setText("");
     setSuggestions([]);
+    setOpen(false);
     return next;
   }, [commitName, text]);
 
@@ -77,52 +88,50 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
   const valueKey = value.join("\u0000");
   const excludeKey = (exclude ?? []).join("\u0000");
   useEffect(() => {
-    const needle = text.trim();
-    if (!needle || !searchSuggestions) {
+    if (!open || inputDisabled || !searchSuggestions) {
       setSuggestions([]);
       return;
     }
+    const request = tagSuggestionRequest(text);
     let disposed = false;
     const timer = window.setTimeout(() => {
-      void searchSuggestions(needle)
-        .then((names) => {
+      void searchSuggestions(request.needle)
+        .then((items) => {
           if (disposed) return;
-          const blocked = new Set(
-            [...(exclude ?? []), ...value].map((name) => name.trim().toLowerCase()),
-          );
-          setSuggestions(
-            names
-              .map((name) => name.trim())
-              .filter((name) => name && !blocked.has(name.toLowerCase()))
-              .slice(0, 12),
-          );
+          setSuggestions(filterTagSuggestions(items, [...(exclude ?? []), ...value]));
         })
         .catch(() => {
-          if (!disposed) setSuggestions([]);
+          if (disposed) return;
+          setSuggestions([]);
+          setOpen(false);
         });
-    }, 160);
+    }, request.debounceMs);
     return () => {
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [text, searchSuggestions, valueKey, excludeKey]);
+  }, [open, text, searchSuggestions, valueKey, excludeKey, inputDisabled]);
+
+  const pickSuggestion = (name: string) => {
+    commitName(name);
+    setText("");
+    setSuggestions([]);
+    setOpen(false);
+    inputRef.current?.focus();
+  };
 
   return (
     <div className="tag-editor">
       {value.length > 0 ? (
         <div className="tag-chips tag-editor-chips">
           {value.map((name, index) => (
-            <span key={`${name}-${index}`} className="tag-chip">
-              <span className="tag-chip-name">{name}</span>
-              <button
-                type="button"
-                aria-label={`移除标签 ${name}`}
-                disabled={disabled}
-                onClick={() => onChange(value.filter((_, item) => item !== index))}
-              >
-                <X size={10} />
-              </button>
-            </span>
+            <TagChip
+              key={`${name}-${index}`}
+              name={name}
+              disabled={disabled}
+              removeLabel={`移除标签 ${name}`}
+              onRemove={() => onChange(value.filter((_, item) => item !== index))}
+            />
           ))}
         </div>
       ) : null}
@@ -135,24 +144,36 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
           disabled={inputDisabled}
           autoComplete="off"
           spellCheck={false}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => {
+            setText(event.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
             if (event.key === "Enter") {
               event.preventDefault();
               commitText();
+            } else if (event.key === "Escape" && open) {
+              event.preventDefault();
+              event.stopPropagation();
+              setOpen(false);
             } else if (event.key === "Backspace" && text === "" && value.length > 0) {
               event.preventDefault();
               onChange(value.slice(0, -1));
             }
           }}
           onBlur={() => {
-            if (commitOnBlur) commitText();
+            if (commitOnBlur) {
+              commitText();
+              return;
+            }
+            setOpen(false);
           }}
         />
         <IconButton
           label="添加标签"
-          disabled={inputDisabled || !text.trim()}
+          disabled={inputDisabled || !needle}
           onClick={() => {
             commitText();
             inputRef.current?.focus();
@@ -160,24 +181,13 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
         >
           <Plus size={13} />
         </IconButton>
-        {suggestions.length > 0 ? (
-          <div className="tag-suggestions">
-            {suggestions.map((name) => (
-              <button
-                key={name}
-                type="button"
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => {
-                  commitName(name);
-                  setText("");
-                  setSuggestions([]);
-                  inputRef.current?.focus();
-                }}
-              >
-                {name}
-              </button>
-            ))}
-          </div>
+        {open && !inputDisabled && searchSuggestions && (suggestions.length > 0 || needle) ? (
+          <TagSuggestions
+            items={suggestions}
+            onPick={pickSuggestion}
+            emptyText={needle ? "没有匹配的标签" : undefined}
+            footnote={needle ? <>回车添加「{needle}」</> : undefined}
+          />
         ) : null}
       </div>
       {max != null && remaining <= 0 ? (

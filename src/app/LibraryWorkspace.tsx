@@ -275,9 +275,11 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return { text: result.text, model: result.model };
   }, []);
 
-  const searchTagNames = useCallback(
+  const searchTagSuggestions = useCallback(
     (query: string) =>
-      libraryApi.searchTags(query, 12).then((tags) => tags.map((tag) => tag.name)),
+      libraryApi
+        .searchTags(query, 200)
+        .then((tags) => tags.map(({ name, imageCount }) => ({ name, imageCount }))),
     [],
   );
 
@@ -686,7 +688,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             initialFolder={importFolder}
             target={importTarget}
             folders={folders}
-            searchTags={searchTagNames}
+            searchTags={searchTagSuggestions}
             onClose={closeImport}
             onFinished={handleImportFinished}
           />

@@ -6,6 +6,7 @@ import { Field } from "../../shared/components/Field";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Modal } from "../../shared/components/Modal";
 import { TagInput, type TagInputHandle } from "../../shared/components/TagInput";
+import type { TagSuggestion } from "../../shared/tagNames";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import { formatBytes } from "../../shared/format";
 import { confirmImportOptimize } from "../../shared/confirm";
@@ -43,7 +44,7 @@ interface ImportDialogProps {
   target?: ImportTarget;
   folders: ImportFolder[];
   /** 标签自动补全；由 app 层注入，避免 import 模块依赖 library 模块。 */
-  searchTags?: (query: string) => Promise<string[]>;
+  searchTags?: (query: string) => Promise<TagSuggestion[]>;
   onClose: () => void;
   onFinished: () => void;
 }

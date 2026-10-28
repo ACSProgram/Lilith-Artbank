@@ -22,6 +22,7 @@ import { Button, IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Popover } from "../../shared/components/Popover";
 import { Spinner } from "../../shared/components/Spinner";
+import { TagChip } from "../../shared/components/TagChip";
 import { TagInput, type TagInputHandle } from "../../shared/components/TagInput";
 import { copyText } from "../../shared/clipboard";
 import { thumbnailUrl } from "../../shared/thumbUrl";
@@ -79,8 +80,10 @@ function descriptionSourceLabel(source: string): string {
   return "手工";
 }
 
-function searchTagSuggestions(query: string): Promise<string[]> {
-  return libraryApi.searchTags(query, 12).then((tags) => tags.map((tag) => tag.name));
+function searchTagSuggestions(query: string) {
+  return libraryApi
+    .searchTags(query, 200)
+    .then((tags) => tags.map(({ name, imageCount }) => ({ name, imageCount })));
 }
 
 export function InspectorPanel({
@@ -633,38 +636,32 @@ function ImageInspector({
           {detail.tags.map((tag) => {
             const active = filterTagIds.includes(tag.id);
             return (
-              <span key={tag.id} className={`tag-chip${active ? " is-filtering" : ""}`}>
-                {onFilterTag ? (
-                  <button
-                    type="button"
-                    className="tag-chip-name"
-                    title={
-                      active
-                        ? "点击可改筛选范围或取消；Ctrl 点击取消该标签"
-                        : "点击选择筛选范围；Ctrl 点击直接叠加到当前视图"
-                    }
-                    onClick={(event) => {
-                      if (event.ctrlKey || event.metaKey) {
-                        onFilterTag(tag.id, "append", "view");
-                        return;
+              <TagChip
+                key={tag.id}
+                name={tag.name}
+                active={active}
+                nameTitle={
+                  onFilterTag
+                    ? active
+                      ? "点击可改筛选范围或取消；Ctrl 点击取消该标签"
+                      : "点击选择筛选范围；Ctrl 点击直接叠加到当前视图"
+                    : undefined
+                }
+                onNameClick={
+                  onFilterTag
+                    ? (event) => {
+                        if (event.ctrlKey || event.metaKey) {
+                          onFilterTag(tag.id, "append", "view");
+                          return;
+                        }
+                        setTagMenu({ id: tag.id, name: tag.name, active });
                       }
-                      setTagMenu({ id: tag.id, name: tag.name, active });
-                    }}
-                  >
-                    {tag.name}
-                  </button>
-                ) : (
-                  <span className="tag-chip-name">{tag.name}</span>
-                )}
-                <button
-                  type="button"
-                  aria-label={`移除标签 ${tag.name}`}
-                  disabled={busy}
-                  onClick={() => removeTag(tag.name)}
-                >
-                  <X size={10} />
-                </button>
-              </span>
+                    : undefined
+                }
+                removeLabel={`移除标签 ${tag.name}`}
+                onRemove={() => removeTag(tag.name)}
+                disabled={busy}
+              />
             );
           })}
           {detail.tags.length === 0 ? <span className="inspector-empty">还没有标签</span> : null}
@@ -1004,23 +1001,23 @@ function SelectionTagChip({
 }) {
   const common = total > 0 && tag.count >= total;
   return (
-    <button
-      type="button"
-      className={`tag-chip tag-chip-remove${common ? "" : " is-partial"}`}
-      disabled={busy}
-      title={
+    <TagChip
+      name={tag.name}
+      muted={!common}
+      count={common ? "全部" : `${tag.count}/${total}`}
+      activateLabel={
+        common
+          ? `从全部选中图片移除「${tag.name}」`
+          : `从拥有「${tag.name}」的图片移除`
+      }
+      activateTitle={
         common
           ? `全部 ${total.toLocaleString()} 张都有；点击从全部选中图片移除`
           : `${tag.count.toLocaleString()}/${total.toLocaleString()} 张有；点击从拥有它的图片移除`
       }
-      onClick={() => onRemove(tag)}
-    >
-      <span className="tag-chip-name">{tag.name}</span>
-      <em className="tag-chip-count">
-        {common ? "全部" : `${tag.count}/${total}`}
-      </em>
-      <X size={10} />
-    </button>
+      disabled={busy}
+      onActivate={() => onRemove(tag)}
+    />
   );
 }
 

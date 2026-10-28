@@ -2861,6 +2861,7 @@ textarea:focus-visible {
   flex-shrink: 0;
   align-items: center;
   gap: 3px;
+  max-width: 100%;
   padding: 2px 4px 2px 7px;
   border: 1px solid var(--accent-border);
   border-radius: 4px;
@@ -2868,6 +2869,20 @@ textarea:focus-visible {
   color: var(--accent);
   font-size: 10px;
   white-space: nowrap;
+}
+
+.tag-chip-name {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-chip button:focus-visible,
+.tag-chip-remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .tag-chip button {
@@ -2935,14 +2950,32 @@ textarea:focus-visible {
   left: 0;
   display: flex;
   flex-direction: column;
+  max-height: 260px;
   padding: 3px;
+  overflow-y: auto;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--panel);
   box-shadow: var(--shadow-lg);
 }
 
+.tag-suggestions.is-inline {
+  position: static;
+  top: auto;
+  right: auto;
+  left: auto;
+  z-index: auto;
+  max-height: 160px;
+  margin-top: 2px;
+  box-shadow: none;
+}
+
 .tag-suggestions button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
   padding: 5px 8px;
   border: none;
   border-radius: 4px;
@@ -2955,6 +2988,35 @@ textarea:focus-visible {
 .tag-suggestions button:hover {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+.tag-suggestions-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-suggestions-count {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.tag-suggestions-empty {
+  margin: 0;
+  padding: 5px 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.tag-suggestions-footnote {
+  margin-top: 2px;
+  padding: 5px 8px 3px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 10px;
 }
 
 .tag-editor {
@@ -2992,9 +3054,14 @@ textarea:focus-visible {
 }
 
 .tag-chip-count {
+  flex-shrink: 0;
   color: var(--text-faint);
   font-size: 9px;
   font-style: normal;
+}
+
+.tag-chip svg {
+  flex-shrink: 0;
 }
 
 .tag-load-error {
@@ -3247,41 +3314,6 @@ textarea:focus-visible {
   border-top: 1px dashed var(--border);
 }
 
-.tag-manager-merge-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  max-height: 160px;
-  overflow-y: auto;
-}
-
-.tag-manager-merge-option {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 4px 6px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text);
-  font-size: 11.5px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.tag-manager-merge-option:hover {
-  border-color: var(--border);
-  background: var(--panel-hover);
-}
-
-.tag-manager-merge-option em {
-  color: var(--text-faint);
-  font-style: normal;
-  font-size: 9.5px;
-  white-space: nowrap;
-}
-
 .collection-manager-name,
 .tag-manager-name {
   flex: 1;
@@ -3310,6 +3342,14 @@ textarea:focus-visible {
 .collection-manager-edit,
 .tag-manager-edit {
   flex: 1;
+}
+
+.tag-manager-edit {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  gap: 5px;
 }
 
 .collection-combine-list {
