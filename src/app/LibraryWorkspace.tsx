@@ -5,8 +5,8 @@ import { ImportDialog } from "../modules/import/ImportDialog";
 import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type { CollectionInfo, FolderChange, FolderInfo } from "../modules/library/types";
-import { sortForViewChange } from "../modules/library/model";
+import type { CollectionInfo, FolderChange, FolderInfo, SortSpec } from "../modules/library/types";
+import { DEFAULT_KEEP_SORT, sortForViewChange } from "../modules/library/model";
 import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
 import {
@@ -98,7 +98,7 @@ async function refreshTaskContext(
 }
 
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
-  const { current, settings } = useAppRuntime();
+  const { current, settings, saveSettings } = useAppRuntime();
   const { notify } = useNotices();
   const statsStore = useMemo(
     () =>
@@ -121,6 +121,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [selectedImageIds, setSelectedImageIds] = useState<number[]>([]);
   const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
+  const [similarityGroupsContext, setSimilarityGroupsContext] =
+    useState<BatchTaskContextInfo | null>(null);
   const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
   const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
   const [maintenanceContext, setMaintenanceContext] = useState<BatchTaskContextInfo | null>(null);
@@ -186,6 +188,20 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       }));
     });
   }, []);
+
+  /** 相似组保留规则改了就存，不弹“设置已保存”。 */
+  const persistKeepSort = useCallback(
+    (next: SortSpec[]) => {
+      if (!settings) return;
+      void saveSettings(
+        { ...settings, ui: { ...settings.ui, similarityKeepSort: next } },
+        { silent: true },
+      ).catch((cause: unknown) => {
+        notify("保存保留规则失败", "error", errorMessage(cause));
+      });
+    },
+    [notify, saveSettings, settings],
+  );
 
   useEffect(() => {
     similarity.clear();
@@ -621,7 +637,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                   beginDrag({ kind: "images", imageIds, label }, event)
                 }
                 similarity={similarity}
-                onOpenSimilarityGroups={() => {
+                onOpenSimilarityGroups={(context) => {
+                  setSimilarityGroupsContext(context);
                   setSimilarityGroupsOpen(true);
                 }}
                 onOpenBatchTasks={setBatchContext}
@@ -730,12 +747,28 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             onClose={() => {
               setSimilarityGroupsOpen(false);
             }}
+            context={similarityGroupsContext}
+            keepSort={
+              settings?.ui.similarityKeepSort?.length
+                ? settings.ui.similarityKeepSort
+                : DEFAULT_KEEP_SORT
+            }
+            onKeepSortChange={persistKeepSort}
             onChanged={() =>
               emitChange({
                 kind: "collection",
                 source: "local",
                 reason: "similarityGroups",
                 similarity: "keep",
+              })
+            }
+            onMerged={(imageIds) =>
+              emitChange({
+                kind: "membership",
+                source: "local",
+                reason: "similarityMerge",
+                ids: imageIds,
+                similarity: "clear",
               })
             }
             initialTaskId={similarityGroupsTaskId}

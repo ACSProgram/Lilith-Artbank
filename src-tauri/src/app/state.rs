@@ -1838,6 +1838,7 @@ impl AppState {
                     embedding: request.group_embedding,
                     embedding_threshold: request.embedding_threshold,
                 },
+                request.scope,
                 request.conflict,
             ),
             BatchTaskKind::OptimizeEstimate => self.start_optimize_estimate(app, request),
@@ -2599,6 +2600,16 @@ impl AppState {
 
     pub fn similarity_groups_result(&self, task_id: &str) -> Option<SimilarityGroupsResult> {
         self.ai.groups_result(task_id)
+    }
+
+    /// 相似分组合并前的保留项挑选：只读，返回与 `groups` 等长的保留 id。
+    pub fn similarity_group_keeps(
+        &self,
+        groups: &[Vec<i64>],
+        sort: &[query::SortSpec],
+    ) -> AppResult<Vec<Option<i64>>> {
+        let (database, _) = self.query_source()?;
+        query::group_keeps(&database, groups, sort)
     }
 }
 

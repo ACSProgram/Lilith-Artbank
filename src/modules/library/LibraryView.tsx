@@ -134,7 +134,7 @@ interface LibraryViewProps {
   /** 开始把网格/列表中的图片拖到文件夹。 */
   onBeginImageDrag: (imageIds: number[], label: string, event: ReactPointerEvent<HTMLDivElement>) => void;
   similarity?: SimilarityBrowseState;
-  onOpenSimilarityGroups?: () => void;
+  onOpenSimilarityGroups?: (context: BatchTaskContextInfo) => void;
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
   onOpenOptimize?: (context: BatchTaskContextInfo) => void;
   /** 打开维护与检查；与批量任务共用同一份范围上下文。 */
@@ -1127,6 +1127,14 @@ export function LibraryView({
     if (context) onOpenOptimize(context);
   }, [buildTaskContextBase, onOpenOptimize]);
 
+  const openSimilarityGroups = useCallback(async () => {
+    setTaskMenuOpen(false);
+    if (!onOpenSimilarityGroups) return;
+    // 相似结果视图下按进入前的图库视图算范围，和找相似面板一致。
+    const context = await buildTaskContext({ includeView: true });
+    if (context) onOpenSimilarityGroups(context);
+  }, [buildTaskContext, onOpenSimilarityGroups]);
+
   const openFindSimilarPanel = useCallback(
     async (reference: SimilarReference, initial: FindSimilarConfig | null) => {
       const context = await buildTaskContext({ includeView: true });
@@ -2000,10 +2008,7 @@ export function LibraryView({
                 type="button"
                 className="context-menu-item"
                 disabled={!onOpenSimilarityGroups}
-                onClick={() => {
-                  setTaskMenuOpen(false);
-                  onOpenSimilarityGroups?.();
-                }}
+                onClick={() => void openSimilarityGroups()}
               >
                 <ScanSearch size={14} />
                 <span>相似分组…</span>

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { DEFAULT_KEEP_SORT } from "../modules/library/model";
 import { mockLibraryCounts } from "../modules/library/mock";
 import { LIST_COLUMNS } from "./types";
 import type {
@@ -50,6 +51,7 @@ const defaultSettings: Settings = {
     sortProfiles: [],
     viewerFilmstrip: true,
     listColumns: [...LIST_COLUMNS],
+    similarityKeepSort: [...DEFAULT_KEEP_SORT],
   },
   maintenance: {
     autoCompactThumbs: true,

@@ -236,7 +236,7 @@ Content-Type: application/octet-stream
 
 相似度有三类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding）、feature pack（pose）。三者都只返回 id + 分数，按 token 分页后再回填元数据。
 
-- **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行（临时区行带 `is_temp` 标记），pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。全库扫描与全库相似分组跳过临时行，显式范围仍可使用。
+- **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行（临时区行带 `is_temp` 标记），pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。全库扫描与相似分组（任何范围）都跳过临时行；显式范围仍可用于找相似与语义搜索。
 - **pHash 相似**：参考图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。只支持单张参考图。
 - **主色相似**：参考主色（单张的 4/8 色，或多张等权合并后的代表色）与索引逐项做对称加权 OKLab 距离（每项匹配对方最近色、按自身权重平均，两个方向再取均值），距离升序。
 - **均值中心化**：打开图库后在后台线程扫描当前 model/dim 的普通图 embedding，求 fp32 均值并保存在内存；不阻塞开库，也不随新增/编辑更新，关闭并重新打开图库刷新。MCP 的临时区特征生成完成后会显式失效均值缓存。均值按 4096 行分块用 rayon 并行累加再合并（真实库 364 056 行 × 1536 维）；语义搜索遇到 `Computing` 时等待后台结果（最多 15 s）而不是同步重算。
@@ -246,7 +246,7 @@ Content-Type: application/octet-stream
 - **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
 - **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。
 - **姿势相似**：`ai/pose_similarity.rs`，33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。移植自旧程序 `MediaPipePoseData::similarity`，现在按本仓库自己的算法维护，权重与索引可以为精度或性能调整（`pose_similarity.rs` 的 golden 值测试要随改动一起更新）。移植来历见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md`。
-- **全库相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。
+- **相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。分组只看范围：临时图片在任何范围都不参与；`scope` 省略或 `library` 时不解析 id，其它范围先解析成 id 集合再过滤分段索引，组内成员不会越出范围。
 - **扫描实现**：feature pack mmap + rayon 分块顺序扫描，收集分数后用部分选择取 top-K（不整体排序）。不把 30 万-50 万条向量读进堆，也不逐条查 SQLite。20 万条 1536 维的查询预算由本机基准记录在 `docs/guides/performance.md`。
 - **结果缓存**：语义搜索与找相似共用**一个**结果槽（token + 图库代次 + 图库 id），后一次查询覆盖前一次；`get_similarity_page` / `get_similarity_ids` 代次不符时报“相似结果已失效，请重新搜索”。切换图库、编辑、回收站操作、AI 任务结束都会清空它。
 - 相似结果只返回 id + 分数，再按页取元数据；不要把向量发给前端。
@@ -272,14 +272,15 @@ Content-Type: application/octet-stream
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
 | `find_similar_images` | 参考图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，`targetIds` 支持单张或最多 100 张平均（多张只允许 color4/color8/embedding）；可选 `threshold`、`limit`（默认 2000，上限 10000）与 `scope` |
-| `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、全库相似分组；立即返回 `{ status: "started", task }`，`task.phase` 为 `queued`（已排队）或 `preparing`（已拿到资源） |
+| `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、相似分组（`scope` 可选）；立即返回 `{ status: "started", task }`，`task.phase` 为 `queued`（已排队）或 `preparing`（已拿到资源） |
 | `preview_batch_task` | 只读预览：返回 `{ total, willProcess }`（“范围 N 张 / 将处理 M 张”）；`kind` 只接受缩略图与三类 AI 任务，缺模型维度时 `willProcess` 为 `null`。与任务启动共用 `query::PendingFilter` 的同一套待处理条件，异步执行以免阻塞窗口事件循环 |
 | `list_tasks` / `cancel_task` | 任务列表与取消；进度通过 `task-progress` / `task-finished` 推送 |
 | `get_similarity_groups_result` | 按 taskId 取回相似分组结果 |
+| `similarity_group_keeps` | 合并前挑每组保留哪一张：`{ groups, sort }` → 与 `groups` 等长的数组，元素是保留的图片 id（组内没有可见图片时为 null）；只读，排序指标限评分/导入时间/修改时间/像素/大小/文件夹 |
 | `get_similarity_page` / `get_similarity_ids` | 相似结果分页与全选（语义搜索与找相似共用） |
 | `get_image_pose` | 读取 feature pack 中的 33 点姿势 |
 
-相似分组请求字段：`groupPhash` / `phashThreshold`（0–7）与 `groupEmbedding` / `embeddingThreshold`（0.5–1，默认 0.97）可以单独或同时启用；同时启用时两个条件都满足才归组。只开语义时，pHash 分段索引只用于产生候选，不参与筛选。结果结构 `{ phash, embedding, groups, truncated, missing, elapsedMs }`。
+相似分组请求字段：`groupPhash` / `phashThreshold`（0–7）与 `groupEmbedding` / `embeddingThreshold`（0.5–1，默认 0.97）可以单独或同时启用；同时启用时两个条件都满足才归组。只开语义时，pHash 分段索引只用于产生候选，不参与筛选。`scope` 与找相似共用同一套 `TaskScope`，语义是“只在范围内找组”，任务名取范围名。结果结构 `{ phash, embedding, groups, truncated, missing, elapsedMs }`。
 
 实现位置：
 
@@ -295,10 +296,10 @@ Content-Type: application/octet-stream
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
 - `src-tauri/src/ai/pose_similarity.rs`：姿势相似度与 golden 值测试。
-- `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、全库 pHash 分组。
+- `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、pHash 分段分组。
 - `src-tauri/src/ai/job.rs`：批量任务、待处理过滤（与预览共用 `PendingFilter`）、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
-- `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/modules/library/FindSimilarPanel.tsx`：参考图、指标、阈值、数量与范围（工具栏下拉面板）；`src/shared/similarity.ts`：kind 与中文标签；`src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`：批量任务、空间优化与找相似共用的范围语义与单选框。
+- `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`，保留规则编辑器是 `KeepSortPicker.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/modules/library/FindSimilarPanel.tsx`：参考图、指标、阈值、数量与范围（工具栏下拉面板）；`src/shared/similarity.ts`：kind 与中文标签；`src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`：批量任务、空间优化、找相似与相似分组共用的范围语义与单选框。
 
 限制：
 
@@ -308,7 +309,7 @@ Content-Type: application/octet-stream
 - 相似模式（语义或找相似）不叠加图库筛选条件；进入后筛选与排序控件禁用。找相似可以显式选择当前视图等范围，范围在进入结果视图前解析。
 - 多张参考图只支持主色与 embedding 的平均；pHash 与姿势平均没有意义。缺特征时弹窗置灰，不在查询路径里自动生成。
 - 结果缓存只保留最近一次查询；换一次搜索/找相似后旧 token 失效。相似分组结果按 taskId 在内存里最多保留 5 份，关库即清空。
-- 全库 pHash 分组的阈值只支持 0-7；更大阈值只能用单张“找相似”。
+- 相似分组的 pHash 阈值只支持 0-7；更大阈值只能用单张“找相似”。语义复核固定取全库第一名的模型与维度，范围里的图片若属于旧模型会计入 `missing`。
 - 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。
 - 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。

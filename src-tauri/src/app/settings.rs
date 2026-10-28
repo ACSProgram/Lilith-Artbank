@@ -273,6 +273,8 @@ pub struct UiSettings {
     pub viewer_filmstrip: bool,
     /// 列表视图显示哪些列；缺键或为空时按默认全显示。
     pub list_columns: Vec<String>,
+    /// 相似分组合并时的保留规则；缺键时按「评分降序 → 导入时间降序」。
+    pub similarity_keep_sort: Vec<SortSpec>,
 }
 
 /// 列表视图可隐藏的列；缩略图列不在其中，永远显示。
@@ -293,6 +295,20 @@ pub fn default_list_columns() -> Vec<String> {
         .collect()
 }
 
+/// 相似分组合并的默认保留规则：评分高优先，其次导入时间晚优先。
+pub fn default_similarity_keep_sort() -> Vec<SortSpec> {
+    vec![
+        SortSpec {
+            key: "score".into(),
+            descending: true,
+        },
+        SortSpec {
+            key: "importedAt".into(),
+            descending: true,
+        },
+    ]
+}
+
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
@@ -304,6 +320,7 @@ impl Default for UiSettings {
             sort_profiles: Vec::new(),
             viewer_filmstrip: true,
             list_columns: default_list_columns(),
+            similarity_keep_sort: default_similarity_keep_sort(),
         }
     }
 }
@@ -430,6 +447,19 @@ impl Settings {
             // 方案内的排序走同一套校验，报错时带上方案名，否则定位不到是哪一个。
             validate_sort(&profile.sort)
                 .map_err(|error| AppError::message(format!("排序方案「{name}」：{error}")))?;
+        }
+        // 保留规则可以留空（回落默认值），但不能出现跨集合才有意义的指标。
+        if !self.ui.similarity_keep_sort.is_empty() {
+            validate_sort(&self.ui.similarity_keep_sort)
+                .map_err(|error| AppError::message(format!("相似组保留规则：{error}")))?;
+            if self
+                .ui
+                .similarity_keep_sort
+                .iter()
+                .any(|spec| spec.key == "collectionPosition")
+            {
+                return Err(AppError::message("相似组保留规则不能用「集合内顺序」"));
+            }
         }
         Ok(())
     }

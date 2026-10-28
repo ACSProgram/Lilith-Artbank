@@ -38,6 +38,34 @@ export const SORT_LABELS: Record<SortKey, string> = {
   collectionPosition: "集合内顺序",
 };
 
+/**
+ * 合并相似组时能用来决定保留哪张的指标。
+ *
+ * 「集合内顺序」不在其中：合并发生在跨集合的范围上，按集合位置保留没有稳定含义。
+ */
+export const KEEP_SORT_KEYS: SortKey[] = [
+  "score",
+  "importedAt",
+  "modifiedAt",
+  "pixels",
+  "size",
+  "folder",
+];
+
+/** 相似分组合并的默认保留规则：评分高的先留，其次导入时间晚的先留。 */
+export const DEFAULT_KEEP_SORT: SortSpec[] = [
+  { key: "score", descending: true },
+  { key: "importedAt", descending: true },
+];
+
+/** 保留规则的一句话说明；确认框与按钮提示共用，空规则按默认值说。 */
+export function keepSortSummary(sort: SortSpec[]): string {
+  const levels = sort.length > 0 ? sort : DEFAULT_KEEP_SORT;
+  return levels
+    .map((spec) => `${SORT_LABELS[spec.key]}${spec.descending ? "降序" : "升序"}`)
+    .join(" → ");
+}
+
 export interface BrowseState {
   view: LibraryView;
   collectionId: number | null;

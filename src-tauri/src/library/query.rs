@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -638,6 +638,104 @@ pub fn query_ids(database: &LibraryDb, query: LibraryQuery) -> AppResult<Vec<i64
         }
         Ok(ids)
     })
+}
+
+/// 相似分组合并的默认保留规则：评分高优先，其次导入时间晚优先。
+pub const DEFAULT_KEEP_SORT: [SortSpec; 2] = [
+    SortSpec {
+        key: SortKey::Score,
+        descending: true,
+    },
+    SortSpec {
+        key: SortKey::ImportedAt,
+        descending: true,
+    },
+];
+
+/// 合并时可用于挑保留项的指标；“集合内顺序”跨集合没有意义，不在其中。
+pub const KEEP_SORT_KEYS: [SortKey; 6] = [
+    SortKey::Score,
+    SortKey::ImportedAt,
+    SortKey::ModifiedAt,
+    SortKey::Pixels,
+    SortKey::Size,
+    SortKey::Folder,
+];
+
+/// 一次最多挑多少组；与相似分组的结果上限一致。
+const MAX_KEEP_GROUPS: usize = crate::library::similarity::MAX_GROUPS;
+/// 单个组的成员上限；与 pHash 分组的单组上限一致。
+const MAX_KEEP_GROUP_SIZE: usize = crate::library::similarity::MAX_GROUP_SIZE;
+
+/// 合并相似组时每组保留哪一张：按给定排序取每组的第一张，规则与浏览排序一致。
+///
+/// 返回与 `groups` 等长的数组，元素是保留的图片 id；组内没有可见图片时是 `None`。
+/// 只读，不改任何状态；调用方拿它算出要移入回收站的其余 id。
+pub fn group_keeps(
+    database: &LibraryDb,
+    groups: &[Vec<i64>],
+    sort: &[SortSpec],
+) -> AppResult<Vec<Option<i64>>> {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    if groups.len() > MAX_KEEP_GROUPS {
+        return Err(AppError::message(format!(
+            "一次最多处理 {MAX_KEEP_GROUPS} 个组"
+        )));
+    }
+    let sort = normalize_keep_sort(sort)?;
+    let order = order_by(&sort);
+    database.with_reader(|connection| {
+        let mut keeps = Vec::with_capacity(groups.len());
+        for group in groups {
+            if group.len() > MAX_KEEP_GROUP_SIZE {
+                return Err(AppError::message(format!(
+                    "单个组超过 {MAX_KEEP_GROUP_SIZE} 张，无法自动挑选保留项"
+                )));
+            }
+            let ids = dedupe_ids(group.clone(), MAX_KEEP_GROUP_SIZE, "分组图片")?;
+            if ids.is_empty() {
+                keeps.push(None);
+                continue;
+            }
+            let marks = placeholders(ids.len());
+            let sql = format!(
+                "SELECT images.id FROM images
+                 LEFT JOIN folders ON folders.id = images.folder_id
+                 WHERE images.id IN ({marks}) AND images.deleted_at IS NULL
+                 ORDER BY {order}
+                 LIMIT 1"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let keep = statement
+                .query_row(params_from_iter(ids.iter()), |row| row.get::<_, i64>(0))
+                .optional()?;
+            keeps.push(keep);
+        }
+        Ok(keeps)
+    })
+}
+
+/// 保留规则只允许白名单指标，去重后不超过排序级数上限；空规则回落到默认值。
+fn normalize_keep_sort(sort: &[SortSpec]) -> AppResult<Vec<SortSpec>> {
+    let mut levels: Vec<SortSpec> = Vec::with_capacity(sort.len());
+    for spec in sort {
+        if !KEEP_SORT_KEYS.contains(&spec.key) {
+            return Err(AppError::message("这个指标不能用来决定保留哪张"));
+        }
+        if levels.iter().any(|level| level.key == spec.key) {
+            continue;
+        }
+        levels.push(*spec);
+    }
+    if levels.is_empty() {
+        levels.extend_from_slice(&DEFAULT_KEEP_SORT);
+    }
+    if levels.len() > MAX_SORT_LEVELS {
+        return Err(AppError::message(format!("排序最多 {MAX_SORT_LEVELS} 级")));
+    }
+    Ok(levels)
 }
 
 pub fn filter_counts(database: &LibraryDb, query: LibraryQuery) -> AppResult<FilterCounts> {
@@ -4771,5 +4869,45 @@ mod tests {
                 will_process: 0
             }
         );
+    }
+
+    #[test]
+    fn group_keeps_picks_first_row_by_sort() {
+        let fixture = fixture();
+        let database = &fixture.session.db;
+        // 夹具：id=1 评分 3、导入 300；id=2 评分 5、导入 200；id=3 评分 1、导入 100。
+        let groups = vec![vec![1, 2], vec![3, 1]];
+
+        let keeps = group_keeps(database, &groups, &DEFAULT_KEEP_SORT).unwrap();
+        assert_eq!(keeps, vec![Some(2), Some(1)]);
+
+        // 换成导入时间升序：第二组保留最早的 id=3。
+        let sort = [SortSpec {
+            key: SortKey::ImportedAt,
+            descending: false,
+        }];
+        let keeps = group_keeps(database, &groups, &sort).unwrap();
+        assert_eq!(keeps, vec![Some(2), Some(3)]);
+
+        // 回收站里的图片不参与挑选。
+        database
+            .with_writer(|connection| {
+                connection.execute("UPDATE images SET deleted_at = 1 WHERE id = 2", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let keeps = group_keeps(database, &groups, &DEFAULT_KEEP_SORT).unwrap();
+        assert_eq!(keeps, vec![Some(1), Some(1)]);
+
+        // 跨集合才有意义的指标不能用来决定保留哪张。
+        let bad = [SortSpec {
+            key: SortKey::CollectionPosition,
+            descending: true,
+        }];
+        assert!(group_keeps(database, &groups, &bad).is_err());
+
+        // 空规则回落到默认值，而不是报错。
+        let keeps = group_keeps(database, &groups, &[]).unwrap();
+        assert_eq!(keeps, vec![Some(1), Some(1)]);
     }
 }

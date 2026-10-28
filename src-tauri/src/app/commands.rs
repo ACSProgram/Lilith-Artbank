@@ -36,7 +36,7 @@ use crate::{
         },
         optimize_estimate::OptimizeEstimate,
         pack_gc::{CompactMark, FeaturePackStat, SegmentStat},
-        query::{FolderChange, FolderInfo, ImagePage, LibraryQuery, TagInfo},
+        query::{FolderChange, FolderInfo, ImagePage, LibraryQuery, SortSpec, TagInfo},
         service::{LibraryCounts, LibraryInfo},
         stats::{StatsRequest, StatsSnapshot},
         viewer::{self, PoseData, ViewerSource},
@@ -1033,6 +1033,18 @@ pub fn get_similarity_groups_result(
     state.similarity_groups_result(&task_id)
 }
 
+/// 合并前挑出每组保留哪一张；只读，不写任何状态。
+#[tauri::command]
+pub fn similarity_group_keeps(
+    state: State<'_, AppState>,
+    groups: Vec<Vec<i64>>,
+    sort: Vec<SortSpec>,
+) -> Result<Vec<Option<i64>>, String> {
+    trace::read("similarity_group_keeps", || {
+        AppError::command(state.similarity_group_keeps(&groups, &sort))
+    })
+}
+
 #[tauri::command]
 pub fn get_optimize_estimate(
     state: State<'_, AppState>,
@@ -1358,6 +1370,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         list_tasks,
         cancel_task,
         get_similarity_groups_result,
+        similarity_group_keeps,
         get_optimize_estimate,
         get_image_capabilities,
         get_feature_summary,

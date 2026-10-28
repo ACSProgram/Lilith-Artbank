@@ -1034,10 +1034,14 @@ impl AiRuntime {
         )
     }
 
-    /// 全库相似分组：两种指标可以单独启用，也可以同时启用（同时满足才归组）。
+    /// 相似分组：两种指标可以单独启用，也可以同时启用（同时满足才归组）。
+    ///
+    /// `scope` 只决定「在哪些图片之间找组」：全库不解析 id，其它范围先解析成 id 集合，
+    /// 再交给分段索引过滤。组内成员不会越出范围。
     fn find_similar_groups_with(
         &self,
         options: GroupOptions,
+        scope: &TaskScope,
         progress: &dyn GroupProgress,
     ) -> AppResult<SimilarityGroupsResult> {
         let GroupOptions {
@@ -1050,6 +1054,7 @@ impl AiRuntime {
             return Err(AppError::message("至少选择一种比较方式"));
         }
         let handles = self.handles()?;
+        let allowed = self.resolve_similarity_scope(&handles.database, Some(scope))?;
         let started = Instant::now();
         let (groups, truncated, missing) = if embedding_enabled {
             let model_rows = embedding::distinct_groups(&handles.database)?;
@@ -1065,7 +1070,8 @@ impl AiRuntime {
             };
             progress.stage("正在建立候选分组", 0, 700);
             let index = self.visual_index(&handles)?;
-            let candidates = index.phash_groups(candidate_threshold, Some(progress))?;
+            let candidates =
+                index.phash_groups(candidate_threshold, allowed.as_ref(), Some(progress))?;
             progress.stage("正在按语义复核", 700, 300);
             let result = embedding::refine_groups(
                 &handles.database,
@@ -1084,6 +1090,7 @@ impl AiRuntime {
             let index = self.visual_index(&handles)?;
             let result = index.phash_groups(
                 phash_threshold.unwrap_or(library_similarity::DEFAULT_PHASH_THRESHOLD),
+                allowed.as_ref(),
                 Some(progress),
             )?;
             (result.groups, result.truncated, 0)
@@ -1104,6 +1111,7 @@ impl AiRuntime {
         app: AppHandle,
         bus: &TaskBus,
         options: GroupOptions,
+        scope: TaskScope,
         policy: ConflictPolicy,
     ) -> AppResult<TaskStartResult> {
         if !options.phash && !options.embedding {
@@ -1111,10 +1119,11 @@ impl AiRuntime {
         }
         // 先确认图库可用；真正的扫描在线程里跑。
         let _ = self.handles()?;
+        let label = scope.label();
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
             TaskKind::SimilarityGroups,
-            "整个图库",
+            label,
         );
         let worker = handle.clone();
         let runtime = self.clone();
@@ -1141,7 +1150,7 @@ impl AiRuntime {
                             }
                         };
                         let progress = TaskProgress::new(worker.clone());
-                        match runtime.find_similar_groups_with(options, &progress) {
+                        match runtime.find_similar_groups_with(options, &scope, &progress) {
                             Ok(result) => {
                                 runtime.store_groups(worker.id(), result);
                                 worker.set_message("");

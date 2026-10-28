@@ -24,7 +24,7 @@ pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_REFERENCE_IDS: usize = 100;
 
 const PHASH_BANDS: usize = 8;
-/// 单次全库分组的候选检查上限；超过即标记截断，避免退化数据把扫描拖成 O(n²)。
+/// 单次分组的候选检查上限；超过即标记截断，避免退化数据把扫描拖成 O(n²)。
 const MAX_CANDIDATE_CHECKS: usize = 20_000_000;
 /// 单个分段候选组的最大规模；更大的组不展开两两比较，只标记截断。
 pub(crate) const MAX_GROUP_SIZE: usize = 4_096;
@@ -54,7 +54,7 @@ pub struct PhashGroups {
     pub truncated: bool,
 }
 
-/// 全库扫描的进度与取消回调。任务总线提供一个适配器；其他调用方传 `None`。
+/// 分组扫描的进度与取消回调。任务总线提供一个适配器；其他调用方传 `None`。
 pub trait GroupProgress {
     /// 当前阶段已完成 `done` / `total` 个工作单元。
     fn report(&self, done: usize, total: usize);
@@ -239,18 +239,29 @@ impl VisualIndex {
         (scored, total)
     }
 
-    /// 全库 pHash 相似对分组；索引已常驻，不再读库。临时图片不参与分组。
+    /// pHash 相似对分组；索引已常驻，不再读库。临时图片不参与分组。
+    ///
+    /// `allowed` 为空表示全库；非空时只在这些 id 之间找组，组内成员不会越出范围。
     pub fn phash_groups(
         &self,
         threshold: u32,
+        allowed: Option<&HashSet<i64>>,
         progress: Option<&dyn GroupProgress>,
     ) -> AppResult<PhashGroups> {
         if threshold > MAX_INDEXED_PHASH_THRESHOLD {
             return Err(AppError::message(
-                "全库 pHash 分组只支持 0-7；更大阈值请使用目标图相似",
+                "pHash 分组只支持 0-7；更大阈值请使用目标图相似",
             ));
         }
-        let rows: Vec<&VisualRow> = self.rows.iter().filter(|row| !row.is_temp).collect();
+        let rows: Vec<&VisualRow> = self
+            .rows
+            .iter()
+            .filter(|row| !row.is_temp)
+            .filter(|row| match allowed {
+                Some(ids) => ids.contains(&row.id),
+                None => true,
+            })
+            .collect();
         if rows.len() < 2 {
             return Ok(PhashGroups {
                 groups: Vec::new(),
@@ -529,7 +540,7 @@ pub fn similar_by_color(
 /// 全库 pHash 相似对分组；分段索引见 `VisualIndex::phash_groups`。
 #[cfg(test)]
 pub fn phash_groups(database: &LibraryDb, threshold: u32) -> AppResult<PhashGroups> {
-    VisualIndex::load(database)?.phash_groups(threshold, None)
+    VisualIndex::load(database)?.phash_groups(threshold, None, None)
 }
 
 /// 并查集；pHash 分组与 embedding 复核共用同一实现。
@@ -702,8 +713,16 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(hits[0].0, 2);
 
-        let groups = index.phash_groups(0, None).unwrap();
+        let groups = index.phash_groups(0, None, None).unwrap();
         assert_eq!(groups.groups, vec![vec![1, 3]]);
+
+        // 显式范围只在范围内找组：只留下 id 3 时没有可配对的图片。
+        let only_three = HashSet::from([3_i64]);
+        let scoped = index.phash_groups(0, Some(&only_three), None).unwrap();
+        assert!(scoped.groups.is_empty());
+        let pair = HashSet::from([1_i64, 3]);
+        let scoped = index.phash_groups(0, Some(&pair), None).unwrap();
+        assert_eq!(scoped.groups, vec![vec![1, 3]]);
     }
 
     #[test]

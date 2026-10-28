@@ -19,6 +19,21 @@ export function confirmTrash(confirm: ConfirmFn, imageCount: number): Promise<bo
   });
 }
 
+/** 相似组合并：每组只留一张，其余移入回收站；整批一条记录，可撤销。 */
+export function confirmMergeSimilarGroups(
+  confirm: ConfirmFn,
+  groupCount: number,
+  trashCount: number,
+  rule: string,
+): Promise<boolean> {
+  return confirm({
+    title: `合并 ${count(groupCount)} 组相似图片？`,
+    message: `每组保留 1 张（${rule}），其余 ${count(trashCount)} 张移入回收站。`,
+    detail: "可以随时从回收站恢复；也可以在操作记录里把这一次合并整批撤销。",
+    confirmLabel: "合并并移入回收站",
+  });
+}
+
 /** 永久删除：先移出回收站；文件延迟释放，清空操作记录后不可撤销。 */
 export function confirmDelete(confirm: ConfirmFn, imageCount: number): Promise<boolean> {
   return confirm({

@@ -125,7 +125,8 @@ history            { maxSteps }  每个图库保留的操作记录步数，默�
 import             { optimize }  「导入时压缩」选项；null 表示关闭（默认）
 mcp                { enabled, port, mode }  MCP 服务；默认关闭、18767、ask
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
-                     sort, sortProfiles, viewerFilmstrip }
+                     sort, sortProfiles, viewerFilmstrip, listColumns,
+                     similarityKeepSort }
 ```
 
 - 不使用旧 `%APPDATA%\com.lilith.artbank\settings.json`，也不做迁移；第一次启动在程序目录生成新文件。
@@ -152,7 +153,9 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - `mcp.port` 1-65535；`mcp.mode` 只能是 `readOnly` / `ask` / `full`，工具按当前档位实时判定。
 - `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
-- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案。
+- `ui.listColumns` 只能从 `pixels` / `format` / `size` / `score` / `tags` / `importedAt` / `folder` 里选（缩略图列固定显示，不在其中），至少要保留一列，认不出的列按不显示处理。
+- `ui.similarityKeepSort` 是相似组合并的保留规则，默认 `[评分降序, 导入时间降序]`；可以留空（读取时回落默认值），但不能用 `collectionPosition`，其余校验同 `sort`。
+- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案；`similarityKeepSort` 由相似分组对话框的“保留规则”编辑并即时写入。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
 - 主日志为 `logs/lilith-artbank.log`；AI 服务 stdout/stderr 为 `logs/ai-server.log`；stdio 小桥诊断为 `logs/mcp.log`。
 
@@ -279,7 +282,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 - 创建或打开图库时确保行与物理目录存在，并清空上一次会话留下的临时图片；关闭图库与应用退出时再次清空。清空会删掉临时图片行、原图与集合引用，保留临时文件夹本身。
 - 临时图片只通过导入 `target=temp` 进入；普通导入不能指定临时路径，图片也不能移入或移出临时文件夹。
-- 普通视图、全库搜索、文件夹树、标签列表、集合计数与图库计数都不包含临时图片；只有 `view=temp`、显式 id 与 `find_similar` 的 `scope=temp` 能拿到它们。全库相似扫描（`scope=library`）、全库相似分组、导入查重与库内 pHash 索引同样排除临时图片。
+- 普通视图、全库搜索、文件夹树、标签列表、集合计数与图库计数都不包含临时图片；只有 `view=temp`、显式 id 与 `find_similar` 的 `scope=temp` 能拿到它们。全库相似扫描（`scope=library`）、相似分组（任何范围）、导入查重与库内 pHash 索引同样排除临时图片。
 - 临时图片可以查看、评分、改描述、加标签、作为相似参考；不能移入回收站/恢复/永久删除、做几何编辑或加入集合。上述写路径在 Rust 侧统一拒绝。
 - 临时图片的评分、描述、标签与 AI 描述不写操作记录，也不会清空重做分支；导入临时文件夹同样不建 `operations` 行。清空临时文件夹不属于撤销范围。
 

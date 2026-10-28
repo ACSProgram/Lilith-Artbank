@@ -97,6 +97,8 @@ export interface UiSettings {
   viewerFilmstrip: boolean;
   /** 列表视图显示哪些列；缩略图列不在其中，永远显示。 */
   listColumns: ListColumn[];
+  /** 相似分组合并时的保留规则；空数组表示按默认规则（评分 → 导入时间）。 */
+  similarityKeepSort: SortSpec[];
 }
 
 /** 列表视图可隐藏的列；与 Rust `settings::LIST_COLUMNS` 一一对应。 */

@@ -63,6 +63,7 @@ import type {
   LibraryQuery,
   MoveReport,
   SelectionTags,
+  SortSpec,
   StatsRequest,
   StatsSnapshot,
   TagInfo,
@@ -344,6 +345,15 @@ export const libraryApi = {
       groups,
       baseName,
     });
+  },
+
+  /** 合并相似组前挑出每组保留哪一张；只读，不写状态。 */
+  async similarityGroupKeeps(
+    groups: number[][],
+    sort: SortSpec[],
+  ): Promise<(number | null)[]> {
+    if (!isTauri()) return groups.map((group) => group[0] ?? null);
+    return invoke<(number | null)[]>("similarity_group_keeps", { groups, sort });
   },
 
   async getImageCapabilities(imageIds: number[]): Promise<ImageCapabilities[]> {

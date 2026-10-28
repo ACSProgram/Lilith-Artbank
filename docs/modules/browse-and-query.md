@@ -325,7 +325,7 @@ src/shared/
   useDragSort.ts            指针事件拖放控制器（图片与文件夹共用）
 ```
 
-- 相似结果不经过图库查询：`src/app/useSimilarityBrowse.ts` 提供 `SimilarityBrowseState`（`mode: "semantic" | "similar"`、`targetIds`、`scopeLabel`、`token`、`findSimilar`、`loadMore`、`ids`），与 `useImageQuery` 共享 `items/status/error/hasMore` 契约，`LibraryView` 只切换数据源；参考图、指标/阈值/数量/范围面板在 `src/modules/library/FindSimilarPanel.tsx`；范围语义与单选框在 `src/shared/scope.ts`、`src/shared/components/ScopePicker.tsx`；全库相似组在 `src/app/SimilarityGroupsDialog.tsx`。
+- 相似结果不经过图库查询：`src/app/useSimilarityBrowse.ts` 提供 `SimilarityBrowseState`（`mode: "semantic" | "similar"`、`targetIds`、`scopeLabel`、`token`、`findSimilar`、`loadMore`、`ids`），与 `useImageQuery` 共享 `items/status/error/hasMore` 契约，`LibraryView` 只切换数据源；参考图、指标/阈值/数量/范围面板在 `src/modules/library/FindSimilarPanel.tsx`；范围语义与单选框在 `src/shared/scope.ts`、`src/shared/components/ScopePicker.tsx`；相似分组在 `src/app/SimilarityGroupsDialog.tsx`，合并的保留规则编辑器在 `src/app/KeepSortPicker.tsx`。
 - 网格列数由容器宽度和设置里的 `ui.gridThumbPx` 决定；只挂载视口前后各一屏的行。列数变化（窗口缩放、详情面板开关）后用 `useLayoutEffect` 按当前活动项补偿 `scrollTop`，让选中的图片留在原视口位置。
 - 列表固定 44px 行高，32px 粘性表头；窄窗口隐藏“导入时间/文件夹”列。
 - 缩略图只挂载当前可见 + 前后一屏的单元格；`<img decoding="async">` 指向 `thumb://`。失败显示占位，点击重试会给 URL 加 `retry` 参数绕过失败缓存；缓存命中时挂载后补查 `img.complete`。
@@ -370,9 +370,11 @@ src/shared/
 - 范围与批量任务共用同一套 `TaskScope`：当前视图（默认）、当前选择、当前文件夹（可选是否包含子文件夹）、当前集合、临时文件夹、整个图库。当前选择全都在参考图里时该项置灰；相似结果视图里的“当前视图”按进入相似结果前的图库视图计算。范围单选框抽在共享 `ScopePicker`，批量任务与图片空间优化也复用。
 - 后端按范围收窄扫描：全库不解析 id；其它范围先在 Rust 侧解析成 id 集合再取交集。主色与 pHash 仍在常驻视觉索引上扫描，embedding/pose 只读取范围内的向量，不退回 O(n²)。
 - 结果仍走统一的相似结果槽：结果覆盖当前视图，不叠加筛选与搜索；结果条显示“相似于文件名 / N 张参考图 · 指标 · 范围 · N 张结果”，平均参考的“平均”由指标名体现，点击文件名打开第一张参考图；`Ctrl+A` 经 `get_similarity_ids` 取全部结果 id，绿色“退出相似结果”清空结果源。编辑、回收站操作、导入完成会让结果过期并自动退出。
-- 工具栏「任务 → 相似分组…」仍是独立的扫描全库入口；与相似面板的参考图状态互不影响。
+- 工具栏「任务 → 相似分组…」是独立入口，与相似面板的参考图状态互不影响；它自己选范围，默认整个图库。
 - 语义搜索首次提交时文本塔可能尚未加载，加载期间结果区提示“首次搜索需要先加载文本模型”。
-- 相似分组对话框：pHash（差异上限 0–7）与语义（相似度下限 0.50–1.00）是两个独立指标，各有开关；同时开启时两个条件都满足才归组。扫描走任务总线，有阶段进度、可取消，关掉对话框后进度仍在右下角任务胶囊里，再打开能接回同一任务与结果。结果按缩略图预览展示，可以把每组各存一个集合、全部合并成一个集合，或一次创建最多 100 个集合；保存走 `create_collections_from_groups` 一次事务提交，只产生一条操作记录；集合名与现有集合重名时由后端自动加后缀。
+- 相似分组对话框：pHash（差异上限 0–7）与语义（相似度下限 0.50–1.00）是两个独立指标，各有开关；同时开启时两个条件都满足才归组。范围复用 `ScopePicker`，语义是“只在范围内找组”：组内成员不会越出范围，临时文件夹选项始终不可用。扫描走任务总线，任务名取范围名，有阶段进度、可取消，关掉对话框后进度仍在右下角任务胶囊里，再打开能接回同一任务与结果。
+- 结果按缩略图预览、每页 50 组翻页（全部组一次返回，翻页只影响渲染），组内按当前保留规则把要留的那张排在最前并标“保留”。可以把每组各存一个集合、全部合并成一个集合，或一次创建最多 100 个集合；保存走 `create_collections_from_groups` 一次事务提交，只产生一条操作记录；集合名与现有集合重名时由后端自动加后缀。
+- 合并：每组行前有勾选框，另有“全选 N 组”，只对勾选的组生效。合并前按保留规则（默认评分降序 → 导入时间降序，可加级、可改方向，存在设置 `ui.similarityKeepSort`）调 `similarity_group_keeps` 取每组第一张，其余全部移入回收站；确认框写明组数、保留规则与将移入的张数，整次合并只产生一条操作记录，可在操作记录里整批撤销。组之间互不重叠，处理过的组直接从结果里去掉，剩下的组可以接着处理；任务 id 同时清空，重开对话框不会把旧结果读回来。
 - 相似结果只以 token 留在 Rust 侧，前端拿 id 与该页行数据；接口与阈值细节见 [AI 服务](ai-service.md)。
 
 ## 详情与批量编辑
@@ -416,7 +418,7 @@ src/shared/
 
 ## 尚未实现
 
-- 相似度作为筛选条件与排序键：目前只有“找相似”结果视图与全库相似组，筛选面板与列表排序没有接 pHash/主色/embedding/pose 分数。
+- 相似度作为筛选条件与排序键：目前只有“找相似”结果视图与相似分组，筛选面板与列表排序没有接 pHash/主色/embedding/pose 分数。
 - 原始文件名：当前不入库；如需按文件名识别，需要 schema 变更与导入记录。
 - 已加载页的窗口回收；长时间滚动到 20 万末尾时前端内存会随已加载行增长。
 - 已移出当前筛选的图片仍可能保持选中（外部变化拿不到 id 时选择只能整批清空）。
