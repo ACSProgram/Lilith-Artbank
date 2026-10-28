@@ -17,6 +17,7 @@
 - 图片空间优化（估算与执行）：读 `docs/modules/maintenance.md` 的“图片空间优化”，再进入 `src-tauri/src/imageops/optimize.rs`、`src-tauri/src/library/optimize_estimate.rs`、`src-tauri/src/library/optimize.rs`、`src-tauri/src/app/state.rs`、`src/app/OptimizeDialog.tsx`。
 - MCP 服务、stdio 小桥、读写工具、导入与审计、三档权限、确认队列、selector 与拼图：读 `docs/modules/mcp.md`，再进入 `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx`。
 - 构建、测试、性能基准：读 `docs/guides/validation.md`、`docs/guides/performance.md`。
+- 日志、命令记录、轮换参数：读 `docs/guides/logging.md`，再进入 `src-tauri/src/app/trace.rs`、`src-tauri/src/lib.rs`。
 - 当前阶段状态与未完成事项：读 `docs/planning/current-handoff.md`、`docs/planning/todo.md`；阶段划分看 `docs/planning/roadmap.md`。
 
 ## 不可动摇的决策

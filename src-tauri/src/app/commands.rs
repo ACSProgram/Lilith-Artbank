@@ -18,6 +18,7 @@ use crate::{
             self, BatchTaskRequest, LaneGuard, TaskHandle, TaskKind, TaskPhase, TaskScope,
             TaskSnapshot, TaskStartResult,
         },
+        trace,
     },
     concurrency::resources::{Access, ResourceRequest},
     import::{ImportRequest, job::ImportSnapshot},
@@ -47,21 +48,23 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
-    let previous = state.settings.snapshot();
-    let saved = AppError::command(state.settings.replace(settings))?;
-    if previous.ai != saved.ai {
-        state.ai.apply_settings(&previous.ai, &saved.ai);
-    }
-    if previous.mcp != saved.mcp {
-        state.apply_mcp_settings(&saved.mcp);
-    }
-    if previous.performance.worker_threads != saved.performance.worker_threads {
-        state
-            .images()
-            .update_from_setting(saved.performance.worker_threads);
-    }
-    state.after_history_write();
-    Ok(saved)
+    trace::write("save_settings", || {
+        let previous = state.settings.snapshot();
+        let saved = AppError::command(state.settings.replace(settings))?;
+        if previous.ai != saved.ai {
+            state.ai.apply_settings(&previous.ai, &saved.ai);
+        }
+        if previous.mcp != saved.mcp {
+            state.apply_mcp_settings(&saved.mcp);
+        }
+        if previous.performance.worker_threads != saved.performance.worker_threads {
+            state
+                .images()
+                .update_from_setting(saved.performance.worker_threads);
+        }
+        state.after_history_write();
+        Ok(saved)
+    })
 }
 
 #[tauri::command]
@@ -76,19 +79,24 @@ pub fn list_mcp_approvals(state: State<'_, AppState>) -> Vec<crate::mcp::approva
 
 #[tauri::command]
 pub async fn approve_mcp_approval(app: AppHandle, approval_id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        state
-            .approve_mcp_approval(&approval_id)
-            .map_err(|error| error.to_string())
+    trace::write_async("approve_mcp_approval", async move {
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            state
+                .approve_mcp_approval(&approval_id)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
     })
     .await
-    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 pub fn reject_mcp_approval(state: State<'_, AppState>, approval_id: String) -> Result<(), String> {
-    AppError::command(state.reject_mcp_approval(&approval_id))
+    trace::write("reject_mcp_approval", || {
+        AppError::command(state.reject_mcp_approval(&approval_id))
+    })
 }
 
 #[tauri::command]
@@ -102,72 +110,96 @@ pub fn create_library(
     name: String,
     path: String,
 ) -> Result<LibraryInfo, String> {
-    AppError::command(state.create_library(&PathBuf::from(path), &name))
+    trace::write("create_library", || {
+        AppError::command(state.create_library(&PathBuf::from(path), &name))
+    })
 }
 
 #[tauri::command]
 pub fn open_library_path(state: State<'_, AppState>, path: String) -> Result<LibraryInfo, String> {
-    let path = PathBuf::from(path);
-    match state.inspect_library(&path) {
-        LibraryInspection::Library { .. } => AppError::command(state.open_library(&path)),
-        LibraryInspection::Empty => Err("目录不是图库，请先创建图库".to_owned()),
-        LibraryInspection::Invalid { reason } => Err(format!("该目录无法作为图库：{reason}")),
-    }
+    trace::write("open_library_path", || {
+        let path = PathBuf::from(path);
+        match state.inspect_library(&path) {
+            LibraryInspection::Library { .. } => AppError::command(state.open_library(&path)),
+            LibraryInspection::Empty => Err("目录不是图库，请先创建图库".to_owned()),
+            LibraryInspection::Invalid { reason } => Err(format!("该目录无法作为图库：{reason}")),
+        }
+    })
 }
 
 #[tauri::command]
 pub fn close_library(state: State<'_, AppState>) -> Result<(), String> {
-    AppError::command(state.close_library())
+    trace::write("close_library", || AppError::command(state.close_library()))
 }
 
 #[tauri::command]
 pub async fn get_library_status(app: AppHandle) -> Result<Option<LibraryInfo>, String> {
-    run_blocking(app, |state| state.status()).await
+    trace::read_async(
+        "get_library_status",
+        run_blocking(app, |state| state.status()),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn get_library_counts(app: AppHandle) -> Result<LibraryCounts, String> {
-    run_blocking(app, |state| state.counts()).await
+    trace::read_async(
+        "get_library_counts",
+        run_blocking(app, |state| state.counts()),
+    )
+    .await
 }
 
 #[tauri::command]
 pub fn rename_library(state: State<'_, AppState>, name: String) -> Result<LibraryInfo, String> {
-    AppError::command(state.rename_current_library(&name))
+    trace::write("rename_library", || {
+        AppError::command(state.rename_current_library(&name))
+    })
 }
 
 #[tauri::command]
 pub fn window_minimize(window: WebviewWindow) -> Result<(), String> {
-    window.minimize().map_err(|error| error.to_string())
+    trace::read("window_minimize", || {
+        window.minimize().map_err(|error| error.to_string())
+    })
 }
 
 #[tauri::command]
 pub fn window_toggle_maximize(window: WebviewWindow) -> Result<bool, String> {
-    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
-    if maximized {
-        window.unmaximize().map_err(|error| error.to_string())?;
-    } else {
-        window.maximize().map_err(|error| error.to_string())?;
-    }
-    Ok(!maximized)
+    trace::read("window_toggle_maximize", || {
+        let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+        if maximized {
+            window.unmaximize().map_err(|error| error.to_string())?;
+        } else {
+            window.maximize().map_err(|error| error.to_string())?;
+        }
+        Ok(!maximized)
+    })
 }
 
 #[tauri::command]
 pub fn window_is_maximized(window: WebviewWindow) -> Result<bool, String> {
-    window.is_maximized().map_err(|error| error.to_string())
+    trace::read("window_is_maximized", || {
+        window.is_maximized().map_err(|error| error.to_string())
+    })
 }
 
 #[tauri::command]
 pub fn window_close(window: WebviewWindow) -> Result<(), String> {
-    window.close().map_err(|error| error.to_string())
+    trace::read("window_close", || {
+        window.close().map_err(|error| error.to_string())
+    })
 }
 
 /// 设置语义：写入后回读真实状态，系统快捷键改变全屏时前端也能同步。
 #[tauri::command]
 pub fn window_set_fullscreen(window: WebviewWindow, value: bool) -> Result<bool, String> {
-    window
-        .set_fullscreen(value)
-        .map_err(|error| error.to_string())?;
-    window.is_fullscreen().map_err(|error| error.to_string())
+    trace::read("window_set_fullscreen", || {
+        window
+            .set_fullscreen(value)
+            .map_err(|error| error.to_string())?;
+        window.is_fullscreen().map_err(|error| error.to_string())
+    })
 }
 
 #[derive(Serialize)]
@@ -214,53 +246,55 @@ pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
 /// 在系统文件管理器里定位一个文件（选中它）或直接打开一个目录。
 #[tauri::command]
 pub fn reveal_path(path: String) -> Result<(), String> {
-    let target = PathBuf::from(path.trim());
-    if target.as_os_str().is_empty() {
-        return Err("路径为空".to_owned());
-    }
-    let is_file = target.is_file();
-    let dir = if target.is_dir() {
-        target.clone()
-    } else {
-        target
-            .parent()
-            .map(|parent| parent.to_path_buf())
-            .ok_or_else(|| "路径无效".to_owned())?
-    };
-    if !dir.exists() {
-        return Err("目录不存在".to_owned());
-    }
+    trace::write("reveal_path", || {
+        let target = PathBuf::from(path.trim());
+        if target.as_os_str().is_empty() {
+            return Err("路径为空".to_owned());
+        }
+        let is_file = target.is_file();
+        let dir = if target.is_dir() {
+            target.clone()
+        } else {
+            target
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .ok_or_else(|| "路径无效".to_owned())?
+        };
+        if !dir.exists() {
+            return Err("目录不存在".to_owned());
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = std::process::Command::new("explorer.exe");
-        if is_file {
-            // /select 需要真实文件路径；文件被移走时退化为打开父目录。
-            command.arg(format!("/select,{}", target.display()));
-        } else {
-            command.arg(dir.as_os_str());
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = std::process::Command::new("explorer.exe");
+            if is_file {
+                // /select 需要真实文件路径；文件被移走时退化为打开父目录。
+                command.arg(format!("/select,{}", target.display()));
+            } else {
+                command.arg(dir.as_os_str());
+            }
+            command.spawn().map_err(|error| error.to_string())?;
         }
-        command.spawn().map_err(|error| error.to_string())?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = std::process::Command::new("open");
-        if is_file {
-            command.arg("-R");
-            command.arg(target.as_os_str());
-        } else {
-            command.arg(dir.as_os_str());
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = std::process::Command::new("open");
+            if is_file {
+                command.arg("-R");
+                command.arg(target.as_os_str());
+            } else {
+                command.arg(dir.as_os_str());
+            }
+            command.spawn().map_err(|error| error.to_string())?;
         }
-        command.spawn().map_err(|error| error.to_string())?;
-    }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(dir.as_os_str())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(dir.as_os_str())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -269,12 +303,16 @@ pub fn start_import(
     state: State<'_, AppState>,
     request: ImportRequest,
 ) -> Result<ImportSnapshot, String> {
-    AppError::command(state.start_import(app, request))
+    trace::write("start_import", || {
+        AppError::command(state.start_import(app, request))
+    })
 }
 
 #[tauri::command]
 pub fn cancel_import(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
-    AppError::command(state.cancel_import(&job_id))
+    trace::write("cancel_import", || {
+        AppError::command(state.cancel_import(&job_id))
+    })
 }
 
 #[tauri::command]
@@ -282,22 +320,32 @@ pub fn get_import_status(
     state: State<'_, AppState>,
     job_id: String,
 ) -> Result<Option<ImportSnapshot>, String> {
-    Ok(state.import_status(&job_id))
+    trace::read("get_import_status", || Ok(state.import_status(&job_id)))
 }
 
 #[tauri::command]
 pub fn copy_text(text: String) -> Result<(), String> {
-    AppError::command(crate::platform::clipboard::copy_text(&text))
+    trace::write("copy_text", || {
+        AppError::command(crate::platform::clipboard::copy_text(&text))
+    })
 }
 
 #[tauri::command]
 pub async fn query_images(app: AppHandle, query: LibraryQuery) -> Result<ImagePage, String> {
-    run_blocking(app, move |state| state.query_images(query)).await
+    trace::read_async(
+        "query_images",
+        run_blocking(app, move |state| state.query_images(query)),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn query_image_ids(app: AppHandle, query: LibraryQuery) -> Result<Vec<i64>, String> {
-    run_blocking(app, move |state| state.query_image_ids(query)).await
+    trace::read_async(
+        "query_image_ids",
+        run_blocking(app, move |state| state.query_image_ids(query)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -305,17 +353,25 @@ pub async fn get_library_stats(
     app: AppHandle,
     request: StatsRequest,
 ) -> Result<StatsSnapshot, String> {
-    run_blocking(app, move |state| state.library_stats(request)).await
+    trace::read_async(
+        "get_library_stats",
+        run_blocking(app, move |state| state.library_stats(request)),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn get_folders(app: AppHandle) -> Result<Vec<FolderInfo>, String> {
-    run_blocking(app, |state| state.folders()).await
+    trace::read_async("get_folders", run_blocking(app, |state| state.folders())).await
 }
 
 #[tauri::command]
 pub async fn create_folder(app: AppHandle, path: String) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| state.create_folder(&path)).await
+    trace::write_async(
+        "create_folder",
+        run_blocking(app, move |state| state.create_folder(&path)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -324,7 +380,11 @@ pub async fn rename_folder(
     folder_id: i64,
     name: String,
 ) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| state.rename_folder(folder_id, &name)).await
+    trace::write_async(
+        "rename_folder",
+        run_blocking(app, move |state| state.rename_folder(folder_id, &name)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -333,7 +393,11 @@ pub async fn move_folder(
     folder_id: i64,
     parent_id: i64,
 ) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| state.move_folder(folder_id, parent_id)).await
+    trace::write_async(
+        "move_folder",
+        run_blocking(app, move |state| state.move_folder(folder_id, parent_id)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -343,8 +407,11 @@ pub async fn reorder_folders(
     parent_id: i64,
     sort_index: i64,
 ) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| {
-        state.reorder_folders(&folder_ids, parent_id, sort_index)
+    trace::write_async("reorder_folders", async move {
+        run_blocking(app, move |state| {
+            state.reorder_folders(&folder_ids, parent_id, sort_index)
+        })
+        .await
     })
     .await
 }
@@ -363,8 +430,11 @@ pub async fn place_folders(
     parent_id: i64,
     sort_index: Option<i64>,
 ) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| {
-        state.place_folders(&folder_ids, parent_id, sort_index)
+    trace::write_async("place_folders", async move {
+        run_blocking(app, move |state| {
+            state.place_folders(&folder_ids, parent_id, sort_index)
+        })
+        .await
     })
     .await
 }
@@ -378,24 +448,35 @@ pub async fn apply_folder_order(
     recursive: bool,
     orders: Vec<FolderOrderInput>,
 ) -> Result<FolderChange, String> {
-    let orders: Vec<(i64, Vec<i64>)> = orders
-        .into_iter()
-        .map(|order| (order.parent_id, order.folder_ids))
-        .collect();
-    run_blocking(app, move |state| {
-        state.apply_folder_order(folder_id, key, descending, recursive, &orders)
+    trace::write_async("apply_folder_order", async move {
+        let orders: Vec<(i64, Vec<i64>)> = orders
+            .into_iter()
+            .map(|order| (order.parent_id, order.folder_ids))
+            .collect();
+        run_blocking(app, move |state| {
+            state.apply_folder_order(folder_id, key, descending, recursive, &orders)
+        })
+        .await
     })
     .await
 }
 
 #[tauri::command]
 pub async fn delete_folder(app: AppHandle, folder_id: i64) -> Result<FolderChange, String> {
-    run_blocking(app, move |state| state.delete_folder(folder_id)).await
+    trace::write_async(
+        "delete_folder",
+        run_blocking(app, move |state| state.delete_folder(folder_id)),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn get_tags(app: AppHandle, limit: Option<u32>) -> Result<Vec<TagInfo>, String> {
-    run_blocking(app, move |state| state.tags(limit)).await
+    trace::read_async(
+        "get_tags",
+        run_blocking(app, move |state| state.tags(limit)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -404,12 +485,18 @@ pub async fn search_tags(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<TagInfo>, String> {
-    run_blocking(app, move |state| state.search_tags(&query, limit)).await
+    trace::read_async(
+        "search_tags",
+        run_blocking(app, move |state| state.search_tags(&query, limit)),
+    )
+    .await
 }
 
 #[tauri::command]
 pub fn get_image_detail(state: State<'_, AppState>, image_id: i64) -> Result<ImageDetails, String> {
-    AppError::command(state.image_detail(image_id))
+    trace::read("get_image_detail", || {
+        AppError::command(state.image_detail(image_id))
+    })
 }
 
 #[tauri::command]
@@ -417,7 +504,9 @@ pub fn get_image_states(
     state: State<'_, AppState>,
     image_ids: Vec<i64>,
 ) -> Result<Vec<ImageState>, String> {
-    AppError::command(state.image_states(&image_ids))
+    trace::read("get_image_states", || {
+        AppError::command(state.image_states(&image_ids))
+    })
 }
 
 #[tauri::command]
@@ -425,7 +514,9 @@ pub fn get_selection_tags(
     state: State<'_, AppState>,
     image_ids: Vec<i64>,
 ) -> Result<SelectionTags, String> {
-    AppError::command(state.selection_tags(&image_ids))
+    trace::read("get_selection_tags", || {
+        AppError::command(state.selection_tags(&image_ids))
+    })
 }
 
 #[tauri::command]
@@ -434,7 +525,9 @@ pub fn update_image_score(
     image_id: i64,
     score: i64,
 ) -> Result<(), String> {
-    AppError::command(state.update_image_score(image_id, score))
+    trace::write("update_image_score", || {
+        AppError::command(state.update_image_score(image_id, score))
+    })
 }
 
 #[tauri::command]
@@ -443,7 +536,9 @@ pub fn set_images_score(
     image_ids: Vec<i64>,
     score: i64,
 ) -> Result<u64, String> {
-    AppError::command(state.set_images_score(&image_ids, score))
+    trace::write("set_images_score", || {
+        AppError::command(state.set_images_score(&image_ids, score))
+    })
 }
 
 #[tauri::command]
@@ -452,7 +547,9 @@ pub fn update_image_description(
     image_id: i64,
     description: String,
 ) -> Result<(), String> {
-    AppError::command(state.update_image_description(image_id, &description))
+    trace::write("update_image_description", || {
+        AppError::command(state.update_image_description(image_id, &description))
+    })
 }
 
 #[tauri::command]
@@ -461,7 +558,9 @@ pub fn set_image_tags(
     image_id: i64,
     tag_names: Vec<String>,
 ) -> Result<Vec<TagRef>, String> {
-    AppError::command(state.set_image_tags(image_id, &tag_names))
+    trace::write("set_image_tags", || {
+        AppError::command(state.set_image_tags(image_id, &tag_names))
+    })
 }
 
 #[tauri::command]
@@ -470,7 +569,9 @@ pub fn add_tags_to_images(
     image_ids: Vec<i64>,
     tag_names: Vec<String>,
 ) -> Result<u64, String> {
-    AppError::command(state.add_tags(&image_ids, &tag_names))
+    trace::write("add_tags_to_images", || {
+        AppError::command(state.add_tags(&image_ids, &tag_names))
+    })
 }
 
 #[tauri::command]
@@ -479,17 +580,21 @@ pub fn remove_tags_from_images(
     image_ids: Vec<i64>,
     tag_names: Vec<String>,
 ) -> Result<u64, String> {
-    AppError::command(state.remove_tags(&image_ids, &tag_names))
+    trace::write("remove_tags_from_images", || {
+        AppError::command(state.remove_tags(&image_ids, &tag_names))
+    })
 }
 
 #[tauri::command]
 pub fn rename_tag(state: State<'_, AppState>, tag_id: i64, name: String) -> Result<(), String> {
-    AppError::command(state.rename_tag(tag_id, &name))
+    trace::write("rename_tag", || {
+        AppError::command(state.rename_tag(tag_id, &name))
+    })
 }
 
 #[tauri::command]
 pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<u64, String> {
-    AppError::command(state.delete_tag(tag_id))
+    trace::write("delete_tag", || AppError::command(state.delete_tag(tag_id)))
 }
 
 #[tauri::command]
@@ -498,7 +603,9 @@ pub fn merge_tags(
     source_id: i64,
     target_id: i64,
 ) -> Result<MergeReport, String> {
-    AppError::command(state.merge_tags(source_id, target_id))
+    trace::write("merge_tags", || {
+        AppError::command(state.merge_tags(source_id, target_id))
+    })
 }
 
 /// 把读命令放进阻塞线程池：同步命令会在 WebView IPC 回调线程上直接执行，
@@ -562,29 +669,36 @@ pub async fn move_images_to_folder(
     image_ids: Vec<i64>,
     folder_path: String,
 ) -> Result<MoveReport, String> {
-    let scope = format!("{} 张", image_ids.len());
-    let request = app
-        .state::<AppState>()
-        .move_task_request(&image_ids, &folder_path)
-        .map_err(|error| error.to_string())?;
-    run_write_task(
-        app,
-        TaskKind::FolderMove,
-        scope,
-        request,
-        move |state, reporter| state.move_images(&image_ids, &folder_path, reporter),
-    )
+    trace::write_async("move_images_to_folder", async move {
+        let scope = format!("{} 张", image_ids.len());
+        let request = app
+            .state::<AppState>()
+            .move_task_request(&image_ids, &folder_path)
+            .map_err(|error| error.to_string())?;
+        run_write_task(
+            app,
+            TaskKind::FolderMove,
+            scope,
+            request,
+            move |state, reporter| state.move_images(&image_ids, &folder_path, reporter),
+        )
+        .await
+    })
     .await
 }
 
 #[tauri::command]
 pub fn trash_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result<u64, String> {
-    AppError::command(state.trash_images(&image_ids))
+    trace::write("trash_images", || {
+        AppError::command(state.trash_images(&image_ids))
+    })
 }
 
 #[tauri::command]
 pub fn restore_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result<u64, String> {
-    AppError::command(state.restore_images(&image_ids))
+    trace::write("restore_images", || {
+        AppError::command(state.restore_images(&image_ids))
+    })
 }
 
 #[tauri::command]
@@ -592,36 +706,44 @@ pub async fn delete_images_permanently(
     app: AppHandle,
     image_ids: Vec<i64>,
 ) -> Result<DeleteReport, String> {
-    let scope = format!("{} 张", image_ids.len());
-    run_write_task(
-        app,
-        TaskKind::PermanentDelete,
-        scope,
-        ResourceRequest::session_read()
-            .with_timeline(Access::Read)
-            .with_metadata_writer(),
-        move |state, reporter| state.delete_images(&image_ids, reporter),
-    )
+    trace::write_async("delete_images_permanently", async move {
+        let scope = format!("{} 张", image_ids.len());
+        run_write_task(
+            app,
+            TaskKind::PermanentDelete,
+            scope,
+            ResourceRequest::session_read()
+                .with_timeline(Access::Read)
+                .with_metadata_writer(),
+            move |state, reporter| state.delete_images(&image_ids, reporter),
+        )
+        .await
+    })
     .await
 }
 
 #[tauri::command]
 pub async fn empty_trash(app: AppHandle) -> Result<DeleteReport, String> {
-    run_write_task(
-        app,
-        TaskKind::EmptyTrash,
-        "回收站".to_owned(),
-        ResourceRequest::session_read()
-            .with_timeline(Access::Read)
-            .with_metadata_writer(),
-        |state, reporter| state.empty_trash(reporter),
-    )
+    trace::write_async("empty_trash", async move {
+        run_write_task(
+            app,
+            TaskKind::EmptyTrash,
+            "回收站".to_owned(),
+            ResourceRequest::session_read()
+                .with_timeline(Access::Read)
+                .with_metadata_writer(),
+            |state, reporter| state.empty_trash(reporter),
+        )
+        .await
+    })
     .await
 }
 
 #[tauri::command]
 pub fn get_operation_history(state: State<'_, AppState>) -> Result<HistoryPage, String> {
-    AppError::command(state.history_page())
+    trace::read("get_operation_history", || {
+        AppError::command(state.history_page())
+    })
 }
 
 #[tauri::command]
@@ -629,7 +751,9 @@ pub fn undo_to_operation(
     state: State<'_, AppState>,
     target_id: i64,
 ) -> Result<TaskStartResult, String> {
-    AppError::command(state.undo_to(target_id))
+    trace::write("undo_to_operation", || {
+        AppError::command(state.undo_to(target_id))
+    })
 }
 
 #[tauri::command]
@@ -637,17 +761,21 @@ pub fn redo_to_operation(
     state: State<'_, AppState>,
     target_id: i64,
 ) -> Result<TaskStartResult, String> {
-    AppError::command(state.redo_to(target_id))
+    trace::write("redo_to_operation", || {
+        AppError::command(state.redo_to(target_id))
+    })
 }
 
 #[tauri::command]
 pub fn clear_operation_history(state: State<'_, AppState>) -> Result<TaskStartResult, String> {
-    AppError::command(state.clear_history())
+    trace::write("clear_operation_history", || {
+        AppError::command(state.clear_history())
+    })
 }
 
 #[tauri::command]
 pub fn get_collections(state: State<'_, AppState>) -> Result<Vec<CollectionInfo>, String> {
-    AppError::command(state.collections())
+    trace::read("get_collections", || AppError::command(state.collections()))
 }
 
 #[tauri::command]
@@ -655,7 +783,9 @@ pub fn create_collection(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<CollectionInfo, String> {
-    AppError::command(state.create_collection(&name))
+    trace::write("create_collection", || {
+        AppError::command(state.create_collection(&name))
+    })
 }
 
 #[tauri::command]
@@ -664,12 +794,16 @@ pub fn rename_collection(
     collection_id: i64,
     name: String,
 ) -> Result<(), String> {
-    AppError::command(state.rename_collection(collection_id, &name))
+    trace::write("rename_collection", || {
+        AppError::command(state.rename_collection(collection_id, &name))
+    })
 }
 
 #[tauri::command]
 pub fn delete_collection(state: State<'_, AppState>, collection_id: i64) -> Result<u64, String> {
-    AppError::command(state.delete_collection(collection_id))
+    trace::write("delete_collection", || {
+        AppError::command(state.delete_collection(collection_id))
+    })
 }
 
 #[tauri::command]
@@ -677,7 +811,9 @@ pub fn reorder_collections(
     state: State<'_, AppState>,
     collection_ids: Vec<i64>,
 ) -> Result<(), String> {
-    AppError::command(state.reorder_collections(&collection_ids))
+    trace::write("reorder_collections", || {
+        AppError::command(state.reorder_collections(&collection_ids))
+    })
 }
 
 #[tauri::command]
@@ -686,7 +822,9 @@ pub fn add_images_to_collection(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<u64, String> {
-    AppError::command(state.add_images_to_collection(collection_id, &image_ids))
+    trace::write("add_images_to_collection", || {
+        AppError::command(state.add_images_to_collection(collection_id, &image_ids))
+    })
 }
 
 #[tauri::command]
@@ -695,7 +833,9 @@ pub fn remove_images_from_collection(
     collection_id: i64,
     image_ids: Vec<i64>,
 ) -> Result<u64, String> {
-    AppError::command(state.remove_images_from_collection(collection_id, &image_ids))
+    trace::write("remove_images_from_collection", || {
+        AppError::command(state.remove_images_from_collection(collection_id, &image_ids))
+    })
 }
 
 #[tauri::command]
@@ -705,7 +845,9 @@ pub fn combine_collections(
     collection_ids: Vec<i64>,
     name: String,
 ) -> Result<CollectionInfo, String> {
-    AppError::command(state.combine_collections(mode, &collection_ids, &name))
+    trace::write("combine_collections", || {
+        AppError::command(state.combine_collections(mode, &collection_ids, &name))
+    })
 }
 
 #[tauri::command]
@@ -714,7 +856,9 @@ pub fn create_collections_from_groups(
     groups: Vec<Vec<i64>>,
     base_name: String,
 ) -> Result<Vec<CollectionInfo>, String> {
-    AppError::command(state.create_collections_from_groups(&groups, &base_name))
+    trace::write("create_collections_from_groups", || {
+        AppError::command(state.create_collections_from_groups(&groups, &base_name))
+    })
 }
 
 #[tauri::command]
@@ -722,17 +866,20 @@ pub async fn get_viewer_source(
     state: State<'_, AppState>,
     image_id: i64,
 ) -> Result<ViewerSource, String> {
-    let (database, root) = state
-        .current_library()
-        .ok_or_else(|| "尚未打开图库".to_owned())?;
-    let resources = state.resources();
-    let images = state.images();
-    tauri::async_runtime::spawn_blocking(move || {
-        viewer::source(&database, &root, image_id, &resources, &images)
+    trace::read_async("get_viewer_source", async move {
+        let (database, root) = state
+            .current_library()
+            .ok_or_else(|| "尚未打开图库".to_owned())?;
+        let resources = state.resources();
+        let images = state.images();
+        tauri::async_runtime::spawn_blocking(move || {
+            viewer::source(&database, &root, image_id, &resources, &images)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -740,23 +887,26 @@ pub async fn save_image_edit(
     state: State<'_, AppState>,
     request: EditRequest,
 ) -> Result<EditResult, String> {
-    let guard = state
-        .begin_edit(request.image_id)
+    trace::write_async("save_image_edit", async move {
+        let guard = state
+            .begin_edit(request.image_id)
+            .map_err(|error| error.to_string())?;
+        let images = state.images();
+        let (database, thumbs, root) = state.edit_handles().map_err(|error| error.to_string())?;
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            let _permit = images
+                .acquire(&|| false)
+                .map_err(|_| AppError::message("图像预算等待已取消"))?;
+            edit::save(&database, &root, &thumbs, &request)
+        })
+        .await
+        .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    let images = state.images();
-    let (database, thumbs, root) = state.edit_handles().map_err(|error| error.to_string())?;
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let _guard = guard;
-        let _permit = images
-            .acquire(&|| false)
-            .map_err(|_| AppError::message("图像预算等待已取消"))?;
-        edit::save(&database, &root, &thumbs, &request)
+        state.after_history_write();
+        Ok(result)
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    state.after_history_write();
-    Ok(result)
 }
 
 #[tauri::command]
@@ -764,13 +914,16 @@ pub async fn estimate_edit_size(
     state: State<'_, AppState>,
     request: EditRequest,
 ) -> Result<EditSizeEstimate, String> {
-    let (database, root) = state
-        .current_library()
-        .ok_or_else(|| "尚未打开图库".to_owned())?;
-    tauri::async_runtime::spawn_blocking(move || edit::estimate(&database, &root, &request))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    trace::read_async("estimate_edit_size", async move {
+        let (database, root) = state
+            .current_library()
+            .ok_or_else(|| "尚未打开图库".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || edit::estimate(&database, &root, &request))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -778,32 +931,42 @@ pub fn get_image_pose(
     state: State<'_, AppState>,
     image_id: i64,
 ) -> Result<Option<PoseData>, String> {
-    AppError::command(state.image_pose(image_id))
+    trace::read("get_image_pose", || {
+        AppError::command(state.image_pose(image_id))
+    })
 }
 
 #[tauri::command]
 pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.status(&settings))
-        .await
-        .map_err(|error| error.to_string())
+    trace::read_async("get_ai_status", async move {
+        let settings = state.settings.snapshot().ai;
+        let runtime = state.ai.clone();
+        tauri::async_runtime::spawn_blocking(move || runtime.status(&settings))
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub fn ai_start_service(state: State<'_, AppState>) -> Result<(), String> {
-    let settings = state.settings.snapshot().ai;
-    AppError::command(state.ai.start_service(&settings))
+    trace::write("ai_start_service", || {
+        let settings = state.settings.snapshot().ai;
+        AppError::command(state.ai.start_service(&settings))
+    })
 }
 
 #[tauri::command]
 pub async fn ai_stop_service(state: State<'_, AppState>) -> Result<(), String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    // 停止包含 shutdown 请求与等待进程退出，放到阻塞线程池避免卡住界面。
-    tauri::async_runtime::spawn_blocking(move || runtime.stop_service(&settings))
-        .await
-        .map_err(|error| error.to_string())
+    trace::write_async("ai_stop_service", async move {
+        let settings = state.settings.snapshot().ai;
+        let runtime = state.ai.clone();
+        // 停止包含 shutdown 请求与等待进程退出，放到阻塞线程池避免卡住界面。
+        tauri::async_runtime::spawn_blocking(move || runtime.stop_service(&settings))
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -812,7 +975,9 @@ pub fn start_batch_task(
     state: State<'_, AppState>,
     request: BatchTaskRequest,
 ) -> Result<TaskStartResult, String> {
-    AppError::command(state.start_batch_task(app, request))
+    trace::write("start_batch_task", || {
+        AppError::command(state.start_batch_task(app, request))
+    })
 }
 
 #[tauri::command]
@@ -820,7 +985,11 @@ pub async fn preview_batch_task(
     app: AppHandle,
     request: BatchTaskPreviewRequest,
 ) -> Result<BatchTaskPreview, String> {
-    run_blocking(app, move |state| state.preview_batch_task(request)).await
+    trace::read_async(
+        "preview_batch_task",
+        run_blocking(app, move |state| state.preview_batch_task(request)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -830,7 +999,9 @@ pub fn list_tasks(state: State<'_, AppState>) -> Vec<TaskSnapshot> {
 
 #[tauri::command]
 pub fn cancel_task(state: State<'_, AppState>, task_id: String) -> Result<(), String> {
-    AppError::command(state.cancel_task(&task_id))
+    trace::write("cancel_task", || {
+        AppError::command(state.cancel_task(&task_id))
+    })
 }
 
 #[tauri::command]
@@ -854,12 +1025,16 @@ pub fn get_image_capabilities(
     state: State<'_, AppState>,
     image_ids: Vec<i64>,
 ) -> Result<Vec<ImageCapabilities>, String> {
-    AppError::command(state.image_capabilities(&image_ids))
+    trace::read("get_image_capabilities", || {
+        AppError::command(state.image_capabilities(&image_ids))
+    })
 }
 
 #[tauri::command]
 pub fn get_feature_summary(state: State<'_, AppState>) -> Result<FeatureSummary, String> {
-    AppError::command(state.feature_summary())
+    trace::read("get_feature_summary", || {
+        AppError::command(state.feature_summary())
+    })
 }
 
 #[tauri::command]
@@ -869,16 +1044,19 @@ pub async fn ai_describe_image(
     prompt: Option<String>,
     max_tokens: Option<u32>,
 ) -> Result<AiDescriptionResult, String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        runtime.describe_image(&settings, image_id, prompt.as_deref(), max_tokens)
+    trace::write_async("ai_describe_image", async move {
+        let settings = state.settings.snapshot().ai;
+        let runtime = state.ai.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            runtime.describe_image(&settings, image_id, prompt.as_deref(), max_tokens)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        state.after_history_write();
+        Ok(result)
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    state.after_history_write();
-    Ok(result)
 }
 
 #[tauri::command]
@@ -886,12 +1064,15 @@ pub async fn ai_generate_pose(
     state: State<'_, AppState>,
     image_id: i64,
 ) -> Result<PoseData, String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.generate_pose(&settings, image_id))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    trace::write_async("ai_generate_pose", async move {
+        let settings = state.settings.snapshot().ai;
+        let runtime = state.ai.clone();
+        tauri::async_runtime::spawn_blocking(move || runtime.generate_pose(&settings, image_id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -901,18 +1082,21 @@ pub async fn semantic_search(
     text: String,
     limit: Option<usize>,
 ) -> Result<SemanticSearchResult, String> {
-    let settings = state.settings.snapshot().ai;
-    let runtime = state.ai.clone();
-    let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let stage = move |label: &str| {
-            let _ = handle.emit("semantic-stage", serde_json::json!({ "stage": label }));
-        };
-        runtime.semantic_search(&settings, &text, limit, None, None, Some(&stage))
+    trace::read_async_with("semantic_search", trace::SLOW_SEARCH_MS, async move {
+        let settings = state.settings.snapshot().ai;
+        let runtime = state.ai.clone();
+        let handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let stage = move |label: &str| {
+                let _ = handle.emit("semantic-stage", serde_json::json!({ "stage": label }));
+            };
+            runtime.semantic_search(&settings, &text, limit, None, None, Some(&stage))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -924,13 +1108,16 @@ pub async fn find_similar_images(
     limit: Option<usize>,
     scope: Option<TaskScope>,
 ) -> Result<ImageSimilarityResult, String> {
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        runtime.find_similar_images(&kind, &target_ids, threshold, limit, scope.as_ref())
+    trace::read_async_with("find_similar_images", trace::SLOW_SEARCH_MS, async move {
+        let runtime = state.ai.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            runtime.find_similar_images(&kind, &target_ids, threshold, limit, scope.as_ref())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -940,29 +1127,37 @@ pub async fn get_similarity_page(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<SimilarityPage, String> {
-    let runtime = state.ai.clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.similarity_page(&token, offset, limit))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    trace::read_async("get_similarity_page", async move {
+        let runtime = state.ai.clone();
+        tauri::async_runtime::spawn_blocking(move || runtime.similarity_page(&token, offset, limit))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub fn get_similarity_ids(state: State<'_, AppState>, token: String) -> Result<Vec<i64>, String> {
-    AppError::command(state.ai.similarity_ids(&token))
+    trace::read("get_similarity_ids", || {
+        AppError::command(state.ai.similarity_ids(&token))
+    })
 }
 
 #[tauri::command]
 pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(), String> {
-    let (path, guard) = state
-        .copy_source(image_id)
-        .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = guard;
-        crate::platform::clipboard::copy_image(&path).map_err(|error| error.to_string())
+    trace::write_async("copy_image", async move {
+        let (path, guard) = state
+            .copy_source(image_id)
+            .map_err(|error| error.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            crate::platform::clipboard::copy_image(&path).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
     })
     .await
-    .map_err(|error| error.to_string())?
 }
 
 pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {

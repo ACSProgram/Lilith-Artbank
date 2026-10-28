@@ -17,6 +17,7 @@
 - **任务与并发**：`app/tasks.rs` 配合 `concurrency/` 资源表（会话、时间线、内容写、元数据写、AI 服务与文件夹子树路径锁），同一资源 FIFO、路径写优先；路径访问分读 / 原地替换 / 写三级，原地替换只与写互斥（图片空间优化用它，压缩期间查看器与 MCP 读图照常可用）。短写冲突立即失败，撤销/重做/清空记录不排队；全局图像预算（`performance.workerThreads`，默认逻辑核数 − 1）统一约束导入、压缩、估算、缩略图、查看器预览、AI 解码与 MCP 拼图。panic、线程起不来与提前返回都落到失败终态并释放资源。批量任务开始前显示“范围 N 张 / 将处理 M 张”，任务 `total` 与 M 一致；快照带运行时长、完成速度、ETA、当前文件与已提交字节；收到取消请求先切“取消中”相位（非终态），收尾完成后才落到“已取消”。
 - **图片空间优化**：只读估算 → 确认执行两阶段，分层切片抽样与按层外推，执行前三道复核（参数指纹、候选集合指纹、逐张 `stat`），不可撤销的 `optimize` 记录。执行时复用同一张估算视图并填入实际数据：顶部一行状态（进度、已完成张数、已用时与剩余、速度、当前文件）、环图换成分阶段、收益曲线叠一条实际实线、里程碑表多一列实际，结束后给一行“实际 vs 预计”。进度按候选张数计，低于 10% 给一位小数。见[维护与批量工作流](../modules/maintenance.md#图片空间优化)。
 - **MCP 图库控制**：应用内 stateless Streamable HTTP 服务（`127.0.0.1` + Bearer 口令 + `mcp-runtime.json`）与同 exe 的 `--mcp-stdio` 小桥；24 个工具、三档权限、10 分钟确认队列、`logs/mcp.log` 审计。永久删除、清空回收站、空间优化、像素编辑与普通库批量 AI 生成不开放。见[MCP 图库控制](../modules/mcp.md)。
+- **日志与命令记录**：等级为发布 Info、调试 Debug，`LILITH_ARTBANK_LOG_LEVEL` 覆盖；行前缀是本地时间 + `[run:xxxxxx]`，可按单次运行切分。51 个写命令成对记 `started` / `finished`（带 `elapsed_ms`），30 个读命令只在失败或超阈值时记（默认 500ms，语义搜索与找相似 3000ms），8 个无 `Result` 的命令不包装；不记命令参数。按 4MB 轮转、保留 5 份归档。见[日志与命令记录](../guides/logging.md)。
 - **前端契约**：`src/modules/<module>/api.ts` 是命令唯一入口，跨模块编排在 `src/app/`，主题只走 `src/styles/tokens.css` 的语义变量，破坏性操作确认文案统一在 `src/shared/confirm.ts`。
 
 ## 基线
@@ -24,7 +25,7 @@
 - 图库：主库 `G:\Lilith Image Library`（396 180 张、758 个普通文件夹（659 个有图）+ 1 个临时文件夹、556 个标签（174 个有图）、81 649 条 pose、396 181 条 embedding、10 个缩略图段、`library.db` 1 019.9 MB），独立测试库 `G:\Lilith Test Library`（9 455 张）；失败内容在 `G:\Lilith Image Library Failed`（247 条超过 1 亿像素）。
 - 压缩候选：主库按默认参数（JPEG 输出、跳过已处理、非透明、非 GIF、bpp ≥ 0.12）为 127 837 张 / 179.58 GB / 853.24 GP，平均 6.67 MP/张；已优化过 249 767 张。
 - 存储版本：schema v9、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
-- 自动检查（2026-10-28，第二轮批次 7 后）：`cargo fmt --check`、`cargo clippy --all-targets`（0 警告）、`cargo test`（410 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（100 通过）、`npm run build`、`git diff --check`。
+- 自动检查（2026-10-28，日志与命令记录后）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test`（410 通过、9 ignored）、`npx tsc --noEmit`、`git diff --check`；前端本轮未改，`npm run test:web`（100 通过）与 `npm run build` 沿用第二轮批次 7 的结果。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

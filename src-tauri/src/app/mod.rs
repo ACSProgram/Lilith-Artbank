@@ -7,4 +7,5 @@ pub mod settings;
 pub mod state;
 pub mod tasks;
 pub mod thumb_protocol;
+pub mod trace;
 pub mod window_state;

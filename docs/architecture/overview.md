@@ -46,7 +46,7 @@ Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数�
 ## 程序目录与运行环境
 
 - 运行环境：Windows + WebView2（系统自带运行时，不随包附带 DLL）。Node 24 与稳定版 Rust 工具链只在开发时需要。
-- 设置、日志与相对资源路径都以程序根目录为准（release 为 exe 所在目录，debug 为仓库根目录，可用 `LILITH_ARTBANK_ROOT` 覆盖）；不读旧 AppData 设置，程序目录不可写时启动失败并提示。
+- 设置、日志与相对资源路径都以程序根目录为准（release 为 exe 所在目录，debug 为仓库根目录，可用 `LILITH_ARTBANK_ROOT` 覆盖）；不读旧 AppData 设置，程序目录不可写时启动失败并提示。日志的等级、行格式、命令记录与轮换参数见 `docs/guides/logging.md`。
 
 ```text
 Lilith Artbank\

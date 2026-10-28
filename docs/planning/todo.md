@@ -119,6 +119,13 @@
 - [ ] 真实窗口语义搜索：文本输入（英文提示）、结果分页、Ctrl+A、退出语义模式、均值计算状态。
 - [ ] **性能专项真实验收**：开库到网格可用的耗时与拖动窗口是否卡、计数/文件夹树稍后补齐；筛选面板打开时窗口可拖动；移动 1000 张后树计数与列表刷新期间仍可滚动；文件夹新建/改名/移动/删除后树立即更新不闪烁；语义搜索的阶段提示与三次耗时（首次 / 再次 / 空闲 10 分钟后）；均值计算中不误报“没有 embedding”；深滚动后改评分列表不跳；`temp/viewer/` 涨到 2 GB 后被清理；关掉 `ai.prewarmImports` 后首次搜索回到约 8 s。步骤见[批次 6 记录](archive/2026-10-27-批次6-性能专项.md)的“十一、实现记录”。
 
+### 日志与命令记录
+
+- [ ] **真实窗口验收**：启动后首行横幅含 `run=`、`level=`、`rotation=4MB×5`，行时间是本地时间且格式为 `2026-10-28 17:13:30[run:xxxxxx][INFO][target]`；打开图库出现成对的 `command started/finished: name=open_library_path`；导入失败路径出现 `command failed` 并带错误原文；快速翻页不产生 `name=query_images` 行。
+- [ ] **等级开关**：以 `LILITH_ARTBANK_LOG_LEVEL=warn` 启动，`info` 行消失、`warn` 行保留；不设变量时调试构建出现 `debug` 行、发布构建没有。
+- [ ] **轮转**：持续使用到单文件超过 4MB，`logs/` 下出现 `lilith-artbank_<日期>_<时间>.log`，归档最多 5 份。
+- [ ] **旧日志时基混用**：现有 `logs/lilith-artbank.log` 的历史行是 UTC，新行是本地时间；需要干净对照时先删该文件再启动。
+
 ### 打包与运行环境
 
 - [ ] **便携包验收**：`npm run pack:portable` 产出 exe + `server/`，放入 `python_embeded/` 与 `resources/models/` 后直接运行；确认设置与日志在 exe 旁、无 NSIS 安装器。
