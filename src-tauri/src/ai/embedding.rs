@@ -1183,7 +1183,7 @@ mod perf_tests {
     /// 手动基准：20 万条 1536 维 fp16 向量扫描。
     /// cargo test --manifest-path src-tauri/Cargo.toml --lib ai::embedding::perf_tests -- --ignored --nocapture
     #[test]
-    #[ignore = "20 万条向量基准，手动运行"]
+    #[ignore = "高成本基准（非日常）：20 万条向量，手动运行"]
     fn perf_embedding_scan_200k() {
         const COUNT: usize = 200_000;
         const DIM: u32 = 1536;

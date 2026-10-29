@@ -21,19 +21,61 @@
 
 ## 无窗口验收入口（开发期）
 
-B0 已加入 `headless` feature 与 `--headless ping`，用于在后台确认最小启动链路：
+`headless` feature 提供 `--headless` 命令面，用于在后台验证图库状态、文件事实、设置、查询与日志。B1 已落地；范围、档位与预算见[无窗口验收测试计划](../planning/2026-10-29-无窗口验收测试计划.md)。
 
 ```bash
 cargo build --manifest-path src-tauri/Cargo.toml --features headless
-LILITH_ARTBANK_ROOT=<target 下的临时目录> \
-  src-tauri/target/debug/lilith-artbank.exe --headless ping
+export LILITH_ARTBANK_ROOT=<target 下的临时目录>
+EXE=src-tauri/target/debug/lilith-artbank.exe
+"$EXE" --headless ping
+
+# 常用命令（DTO 用 --request 文件或 --request-json 内联传入）
+"$EXE" --headless library create --request-json '{"path":"<临时图库>","name":"验收"}'
+"$EXE" --headless fixture seed-db --library <临时图库> \
+  --request-json '{"folders":["人物"],"tags":["红"],"images":40,"writeFiles":true}'
+"$EXE" --headless query stats --library <临时图库> \
+  --request-json '{"profile":"summary","query":{}}'
+"$EXE" --headless logs emit --request-json '{"level":"debug","lines":2,"lineBytes":8}'
 ```
 
-- 入口不调用 GUI 的 `run()`，不创建用户可见窗口、不建托盘、不加载 WebView、不经过 IPC。
-- 必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出，避免把 `settings.json` 写进仓库根。
-- B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
+- 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
+- `--library <path>` 在执行命令前显式打开图库；无头模式不自动打开上次图库。`--result <file>` 另存格式化结果；stdout 始终只有一行 JSON，含 `command/ok/cancelled/elapsedMs/peakWorkingSetBytes/data/error`；退出码 0 成功、1 失败、2 取消。
+- 入口不调用 GUI 的 `run()`，不创建用户可见窗口、不建托盘、不加载 WebView、不经过 IPC。必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出。B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
 - 该 feature 不进 default、不进发布产物；不传 `--headless` 时同一二进制仍是正常 GUI 程序。
-- 当前只有 `ping`，不能作为任何待验收条目的通过依据；`acceptance_*` 套件（B1–B3）尚未实施，范围与档位见[待办](../planning/todo.md)与[归档计划](../planning/archive/2026-10-29-无窗口验收测试计划.md)。
+- 日志与 GUI 同源（本地时间 + `[run:]` + `[LEVEL]` + `[target]`、4MB×5 轮转），但无头只写 `<root>/logs`，不写 stdout。
+
+验收套件：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --features headless \
+  --test acceptance_library --test acceptance_query \
+  --test acceptance_settings --test acceptance_logs -- --test-threads=1
+# 或后台入口（Idle 优先级、单线程、默认 cheap+default）：
+powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1
+powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Tier heavy
+```
+
+- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1 的 12 个用例里 11 个是 cheap，日志轮转 1 个是 default。
+- 工作区在 `<target>/acceptance/workspaces/`，正常结束自动回收；每个用例向 `<target>/acceptance/report.jsonl` 追加一行（名称、档位、成败、耗时、命令数、峰值工作集、文件数与字节数）。
+- 裸 `cargo test` 下所有验收目标编译为空，不启动子进程；`tests/gate_guard.rs` 强制这一门控。
+
+## 高成本测试（不用于日常检查）
+
+以下测试会显著占用 CPU、内存或磁盘，单次几十秒到几分钟，**不属于日常代码检查**；只在改动命中对应路径、提交前验收或用户明确要求时运行：
+
+| 类别 | 标记 | 何时跑 |
+| --- | --- | --- |
+| 性能基准 `perf_*` | `#[ignore = "高成本基准（非日常）…"]`，清单见[性能基准](#性能基准) | 改动命中该基准的路径，或需要更新[性能基准](performance.md)时 |
+| 无窗口验收套件 `acceptance_*` | `headless` feature + 显式 `--test` | 提交前或验收阶段跑一次；改文档、单测、前端时不必跑 |
+| `heavy` 档场景 | `LILITH_ACCEPT_TIERS=heavy` | 只有用户明确要求时才跑 |
+
+规则：
+
+- 日常只用 `cargo fmt` / `cargo check` / 裸 `cargo test` / `clippy` / 前端 typecheck 与 `test:web`。
+- 不要执行不带过滤的 `cargo test -- --ignored`：它会把全部高成本基准一起跑起来。
+- `perf_*` 一次只跑与改动相关的一项，命令里带具体名字并加 `--nocapture`。
+- 同一个改动不重复跑同一基准；跨机器或跨构建档的数字不比较。
+- 全量验收（`tools/acceptance/run.ps1`）按阶段跑，不跟着每次编辑跑。
 
 ## 日常检查
 
@@ -142,7 +184,7 @@ npm run pack:portable
 
 ## 性能基准
 
-默认被 `#[ignore]` 标记，按需运行：
+全部是高成本测试，不属于日常检查；规则见[高成本测试](#高成本测试不用于日常检查)。默认被 `#[ignore]` 标记，按需运行：
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture perf_metadata_200k

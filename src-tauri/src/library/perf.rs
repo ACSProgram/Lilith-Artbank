@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -56,100 +57,40 @@ fn sample_query<T>(
 
 fn seed(connection: &mut Connection) -> AppResult<Duration> {
     let start = Instant::now();
-    let transaction = connection.transaction()?;
-    let mut leaf_folder_ids = Vec::with_capacity(TREE_FOLDERS as usize);
-    {
-        let mut folder_statement =
-            transaction.prepare("INSERT INTO folders(path, created_at) VALUES (?1, ?2)")?;
-        for top in 0..20 {
-            let top_path = format!("folder{top}");
-            folder_statement.execute(params![top_path, 1_i64])?;
-            for middle in 0..10 {
-                let middle_path = format!("{top_path}/set{middle}");
-                folder_statement.execute(params![middle_path, 1_i64])?;
-                for leaf in 0..50 {
-                    let leaf_path = format!("{middle_path}/leaf{leaf}");
-                    folder_statement.execute(params![leaf_path, 1_i64])?;
-                    leaf_folder_ids.push(transaction.last_insert_rowid());
-                }
-            }
-        }
-    }
-    {
-        let mut tag_statement = transaction.prepare("INSERT INTO tags(name) VALUES (?1)")?;
-        for index in 0..TAG_COUNT {
-            tag_statement.execute(params![format!("标签{index}")])?;
-        }
-    }
-
-    let tag_ids: Vec<i64> = {
-        let mut statement = transaction.prepare("SELECT id FROM tags ORDER BY id")?;
-        statement
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    {
-        let mut image_statement = transaction.prepare(
-            "INSERT INTO images(
-                content_hash, file_ext, folder_id, file_size, width, height, format,
-                has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
-             ) VALUES (?1, 'jpg', ?2, ?3, 1920, 1080, 'jpeg', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-        )?;
-        let mut tag_link_statement =
-            transaction.prepare("INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)")?;
-        for index in 0..IMAGE_COUNT {
-            // 相似度基准需要分布开的哈希与主色；全部相同会让分段索引退化成单一大组。
-            let mut phash = [0_u8; 32];
-            let mut state = index as u64 + 0x9e37_79b9_7f4a_7c15;
-            for chunk in phash.chunks_exact_mut(8) {
-                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                let mut mixed = state;
-                mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                mixed ^= mixed >> 31;
-                chunk.copy_from_slice(&mixed.to_le_bytes());
-            }
-            let colors4: Vec<u8> = (0..16)
-                .map(|byte| ((index as u64 * 7 + byte * 13) % 256) as u8)
-                .collect();
-            let colors8: Vec<u8> = (0..32)
-                .map(|byte| ((index as u64 * 11 + byte * 19) % 256) as u8)
-                .collect();
-            let content_hash = format!("{index:064x}");
-            let folder_id = leaf_folder_ids[(index % TREE_FOLDERS) as usize];
-            let file_size = 100_000 + (index % 1_000) * 1_000;
-            let score = index % 6;
-            let description = if index % 10 == 0 {
-                format!("人物速写 第{index}张")
-            } else {
-                format!("参考素材 编号{index}")
-            };
-            image_statement.execute(params![
-                content_hash,
-                folder_id,
-                file_size,
-                phash.as_slice(),
-                colors4.as_slice(),
-                colors8.as_slice(),
-                score,
-                description,
-                index,
-            ])?;
-            let image_id = transaction.last_insert_rowid();
-            for offset in 0..TAGS_PER_IMAGE {
-                let tag_id = tag_ids[((index + offset) % TAG_COUNT) as usize];
-                tag_link_statement.execute(params![image_id, tag_id])?;
-            }
-        }
-    }
-    transaction.execute_batch("ANALYZE;")?;
-    transaction.commit()?;
+    crate::library::fixture::seed(connection, &seed_spec(), Path::new(""))?;
     Ok(start.elapsed())
 }
 
+/// 20 万行基准的种子形状：2 万/1 万文件夹树、200 个标签、每图 3 个标签。
+fn seed_spec() -> crate::library::fixture::SeedSpec {
+    let mut folders = Vec::with_capacity(20 + 200 + TREE_FOLDERS as usize);
+    let mut leaf_folders = Vec::with_capacity(TREE_FOLDERS as usize);
+    for top in 0..20 {
+        let top_path = format!("folder{top}");
+        folders.push(top_path.clone());
+        for middle in 0..10 {
+            let middle_path = format!("{top_path}/set{middle}");
+            folders.push(middle_path.clone());
+            for leaf in 0..50 {
+                let leaf_path = format!("{middle_path}/leaf{leaf}");
+                folders.push(leaf_path.clone());
+                leaf_folders.push(leaf_path);
+            }
+        }
+    }
+    crate::library::fixture::SeedSpec {
+        folders,
+        image_folders: leaf_folders,
+        tags: (0..TAG_COUNT).map(|index| format!("标签{index}")).collect(),
+        images: IMAGE_COUNT as usize,
+        tags_per_image: TAGS_PER_IMAGE as usize,
+        extensions: vec!["jpg".into()],
+        write_files: false,
+    }
+}
+
 #[test]
-#[ignore = "20 万行规模基准；用 cargo test -- --ignored --nocapture perf_metadata_200k 运行"]
+#[ignore = "高成本基准（非日常）：20 万行规模；用 cargo test -- --ignored --nocapture perf_metadata_200k 运行"]
 fn perf_metadata_200k() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("perf-library");
@@ -986,7 +927,7 @@ fn perf_metadata_200k() {
 }
 
 #[test]
-#[ignore = "20 万行操作记录与待释放基准；用 cargo test --lib -- --ignored --nocapture perf_history_200k 运行"]
+#[ignore = "高成本基准（非日常）：20 万行操作记录与待释放；用 cargo test --lib -- --ignored --nocapture perf_history_200k 运行"]
 fn perf_history_200k() {
     use crate::library::{NoopReporter, history};
 
@@ -1109,7 +1050,7 @@ fn time_query(
 }
 
 #[test]
-#[ignore = "缩略图包 vs 逐文件读取；用 cargo test -- --ignored --nocapture perf_thumb_pack_read 运行"]
+#[ignore = "高成本基准（非日常）：缩略图包 vs 逐文件读取；用 cargo test -- --ignored --nocapture perf_thumb_pack_read 运行"]
 fn perf_thumb_pack_read() {
     let temp = tempfile::tempdir().expect("temp dir");
     let count = 150usize;
@@ -1193,7 +1134,7 @@ fn perf_thumb_pack_read() {
 ///
 /// 不测磁盘：样本在内存里生成，只衡量解码 + 阶梯编码 + PSNR 的并行扩展性。
 #[test]
-#[ignore = "编码线程基准；cargo test --lib -- --ignored --nocapture perf_encode_threads"]
+#[ignore = "高成本基准（非日常）：编码线程；cargo test --lib -- --ignored --nocapture perf_encode_threads"]
 fn perf_encode_threads() {
     use rayon::prelude::*;
 
@@ -1275,7 +1216,7 @@ fn perf_encode_threads() {
 /// 每档都用一份全新的临时库：同一批图压第二次时新内容等于当前内容，会被判为
 /// 「省得太少」而全部跳过，量不到写路径。
 #[test]
-#[ignore = "批次大小基准；cargo test --lib -- --ignored --nocapture perf_optimize_batch_size"]
+#[ignore = "高成本基准（非日常）：批次大小；cargo test --lib -- --ignored --nocapture perf_optimize_batch_size"]
 fn perf_optimize_batch_size() {
     use crate::{
         imageops::optimize::OptimizeOptions,
@@ -1372,7 +1313,7 @@ fn perf_optimize_batch_size() {
 /// 只用于同机同参数的近似校验，不做跨机器比较；复测：
 /// `cargo test --lib -- --ignored --nocapture perf_estimate_vs_actual`。
 #[test]
-#[ignore = "预计/实际耗时对比；cargo test --lib -- --ignored --nocapture perf_estimate_vs_actual"]
+#[ignore = "高成本基准（非日常）：预计/实际耗时对比；cargo test --lib -- --ignored --nocapture perf_estimate_vs_actual"]
 fn perf_estimate_vs_actual() {
     use crate::{
         imageops::optimize::OptimizeOptions,
@@ -1505,7 +1446,7 @@ fn perf_estimate_vs_actual() {
 /// 均匀数据抹平，测不出东西。复测：
 /// `cargo test --lib -- --ignored --nocapture perf_estimate_sampling_spread`。
 #[test]
-#[ignore = "抽样离散度；cargo test --lib -- --ignored --nocapture perf_estimate_sampling_spread"]
+#[ignore = "高成本基准（非日常）：抽样离散度；cargo test --lib -- --ignored --nocapture perf_estimate_sampling_spread"]
 fn perf_estimate_sampling_spread() {
     use crate::{
         imageops::optimize::OptimizeOptions,

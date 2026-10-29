@@ -4,6 +4,7 @@ pub mod commands;
 pub mod error;
 pub mod idle;
 pub mod img_protocol;
+pub mod logging;
 pub mod paths;
 pub mod settings;
 pub mod state;

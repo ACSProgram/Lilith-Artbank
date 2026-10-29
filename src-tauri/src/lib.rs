@@ -17,11 +17,6 @@ pub fn run_headless(args: &[String]) -> i32 {
     headless::run(args)
 }
 
-/// 单个日志文件的上限。超过即轮转。
-const LOG_MAX_FILE_SIZE: u128 = 4_000_000;
-/// 保留的归档份数；活动文件不计入，因此 `logs/` 最多 6 个文件、约 24MB。
-const LOG_KEPT_FILES: usize = 5;
-
 /// `--mcp-stdio` 分支：在 Tauri 初始化与 single-instance 插件之前接管 stdio。
 pub fn run_stdio_bridge() -> i32 {
     mcp::bridge::run()
@@ -52,29 +47,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            // 刻意不调用 `.level()`：fern 的 dispatch 等级会被插件拿去当全局 `max_level`，
-            // 固定之后运行时再改也放不出更低等级。等级只由 `setup` 里的 `set_max_level`
-            // 控制，见 `app/trace.rs` 的模块说明。
-            tauri_plugin_log::Builder::new()
-                .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Folder {
-                        path: log_dir,
-                        file_name: Some("lilith-artbank".into()),
-                    },
-                ))
-                .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Stdout,
-                ))
-                // 顺序不能换：`timezone_strategy` 会把 dispatch 的格式重置成插件默认格式，
-                // 必须排在 `format` 之前。它在这里只负责轮转文件名里的日期，行内时间戳
-                // 由 `trace::format` 自己取本地时区。
-                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
-                .format(app::trace::format)
-                .max_file_size(LOG_MAX_FILE_SIZE)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(LOG_KEPT_FILES))
-                .build(),
-        );
+        .plugin(app::logging::plugin(log_dir, true));
     let builder = app::thumb_protocol::register(builder);
     let builder = app::img_protocol::register(builder);
 
@@ -93,16 +66,7 @@ pub fn run() {
             let root = app::paths::app_root();
             // 启动横幅放在最前：图库打开时的日志（schema 升级、无法加载）都排在它之后，
             // 一次运行的上下文才能从第一行读到。
-            log::info!(
-                "Lilith Artbank starting: version={}, root={}, run={}, level={}, log_dir={}, rotation={}MB×{}",
-                env!("CARGO_PKG_VERSION"),
-                root.display(),
-                app::trace::run_id(),
-                app::trace::baseline_level().as_str().to_ascii_lowercase(),
-                app::paths::log_dir().display(),
-                LOG_MAX_FILE_SIZE / 1_000_000,
-                LOG_KEPT_FILES,
-            );
+            app::logging::startup_banner(&root);
             let settings_path = app::paths::settings_path();
             if let Some(parent) = settings_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| {

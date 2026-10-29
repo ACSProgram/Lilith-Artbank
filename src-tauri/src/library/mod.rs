@@ -7,6 +7,10 @@ pub mod content;
 pub mod db;
 pub mod edit;
 pub mod folders;
+
+/// 合成行种子：性能基准与无头验收共用，只在测试与 headless feature 下编译。
+#[cfg(any(test, feature = "headless"))]
+pub mod fixture;
 pub mod history;
 pub mod import;
 pub mod inspect;

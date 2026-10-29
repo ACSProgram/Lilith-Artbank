@@ -2002,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "生成并导入 1000 张样本；用 cargo test -- --ignored --nocapture perf_import_1000 运行"]
+    #[ignore = "高成本基准（非日常）：生成并导入 1000 张样本；用 cargo test -- --ignored --nocapture perf_import_1000 运行"]
     fn perf_import_1000() {
         let temp = tempdir().unwrap();
         let source_dir = temp.path().join("source");

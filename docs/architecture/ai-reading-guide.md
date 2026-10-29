@@ -14,8 +14,8 @@
 | 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索）、`docs/modules/browse-and-query.md`（找相似与相似分组） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`、`src/modules/library/FindSimilarPanel.tsx`、`src/shared/scope.ts` |
 | MCP 服务、stdio 小桥、读写工具、三档权限、确认队列、selector、拼图 | `docs/modules/mcp.md` | `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx` |
 | 清理、缩略图重建、描述导入导出、图片空间优化（估算与执行） | `docs/modules/maintenance.md`（图片空间优化） | `src-tauri/src/` 对应领域模块；空间优化在 `imageops/optimize.rs`、`library/optimize_estimate.rs`、`library/optimize.rs`、`src/app/OptimizeDialog.tsx` |
-| 构建、检查、基准 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试 |
-| 日志等级、行格式、命令记录、轮换 | `docs/guides/logging.md` | `src-tauri/src/app/trace.rs`、`src-tauri/src/lib.rs` |
+| 构建、检查、基准、无窗口验收 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试；无头入口在 `src-tauri/src/headless.rs`，验收套件在 `src-tauri/tests/acceptance_*`，后台入口在 `tools/acceptance/run.ps1` |
+| 日志等级、行格式、命令记录、轮换 | `docs/guides/logging.md` | `src-tauri/src/app/trace.rs`、`src-tauri/src/app/logging.rs` |
 | 当前状态/未完成事项 | `docs/planning/current-handoff.md`、`docs/planning/todo.md` | 只读 |
 
 ## 读序

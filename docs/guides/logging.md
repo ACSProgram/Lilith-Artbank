@@ -1,8 +1,8 @@
 # 日志与命令记录规范
 
 本文件规定日志的等级、行格式、命令记录的取舍与轮换参数，是新增日志时的第一依据。
-实现见 `src-tauri/src/app/trace.rs`（格式、运行标识、命令包装）与 `src-tauri/src/lib.rs`
-（插件与轮换参数）。
+实现见 `src-tauri/src/app/trace.rs`（格式、运行标识、命令包装）与
+`src-tauri/src/app/logging.rs`（插件、目标与轮换参数）。GUI 与无头验收共用后者。
 
 本规范只覆盖**常规档**：事件驱动、常开、平时零噪声。周期性探针、前端诊断桥、取证通道
 与看门狗属于诊断档，目前没有实现。
@@ -15,8 +15,8 @@
 | 调试构建 | `debug` |
 | `LILITH_ARTBANK_LOG_LEVEL` | 覆盖以上两者（`off` / `error` / `warn` / `info` / `debug` / `trace`） |
 
-等级由 `log::set_max_level` 单独控制，调用点在 `lib.rs` 的应用 `setup` 里，且必须是
-`setup` 的第一句。
+等级由 `log::set_max_level` 单独控制：GUI 的调用点是 `lib.rs` 应用 `setup` 的第一句，
+无头入口在构建应用之后覆盖一次。两处都必须在日志插件初始化之后。
 
 两处容易踩的坑：
 
@@ -26,6 +26,17 @@
 - **`set_max_level` 不能提前到 `run()` 开头**。日志插件在应用 `setup` 之前初始化，它自己
   会调用一次 `set_max_level`（取 fern dispatch 的默认值 `Trace`），早设的基线会被覆盖，
   `LILITH_ARTBANK_LOG_LEVEL` 也就失效。
+
+## 目标
+
+插件默认目标会给 `Stdout` 与 `LogDir` 各写一份；`app/logging.rs` 用 `targets()` 显式替换：
+
+| 入口 | 目标 |
+| --- | --- |
+| GUI | 程序目录 `logs/` + stdout |
+| 无头验收 | 只有程序目录 `logs/`，stdout 留给单行结果 JSON |
+
+用 `target()` 是在默认目标上追加，会留下重复 stdout 与一份 AppData 日志，不要改回去。
 
 ## 行格式
 
@@ -88,8 +99,8 @@
 
 | 参数 | 值 | 位置 |
 | --- | --- | --- |
-| 单文件上限 | 4MB | `LOG_MAX_FILE_SIZE` |
-| 保留归档 | 5 份 | `LOG_KEPT_FILES` |
+| 单文件上限 | 4MB | `LOG_MAX_FILE_SIZE`（`app/logging.rs`） |
+| 保留归档 | 5 份 | `LOG_KEPT_FILES`（`app/logging.rs`） |
 
 - 活动文件 `logs/lilith-artbank.log`；轮转时改名为
   `logs/lilith-artbank_2026-10-28_17-13-30.log`（本地时区，秒级）。
@@ -109,8 +120,8 @@ grep 'command failed' logs/lilith-artbank.log      # 只看失败
 
 ## 验证
 
-- Rust：`cargo fmt --check`、`cargo check`、`cargo test`。
+- Rust：`cargo fmt --check`、`cargo check`、`cargo test`；无窗口日志断言在 `cargo test --features headless --test acceptance_logs`。
 - 自检：`grep -c "trace::write\|trace::read" src-tauri/src/app/commands.rs` 应为 92；
-  `grep -n "^\s*\.level(" src-tauri/src/lib.rs` 应无输出（只匹配调用，注释里的 `.level()` 不算）；
-  `grep -n "timezone_strategy" -A 2 src-tauri/src/lib.rs` 里 `.format(` 必须排在它之后。
+  `grep -n "^\s*\.level(" src-tauri/src/app/logging.rs` 应无输出（只匹配调用，注释里的 `.level()` 不算）；
+  `grep -n "timezone_strategy" -A 2 src-tauri/src/app/logging.rs` 里 `.format(` 必须排在它之后。
 - 提交前：`git diff --check`。
