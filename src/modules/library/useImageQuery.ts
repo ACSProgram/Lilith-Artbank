@@ -11,7 +11,8 @@ export type MoreStatus = "idle" | "loading" | "error";
 
 /**
  * 刷新时按“已加载行数”重取同样多的行：截断会让深滚动后的列表突然变短、
- * 滚动位置跟着跳。页预算按行数折算，多留一页用来判断还有没有更多。
+ * 滚动位置跟着跳。页数上限按行数折算并多留一页，兜住后端返回行数少于请求数时
+ * 还需要再请求一页的情况。
  */
 function refreshPageBudget(rows: number): number {
   return Math.ceil(rows / PAGE_SIZE) + 1;
@@ -146,11 +147,14 @@ export function useImageQuery(query: LibraryQuery): ImageQueryState {
       // 页预算既限制深滚动的请求数，也避免后端返回空页但仍有游标时死循环。
       while (collected.length < target && pages < pageBudget) {
         pages += 1;
+        // 每页只取缺口那么多行：多取的行会被丢掉，游标却已经越过它们，那个位置从此漏图。
+        const remaining = target - collected.length;
         const page = await libraryApi.queryImages({
           ...queryRef.current,
           cursor: pageToken ? null : cursor,
           pageToken,
           anchorId: null,
+          limit: Math.min(PAGE_SIZE, remaining),
         });
         if (currentGeneration !== generation.current) return false;
         for (const item of page.items) {
@@ -164,13 +168,13 @@ export function useImageQuery(query: LibraryQuery): ImageQueryState {
       }
       if (currentGeneration !== generation.current) return false;
 
-      const nextItems = collected.slice(0, target);
+      // 每页按缺口取行，collected 恰好等于目标行数，游标停在第 target 行之后。
       cursorRef.current = cursor;
       pageTokenRef.current = pageToken;
       const nextHasMore = cursor !== null || pageToken !== null;
       hasMoreRef.current = nextHasMore;
       setHasMore(nextHasMore);
-      replaceItems(nextItems);
+      replaceItems(collected);
       setLoadedKey(queryKey(queryRef.current));
       setStatus("ready");
       setReplaceRevision((value) => value + 1);

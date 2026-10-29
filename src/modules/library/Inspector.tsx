@@ -309,19 +309,36 @@ function ImageInspector({
   );
   const [folderDraft, setFolderDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  /** 写入返回时对一下当前图：中途切了图就不再改新图的输入框。 */
+  const imageIdRef = useRef(imageId);
+  imageIdRef.current = imageId;
 
   useEffect(() => {
     setTagMenu(null);
   }, [imageId]);
 
+  /**
+   * 只对“这张图”应用就地更新：切图后上一张的写入结果不能落到新图上。
+   * 详情被清空时（还没读回来）直接丢弃。
+   */
+  const patchDetail = useCallback((id: number, update: Partial<ImageDetails>) => {
+    setDetail((previous) =>
+      previous && previous.id === id ? { ...previous, ...update } : previous,
+    );
+  }, []);
+
   useEffect(() => {
     let disposed = false;
+    // 切图先清空上一张的详情：标题与操作按钮都用当前 imageId，留着旧内容会张冠李戴。
+    // 同一张图的版本刷新（写入后重取）保留旧内容，避免每次改评分都闪一下加载态。
+    setDetail((previous) => (previous && previous.id === imageId ? previous : null));
     setLoading(true);
     setLoadError(null);
     void libraryApi
       .getImageDetail(imageId)
       .then((next) => {
         if (disposed) return;
+        if (next.id !== imageId) return;
         setDetail(next);
         setFolderDraft(next.folderPath);
         setThumbFailed(false);
@@ -423,16 +440,11 @@ function ImageInspector({
     if (nextDescription === detail.description.trim()) return;
     void run(async () => {
       await libraryApi.updateImageDescription(detail.id, nextDescription);
-      setDetail((previous) =>
-        previous
-          ? {
-              ...previous,
-              description: nextDescription,
-              descriptionSource: "user",
-              descriptionModel: "",
-            }
-          : previous,
-      );
+      patchDetail(detail.id, {
+        description: nextDescription,
+        descriptionSource: "user",
+        descriptionModel: "",
+      });
       setDescriptionDraftFor(detail.id, null);
       return {
         kind: "metadata",
@@ -459,16 +471,11 @@ function ImageInspector({
     setAiBusy(true);
     try {
       const result = await onGenerateDescription(detail.id);
-      setDetail((previous) =>
-        previous
-          ? {
-              ...previous,
-              description: result.text,
-              descriptionSource: "ai",
-              descriptionModel: result.model,
-            }
-          : previous,
-      );
+      patchDetail(detail.id, {
+        description: result.text,
+        descriptionSource: "ai",
+        descriptionModel: result.model,
+      });
       setDescriptionDraftFor(detail.id, null);
       notify("AI 描述已生成并保存", "success");
       onChanged({
@@ -491,7 +498,7 @@ function ImageInspector({
     if (!detail || detail.score === score) return;
     void run(async () => {
       await libraryApi.updateImageScore(detail.id, score);
-      setDetail((previous) => (previous ? { ...previous, score } : previous));
+      patchDetail(detail.id, { score });
       return {
         kind: "metadata",
         source: "local",
@@ -517,7 +524,7 @@ function ImageInspector({
         ...detail.tags.map((tag) => tag.name),
         ...additions,
       ]);
-      setDetail((previous) => (previous ? { ...previous, tags: applied } : previous));
+      patchDetail(detail.id, { tags: applied });
       return {
         kind: "metadata",
         source: "local",
@@ -538,7 +545,7 @@ function ImageInspector({
         detail.id,
         detail.tags.map((tag) => tag.name).filter((value) => value !== name),
       );
-      setDetail((previous) => (previous ? { ...previous, tags: applied } : previous));
+      patchDetail(detail.id, { tags: applied });
       return {
         kind: "metadata",
         source: "local",
@@ -567,7 +574,7 @@ function ImageInspector({
       if (report.failures.length > 0) {
         throw new Error(report.failures[0].reason);
       }
-      setFolderDraft(target);
+      if (imageIdRef.current === detail.id) setFolderDraft(target);
       if (report.moved === 0) {
         notify("图片已在该文件夹", "info");
         return null;

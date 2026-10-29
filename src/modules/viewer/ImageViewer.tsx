@@ -210,6 +210,11 @@ export function ImageViewer({
 
   const index = items.findIndex((item) => item.id === activeId);
   const item = index >= 0 ? items[index] : undefined;
+  /**
+   * 原图内容的身份。空间优化与像素编辑都会换掉 `contentHash`，只按 id 判断会一直
+   * 显示旧内容；旧文件被释放后还会变成坏图，编辑也基于过期源。
+   */
+  const contentKey = item ? `${item.contentHash}:${item.fileSize}` : "";
 
   const hasChanges = source && geometry ? hasPixelChanges(source, geometry) : false;
   const hasPose = hasVisiblePose(pose);
@@ -243,6 +248,7 @@ export function ImageViewer({
   );
 
   // 源图加载：过期请求直接丢弃；大图预览由 Rust 生成并缓存。
+  // `contentKey` 在体内不用到，只作为重取条件：内容被替换后图片 id 不变，只按 id 判断会停在旧图。
   useEffect(() => {
     let disposed = false;
     const fromPlaceholder = sourceRef.current == null;
@@ -299,7 +305,7 @@ export function ImageViewer({
     return () => {
       disposed = true;
     };
-  }, [activeId, reloadToken, resetHistory, retry]);
+  }, [activeId, contentKey, reloadToken, resetHistory, retry]);
 
   useEffect(() => {
     session.onActiveChange(activeId);

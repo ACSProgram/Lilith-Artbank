@@ -134,6 +134,12 @@ export const appApi = {
     return invoke<void>("close_library");
   },
 
+  /** 换库后重启进程；浏览器预览里只当作已关闭，没有进程可重启。 */
+  async restartApp(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("restart_app");
+  },
+
   async getLibraryStatus(): Promise<LibraryInfo | null> {
     if (!isTauri()) {
       if (mockCurrent) {

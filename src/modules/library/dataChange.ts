@@ -83,6 +83,8 @@ export interface DataChangePlan {
   tagOptions: boolean;
   detail: boolean;
   similarity: "keep" | "clear";
+  /** 已经不存在的标签 id（删除或合并的源）：筛选条件里带着它们会让列表永远为空。 */
+  dropTags: number[];
 }
 
 export interface PlanContext {
@@ -100,6 +102,7 @@ const EMPTY_PLAN: DataChangePlan = {
   tagOptions: false,
   detail: false,
   similarity: "keep",
+  dropTags: [],
 };
 
 function isSearching(query: LibraryQuery): boolean {
@@ -123,8 +126,17 @@ function scoreAffectsQuery(query: LibraryQuery): boolean {
   return query.filters.scores.length > 0 || sortsBy(query, ["score"]);
 }
 
+/**
+ * 标签写入是否可能改变当前结果集。“无标签”与“排除标签”两种条件同样靠标签关系判定，
+ * 漏掉它们会让写完之后列表里还留着本该离开的图片。
+ */
 function tagsAffectQuery(query: LibraryQuery): boolean {
-  return query.filters.tagIds.length > 0 || isSearching(query);
+  return (
+    query.filters.tagIds.length > 0 ||
+    query.filters.tagPresence !== "any" ||
+    query.filters.excludeTagIds.length > 0 ||
+    isSearching(query)
+  );
 }
 
 function descriptionAffectsQuery(query: LibraryQuery): boolean {
@@ -225,7 +237,8 @@ function metadataPlan(
 function metadataSelection(change: DataChange, query: LibraryQuery): SelectionAction {
   if (!changeAffectsQuery(change, query)) return "keep";
   if (change.source !== "local" && !(change.ids?.length)) return "clear";
-  if ((change.fields ?? []).includes("tags") && change.tagAction === "add") return "keep";
+  // 加标签在“包含某标签”的筛选下只会让图片进入结果；但“无标签/排除标签”下可能离开，
+  // 具体哪几张由 `selectionAfterChange` 按写入后的标签集判断。
   return "prune";
 }
 
@@ -286,17 +299,20 @@ function collectionPlan(change: DataChange, query: LibraryQuery): DataChangePlan
 
 function tagCatalogPlan(change: DataChange, query: LibraryQuery): DataChangePlan {
   // 合并同样会删掉源标签，筛选里含它时结果集必然变空。
-  const deletesFilteredTag =
-    (change.tagAction === "delete" || change.tagAction === "merge") &&
-    change.tagId != null &&
-    query.filters.tagIds.includes(change.tagId);
+  const removedTagId =
+    (change.tagAction === "delete" || change.tagAction === "merge") && change.tagId != null
+      ? change.tagId
+      : null;
+  const inInclude = removedTagId != null && query.filters.tagIds.includes(removedTagId);
+  const inExclude = removedTagId != null && query.filters.excludeTagIds.includes(removedTagId);
   return {
     ...EMPTY_PLAN,
     list: "refresh",
-    selection: deletesFilteredTag ? "clear" : "keep",
+    selection: inInclude ? "clear" : "keep",
     tagOptions: true,
     facets: true,
     detail: true,
+    dropTags: removedTagId != null && (inInclude || inExclude) ? [removedTagId] : [],
     similarity: change.similarity,
   };
 }
@@ -412,6 +428,39 @@ function pathInFolderScope(target: string, folderPaths: string[], direct: boolea
 }
 
 /**
+ * 加标签后哪些选中的图片会离开结果集。
+ *
+ * “包含某标签”的筛选不会因为加标签而失去图片；“无标签”看写入后的标签集是否为空，
+ * 单张与批量写入带回的 `rowPatches` 能直接判断。“排除标签”要拿标签 id 与名字的对应，
+ * 写入回执里没有这层映射，只能按“可能离开”处理。
+ */
+function leavingAfterTagAdd(
+  selected: Set<number>,
+  ids: ReadonlySet<number>,
+  change: DataChange,
+  query: LibraryQuery,
+): Set<number> {
+  const presenceLeaves = query.filters.tagPresence === "missing";
+  const excludeLeaves = query.filters.excludeTagIds.length > 0;
+  if (!presenceLeaves && !excludeLeaves) return selected;
+  if (excludeLeaves) return new Set([...selected].filter((id) => !ids.has(id)));
+
+  const tagsByImage = new Map<number, string[] | undefined>();
+  for (const patch of change.rowPatches ?? []) {
+    tagsByImage.set(patch.id, patch.update.tags);
+  }
+  return new Set(
+    [...selected].filter((id) => {
+      if (!ids.has(id)) return true;
+      const tags = tagsByImage.get(id);
+      // 只有“写入后确实没有标签”才留在“无标签”视图里；拿不到标签集时按可能离开处理，
+      // 宁可多裁也不要留下看不见的选中项。
+      return tags != null && tags.length === 0;
+    }),
+  );
+}
+
+/**
  * 从当前选择中按这次变化移除已不在结果里的图片。
  *
  * `changeIds` 是调用方预先构好的 `Set`；批量变化时复用同一份，避免对每个选中
@@ -488,7 +537,14 @@ export function selectionAfterChange(
     }
   }
 
-  if (fields.includes("tags") && tagsAffectQuery(query) && change.tagAction !== "add") {
+  if (fields.includes("tags") && tagsAffectQuery(query)) {
+    // 加标签可能让图片离开“无标签/排除标签”的结果，按写入后的标签集判断。
+    if (change.tagAction === "add") return leavingAfterTagAdd(selected, ids, change, query);
+    // 移除标签只可能让图片进入“无标签/排除标签”的结果；含标签筛选与搜索仍可能离开，
+    // 但写入回执里没有标签 id 与名字的对应，只能按“可能离开”整批裁掉。
+    if (change.tagAction === "remove" && query.filters.tagIds.length === 0 && !isSearching(query)) {
+      return selected;
+    }
     return new Set([...selected].filter((id) => !ids.has(id)));
   }
 
@@ -689,8 +745,13 @@ export function combinePlans(plans: DataChangePlan[]): DataChangePlan {
       tagOptions: merged.tagOptions || plan.tagOptions,
       detail: merged.detail || plan.detail,
       similarity: stronger(merged.similarity, plan.similarity, SIMILARITY_ORDER),
+      dropTags:
+        plan.dropTags.length === 0
+          ? merged.dropTags
+          : [...new Set([...merged.dropTags, ...plan.dropTags])],
     }),
-    { ...EMPTY_PLAN },
+    // 累加字段给每个合并结果一份新数组，不共享 EMPTY_PLAN 里那一份。
+    { ...EMPTY_PLAN, dropTags: [] },
   );
 }
 

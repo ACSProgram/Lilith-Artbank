@@ -68,6 +68,8 @@ interface FolderTreeProps {
     delta?: { images?: number; trash?: number },
     reason?: string,
   ) => void;
+  /** 把图片移入某个文件夹；带 ids 与目标路径，供图库裁剪选择与刷新。 */
+  onImagesMoved?: (imageIds: number[], targetPath: string) => void;
   /** 回收站模式：只读树，只提供恢复与永久删除。 */
   mode?: "normal" | "trash";
   /** 回收站根行“直属图片”的数量与选中状态。 */
@@ -141,6 +143,7 @@ export function FolderTree({
   onSelectDirect,
   onFoldersChanged,
   onDataChanged,
+  onImagesMoved,
   onBeginFolderDrag,
   mode = "normal",
   trashDirectCount = 0,
@@ -464,11 +467,16 @@ export function FolderTree({
 
   const moveImagesTo = async (imageIds: number[], node: FolderNode | null) => {
     if (imageIds.length === 0) return;
+    const targetPath = node?.path ?? "";
     try {
-      const report = await libraryApi.moveImagesToFolder(imageIds, node?.path ?? "");
+      const report = await libraryApi.moveImagesToFolder(imageIds, targetPath);
       // 移动图片只改计数，不增删文件夹；直接整树替换一次，比按 id 合并更省事。
       onFoldersChanged(await libraryApi.getFolders());
-      onDataChanged();
+      if (onImagesMoved) {
+        onImagesMoved(imageIds, targetPath);
+      } else {
+        onDataChanged();
+      }
       notify(
         `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`,
         report.failures.length > 0 ? "error" : "success",

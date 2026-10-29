@@ -74,11 +74,57 @@ test("标签添加保留选择；批量标签写入因缺少行数据而刷新",
     ids: [1],
     rowPatches: [{ id: 1, update: { tags: ["人物"] } }],
   });
-  assert.equal(planDataChange(single, current, context).selection, "keep");
+  // “包含某标签”下加标签不会让图片离开，裁剪结果是原样保留。
+  assert.equal(planDataChange(single, current, context).selection, "prune");
   assert.deepEqual([...selectionAfterChange(new Set([1]), single, current, [])], [1]);
 
   const batch = change({ fields: ["tags"], tagAction: "add", ids: [1] });
   assert.equal(planDataChange(batch, query(), context).list, "refresh");
+});
+
+test("无标签筛选下加标签剔除选择，移除标签保留选择", () => {
+  const current = query({ filters: { tagPresence: "missing" } });
+  const add = change({
+    fields: ["tags"],
+    tagAction: "add",
+    ids: [1],
+    rowPatches: [{ id: 1, update: { tags: ["人物"] } }],
+  });
+  assert.equal(planDataChange(add, current, context).list, "refresh");
+  assert.deepEqual([...selectionAfterChange(new Set([1, 2]), add, current, [])], [2]);
+
+  // 批量加标签拿不到每行标签集，按“可能已有标签”整批裁掉。
+  const batchAdd = change({ fields: ["tags"], tagAction: "add", ids: [1] });
+  assert.deepEqual([...selectionAfterChange(new Set([1, 2]), batchAdd, current, [])], [2]);
+
+  // 移除标签只会让图片进入“无标签”视图，不裁剪。
+  const remove = change({
+    fields: ["tags"],
+    tagAction: "remove",
+    ids: [1],
+    rowPatches: [{ id: 1, update: { tags: [] } }],
+  });
+  assert.deepEqual([...selectionAfterChange(new Set([1, 2]), remove, current, [])], [1, 2]);
+});
+
+test("排除标签筛选下加标签按可能离开裁剪，移除标签保留选择", () => {
+  const current = query({ filters: { excludeTagIds: [7] } });
+  const add = change({
+    fields: ["tags"],
+    tagAction: "add",
+    ids: [1],
+    rowPatches: [{ id: 1, update: { tags: ["人物"] } }],
+  });
+  assert.equal(planDataChange(add, current, context).list, "refresh");
+  assert.deepEqual([...selectionAfterChange(new Set([1, 2]), add, current, [])], [2]);
+
+  const remove = change({
+    fields: ["tags"],
+    tagAction: "remove",
+    ids: [1],
+    rowPatches: [{ id: 1, update: { tags: [] } }],
+  });
+  assert.deepEqual([...selectionAfterChange(new Set([1, 2]), remove, current, [])], [1, 2]);
 });
 
 test("标签移除在当前标签筛选下剔除受影响的行", () => {
@@ -259,6 +305,33 @@ test("合并掉正在筛选的源标签也清空选择", () => {
   });
   assert.deepEqual([...selectionAfterChange(new Set([1]), merge, current, [])], []);
   assert.equal(planDataChange(merge, current, context).tagOptions, true);
+  // 条件里带着已不存在的标签，列表会永远为空：计划要把它交出去清掉。
+  assert.deepEqual(planDataChange(merge, current, context).dropTags, [7]);
+});
+
+test("删除或合并标签时把筛选条件里残留的 id 带出计划", () => {
+  const include = query({ filters: { tagIds: [7] } });
+  const exclude = query({ filters: { excludeTagIds: [7] } });
+  const unrelated = query({ filters: { tagIds: [8] } });
+  const remove = change({ kind: "tagCatalog", tagId: 7, tagAction: "delete" });
+  assert.deepEqual(planDataChange(remove, include, context).dropTags, [7]);
+  assert.deepEqual(planDataChange(remove, exclude, context).dropTags, [7]);
+  // 排除条件被清掉只会让结果变多，选择不用清空。
+  assert.equal(planDataChange(remove, exclude, context).selection, "keep");
+  assert.deepEqual(planDataChange(remove, unrelated, context).dropTags, []);
+  // 改名不删标签，条件仍然有效。
+  const rename = change({ kind: "tagCatalog", tagId: 7, tagAction: "rename" });
+  assert.deepEqual(planDataChange(rename, include, context).dropTags, []);
+
+  const merged = combinePlans([
+    planDataChange(remove, include, context),
+    planDataChange(
+      change({ kind: "tagCatalog", tagId: 8, tagAction: "delete" }),
+      unrelated,
+      context,
+    ),
+  ]);
+  assert.deepEqual(merged.dropTags, [7, 8]);
 });
 
 test("五万张选择与五万条变化按集合过滤，不出现平方级退化", () => {

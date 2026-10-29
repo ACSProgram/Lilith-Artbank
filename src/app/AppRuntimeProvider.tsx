@@ -4,6 +4,7 @@ import { useNotices } from "./noticeContext";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
 import { setThumbCacheLimit } from "../shared/thumbCache";
+import { setThumbLibraryId } from "../shared/thumbUrl";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
 import type { LibraryCountDelta } from "../modules/library/dataChange";
 import { errorMessage } from "../shared/errors";
@@ -75,6 +76,10 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setThumbCacheLimit(settings?.ui.thumbCacheCount ?? 1024);
   }, [settings?.ui.thumbCacheCount]);
+
+  // 子组件渲染时就要拼 URL，所以这里是渲染期写入而不是 effect：库 id 变了再进 effect，
+  // 已经挂上的 <img> 不会重建，仍会命中上一个库的缩略图。
+  setThumbLibraryId(current?.id);
 
   // 全屏状态由窗口真实状态决定：系统快捷键（F11、Win+↑）改变时按钮图标也能同步。
   useEffect(() => {

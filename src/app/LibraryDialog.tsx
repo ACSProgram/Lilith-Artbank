@@ -19,7 +19,7 @@ function basename(path: string): string {
 
 export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClose: () => void }) {
   const { current, createLibrary, openLibrary } = useAppRuntime();
-  const { notify } = useNotices();
+  const { notify, confirm } = useNotices();
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [inspection, setInspection] = useState<LibraryInspection | null>(null);
@@ -101,6 +101,17 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
 
   const submit = async () => {
     if (!canSubmit) return;
+    // 已有图库时是“换库”：前端按 URL 缓存缩略图、按库构造模块级状态，热切换要逐项清理
+    // 才不会串库，重启是唯一可靠的复位方式，所以先确认再换。
+    const switching = current != null;
+    if (switching) {
+      const accepted = await confirm({
+        title: "更换图库会重启应用",
+        message: "当前图库会先关闭，应用随后自动重启并打开新图库。",
+        confirmLabel: "重启并打开",
+      });
+      if (!accepted) return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -108,6 +119,19 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
         await openLibrary(path.trim());
       } else {
         await createLibrary(name.trim(), path.trim());
+      }
+      if (switching) {
+        try {
+          await appApi.restartApp();
+        } catch (cause) {
+          // 图库已经开好了，失败的是重启这一步，不能报成“打开图库失败”。
+          const message = `图库已打开，但自动重启失败：${errorMessage(cause)}`;
+          setError(message);
+          notify("自动重启失败", "error", "新图库已打开，请手动重启应用完成切换。");
+          return;
+        }
+        if (browserPreview) onClose();
+        return;
       }
       onClose();
     } catch (cause) {
@@ -128,7 +152,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
       title={current ? "更换图库" : "打开或创建图库"}
       subtitle={
         current
-          ? "新图库会替换当前打开的图库；当前图库的数据不会被修改。"
+          ? "新图库会替换当前打开的图库，替换后应用自动重启；当前图库的数据不会被修改。"
           : "图库目录里放图片和图库数据。已有图库会直接打开，空目录会初始化新库。"
       }
       onClose={onClose}

@@ -23,6 +23,8 @@ interface SidebarProps {
     delta?: { images?: number; trash?: number },
     reason?: string,
   ) => void;
+  /** 图片被移入某个文件夹；带 ids 与目标路径。 */
+  onImagesMoved?: (imageIds: number[], targetPath: string) => void;
   /** 回收站视图：左侧显示回收站文件夹树。 */
   trashMode?: boolean;
   trashFolders?: TrashFolders | null;
@@ -48,6 +50,7 @@ export function Sidebar({
   onSelectDirect,
   onFoldersChanged,
   onDataChanged,
+  onImagesMoved,
   onBeginFolderDrag,
   trashMode = false,
   trashFolders = null,
@@ -105,6 +108,7 @@ export function Sidebar({
           onSelectDirect={onSelectDirect ?? (() => undefined)}
           onFoldersChanged={onFoldersChanged ?? (() => undefined)}
           onDataChanged={onDataChanged ?? (() => undefined)}
+          onImagesMoved={onImagesMoved}
           onBeginFolderDrag={onBeginFolderDrag ?? (() => undefined)}
           mode={trashMode ? "trash" : "normal"}
           trashDirectCount={trashFolders?.directImageCount ?? 0}

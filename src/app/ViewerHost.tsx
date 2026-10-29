@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { InspectorPanel } from "../modules/library/Inspector";
 import { libraryApi } from "../modules/library/api";
 import type { DataChange } from "../modules/library/dataChange";
@@ -44,6 +44,8 @@ export function ViewerHost({
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [version, setVersion] = useState(0);
   const filmstripOpen = settings?.ui.viewerFilmstrip ?? true;
+  // 查看器的数据源就是这张列表：它变了（刷新、筛选、集合成员变化）就重新判定归属。
+  const items = useSyncExternalStore(session.subscribe, session.getItems, session.getItems);
 
   const refresh = (change: DataChange) => {
     setVersion((value) => value + 1);
@@ -80,6 +82,25 @@ export function ViewerHost({
       disposed = true;
     };
   }, [activeId, version, revalidateRevision, session, notify]);
+
+  /**
+   * 图片离开了当前列表就退出：评分/标签/描述改动可能让它不再符合筛选，集合成员变化
+   * 也会让它不在结果里。留在查看器里既看的是过期内容，←/→ 也没有相邻图。
+   * 列表为空表示正在换结果集，此时不判定。
+   */
+  const stillInList = useMemo(
+    () => items.length === 0 || items.some((item) => item.id === activeId),
+    [activeId, items],
+  );
+  useEffect(() => {
+    if (stillInList) return;
+    notify(
+      "当前图片已离开列表",
+      "info",
+      "它可能已被删除或恢复，或不再符合当前筛选与集合。",
+    );
+    closeRef.current();
+  }, [notify, stillInList]);
 
   const toggleFilmstrip = () => {
     if (!settings) return;

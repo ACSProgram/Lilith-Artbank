@@ -175,6 +175,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `create_library` | `{ name, path }` | `LibraryInfo`（创建并打开） |
 | `open_library_path` | `{ path }` | `LibraryInfo`（只打开已存在的图库） |
 | `close_library` | — | `null` |
+| `restart_app` | — | `null`（请求重启进程；退出流程仍走 `RunEvent::Exit`） |
 | `get_library_status` | — | `LibraryInfo \| null`（只返回缓存计数，不重算） |
 | `get_library_counts` | — | `{ imageCount, trashCount, tempCount }`（重算并写回缓存） |
 | `rename_library` | `{ name }` | `LibraryInfo`（只改名称，不改目录） |
@@ -348,7 +349,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 启动：`open_configured_library` 按 `libraryPath` 自动打开；失败只记日志，前端随后再尝试一次并提示，最终退回欢迎页。
 - `close_library`：清空当前图库的临时文件夹，再释放连接、清空 AI 运行时状态与 `libraryPath`，不动其它文件。应用退出时同样尽力清空一次。
 - `rename_library`：更新清单名称与当前 `LibraryInfo.name`；不改目录名，也不写设置。
-- 应用内没有多库列表与“移除图库”操作；换库由“打开另一个图库”完成。
+- 应用内没有多库列表与“移除图库”操作；换库由“打开另一个图库”完成。已有图库时换库要重启应用：前端先确认，开库成功后调 `restart_app`（`AppHandle::request_restart`），由事件循环在退出流程里重新拉起进程，下次启动按设置里的新 `libraryPath` 自动打开。前端按 URL 缓存缩略图解码、按库构造模块级状态，热切换要逐项清理才不会串库。
 - 导入/AI 任务/文件操作运行时，创建与打开图库会被拒绝；关闭图库在 write 任务进行时拒绝，只有 ai/scan 任务时先取消再关闭。
 
 ## 能力边界

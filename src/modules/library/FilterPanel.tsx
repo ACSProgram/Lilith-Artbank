@@ -25,6 +25,11 @@ import { presenceAvailability } from "../../shared/capability";
 import { errorMessage } from "../../shared/errors";
 import { useStats } from "./StatsProvider";
 
+/** 标签搜索一次取回的上限；与后端 `search_tags` 的 200 上限一致。 */
+const TAG_SEARCH_LIMIT = 200;
+/** 输入防抖：每敲一个字都查一次库没有必要。 */
+const TAG_SEARCH_DEBOUNCE_MS = 180;
+
 interface FilterPanelProps {
   open: boolean;
   filters: LibraryFilters;
@@ -56,6 +61,12 @@ export function FilterPanel({
   const [optionsLoading, setOptionsLoading] = useState(false);
   const [optionsError, setOptionsError] = useState<string | null>(null);
   const [tagQuery, setTagQuery] = useState("");
+  /** 有输入时的后端搜索结果；标签库超过一次能取回的数量后，靠它才找得到靠后的标签。 */
+  const [tagSearchResults, setTagSearchResults] = useState<TagInfo[] | null>(null);
+  const [tagSearchLoading, setTagSearchLoading] = useState(false);
+  /** 搜索失败单独记：面板顶部的「重试」只重取标签列表，重跑不了搜索。 */
+  const [tagSearchError, setTagSearchError] = useState<string | null>(null);
+  const [tagSearchAttempt, setTagSearchAttempt] = useState(0);
   const [sizeMinDraft, setSizeMinDraft] = useState(bytesToMbInput(filters.sizeMin));
   const [sizeMaxDraft, setSizeMaxDraft] = useState(bytesToMbInput(filters.sizeMax));
 
@@ -94,6 +105,42 @@ export function FilterPanel({
     if (!open) setTagQuery("");
   }, [open]);
 
+  // 输入即查后端：初始列表只是前若干个标签，靠后的标签只能搜出来。
+  useEffect(() => {
+    if (!open) {
+      setTagSearchLoading(false);
+      return;
+    }
+    const keyword = tagQuery.trim();
+    if (!keyword) {
+      setTagSearchResults(null);
+      setTagSearchError(null);
+      setTagSearchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setTagSearchLoading(true);
+    setTagSearchError(null);
+    const timer = window.setTimeout(() => {
+      void libraryApi
+        .searchTags(keyword, TAG_SEARCH_LIMIT)
+        .then((next) => {
+          if (!cancelled) setTagSearchResults(next);
+        })
+        .catch((cause: unknown) => {
+          // 不能静默当成“没有匹配的标签”，否则用户会以为标签不存在。
+          if (!cancelled) setTagSearchError(errorMessage(cause));
+        })
+        .finally(() => {
+          if (!cancelled) setTagSearchLoading(false);
+        });
+    }, TAG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [tagQuery, open, tagSearchAttempt]);
+
   const extensionCounts = useMemo(
     () => new Map((counts?.extensions ?? []).map((item) => [item.value, item.count])),
     [counts],
@@ -107,9 +154,23 @@ export function FilterPanel({
     [counts],
   );
 
-  const extensions = counts
-    ? counts.extensions.map((item) => item.value)
-    : filters.extensions;
+  /**
+   * 分面只给“当前范围内有内容”的扩展名；已选中的即使计数为 0 也必须留着，
+   * 否则叠加别的条件后 chip 会消失，用户没法单独取消它。
+   */
+  const extensions = useMemo(() => {
+    const values = counts ? counts.extensions.map((item) => item.value) : [];
+    const known = new Set(values);
+    return [...values, ...filters.extensions.filter((value) => !known.has(value))];
+  }, [counts, filters.extensions]);
+
+  /** 见过的标签：初始列表 + 搜索结果；已选但不在列表里的标签靠它保持可见。 */
+  const knownTags = useMemo(() => {
+    const map = new Map<number, TagInfo>();
+    for (const tag of tags) map.set(tag.id, tag);
+    for (const tag of tagSearchResults ?? []) map.set(tag.id, tag);
+    return map;
+  }, [tags, tagSearchResults]);
 
   /**
    * 分面只显示“有内容”的项：计数为 0 且未被选中的不渲染，已选中的即使为 0 也保留
@@ -124,7 +185,10 @@ export function FilterPanel({
 
   const tagOptions = useMemo(() => {
     const keyword = tagQuery.trim().toLowerCase();
-    return tags.filter((tag) => {
+    // 有输入时用后端结果，没输入时用初始列表；两者都还要过一遍范围计数。
+    // 首次搜索还没回来前先用初始列表按关键字过滤，避免闪一下“没有匹配的标签”。
+    const source = keyword ? (tagSearchResults ?? tags) : tags;
+    const listed = source.filter((tag) => {
       if (keyword && !tag.name.toLowerCase().includes(keyword)) return false;
       if (!counts) return true;
       // “无标签”时不按计数过滤：搜索与集合视图的标签分面按命中集统计，会全是 0；
@@ -136,7 +200,28 @@ export function FilterPanel({
         (tagCounts.get(tag.id) ?? 0) > 0
       );
     });
-  }, [counts, filters.tagIds, filters.excludeTagIds, filters.tagPresence, tagCounts, tagQuery, tags]);
+    // 已选中的标签必须始终可取消：不在当前列表里（例如超出初始数量）时补在末尾。
+    const listedIds = new Set(listed.map((tag) => tag.id));
+    const pinned: TagInfo[] = [];
+    for (const tagId of [...filters.tagIds, ...filters.excludeTagIds]) {
+      if (listedIds.has(tagId)) continue;
+      const tag = knownTags.get(tagId);
+      if (!tag) continue;
+      listedIds.add(tagId);
+      pinned.push(tag);
+    }
+    return pinned.length > 0 ? [...listed, ...pinned] : listed;
+  }, [
+    counts,
+    filters.excludeTagIds,
+    filters.tagIds,
+    filters.tagPresence,
+    knownTags,
+    tagCounts,
+    tagQuery,
+    tagSearchResults,
+    tags,
+  ]);
 
   if (!open) return null;
 
@@ -236,7 +321,7 @@ export function FilterPanel({
                   onClick={() => patch({ extensions: toggleValue(filters.extensions, extension) })}
                 >
                   {extension.toUpperCase()}
-                  <em>{extensionCounts.get(extension) ?? "—"}</em>
+                  <em>{extensionCounts.get(extension) ?? (counts ? 0 : "—")}</em>
                 </button>
               );
             })}
@@ -411,10 +496,21 @@ export function FilterPanel({
             onChange={(event) => setTagQuery(event.target.value)}
           />
           <div className="filter-option-list filter-tag-list">
-            {tagOptions.length === 0 ? (
+            {tagSearchError ? (
+              <div className="filter-panel-error">
+                <span>{tagSearchError}</span>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setTagSearchAttempt((value) => value + 1)}
+                >
+                  重试
+                </button>
+              </div>
+            ) : tagOptions.length === 0 ? (
               <span className="filter-loading">
-                {optionsLoading || countsLoading ? <Spinner size={12} /> : null}
-                {optionsLoading
+                {optionsLoading || countsLoading || tagSearchLoading ? <Spinner size={12} /> : null}
+                {optionsLoading || tagSearchLoading
                   ? "载入标签…"
                   : tagQuery.trim()
                     ? "没有匹配的标签"

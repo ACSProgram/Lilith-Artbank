@@ -627,6 +627,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   };
 
   const selectFolderScope = (folderIds: number[], folderDirect: boolean) => {
+    // 相似/语义结果是独立的结果集，切文件夹必须退出它，否则网格与左侧高亮会对不上。
+    similarity.clear();
     const leavingTemp = browse.browse.view === "temp";
     browse.applyBrowse({
       ...browse.browse,
@@ -643,6 +645,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
 
   /** 回收站根行的“直属图片”：原文件夹仍在图库中的回收站图片。 */
   const selectTrashDirect = () => {
+    similarity.clear();
     browse.applyBrowse({
       ...browse.browse,
       view: "trash",
@@ -703,6 +706,17 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
         onSelectDirect={(folderId) => selectFolderScope([folderId], true)}
         onFoldersChanged={setFolders}
         onDataChanged={handleDataChanged}
+        onImagesMoved={(imageIds, targetPath) =>
+          emitChange({
+            kind: "folder",
+            source: "local",
+            reason: "moveImages",
+            ids: imageIds,
+            fields: ["folder"],
+            targetFolderPath: targetPath,
+            similarity: "keep",
+          })
+        }
         onBeginFolderDrag={(folderIds, label, event) =>
           beginDrag({ kind: "folders", folderIds, label }, event)
         }

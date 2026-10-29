@@ -22,6 +22,7 @@
 - 复制图片：`copy_image` 解码原图、应用 EXIF 方向后以 RGBA 写入系统剪贴板；超过 5000 万像素给出可行动错误。
 - 拖出到资源管理器（Windows OLE）：评估后暂缓；当前提供“复制图片”和“复制文件路径”。
 - 元数据侧栏：由 `src/app/ViewerHost.tsx` 复用图库详情侧栏，评分、标签、描述、文件夹可直接编辑；每次写入携带 `DataChange` 交给图库统一刷新，回收站/恢复/永久删除成功后关闭查看器。侧栏里的标签可以点击按范围筛选（见[浏览与检索](browse-and-query.md)的“按标签筛选”），点击后查看器关闭并把控制权交回网格。
+- 与数据源同步：原图加载 key 除图片 id 外还含 `contentHash` 与文件大小，空间优化或像素编辑换掉内容后自动重取源，不会停在旧内容或坏图上。`ViewerHost` 订阅 `session.getItems()`：活动图不在当前列表里（评分/标签改动让它不再符合筛选、集合成员变化、移入回收站等）就提示并关闭查看器；列表为空表示正在换结果集，此时不判定。
 - 大图内存：查看器原图由 WebView2 解码；Rust 侧编辑/预览都受 512 MiB 分配、单边 65535、1 亿像素的解码上限约束，并对 >5000 万像素的图片禁用编辑。
 - 配色跟随全局主题：查看器不再固定深色，顶栏/工具面板/状态栏/输入框/裁剪框都用 `src/styles/tokens.css` 的语义变量；画布用 `--canvas`（浅色下中性灰、深色下比面板再暗一档），透明区域显示 `--checker` 棋盘格。
 - 胶片带：画布底部一条 68px 的横向缩略图带，当前项高亮并自动居中，点击切换，滚轮转横向滚动，滚到末尾沿用 `session.loadMore()` 继续加载。只渲染视口附近的条目（`OVERSCAN` 8 条），20 万条也不会一次挂满 DOM。开关写在 `settings.ui.viewerFilmstrip`，状态栏左侧按钮切换。
@@ -80,7 +81,7 @@
 前端结构：
 
 - `src/modules/viewer/`：types、api、model、ImageViewer、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）、model.test。
-- `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。详情侧栏的写入经 `session.refresh(change)` 交给图库，生成姿势后同样发特征变化；外部变化后按活动图复核存在与回收站状态，离开当前范围时关闭。两个前端模块不互相导入。
+- `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。详情侧栏的写入经 `session.refresh(change)` 交给图库，生成姿势后同样发特征变化；外部变化后按活动图复核存在与回收站状态，并按数据源列表复核它是否还在结果里，离开时关闭。两个前端模块不互相导入。
 - `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步、保存后就地更新行（`ViewerSessionUpdate`）、`refresh(change)`、`expectTrashed`、标签筛选与元数据操作的桥接契约。
 - `src/shared/tagFilter.ts`：标签筛选的范围与动作类型，图库与查看器共用的最小契约。
 - `src/shared/imgUrl.ts`：`img://` URL 生成。

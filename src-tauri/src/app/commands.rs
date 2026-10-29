@@ -146,6 +146,19 @@ pub fn close_library(state: State<'_, AppState>) -> Result<(), String> {
     trace::write("close_library", || AppError::command(state.close_library()))
 }
 
+/// 换库后重启进程。
+///
+/// 前端有按 URL 缓存缩略图解码结果、按库构造的模块级状态，热切换要逐一清理才不出错；
+/// 重启是唯一可靠的复位方式。这里只请求重启，退出流程（关库、停 AI 与 MCP）仍走
+/// `RunEvent::Exit`，不在命令里另开一条关闭路径。
+#[tauri::command]
+pub fn restart_app(app: AppHandle) -> Result<(), String> {
+    trace::write("restart_app", || {
+        app.request_restart();
+        Ok(())
+    })
+}
+
 #[tauri::command]
 pub async fn get_library_status(app: AppHandle) -> Result<Option<LibraryInfo>, String> {
     trace::read_async(
@@ -1332,6 +1345,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         create_library,
         open_library_path,
         close_library,
+        restart_app,
         get_library_status,
         get_library_counts,
         rename_library,

@@ -591,6 +591,27 @@ export function LibraryView({
         planDataChange(change, query, { hasMore: hasMoreRef.current }),
       );
       const plan = combinePlans(plans);
+      // 删除/合并掉的标签还留在筛选条件里，列表会永远为空且用户无从取消。
+      // 清掉它等于换了一次查询身份，列表由 loadFirst 重取，这一轮不再做保留旧行的刷新。
+      const staleFilterTags = plan.dropTags.filter(
+        (tagId) =>
+          query.filters.tagIds.includes(tagId) || query.filters.excludeTagIds.includes(tagId),
+      );
+      if (staleFilterTags.length > 0) {
+        const stale = new Set(staleFilterTags);
+        const currentBrowse = browseRef.current;
+        onApplyBrowse(
+          {
+            ...currentBrowse,
+            filters: {
+              ...currentBrowse.filters,
+              tagIds: currentBrowse.filters.tagIds.filter((id) => !stale.has(id)),
+              excludeTagIds: currentBrowse.filters.excludeTagIds.filter((id) => !stale.has(id)),
+            },
+          },
+          false,
+        );
+      }
 
       // 同一个 id 只留一份合并后的补丁；评分/文件夹这类批量写入按 id + 新值推导。
       const patchById = new Map<number, Partial<ImageRow>>();
@@ -687,7 +708,7 @@ export function LibraryView({
         }
       }
 
-      if (plan.list === "refresh") {
+      if (plan.list === "refresh" && staleFilterTags.length === 0) {
         await measureStage("list", refreshKeepingRows());
       }
 
@@ -733,6 +754,7 @@ export function LibraryView({
       adjustCounts,
       folders,
       notify,
+      onApplyBrowse,
       onContextsChanged,
       onFoldersChanged,
       patchItems,
@@ -1857,8 +1879,10 @@ export function LibraryView({
           trashLoose: false,
         },
       });
+      // 面包屑切文件夹同样要离开相似/语义结果，否则网格还是旧文件夹的结果。
+      similarityClear?.();
     },
-    [applyBrowse],
+    [applyBrowse, similarityClear],
   );
 
   /** 从详情跳到所在文件夹：退出回收站/临时视图，清空搜索与其它筛选。 */
