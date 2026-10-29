@@ -1417,9 +1417,13 @@ pub fn recover_on_open(database: &LibraryDb) -> AppResult<RecoveryPlan> {
         )?;
 
         let orphan: i64 = transaction.query_row(
-            "SELECT count(*) FROM images
-             WHERE purge_operation_id IS NOT NULL
-               AND purge_operation_id NOT IN (SELECT id FROM operations)",
+            "SELECT
+                 (SELECT count(*) FROM images
+                  WHERE purge_operation_id IS NOT NULL
+                    AND purge_operation_id NOT IN (SELECT id FROM operations))
+               + (SELECT count(*) FROM folders
+                  WHERE purge_operation_id IS NOT NULL
+                    AND purge_operation_id NOT IN (SELECT id FROM operations))",
             [],
             |row| row.get(0),
         )?;
@@ -1520,21 +1524,40 @@ pub fn clear(database: &LibraryDb, root: &Path) -> AppResult<u64> {
     Ok(deleted)
 }
 
-pub fn has_orphan_purge(database: &LibraryDb) -> AppResult<bool> {
-    database.with_reader(|connection| {
-        let count: i64 = connection.query_row(
-            "SELECT
-                 EXISTS(SELECT 1 FROM images
-                        WHERE purge_operation_id IS NOT NULL
-                          AND purge_operation_id NOT IN (SELECT id FROM operations))
-              OR EXISTS(SELECT 1 FROM folders
-                        WHERE purge_operation_id IS NOT NULL
-                          AND purge_operation_id NOT IN (SELECT id FROM operations))",
+/// 还有没有可以真正释放的待删除批次。
+///
+/// 图片行只要还有无主标记（对应记录已不存在）就算：行必须删掉。文件夹行还要看磁盘目录：
+/// 目录里还有未纳管文件时这一轮删不掉，保留标记等下次清空回收站再试，不能因此让这里
+/// 永远为真——否则每次写入后都会白排一次释放任务。
+pub fn has_orphan_purge(database: &LibraryDb, root: &Path) -> AppResult<bool> {
+    let (images, folders): (i64, Vec<String>) = database.with_reader(|connection| {
+        let images: i64 = connection.query_row(
+            "SELECT count(*) FROM images
+             WHERE purge_operation_id IS NOT NULL
+               AND purge_operation_id NOT IN (SELECT id FROM operations)",
             [],
             |row| row.get(0),
         )?;
-        Ok(count > 0)
-    })
+        let mut statement = connection.prepare(
+            "SELECT path FROM folders
+             WHERE purge_operation_id IS NOT NULL
+               AND purge_operation_id NOT IN (SELECT id FROM operations)",
+        )?;
+        let folders = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((images, folders))
+    })?;
+    if images > 0 {
+        return Ok(true);
+    }
+    let paths = LibraryPaths::new(root);
+    Ok(folders.iter().any(|path| {
+        matches!(
+            metadata::folder_dir_state(&paths, path),
+            metadata::FolderDirState::Missing | metadata::FolderDirState::Empty
+        )
+    }))
 }
 
 /// 撤销目标及其之后的全部记录；最新的先撤，取消只在记录之间生效。
@@ -4187,9 +4210,24 @@ fn redo_import(
 
     let total = images.len();
     let mut restored = 0_usize;
+    let mut missing = 0_usize;
     for batch in images.chunks(200) {
         for item in batch {
-            restore_import_file(root, operation_id, item)?;
+            // 缺原图只影响这一张：行照常恢复，文件留空，不能中断整条重做链。
+            if let ImportFileRestore::Missing(path) = restore_import_file(root, operation_id, item)?
+            {
+                log::warn!(
+                    "重做导入：图片 {} 的原图缺失，已按缺图恢复（预期位置 {}）",
+                    item.row.id,
+                    path.display()
+                );
+                task.add_failure(
+                    Some(item.row.id),
+                    path.to_string_lossy().into_owned(),
+                    "原图文件缺失，已按缺图恢复".to_owned(),
+                );
+                missing += 1;
+            }
         }
         database.with_writer(|connection| {
             let transaction =
@@ -4234,7 +4272,13 @@ fn redo_import(
             Ok(())
         })?;
         restored += batch.len();
-        task.set_message(format!("重做导入：已恢复 {restored}/{total} 张"));
+        if missing > 0 {
+            task.set_message(format!(
+                "重做导入：已恢复 {restored}/{total} 张，{missing} 张缺原图"
+            ));
+        } else {
+            task.set_message(format!("重做导入：已恢复 {restored}/{total} 张"));
+        }
     }
 
     if !merged.is_empty() {
@@ -4396,7 +4440,19 @@ fn stage_import_file(
     }
 }
 
-fn restore_import_file(root: &Path, operation_id: i64, item: &ImportRedoImage) -> AppResult<()> {
+/// 重做导入时原图文件的恢复结果。
+enum ImportFileRestore {
+    Restored,
+    /// 撤销时原图就已经不在了（或暂存文件被清理）：行照常恢复，文件留空，
+    /// 由检查图库按「缺失」报出来，不阻塞同一条记录里其它图片的重做。
+    Missing(PathBuf),
+}
+
+fn restore_import_file(
+    root: &Path,
+    operation_id: i64,
+    item: &ImportRedoImage,
+) -> AppResult<ImportFileRestore> {
     let destination = metadata::content_path(
         &LibraryPaths::new(root),
         &item.folder_path,
@@ -4404,26 +4460,25 @@ fn restore_import_file(root: &Path, operation_id: i64, item: &ImportRedoImage) -
         &item.row.file_ext,
     )?;
     if destination.is_file() {
-        return Ok(());
+        return Ok(ImportFileRestore::Restored);
     }
     let Some(name) = &item.staged_file else {
-        return Err(AppError::message(format!(
-            "重做导入时图片 {} 的原图文件缺失",
-            item.row.id
-        )));
+        // 撤销时原图就已经不在了：由调用方统一记一条失败清单。
+        return Ok(ImportFileRestore::Missing(destination));
     };
     let staged = undo_dir(root, operation_id).join(name);
     if !staged.is_file() {
-        return Err(AppError::message(format!(
-            "重做导入时图片 {} 的暂存文件缺失",
+        log::warn!(
+            "重做导入时图片 {} 的暂存文件已不存在，按缺图恢复",
             item.row.id
-        )));
+        );
+        return Ok(ImportFileRestore::Missing(destination));
     }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::rename(&staged, &destination)?;
-    Ok(())
+    Ok(ImportFileRestore::Restored)
 }
 
 fn insert_import_row(transaction: &Transaction<'_>, row: &ImportedRow) -> AppResult<()> {
@@ -4517,7 +4572,14 @@ fn restore_import_merges(
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut redo = Vec::new();
+        // 同一次导入里同一张图可能被合并多次（一次导入里有两份重复内容）。
+        // 每条记录存的是「合并前」的快照，只有最早那份才是导入前的状态；
+        // 按记录顺序全应用会把图片停在中间态，所以每张图只应用第一条。
+        let mut restored: HashSet<i64> = HashSet::new();
         for item in merged {
+            if !restored.insert(item.image_id) {
+                continue;
+            }
             let current: Option<(i64, i64)> = transaction
                 .query_row(
                     "SELECT score, modified_at FROM images WHERE id = ?1",
@@ -4726,6 +4788,7 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
     let total: u64 = batches.iter().map(|(_, count)| *count).sum();
     task.set_total(total as usize);
     let mut offset = 0_usize;
+    let mut failures = 0_usize;
     for (operation_id, count) in batches {
         if task.should_cancel() {
             break;
@@ -4735,11 +4798,30 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
             offset,
             total: total as usize,
         };
-        metadata::purge_by_operation(database, root, &[operation_id], &reporter)?;
+        let report = metadata::purge_by_operation(database, root, &[operation_id], &reporter)?;
+        // 释放失败不能只留在报告里：行已经删了，用户只能靠这条失败清单找回文件。
+        for failure in &report.failures {
+            log::warn!(
+                "释放失败 path={} image={:?}：{}",
+                failure.path,
+                failure.image_id,
+                failure.reason
+            );
+            task.add_failure(
+                failure.image_id,
+                failure.path.clone(),
+                failure.reason.clone(),
+            );
+            failures += 1;
+        }
         offset += count as usize;
         task.report(offset, total as usize);
     }
-    task.set_message("");
+    if failures > 0 {
+        task.set_message(format!("{failures} 项未能释放，详见失败清单与日志"));
+    } else {
+        task.set_message("");
+    }
     Ok(())
 }
 
@@ -5067,7 +5149,7 @@ mod tests {
 
         // 记录被裁掉后，待释放批次变成无主。
         trim(fixture.db(), 0).unwrap();
-        assert!(has_orphan_purge(fixture.db()).unwrap());
+        assert!(has_orphan_purge(fixture.db(), &fixture.root).unwrap());
 
         run_release(fixture.db(), &fixture.root, task()).unwrap();
         assert!(!path.exists());
@@ -5078,7 +5160,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
-        assert!(!has_orphan_purge(fixture.db()).unwrap());
+        assert!(!has_orphan_purge(fixture.db(), &fixture.root).unwrap());
     }
 
     #[test]
@@ -5168,7 +5250,7 @@ mod tests {
         folders::trash(fixture.db(), parent).unwrap();
         folders::delete_permanently(fixture.db(), parent).unwrap();
         trim(fixture.db(), 0).unwrap();
-        assert!(has_orphan_purge(fixture.db()).unwrap());
+        assert!(has_orphan_purge(fixture.db(), &fixture.root).unwrap());
 
         run_release(fixture.db(), &fixture.root, task()).unwrap();
         assert!(!content.exists());
@@ -5180,7 +5262,43 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(!has_orphan_purge(fixture.db()).unwrap());
+        assert!(!has_orphan_purge(fixture.db(), &fixture.root).unwrap());
+    }
+
+    /// 目录里还有未纳管文件时保留待释放标记，但不能再被当成「还有待释放文件」，
+    /// 否则每次写入都会白排一次释放任务；清空目录后再清空回收站能重试成功。
+    #[test]
+    fn folder_release_defers_while_the_directory_is_not_empty() {
+        let fixture = Fixture::new();
+        folders::create(fixture.db(), &fixture.root, "整目录").unwrap();
+        let folder_id = folders::find_id(fixture.db(), "整目录").unwrap().unwrap();
+        let directory = LibraryPaths::new(&fixture.root).folder_dir("整目录");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("notes.txt"), "未纳管文件".as_bytes()).unwrap();
+
+        folders::trash(fixture.db(), folder_id).unwrap();
+        folders::delete_permanently(fixture.db(), folder_id).unwrap();
+        trim(fixture.db(), 0).unwrap();
+        assert!(
+            !has_orphan_purge(fixture.db(), &fixture.root).unwrap(),
+            "目录不空的文件夹不该让释放检查永远为真"
+        );
+
+        let handle = task();
+        run_release(fixture.db(), &fixture.root, handle.clone()).unwrap();
+        assert!(directory.exists(), "不能递归强删目录");
+        assert!(folders::find_id(fixture.db(), "整目录").unwrap().is_some());
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.failures.len(), 1, "暂不释放要进失败清单");
+        assert!(snapshot.message.contains("未能释放"));
+
+        fs::remove_file(directory.join("notes.txt")).unwrap();
+        metadata::empty_trash(fixture.db(), &NoopReporter).unwrap();
+        trim(fixture.db(), 0).unwrap();
+        run_release(fixture.db(), &fixture.root, task()).unwrap();
+        assert!(!directory.exists());
+        assert!(folders::find_id(fixture.db(), "整目录").unwrap().is_none());
+        assert!(!has_orphan_purge(fixture.db(), &fixture.root).unwrap());
     }
 
     #[test]
@@ -6014,6 +6132,171 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, third);
         assert_eq!(entries[0].affected, 2);
+    }
+
+    /// 同一次导入里同一张图被合并两次时，只有最早那份快照是导入前的状态。
+    #[test]
+    fn import_undo_applies_only_the_earliest_merge_snapshot() {
+        let fixture = Fixture::new();
+        let image_id = fixture.insert_image("a");
+        let tag_id = fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute("INSERT INTO tags(name) VALUES ('追加')", [])?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        let operation = begin_live(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Import, "合并导入"),
+        )
+        .unwrap();
+        // 第一次合并 3 → 5，第二次合并只加标签。
+        let merges = [
+            ImportMerged {
+                image_id,
+                old_score: 3,
+                old_modified_at: 10,
+                old_tag_ids: Vec::new(),
+            },
+            ImportMerged {
+                image_id,
+                old_score: 5,
+                old_modified_at: 20,
+                old_tag_ids: vec![tag_id],
+            },
+        ];
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                for item in &merges {
+                    append_live_in_tx(
+                        &transaction,
+                        operation,
+                        ChunkFormat::Json,
+                        &serde_json::to_vec(&ImportRecord::Merged {
+                            items: vec![item.clone()],
+                        })?,
+                    )?;
+                }
+                // 导入后的状态：评分 5、带「追加」标签。
+                transaction.execute(
+                    "UPDATE images SET score = 5, modified_at = 20 WHERE id = ?1",
+                    [image_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO image_tags(image_id, tag_id) VALUES (?1, ?2)",
+                    params![image_id, tag_id],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        undo_import(fixture.db(), &fixture.root, &task(), operation).unwrap();
+
+        let (score, modified_at, tags): (i64, i64, Vec<i64>) = fixture
+            .db()
+            .with_reader(|connection| {
+                let (score, modified_at) = connection.query_row(
+                    "SELECT score, modified_at FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let mut statement =
+                    connection.prepare("SELECT tag_id FROM image_tags WHERE image_id = ?1")?;
+                let tags = statement
+                    .query_map([image_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok((score, modified_at, tags))
+            })
+            .unwrap();
+        assert_eq!((score, modified_at), (3, 10), "恢复到导入前，不是中间态");
+        assert!(tags.is_empty(), "导入前没有标签");
+    }
+
+    /// 撤销时原图已经缺失，重做要按缺图恢复这一张，不能阻塞整条重做链。
+    #[test]
+    fn redo_import_restores_rows_whose_original_is_missing() {
+        let fixture = Fixture::new();
+        let operation = begin_live(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Import, "缺图导入"),
+        )
+        .unwrap();
+        let row = ImportedRow {
+            id: 7,
+            content_hash: "a".repeat(64),
+            file_ext: "jpg".to_owned(),
+            folder_id: fixture.folder,
+            file_size: 100,
+            width: 10,
+            height: 10,
+            format: "jpeg".to_owned(),
+            has_alpha: false,
+            phash: vec![0; 32],
+            colors4: vec![0; 16],
+            colors8: vec![0; 32],
+            score: 2,
+            description: String::new(),
+            description_source: "import".to_owned(),
+            description_model: String::new(),
+            imported_at: 1,
+            modified_at: 1,
+            deleted_at: None,
+            thumb_segment: 0,
+            thumb_offset: 0,
+            thumb_length: 0,
+            thumb_format: String::new(),
+            thumb_width: 0,
+            thumb_height: 0,
+            thumb_version: 0,
+            origin_operation_id: Some(operation),
+        };
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                append_redo(
+                    &transaction,
+                    operation,
+                    &RedoRecord::ImportImages {
+                        items: vec![ImportRedoImage {
+                            row,
+                            folder_path: "人物".to_owned(),
+                            tag_ids: Vec::new(),
+                            collection_items: Vec::new(),
+                            // 撤销时原图就已经不在了。
+                            staged_file: None,
+                        }],
+                    },
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let handle = task();
+        redo_import(fixture.db(), &fixture.root, &handle, operation).unwrap();
+
+        let count: i64 =
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT count(*) FROM images WHERE id = 7",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+        assert_eq!(count, 1, "行要照常恢复");
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.failures.len(), 1, "缺图要进失败清单");
+        assert!(snapshot.message.contains("缺原图"), "{}", snapshot.message);
     }
 
     /// 文件夹五类记录串成一条时间线：创建 → 重命名 → 移动 → 同级排序 → 删除。

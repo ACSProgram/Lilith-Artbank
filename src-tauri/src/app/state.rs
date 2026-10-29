@@ -1602,10 +1602,10 @@ impl AppState {
         {
             return;
         }
-        let Some((database, _, _)) = self.library_handles() else {
+        let Some((database, _, root)) = self.library_handles() else {
             return;
         };
-        match history::has_orphan_purge(&database) {
+        match history::has_orphan_purge(&database, &root) {
             Ok(true) => {
                 if let Err(error) = self.start_release_task("释放删除文件", ConflictPolicy::Queue)
                 {

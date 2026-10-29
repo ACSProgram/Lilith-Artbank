@@ -2,7 +2,7 @@
 
 日期：2026-10-29
 
-本文件只写“现在”：当前生效的能力、基线与约束。项目已进入落地与持续维护阶段，不再有阶段计划；未完成、未验收与待决策事项只写在[待办与待决策](todo.md)，建设与迁移期的历史见[规划归档](archive/README.md)。功能已全部落地，第三轮整改（交互、导入内存、文件夹回收站树）代码与自动检查通过，出口条件是用户手工验收。全量审查整改批次 A（数据安全 I：多文件夹撤销整次回退、导入写线程收口、撤销暂存目录清理、文件夹路径规范）与批次 B（数据安全 II：写事务文件动作统一补偿、孤儿清理先搬后记账、缩略图段与特征包落盘边界）已完成，见[批次 A 记录](archive/2026-10-29-整改批次A-数据安全I.md)、[批次 B 记录](archive/2026-10-29-整改批次B-数据安全II.md)。
+本文件只写“现在”：当前生效的能力、基线与约束。项目已进入落地与持续维护阶段，不再有阶段计划；未完成、未验收与待决策事项只写在[待办与待决策](todo.md)，建设与迁移期的历史见[规划归档](archive/README.md)。功能已全部落地，第三轮整改（交互、导入内存、文件夹回收站树）代码与自动检查通过，出口条件是用户手工验收。全量审查整改批次 A（数据安全 I：多文件夹撤销整次回退、导入写线程收口、撤销暂存目录清理、文件夹路径规范）、批次 B（数据安全 II：写事务文件动作统一补偿、孤儿清理先搬后记账、缩略图段与特征包落盘边界）与批次 C（释放与导入历史：释放失败可见、路径无效行保留、非空目录不再反复重排、导入撤销恢复到导入前、重做允许缺图、恢复图片的文件夹守卫进写事务）已完成，见[批次 A 记录](archive/2026-10-29-整改批次A-数据安全I.md)、[批次 B 记录](archive/2026-10-29-整改批次B-数据安全II.md)、[批次 C 记录](archive/2026-10-29-整改批次C-释放与导入历史.md)。
 
 ## 能力现状
 
@@ -29,7 +29,7 @@
 - 压缩候选：主库按默认参数（JPEG 输出、跳过已处理、非透明、非 GIF、bpp ≥ 0.12）为 127 837 张 / 179.58 GB / 853.24 GP，平均 6.67 MP/张；已优化过 249 767 张。
 - 存储版本：schema v10、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
 - 维护实测（主库）：39.6 万行逐张 `stat` 的快速检查 19.9 s，缺失 0、孤儿 0、非内容寻址文件 1；缩略图 9 段 9.24 GB、未引用字节 0；embedding 1.217 GB 与 pose 43.1 MB 各恰好一条/张、垃圾 0；556 个标签里 382 个图片数为 0。
-- 自动检查（2026-10-29，整改批次 B 之后）：`cargo fmt --check`、`cargo check --all-targets`（裸与 headless）、`cargo clippy --all-targets`（0 警告）、`cargo test`（487 通过、9 ignored）、`cargo test --features headless` 的 9 个验收目标共 31 个用例（`acceptance_folders` / `acceptance_history` / `acceptance_maintenance` / `acceptance_import` / `acceptance_metadata` / `acceptance_viewer_edit` / `acceptance_ai` / `acceptance_optimize` / `acceptance_library`，含 3 个 heavy）。其余 5 个验收目标、`perf_*` 基准与前端检查沿用批次 B 之前的结论（`npm run typecheck` / `test:web` / `build` 在 B3 那轮通过，本批不改前端）。
+- 自动检查（2026-10-29，整改批次 C 之后）：`cargo fmt --check`、`cargo check --all-targets`（裸与 headless）、`cargo clippy --all-targets`（0 警告）、`cargo test`（492 通过、9 ignored）、`cargo test --features headless` 的 7 个验收目标共 29 个用例（`acceptance_folders` / `acceptance_history` / `acceptance_metadata` / `acceptance_import` / `acceptance_maintenance` / `acceptance_library` / `acceptance_tasks`，含 2 个 heavy）。其余 7 个验收目标、`perf_*` 基准与前端检查沿用批次 B 之前的结论（`npm run typecheck` / `test:web` / `build` 在 B3 那轮通过，本批不改前端）。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

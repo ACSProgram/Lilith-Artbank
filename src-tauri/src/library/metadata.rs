@@ -1385,6 +1385,29 @@ pub fn set_trashed(database: &LibraryDb, image_ids: &[i64], trashed: bool) -> Ap
     set_trashed_with_id(database, image_ids, trashed).map(|(changed, _)| changed)
 }
 
+/// 恢复单张图片的守卫：图片所在文件夹整目录在回收站里时拒绝，避免出现
+/// 「正常图片位于已删除文件夹」——那种行会让空回收站永远释放不掉这个文件夹。
+fn reject_restore_from_trashed_folder(transaction: &Transaction<'_>, ids: &[i64]) -> AppResult<()> {
+    for chunk in ids.chunks(SQL_CHUNK) {
+        let marks = placeholders(chunk.len());
+        let count: i64 = transaction.query_row(
+            &format!(
+                "SELECT count(*) FROM images
+                 JOIN folders ON folders.id = images.folder_id
+                 WHERE images.id IN ({marks}) AND folders.trashed_at IS NOT NULL"
+            ),
+            params_from_iter(chunk.iter()),
+            |row| row.get(0),
+        )?;
+        if count > 0 {
+            return Err(AppError::message(
+                "已删除文件夹下的图片不能单张恢复；请恢复整个文件夹",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn set_trashed_with_id(
     database: &LibraryDb,
     image_ids: &[i64],
@@ -1401,31 +1424,6 @@ pub fn set_trashed_with_id(
     } else {
         (HistoryKind::Restore, "恢复图片")
     };
-    if !trashed {
-        let blocked = database.with_reader(|connection| {
-            for chunk in ids.chunks(SQL_CHUNK) {
-                let marks = placeholders(chunk.len());
-                let count: i64 = connection.query_row(
-                    &format!(
-                        "SELECT count(*) FROM images
-                         JOIN folders ON folders.id = images.folder_id
-                         WHERE images.id IN ({marks}) AND folders.trashed_at IS NOT NULL"
-                    ),
-                    params_from_iter(chunk.iter()),
-                    |row| row.get(0),
-                )?;
-                if count > 0 {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })?;
-        if blocked {
-            return Err(AppError::message(
-                "已删除文件夹下的图片不能单张恢复；请恢复整个文件夹",
-            ));
-        }
-    }
     // 只处理仍处于目标状态的行；待释放行不参与，否则会把标记中的图片恢复成正常图片。
     let matches = if trashed {
         "deleted_at IS NULL"
@@ -1437,6 +1435,11 @@ pub fn set_trashed_with_id(
         database,
         NewOperation::new(kind, label),
         |transaction, draft| {
+            if !trashed {
+                // 必须在写事务里判断：文件夹整目录删除也走同一条写连接，
+                // 事务外检查会与它擦肩而过，留下「正常图片位于已删除文件夹」的非法状态。
+                reject_restore_from_trashed_folder(transaction, &ids)?;
+            }
             let now = now_ms();
             let mut triples = Vec::new();
             let mut changed = 0_u64;
@@ -1506,7 +1509,8 @@ fn mark_for_purge(
             Ok(connection.query_row(
                 "SELECT count(*) FROM folders
                  WHERE kind = 'normal' AND trashed_at IS NOT NULL
-                   AND purge_operation_id IS NULL",
+                   AND (purge_operation_id IS NULL
+                        OR purge_operation_id NOT IN (SELECT id FROM operations))",
                 [],
                 |row| row.get::<_, i64>(0),
             )? as u64)
@@ -1554,10 +1558,13 @@ fn mark_for_purge(
                 reporter.report(done, total);
             }
             let folders_marked = if image_ids.is_none() {
+                // 无主标记（记录已被裁剪或清空）一并改成这次的记录：上次因为目录不空
+                // 没释放掉的文件夹，下次清空回收站时再试一次。
                 transaction.execute(
                     "UPDATE folders SET purge_operation_id = ?1
                      WHERE kind = 'normal' AND trashed_at IS NOT NULL
-                       AND purge_operation_id IS NULL",
+                       AND (purge_operation_id IS NULL
+                            OR purge_operation_id NOT IN (SELECT id FROM operations))",
                     [draft.id()],
                 )? as u64
             } else {
@@ -1671,17 +1678,52 @@ pub fn purge_by_operation(
     })?;
 
     let mut files = Vec::with_capacity(selected.len());
+    // 路径无效的行不能删：删了用户既看不见也查不到，留着还能在检查图库里定位。
+    let mut invalid: Vec<(i64, String, String)> = Vec::new();
     for (image_id, content_hash, file_ext, folder_path) in selected {
+        let stored = format!("{folder_path}/{content_hash}.{file_ext}");
         match content_path(&paths, &folder_path, &content_hash, &file_ext) {
             Ok(path) => files.push((image_id, path)),
-            Err(error) => log::warn!("跳过无效图片路径 image={image_id}: {error}"),
+            Err(error) => {
+                log::warn!("保留无法定位原图的图片行 image={image_id}，原路径 {stored}：{error}");
+                invalid.push((image_id, stored, error.to_string()));
+            }
         }
     }
 
-    let total = files.len();
+    let total = files.len() + invalid.len();
     reporter.report(0, total);
     let mut report = DeleteReport::default();
     let mut done = 0_usize;
+
+    // 无效路径行只清掉待释放标记：留着标记会让「还有待释放文件」永远为真，
+    // 每次写入后都重新排一次释放任务，而且这个任务永远清不掉它。
+    for chunk in invalid.chunks(SQL_CHUNK) {
+        let ids: Vec<i64> = chunk.iter().map(|(id, _, _)| *id).collect();
+        database.with_durable_writer(|connection| {
+            let transaction = connection.transaction()?;
+            let marks = placeholders(ids.len());
+            let ops = placeholders(operation_ids.len());
+            transaction.execute(
+                &format!(
+                    "UPDATE images SET purge_operation_id = NULL
+                     WHERE id IN ({marks}) AND purge_operation_id IN ({ops})"
+                ),
+                params_from_iter(ids.iter().chain(operation_ids.iter())),
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
+        for (image_id, stored, reason) in chunk {
+            report.failures.push(BatchFailure {
+                image_id: Some(*image_id),
+                path: stored.clone(),
+                reason: format!("无法定位原图，已保留图片行：{reason}"),
+            });
+            done += 1;
+            reporter.report(done, total);
+        }
+    }
 
     for chunk in files.chunks(SQL_CHUNK) {
         if reporter.cancelled() {
@@ -1705,11 +1747,17 @@ pub fn purge_by_operation(
             if path.exists() {
                 match remove_content_file(&paths.root, path) {
                     Ok(()) => report.files_removed += 1,
-                    Err(error) => report.failures.push(BatchFailure {
-                        image_id: Some(*image_id),
-                        path: path.to_string_lossy().into_owned(),
-                        reason: error.to_string(),
-                    }),
+                    Err(error) => {
+                        log::warn!(
+                            "删除原图失败 image={image_id}，文件位于 {}：{error}",
+                            path.display()
+                        );
+                        report.failures.push(BatchFailure {
+                            image_id: Some(*image_id),
+                            path: path.to_string_lossy().into_owned(),
+                            reason: error.to_string(),
+                        });
+                    }
                 }
             }
             done += 1;
@@ -1717,18 +1765,20 @@ pub fn purge_by_operation(
         }
     }
     if !reporter.cancelled() {
-        purge_folders_for_operation(database, root, operation_ids)?;
+        purge_folders_for_operation(database, root, operation_ids, &mut report)?;
     }
     Ok(report)
 }
 
 /// 释放文件夹：自底向上删除已无图片、已无子文件夹且磁盘目录为空的回收站文件夹行。
 ///
-/// 目录里还有未纳管文件时保留行并记警告，留给下一次释放；不会递归强删。
+/// 目录里还有未纳管文件时保留行与待释放标记，只记日志与失败清单；不会递归强删。
+/// 这类文件夹不在每次开库时自动重试，等下次清空回收站重新标记时再试。
 fn purge_folders_for_operation(
     database: &LibraryDb,
     root: &Path,
     operation_ids: &[i64],
+    report: &mut DeleteReport,
 ) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
     let mut rows: Vec<(i64, String)> = Vec::new();
@@ -1767,39 +1817,47 @@ fn purge_folders_for_operation(
             continue;
         }
         let directory = paths.folder_dir(&path);
-        if directory.exists() {
-            if let Err(error) = ensure_dir_inside_root(&paths.root, &directory) {
-                log::warn!(
-                    "跳过图库外的回收站目录：{error}；目录位于 {}",
-                    directory.display()
-                );
-                continue;
-            }
-            match std::fs::read_dir(&directory) {
-                Ok(mut entries) => {
-                    if entries.next().is_some() {
-                        log::warn!(
-                            "回收站文件夹目录不是空的，暂不删除：{}",
-                            directory.display()
-                        );
-                        continue;
-                    }
-                }
+        let deferred = match folder_dir_state(&paths, &path) {
+            FolderDirState::Missing => None,
+            FolderDirState::Empty => match std::fs::remove_dir(&directory) {
+                Ok(()) => None,
                 Err(error) => {
                     log::warn!(
-                        "读取回收站目录失败：{error}；目录位于 {}",
+                        "删除回收站空目录失败：{error}；目录位于 {}",
                         directory.display()
                     );
-                    continue;
+                    Some(format!("删除空目录失败：{error}"))
                 }
-            }
-            if let Err(error) = std::fs::remove_dir(&directory) {
+            },
+            FolderDirState::NotEmpty => {
                 log::warn!(
-                    "删除回收站空目录失败：{error}；目录位于 {}",
+                    "回收站文件夹目录里还有未纳管文件，保留待释放标记：{}",
                     directory.display()
                 );
-                continue;
+                Some("目录里还有未纳管文件，暂不删除；清空该目录后再清空回收站会重试".to_owned())
             }
+            FolderDirState::Unreadable => {
+                log::warn!(
+                    "读取回收站目录失败，保留待释放标记：{}",
+                    directory.display()
+                );
+                Some("无法读取目录，暂不删除".to_owned())
+            }
+            FolderDirState::OutsideRoot => {
+                log::warn!(
+                    "跳过图库外的回收站目录，保留待释放标记：{}",
+                    directory.display()
+                );
+                Some("目录位于图库之外，暂不删除".to_owned())
+            }
+        };
+        if let Some(reason) = deferred {
+            report.failures.push(BatchFailure {
+                image_id: None,
+                path: path.clone(),
+                reason,
+            });
+            continue;
         }
         database.with_durable_writer(|connection| {
             connection.execute(
@@ -1810,6 +1868,38 @@ fn purge_folders_for_operation(
         })?;
     }
     Ok(())
+}
+
+/// 回收站文件夹目录的磁盘状态；只有「不存在」与「空」能在这一轮释放里删掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderDirState {
+    Missing,
+    Empty,
+    NotEmpty,
+    Unreadable,
+    OutsideRoot,
+}
+
+/// 判断回收站文件夹目录能否直接删除。释放与「还有没有待释放文件」共用这一份口径，
+/// 否则两边对「卡住的文件夹」判断不一致，会每次开库都白排一次释放任务。
+pub(crate) fn folder_dir_state(paths: &LibraryPaths, folder_path: &str) -> FolderDirState {
+    let directory = paths.folder_dir(folder_path);
+    if !directory.exists() {
+        return FolderDirState::Missing;
+    }
+    if ensure_dir_inside_root(&paths.root, &directory).is_err() {
+        return FolderDirState::OutsideRoot;
+    }
+    match std::fs::read_dir(&directory) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                FolderDirState::NotEmpty
+            } else {
+                FolderDirState::Empty
+            }
+        }
+        Err(_) => FolderDirState::Unreadable,
+    }
 }
 
 pub(crate) fn content_path(
@@ -2536,6 +2626,96 @@ mod tests {
         .unwrap();
         assert!(!trashed_path.exists());
         assert!(image_details(&fixture.session.db, &fixture.root, trashed).is_err());
+    }
+
+    /// 路径无效的行删掉就再也查不到：保留行、清掉待释放标记，并在报告里给出原路径。
+    #[test]
+    fn release_keeps_rows_whose_content_path_is_invalid() {
+        let fixture = fixture();
+        let hash = "b".repeat(64);
+        let broken = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                // 扩展名没规范化：`content_path` 会拒绝，这类行永远定位不到原图。
+                connection.execute(
+                    "INSERT INTO images(
+                        content_hash, file_ext, folder_id, file_size, width, height, format,
+                        has_alpha, phash, colors4, colors8, score, description, imported_at,
+                        modified_at, deleted_at
+                     ) VALUES (?1, 'JPG', ?2, 100, 10, 10, 'jpeg', 0, zeroblob(32),
+                        zeroblob(16), zeroblob(32), 0, '', 1, 1, 1)",
+                    params![hash, fixture.folder],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        let (_, operation) = history::write_with_id(
+            &fixture.session.db,
+            NewOperation::new(HistoryKind::PermanentDelete, "永久删除"),
+            |transaction, draft| {
+                transaction.execute(
+                    "UPDATE images SET purge_operation_id = ?1 WHERE id = ?2",
+                    params![draft.id(), broken],
+                )?;
+                draft.affected(1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let operation = operation.unwrap();
+
+        let report = purge_by_operation(
+            &fixture.session.db,
+            &fixture.root,
+            &[operation],
+            &NoopReporter,
+        )
+        .unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.files_removed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].path.contains(&hash),
+            "失败清单要给出原路径：{:?}",
+            report.failures[0].path
+        );
+
+        let (rows, purge): (i64, Option<i64>) = fixture
+            .session
+            .db
+            .with_reader(|connection| {
+                Ok((
+                    connection.query_row("SELECT count(*) FROM images", [], |row| row.get(0))?,
+                    connection
+                        .query_row(
+                            "SELECT purge_operation_id FROM images WHERE id = ?1",
+                            [broken],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "行保留，仍能在回收站里看到");
+        assert!(purge.is_none(), "待释放标记要清掉，否则永远释放不完");
+    }
+
+    /// 恢复图片的守卫在写事务里：被拒时不能留下一条空的操作记录。
+    #[test]
+    fn rejecting_a_restore_from_a_trashed_folder_leaves_no_record() {
+        let fixture = fixture();
+        let image_id = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
+        crate::library::folders::trash(&fixture.session.db, fixture.folder).unwrap();
+        let before = history::list(&fixture.session.db).unwrap().len();
+
+        assert!(set_trashed(&fixture.session.db, &[image_id], false).is_err());
+        assert_eq!(
+            history::list(&fixture.session.db).unwrap().len(),
+            before,
+            "被拒的恢复不该写记录"
+        );
     }
 
     fn tag_pair_count(fixture: &Fixture, tag_id: i64) -> u64 {
