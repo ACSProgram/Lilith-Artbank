@@ -4789,8 +4789,11 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
     task.set_total(total as usize);
     let mut offset = 0_usize;
     let mut failures = 0_usize;
+    let mut stopped = false;
     for (operation_id, count) in batches {
         if task.should_cancel() {
+            // 停在块边界：没处理的行还带着待释放标记，下次释放接着删。
+            stopped = true;
             break;
         }
         let reporter = OffsetReporter {
@@ -4812,16 +4815,23 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
                 failure.path.clone(),
                 failure.reason.clone(),
             );
+            task.inc_failed();
             failures += 1;
         }
         offset += count as usize;
         task.report(offset, total as usize);
     }
+    let mut message = String::new();
     if failures > 0 {
-        task.set_message(format!("{failures} 项未能释放，详见失败清单与日志"));
-    } else {
-        task.set_message("");
+        message.push_str(&format!("{failures} 项未能释放，详见失败清单与日志"));
     }
+    if stopped {
+        if !message.is_empty() {
+            message.push_str(" · ");
+        }
+        message.push_str("已停止，剩余待释放保留到下次");
+    }
+    task.set_message(message);
     Ok(())
 }
 
@@ -5160,6 +5170,39 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+        assert!(!has_orphan_purge(fixture.db(), &fixture.root).unwrap());
+    }
+
+    /// 释放任务取消后停下：没处理的行还带着待释放标记，下次接着删。
+    #[test]
+    fn release_stops_on_cancel_and_keeps_pending_marks() {
+        let fixture = Fixture::new();
+        let first = fixture.insert_image("a");
+        let first_path = fixture.write_content("a");
+        let second = fixture.insert_image("b");
+        let second_path = fixture.write_content("b");
+        metadata::set_trashed(fixture.db(), &[first, second], true).unwrap();
+        // 两次永久删除 → 两批待释放；记录被裁掉后一起变成无主批次。
+        metadata::delete_images(fixture.db(), &[first], &NoopReporter).unwrap();
+        metadata::delete_images(fixture.db(), &[second], &NoopReporter).unwrap();
+        trim(fixture.db(), 0).unwrap();
+
+        let stopped = TaskHandle::new("release", TaskKind::ReleaseGarbage, "释放删除文件");
+        stopped.set_cancellable(true);
+        stopped.request_cancel();
+        run_release(fixture.db(), &fixture.root, stopped.clone()).unwrap();
+        assert!(stopped.should_cancel());
+        assert!(
+            stopped.snapshot().message.contains("剩余待释放保留到下次"),
+            "{}",
+            stopped.snapshot().message
+        );
+        // 一行都没删：文件与标记都还在，下次释放继续。
+        assert!(first_path.exists() && second_path.exists());
+        assert!(has_orphan_purge(fixture.db(), &fixture.root).unwrap());
+
+        run_release(fixture.db(), &fixture.root, task()).unwrap();
+        assert!(!first_path.exists() && !second_path.exists());
         assert!(!has_orphan_purge(fixture.db(), &fixture.root).unwrap());
     }
 

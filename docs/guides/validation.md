@@ -39,7 +39,7 @@ EXE=src-tauri/target/debug/lilith-artbank.exe
 ```
 
 - 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`import run|start|cancel|status`、`metadata score|set-score|description|tags|add-tags|remove-tags|rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash`、`folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash`、`collection list|create|rename|delete|reorder|add|remove|combine`、`history list|undo|redo|clear`、`viewer source`、`edit estimate|save`、`task list|wait|cancel`、`maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags`、`optimize estimate`、`ai status|health|ensure|embed-text|shutdown|embed|pose|pose-get|describe|search|similar|groups|keeps|temp-features|features`、`mcp status`、`scenario <name>`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
-- 场景（同进程编排）：`import_cancel`、`task_queue_cancel`、`task_panic`、`close_during_task`、`folder_lock`、`ai_lock`、`maintenance_check`、`idle_gc`、`idle_yield`、`mcp_bridge`、`mcp_modes`、`optimize_flow`、`ai_search_flow`、`ai_temp_flow`。`ai_lock` 用假任务占资源；`acceptance_ai` 里的 `ai_*` 场景只连测试进程内的假 `/v1` 服务，不接真实 AI。
+- 场景（同进程编排）：`import_cancel`、`task_queue_cancel`、`task_panic`、`close_during_task`、`epoch_switch`、`folder_lock`、`ai_lock`、`maintenance_check`、`idle_gc`、`idle_yield`、`mcp_bridge`、`mcp_modes`、`optimize_flow`、`ai_search_flow`、`ai_temp_flow`。`ai_lock` 用假任务占资源；`acceptance_ai` 里的 `ai_*` 场景只连测试进程内的假 `/v1` 服务，不接真实 AI。
 - 估算凭证、语义/相似结果 token、MCP 审批队列与临时文件夹都是进程内状态，跨进程会失效；这些流程用同进程场景（`optimize_flow`、`ai_search_flow`、`ai_temp_flow`、`mcp_modes`）编排，不拆成多条命令。
 - `LILITH_IDLE_THRESHOLD_MS` / `LILITH_IDLE_POLL_MS` 只在 `features=headless` 构建里生效，用于把自动回收的空闲窗口缩短到秒级；GUI 构建固定 3 分钟 / 30 秒。
 - `--library <path>` 在执行命令前显式打开图库；无头模式不自动打开上次图库。`--result <file>` 另存格式化结果；stdout 始终只有一行 JSON，含 `command/ok/cancelled/elapsedMs/peakWorkingSetBytes/data/error`；退出码 0 成功、1 失败、2 取消。
@@ -63,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Tier heavy
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Targets acceptance_import
 ```
 
-- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1–B3 共 48 个用例：默认 45 个 cheap/default；3 个 heavy（9,455 文件完整检查、20,000 张移动、300 张纹理压缩）只在 `heavy` 档运行。
+- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。14 个目标共 50 个用例：默认 47 个 cheap/default；3 个 heavy（9,455 文件完整检查、20,000 张移动、300 张纹理压缩）只在 `heavy` 档运行。
 - `acceptance_ai` 的 `/v1` 服务在测试进程内用 `TcpListener` 启动，返回确定性向量；`acceptance_mcp` 启动真实的 `--mcp-stdio` 子进程，只通过 JSON-RPC 行与磁盘事实断言。两者都不加载模型、不访问外网。
 - 工作区在 `<target>/acceptance/workspaces/`，正常结束自动回收；每个用例向 `<target>/acceptance/report.jsonl` 追加一行（名称、档位、成败、耗时、命令数、峰值工作集、文件数与字节数）。
 - 排查失败用例时设 `LILITH_ACCEPT_KEEP=1`：工作区不再回收，用例会把它打印成 `[keep] <路径>`。`LILITH_ACCEPT_BIN` 换被测二进制，`LILITH_ACCEPT_DISK_BUDGET` 改工作区磁盘预算（默认 2 GiB）。

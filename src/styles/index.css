@@ -5923,6 +5923,10 @@ body.is-drag-sorting * {
   color: var(--danger);
 }
 
+.task-phase-partialFailed {
+  color: var(--warning);
+}
+
 .task-phase-completed {
   color: var(--success);
 }

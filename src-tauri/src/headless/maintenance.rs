@@ -224,6 +224,7 @@ fn run_scenario(
         "task_queue_cancel" => scenario_task_queue_cancel(app, options, cancelled),
         "task_panic" => scenario_task_panic(app),
         "close_during_task" => scenario_close_during_task(app, options),
+        "epoch_switch" => scenario_epoch_switch(app, options),
         "folder_lock" => scenario_folder_lock(app, options),
         "ai_lock" => scenario_ai_lock(app, options),
         "idle_gc" => scenario_idle_gc(app, options),
@@ -493,6 +494,45 @@ fn scenario_task_panic(app: &tauri::AppHandle) -> Result<Value, String> {
     Ok(json!({
         "failed": failed,
         "followUp": follow,
+        "idle": state.tasks.wait_idle(Duration::from_secs(10)),
+    }))
+}
+
+/// 排队任务在换库后拿到资源时按代次取消：这是一行都没写的安全取消。
+fn scenario_epoch_switch(app: &tauri::AppHandle, options: &Options) -> Result<Value, String> {
+    let state = app.state::<AppState>();
+    let request: HoldRequest = options.request_or_default()?;
+    let hold = hold_task(
+        app,
+        TaskKind::Thumbnail,
+        "验收占位内容写",
+        crate::concurrency::resources::ResourceRequest::session_read()
+            .with_content_writer()
+            .with_paths(vec![crate::concurrency::resources::PathScope::write("")]),
+        Duration::from_millis(request.hold_ms.max(200)),
+    )?;
+    // 内容写被占住，回收任务只能排队。
+    let queued = started_task(trace::write("start_pack_compact", || {
+        AppError::command(state.start_pack_compact(app.clone()))
+    })?)?;
+    wait_phase(
+        state.inner(),
+        &queued.task_id,
+        |phase| phase == "queued",
+        Duration::from_secs(5),
+    )?;
+    // 等价于「关库把代次推进了一代」；排队者还没写任何东西。
+    state.tasks.bump_epoch();
+    let queued_after = wait_task(state.inner(), &queued.task_id)?;
+    let holder_after = wait_handle(state.inner(), &hold)?;
+    let closed = state.close_library();
+    let still_open = state.status().map_err(|error| error.to_string())?.is_some();
+    Ok(json!({
+        "queued": queued_after,
+        "holder": holder_after,
+        "closed": closed.is_ok(),
+        "closeError": closed.err().map(|error| error.to_string()),
+        "libraryStillOpen": still_open,
         "idle": state.tasks.wait_idle(Duration::from_secs(10)),
     }))
 }

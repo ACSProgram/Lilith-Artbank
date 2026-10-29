@@ -210,14 +210,34 @@ pub enum CompactStop {
     Yielded,
     /// 用户点了取消。
     Cancelled,
+    /// 中途出错；已回收的段留在报告里，不再让整份结果消失。
+    Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactReport {
+    /// 指针已经切到新段、旧段不再被引用的段数。
     pub segments: u64,
+    /// 真正从磁盘上删掉、确实回收了的字节；删不掉的不算。
     pub freed_bytes: u64,
+    /// 旧段文件删不掉的数量（Windows 上通常是还有读句柄）。
+    pub delete_failed: u64,
     pub stop: CompactStop,
+    /// `stop == Failed` 时的原因；其余情况为空。
+    pub error: Option<String>,
+}
+
+impl CompactReport {
+    fn new() -> Self {
+        Self {
+            segments: 0,
+            freed_bytes: 0,
+            delete_failed: 0,
+            stop: CompactStop::Done,
+            error: None,
+        }
+    }
 }
 
 /// 回收所有垃圾率超过触发阈值的段；被打断就带着已完成的部分返回。
@@ -231,11 +251,7 @@ pub fn compact(
     reporter: &dyn BatchReporter,
     user_back: &dyn Fn() -> bool,
 ) -> AppResult<CompactReport> {
-    let mut report = CompactReport {
-        segments: 0,
-        freed_bytes: 0,
-        stop: CompactStop::Done,
-    };
+    let mut report = CompactReport::new();
     loop {
         if reporter.cancelled() {
             report.stop = CompactStop::Cancelled;
@@ -254,17 +270,28 @@ pub fn compact(
             segment.id,
             segment.garbage_ratio() * 100.0
         ));
-        match compact_segment(database, root, reporter, user_back, &segment)? {
-            SegmentOutcome::Compacted(freed) => {
+        match compact_segment(database, root, reporter, user_back, &segment) {
+            Ok(SegmentOutcome::Compacted { freed, deleted }) => {
                 report.segments += 1;
-                report.freed_bytes += freed;
+                if deleted {
+                    report.freed_bytes += freed;
+                } else {
+                    report.delete_failed += 1;
+                }
             }
-            SegmentOutcome::Yielded => {
+            Ok(SegmentOutcome::Yielded) => {
                 report.stop = CompactStop::Yielded;
                 break;
             }
-            SegmentOutcome::Cancelled => {
+            Ok(SegmentOutcome::Cancelled) => {
                 report.stop = CompactStop::Cancelled;
+                break;
+            }
+            Err(error) => {
+                // 前几段已经提交并删掉了；把半份结果交回去，别让用户以为一段都没回收。
+                log::warn!("回收缩略图包失败：{error}");
+                report.stop = CompactStop::Failed;
+                report.error = Some(error.to_string());
                 break;
             }
         }
@@ -322,7 +349,11 @@ fn stats_segments_only(database: &LibraryDb) -> AppResult<Vec<SegmentStat>> {
 }
 
 enum SegmentOutcome {
-    Compacted(u64),
+    /// `deleted` 为假表示指针已经切走，但旧段文件删不掉（还有读句柄）。
+    Compacted {
+        freed: u64,
+        deleted: bool,
+    },
     Yielded,
     Cancelled,
 }
@@ -374,8 +405,11 @@ fn compact_segment(
             transaction.commit()?;
             Ok(())
         })?;
-        remove_quietly(&old_path);
-        return Ok(SegmentOutcome::Compacted(segment.garbage));
+        let deleted = remove_segment(&old_path);
+        return Ok(SegmentOutcome::Compacted {
+            freed: segment.garbage,
+            deleted,
+        });
     }
 
     let reader = File::open(&old_path)?;
@@ -460,14 +494,15 @@ fn compact_segment(
     }
 
     // 提交后等两秒再删旧段：这期间新到的读请求已经全部指向新指针。
-    // 仍失败的请求由现有的缩略图 404 重试兜底；删除失败只记日志，留待下次回收。
+    // 删不掉不当作已释放：退回的字节数只用真正删掉的部分算。
     std::thread::sleep(DELETE_DELAY);
-    if let Err(error) = std::fs::remove_file(&old_path) {
-        log::warn!("删除旧缩略图段 {} 失败：{error}", segment.id);
-    }
+    let deleted = remove_segment(&old_path);
 
     reporter.report(pointers.len(), pointers.len());
-    Ok(SegmentOutcome::Compacted(segment.garbage))
+    Ok(SegmentOutcome::Compacted {
+        freed: segment.garbage,
+        deleted,
+    })
 }
 
 fn next_segment_id(database: &LibraryDb, directory: &Path) -> AppResult<u32> {
@@ -511,6 +546,18 @@ fn remove_quietly(path: &Path) {
         && error.kind() != io::ErrorKind::NotFound
     {
         log::warn!("删除缩略图包 {} 失败：{error}", path.display());
+    }
+}
+
+/// 删旧段并报告是否真的消失；文件本来就不算成功（不需要再删一次）。
+fn remove_segment(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            log::warn!("删除旧缩略图段 {} 失败：{error}", path.display());
+            false
+        }
     }
 }
 
@@ -816,6 +863,38 @@ mod tests {
         assert_eq!(
             cleanup_orphan_segments(fixture.db(), &fixture.root).unwrap(),
             0
+        );
+    }
+
+    /// 复制阶段出错不能把整份结果丢掉：报告里要带 stop=Failed 与原因。
+    #[test]
+    fn a_broken_pointer_returns_a_failed_report_with_the_reason() {
+        let fixture = Fixture::new();
+        fixture.add('b', b"0123456789");
+        fixture.make_garbage();
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute("UPDATE images SET thumb_offset = 999999", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let report = compact(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            &NoopReporter,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(report.stop, CompactStop::Failed);
+        assert_eq!(report.segments, 0);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(
+            report.error.as_deref().unwrap_or_default().contains("越界"),
+            "{:?}",
+            report.error
         );
     }
 

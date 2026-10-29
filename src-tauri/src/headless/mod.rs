@@ -813,7 +813,7 @@ fn usage() -> String {
          \x20    search|similar|groups|keeps|temp-features|features\n\
          \x20 mcp status\n\
          \x20 scenario import_cancel|task_queue_cancel|task_panic|close_during_task\n\
-         \x20          folder_lock|ai_lock|maintenance_check|idle_gc|idle_yield\n\
+         \x20          epoch_switch|folder_lock|ai_lock|maintenance_check|idle_gc|idle_yield\n\
          \x20          mcp_bridge|mcp_modes|optimize_flow|ai_search_flow|ai_temp_flow\n\
          \x20 fixture seed-db|write-image|corpus\n\
          \x20 logs emit|path\n\

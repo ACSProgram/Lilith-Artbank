@@ -2,6 +2,10 @@
 //!
 //! 所有资源一次性申请：全部可用才同时占用，否则一个都不占。等待者按“与该请求冲突的
 //! 既有等待者”排队，这同时实现了路径锁的写者优先——文件夹写者等待时，新读者不再插队。
+//!
+//! 排队中的任务一个字节都没写，所以它只在**路径锁**上占用优先权：短写（评分、标签、
+//! 集合）立即申请时不看排队者，不会被“排队等 AI 的描述任务”挡住；路径写者优先保留，
+//! 否则一个文件夹写者会被源源不断的读者饿死。
 
 use std::{
     collections::VecDeque,
@@ -263,11 +267,16 @@ pub fn normalize_path(path: &str) -> String {
 pub struct Conflict {
     pub holder: HolderInfo,
     pub detail: String,
+    /// 占用者自己还没开始（只是排着队），文案要说“排队中”而不是“正在进行”。
+    pub queued: bool,
 }
 
 impl Conflict {
     /// “「导入」正在写入「角色」文件夹”这样的短句，调用方自行补“请……”。
     pub fn sentence(&self) -> String {
+        if self.queued {
+            return format!("「{}」还在排队、尚未开始", self.holder.label);
+        }
         if self.detail.is_empty() {
             format!("「{}」{}", self.holder.label, self.holder.reason)
         } else {
@@ -490,6 +499,7 @@ impl TableState {
                         .request
                         .conflicting_path(request)
                         .map(|(held, _)| held),
+                    false,
                 ));
             }
         }
@@ -498,10 +508,14 @@ impl TableState {
                 continue;
             }
             // 只让排在前面的等待者挡路：否则两个互斥的写者会互相等待。
-            // `None` 表示立即申请，等于排在所有等待者之后，因此要检查全部。
             if let Some(own) = own_waiter
                 && waiter.seq >= own
             {
+                continue;
+            }
+            // 立即申请（`None`）虽然排在所有等待者之后，但等待者一个字节都还没写：
+            // 只保留路径锁上的优先权，粗资源上的等待者不挡评分、标签这类短写。
+            if own_waiter.is_none() && !shares_path_conflict(request, &waiter.request) {
                 continue;
             }
             if request.conflicts_with(&waiter.request) {
@@ -512,6 +526,7 @@ impl TableState {
                         .request
                         .conflicting_path(request)
                         .map(|(held, _)| held),
+                    true,
                 ));
             }
         }
@@ -519,10 +534,20 @@ impl TableState {
     }
 }
 
+fn shares_path_conflict(left: &ResourceRequest, right: &ResourceRequest) -> bool {
+    left.paths.iter().any(|left| {
+        right
+            .paths
+            .iter()
+            .any(|right| path_scopes_conflict(left, right))
+    })
+}
+
 fn describe(
     holder: &HolderInfo,
     holder_request: &ResourceRequest,
     holder_scope: Option<&PathScope>,
+    queued: bool,
 ) -> Conflict {
     let detail = holder_scope.map_or_else(
         || holder.reason.clone(),
@@ -545,6 +570,7 @@ fn describe(
     Conflict {
         holder: holder.clone(),
         detail,
+        queued,
     }
 }
 
@@ -689,6 +715,96 @@ mod tests {
         }
         drop(held);
         assert!(table.is_idle());
+    }
+
+    // 排队者还没写过一个字节：短写（评分/标签/集合）不能被它挡住。
+    #[test]
+    fn a_queued_task_does_not_block_short_writes() {
+        use std::sync::Arc as Shared;
+        let table = Shared::new(ResourceTable::new());
+        // 正在跑的 AI 任务：只占 AI 服务与内容写，不写元数据。
+        let running = table
+            .try_acquire(
+                &ResourceRequest::session_read()
+                    .with_ai_service()
+                    .with_content_writer(),
+                &holder("embedding"),
+            )
+            .unwrap();
+
+        // 描述任务排在它后面，请求里带 metadata_writer。
+        let queued_table = table.clone();
+        let queued = std::thread::spawn(move || {
+            queued_table.acquire(
+                &ResourceRequest::session_read()
+                    .with_ai_service()
+                    .with_content_writer()
+                    .with_metadata_writer(),
+                &holder("description"),
+                None,
+                &|| false,
+            )
+        });
+        for _ in 0..200 {
+            if table.has_waiters() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(table.has_waiters(), "描述任务应当排上队");
+
+        let short = table.try_acquire(
+            &ResourceRequest::session_read().with_metadata_writer(),
+            &holder("score"),
+        );
+        assert!(short.is_ok(), "排队中的任务不该挡住改评分");
+        drop(short);
+
+        // 真正冲突的短写仍然按占用者拒绝。
+        let blocked = table.try_acquire(
+            &ResourceRequest::session_read().with_content_writer(),
+            &holder("edit"),
+        );
+        assert!(blocked.is_err());
+
+        drop(running);
+        let guard = queued.join().unwrap().unwrap();
+        drop(guard);
+        assert!(table.is_idle());
+    }
+
+    /// 路径锁的写者优先保留：排队中的文件夹写者照样挡住新的读者。
+    #[test]
+    fn a_queued_path_writer_still_blocks_readers_and_says_so() {
+        use std::sync::Arc as Shared;
+        let table = Shared::new(ResourceTable::new());
+        let held = table.try_acquire(&read("角色"), &holder("reader")).unwrap();
+
+        let writer_table = table.clone();
+        let writer = std::thread::spawn(move || {
+            writer_table.acquire(&write("角色"), &holder("move"), None, &|| false)
+        });
+        for _ in 0..200 {
+            if table.has_waiters() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let conflicts = table
+            .try_acquire(&read("角色"), &holder("viewer"))
+            .err()
+            .expect("写者在等时新读者不能插队");
+        assert!(conflicts[0].queued);
+        assert!(
+            conflicts[0].sentence().contains("排队"),
+            "排队者不能说成正在进行：{}",
+            conflicts[0].sentence()
+        );
+
+        drop(held);
+        let guard = writer.join().unwrap().unwrap();
+        drop(guard);
     }
 
     #[test]

@@ -555,7 +555,7 @@ impl AppState {
                 {
                     match task.phase {
                         TaskPhase::Completed => view.status = ApprovalStatus::Completed,
-                        TaskPhase::Failed => {
+                        TaskPhase::PartialFailed | TaskPhase::Failed => {
                             view.status = ApprovalStatus::Failed;
                             if view.error.is_none() {
                                 view.error = Some(task.message.clone());
@@ -762,6 +762,8 @@ impl AppState {
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        // 换库算换了一代：换库期间提交、还在排队的任务拿到资源后会直接取消。
+        self.tasks.bump_epoch();
         self.restart_idle_loop();
         Ok(info)
     }
@@ -798,6 +800,8 @@ impl AppState {
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        // 换库算换了一代：换库期间提交、还在排队的任务拿到资源后会直接取消。
+        self.tasks.bump_epoch();
         self.restart_idle_loop();
         drop(_session);
         if self.managed.load(Ordering::SeqCst) {
@@ -844,6 +848,8 @@ impl AppState {
 
     pub fn close_library(&self) -> AppResult<()> {
         // 内容写任务不能中途关库；排队中的写任务也算，不能等关库时再启动。
+        // 这一步放在停空闲线程之前：停线程要等它退出（最多 1 秒），期间短任务可能已经结束，
+        // 拒绝理由就会时有时无。
         if let Some(task) = self
             .tasks
             .active()
@@ -860,17 +866,22 @@ impl AppState {
                 task.label
             )));
         }
+        // 先停空闲回收再取消任务：它可能正停在「判断空闲 → 提交回收任务」之间，
+        // 那一步会在关库之后落地，拿着旧库的句柄继续压缩略图包。停线程会 join，
+        // 返回时不可能再有新的自动回收。
+        self.stop_idle_loop();
         self.tasks.cancel_for_close();
         // 可取消任务与短操作释放资源后再关库；超时会点名占用者。
         let _session =
             self.begin_session_write("关闭图库", "关闭图库", Some(Duration::from_secs(10)))?;
+        // 从这一刻起图库算换了代：排队任务拿到资源时会发现自己已经过期，直接取消。
+        self.tasks.bump_epoch();
         if let Some((database, _, root)) = self.library_handles()
             && let Err(error) = temp::clear(&database, &root)
         {
             log::warn!("关闭图库前清空临时文件夹失败：{error}");
         }
         self.ai.library_closed();
-        self.stop_idle_loop();
         activity::reset();
         *self.library.lock() = None;
         *self.recovery.lock() = RecoveryPlan::default();
@@ -881,6 +892,8 @@ impl AppState {
         self.mcp_sheets.lock().clear();
         self.mcp_approvals.clear();
         query::clear_page_cache();
+        // 关库期间提交的任务已经拿着旧句柄，再递增一次让它们一起作废。
+        self.tasks.bump_epoch();
         self.settings.set_library_path(None)?;
         Ok(())
     }
@@ -897,9 +910,9 @@ impl AppState {
             return;
         }
         // 排队任务还没占资源，退出前直接取消，避免关闭过程中突然启动。
+        self.stop_idle_loop();
         self.tasks.cancel_queued();
         self.tasks.cancel_for_close();
-        self.stop_idle_loop();
         if !self.tasks.wait_idle(Duration::from_secs(2)) {
             log::warn!("退出时任务未停止，临时文件夹留到下次打开图库时清空");
             return;
@@ -1467,7 +1480,8 @@ impl AppState {
             TaskKind::ReleaseGarbage,
             "清空操作记录",
         );
-        handle.set_cancellable(false);
+        // 清空本身是一条事务；随后的释放和自动释放一样按块检查取消，所以同样允许取消。
+        handle.set_cancellable(true);
         let app = self.app.clone();
         let worker = handle.clone();
         let tasks = self.tasks.clone();
@@ -1497,7 +1511,7 @@ impl AppState {
                             .and_then(|_| history::run_release(&database, &root, task.clone()));
                         query::clear_page_cache();
                         ai.invalidate_similarity();
-                        task.finish_from(&result);
+                        finish_release(&task, &result);
                     },
                 );
             },
@@ -1708,7 +1722,9 @@ impl AppState {
             TaskKind::ReleaseGarbage,
             scope,
         );
-        handle.set_cancellable(false);
+        // 可在块边界停下：没处理的行还带着待释放标记，下次释放接着删，
+        // 所以关库不必等几十万文件删完，用户也能自己取消。
+        handle.set_cancellable(true);
         let app = self.app.clone();
         let worker = handle.clone();
         let tasks = self.tasks.clone();
@@ -1730,7 +1746,7 @@ impl AppState {
                     let result = history::run_release(&database, &root, task.clone());
                     query::clear_page_cache();
                     ai.invalidate_similarity();
-                    task.finish_from(&result);
+                    finish_release(&task, &result);
                 });
             })
     }
@@ -1920,7 +1936,9 @@ impl AppState {
                         let holder =
                             HolderInfo::new(worker.id(), "重建缩略图").with_path_note("正在读取");
                         let mut consecutive_failures = 0_usize;
-                        for image_id in pending {
+                        let mut settled = 0_usize;
+                        let mut aborted = false;
+                        for image_id in pending.iter().copied() {
                             if worker.should_cancel() {
                                 break;
                             }
@@ -1940,23 +1958,34 @@ impl AppState {
                                 Ok(true) => {
                                     worker.inc_completed();
                                     consecutive_failures = 0;
+                                    settled += 1;
                                 }
                                 Ok(false) => {
                                     worker.inc_skipped();
                                     consecutive_failures = 0;
+                                    settled += 1;
                                 }
                                 Err(error) => {
                                     worker.inc_failed();
                                     worker.add_failure(Some(image_id), "", error.to_string());
+                                    settled += 1;
                                     consecutive_failures += 1;
                                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                                        worker.set_message("连续多张缩略图处理失败，任务已停止");
+                                        aborted = true;
                                         break;
                                     }
                                 }
                             }
                         }
-                        worker.finish_from(&Ok(()));
+                        if aborted {
+                            // 停在这里不是“完成”：剩下的图一张都没做过，必须说清楚。
+                            let remaining = pending.len().saturating_sub(settled);
+                            worker.finish_partial(format!(
+                                "连续 {MAX_CONSECUTIVE_FAILURES} 张失败，任务已停止；还有 {remaining} 张未处理"
+                            ));
+                        } else {
+                            worker.finish_from(&Ok(()));
+                        }
                     });
             },
         )
@@ -2175,23 +2204,6 @@ impl AppState {
                             // 否则跑完那一刻会从 1.7 万跳到 7 万，环图与进度一起翻车。
                             worker.set_skipped(report.progress_skipped());
                             worker.set_skip_breakdown(&report.skip_buckets());
-                            let mut summary = format!(
-                                "已替换 {} 张 · 省 {}",
-                                report.processed,
-                                format_savings(report.savings_bytes)
-                            );
-                            let skipped = report.progress_skipped();
-                            if skipped > 0 {
-                                summary.push_str(&format!(" · 已跳过 {skipped} 张"));
-                            }
-                            // 未纳入候选 = 前置判据排除 + 执行前复核剔除，与估算视图同名分组。
-                            let excluded = report.prefilter_skipped + dropped;
-                            if excluded > 0 {
-                                summary.push_str(&format!(" · 未纳入候选 {excluded} 张"));
-                            }
-                            if report.failed > 0 {
-                                summary.push_str(&format!(" · 失败 {} 张", report.failed));
-                            }
                             // 报告里的失败清单要进任务胶囊，否则用户只知道失败了几张。
                             for failure in &report.failures {
                                 worker.add_failure(
@@ -2200,12 +2212,10 @@ impl AppState {
                                     &failure.reason,
                                 );
                             }
-                            worker.set_message(&summary);
-                            if report.stop_reason.is_some() {
-                                worker.finish(TaskPhase::Failed);
-                            } else {
-                                worker.finish_from(&Ok(()));
-                            }
+                            let cancelled = report.cancelled || worker.should_cancel();
+                            let (phase, summary) = optimize_outcome(&report, dropped, cancelled);
+                            worker.set_message(summary);
+                            worker.finish(phase);
                         }
                         Err(error) => {
                             if let Err(error) = operation.finish(&error.to_string()) {
@@ -2313,31 +2323,9 @@ impl AppState {
                     };
                     match pack_gc::compact(&database, &root, &thumbs, &*worker, &user_back) {
                         Ok(report) => {
-                            let freed = format_savings(report.freed_bytes);
-                            let message = match report.stop {
-                                pack_gc::CompactStop::Done => {
-                                    format!("已回收 {} 个段 · 释放 {freed}", report.segments)
-                                }
-                                pack_gc::CompactStop::Yielded => format!(
-                                    "已让位 · 已回收 {} 个段 · 释放 {freed}，剩余部分下次空闲继续",
-                                    report.segments
-                                ),
-                                pack_gc::CompactStop::Cancelled => {
-                                    format!("已停止 · 已回收 {} 个段 · 释放 {freed}", report.segments)
-                                }
-                            };
-                            worker.set_message(&message);
-                            match report.stop {
-                                pack_gc::CompactStop::Yielded => {
-                                    worker.finish(TaskPhase::Yielded)
-                                }
-                                pack_gc::CompactStop::Cancelled => {
-                                    worker.finish(TaskPhase::Cancelled)
-                                }
-                                pack_gc::CompactStop::Done => {
-                                    worker.finish_from(&Ok::<(), AppError>(()))
-                                }
-                            }
+                            let (phase, message) = pack_compact_outcome(&report);
+                            worker.set_message(message);
+                            worker.finish(phase);
                         }
                         Err(error) => {
                             worker.set_message(error.to_string());
@@ -2632,6 +2620,103 @@ fn conflict_sentence(conflicts: &[Conflict]) -> String {
         .unwrap_or_else(|| "有操作正在进行".to_owned())
 }
 
+/// 释放任务的终态：有释放失败就是「部分失败」，让用户知道有些文件还在磁盘上。
+fn finish_release(task: &TaskHandle, result: &AppResult<()>) {
+    if let Err(error) = result {
+        task.set_message(error.to_string());
+        task.finish(TaskPhase::Failed);
+        return;
+    }
+    if task.should_cancel() {
+        task.finish(TaskPhase::Cancelled);
+        return;
+    }
+    if task.failed() > 0 {
+        task.finish(TaskPhase::PartialFailed);
+    } else {
+        task.finish(TaskPhase::Completed);
+    }
+}
+
+/// 压缩执行的终态与摘要：失败张数、未删旧原图、未纳入候选都写进同一句话。
+///
+/// 用户取消优先于其他结果：取消时跑的仍是中途停止，不能落成「完成」。
+fn optimize_outcome(
+    report: &crate::library::optimize::OptimizeReport,
+    dropped: u64,
+    cancelled: bool,
+) -> (TaskPhase, String) {
+    let mut summary = format!(
+        "已替换 {} 张 · 省 {}",
+        report.processed,
+        format_savings(report.savings_bytes)
+    );
+    let skipped = report.progress_skipped();
+    if skipped > 0 {
+        summary.push_str(&format!(" · 已跳过 {skipped} 张"));
+    }
+    // 未纳入候选 = 前置判据排除 + 执行前复核剔除，与估算视图同名分组。
+    let excluded = report.prefilter_skipped + dropped;
+    if excluded > 0 {
+        summary.push_str(&format!(" · 未纳入候选 {excluded} 张"));
+    }
+    if report.failed > 0 {
+        summary.push_str(&format!(" · 失败 {} 张", report.failed));
+    }
+    // 旧原图删不掉时“省 X”并不成立：文件还在磁盘上，必须说出来。
+    if report.delete_failed > 0 {
+        summary.push_str(&format!(" · {} 张旧原图未删除", report.delete_failed));
+    }
+    let phase = if cancelled {
+        TaskPhase::Cancelled
+    } else if report.stop_reason.is_some() {
+        TaskPhase::Failed
+    } else if report.delete_failed > 0 {
+        TaskPhase::PartialFailed
+    } else {
+        TaskPhase::Completed
+    };
+    (phase, summary)
+}
+
+/// 缩略图包回收的终态与文案：删不掉旧段不等于回收成功，半途出错也不抹掉已回收的段。
+fn pack_compact_outcome(report: &pack_gc::CompactReport) -> (TaskPhase, String) {
+    use pack_gc::CompactStop;
+
+    let freed = format_savings(report.freed_bytes);
+    let mut message = match report.stop {
+        CompactStop::Done => format!("已回收 {} 个段 · 释放 {freed}", report.segments),
+        CompactStop::Yielded => format!(
+            "已让位 · 已回收 {} 个段 · 释放 {freed}，剩余部分下次空闲继续",
+            report.segments
+        ),
+        CompactStop::Cancelled => {
+            format!("已停止 · 已回收 {} 个段 · 释放 {freed}", report.segments)
+        }
+        CompactStop::Failed => format!(
+            "已回收 {} 个段 · 释放 {freed}，之后出错：{}",
+            report.segments,
+            report.error.as_deref().unwrap_or("未知错误")
+        ),
+    };
+    if report.delete_failed > 0 {
+        // 段行已经删了，残留文件不会再被回收任务碰到；下次打开图库时统一清掉。
+        message.push_str(&format!(
+            " · {} 个旧段删除失败，空间要等下次打开图库时清理",
+            report.delete_failed
+        ));
+    }
+    let phase = match report.stop {
+        CompactStop::Yielded => TaskPhase::Yielded,
+        CompactStop::Cancelled => TaskPhase::Cancelled,
+        CompactStop::Failed if report.segments == 0 => TaskPhase::Failed,
+        CompactStop::Failed => TaskPhase::PartialFailed,
+        CompactStop::Done if report.delete_failed > 0 => TaskPhase::PartialFailed,
+        CompactStop::Done => TaskPhase::Completed,
+    };
+    (phase, message)
+}
+
 /// 移动图片的任务级路径写：源文件夹与目标文件夹；源文件夹过多时退化为根写。
 fn move_resource_request(
     database: &LibraryDb,
@@ -2885,4 +2970,110 @@ fn inspection_summary(report: &InspectionReport) -> String {
         message = format!("扫描 {} 张 · 没有发现问题", report.scanned_rows);
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::library::pack_gc::{CompactReport, CompactStop};
+
+    fn compact_report(stop: CompactStop, segments: u64, delete_failed: u64) -> CompactReport {
+        CompactReport {
+            segments,
+            freed_bytes: segments * 1024 * 1024,
+            delete_failed,
+            stop,
+            error: (stop == CompactStop::Failed).then(|| "缩略图指针越界".to_owned()),
+        }
+    }
+
+    #[test]
+    fn compact_without_problems_is_completed() {
+        let (phase, message) = pack_compact_outcome(&compact_report(CompactStop::Done, 2, 0));
+        assert_eq!(phase, TaskPhase::Completed);
+        assert!(message.contains("已回收 2 个段"), "{message}");
+        assert!(!message.contains("删除失败"), "{message}");
+    }
+
+    /// 旧段删不掉时释放字节不算数，结果只能是「部分失败」。
+    #[test]
+    fn compact_with_undeleted_segments_is_partial() {
+        let (phase, message) = pack_compact_outcome(&compact_report(CompactStop::Done, 2, 1));
+        assert_eq!(phase, TaskPhase::PartialFailed);
+        assert!(message.contains("1 个旧段删除失败"), "{message}");
+    }
+
+    /// 半途出错也要交出已回收的部分，而不是整份失败。
+    #[test]
+    fn compact_failing_after_a_segment_is_partial() {
+        let (phase, message) = pack_compact_outcome(&compact_report(CompactStop::Failed, 1, 0));
+        assert_eq!(phase, TaskPhase::PartialFailed);
+        assert!(message.contains("缩略图指针越界"), "{message}");
+    }
+
+    /// 一段都没回收就出错，没有什么可以保留的，直接失败。
+    #[test]
+    fn compact_failing_before_any_segment_is_failed() {
+        let (phase, _) = pack_compact_outcome(&compact_report(CompactStop::Failed, 0, 0));
+        assert_eq!(phase, TaskPhase::Failed);
+    }
+
+    #[test]
+    fn compact_yielded_and_cancelled_keep_their_phases() {
+        assert_eq!(
+            pack_compact_outcome(&compact_report(CompactStop::Yielded, 1, 0)).0,
+            TaskPhase::Yielded
+        );
+        assert_eq!(
+            pack_compact_outcome(&compact_report(CompactStop::Cancelled, 1, 0)).0,
+            TaskPhase::Cancelled
+        );
+    }
+
+    fn optimize_report() -> crate::library::optimize::OptimizeReport {
+        crate::library::optimize::OptimizeReport {
+            processed: 10,
+            savings_bytes: 1024 * 1024,
+            ..Default::default()
+        }
+    }
+
+    /// 旧原图删不掉时“省 X”不成立：终态是「部分失败」，摘要要点名未删张数。
+    #[test]
+    fn optimize_with_undeleted_originals_is_partial() {
+        let mut report = optimize_report();
+        report.delete_failed = 3;
+        report.deleted_files = 7;
+        let (phase, summary) = optimize_outcome(&report, 0, false);
+        assert_eq!(phase, TaskPhase::PartialFailed);
+        assert!(summary.contains("3 张旧原图未删除"), "{summary}");
+    }
+
+    #[test]
+    fn optimize_without_problems_is_completed() {
+        let (phase, summary) = optimize_outcome(&optimize_report(), 2, false);
+        assert_eq!(phase, TaskPhase::Completed);
+        assert!(summary.contains("已替换 10 张"), "{summary}");
+        assert!(!summary.contains("未删除"), "{summary}");
+    }
+
+    /// 连续失败提前停止仍是彻底失败，不因为删掉了部分旧图就变「部分失败」。
+    #[test]
+    fn optimize_stopped_early_is_failed() {
+        let mut report = optimize_report();
+        report.delete_failed = 1;
+        report.stop_reason = Some("连续失败过多".to_owned());
+        let (phase, summary) = optimize_outcome(&report, 0, false);
+        assert_eq!(phase, TaskPhase::Failed);
+        assert!(summary.contains("1 张旧原图未删除"), "{summary}");
+    }
+
+    /// 取消是中途停止：跑了多少张都不能写成「完成」或「部分失败」。
+    #[test]
+    fn optimize_cancelled_is_cancelled() {
+        let mut report = optimize_report();
+        report.cancelled = true;
+        let (phase, _) = optimize_outcome(&report, 0, true);
+        assert_eq!(phase, TaskPhase::Cancelled);
+    }
 }

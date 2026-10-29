@@ -410,6 +410,49 @@ fn heavy_check_9455_files() {
     report.success();
 }
 
+/// 连续 5 张失败就停下：终态必须是「部分失败」并给出未处理张数，不能说成已完成。
+#[test]
+fn thumbnail_rebuild_stops_after_repeated_failures() {
+    if skip_unless(
+        Tier::Cheap,
+        "thumbnail_rebuild_stops_after_repeated_failures",
+    ) {
+        return;
+    }
+    let workspace = Workspace::new();
+    let mut report = Report::new(
+        "thumbnail_rebuild_stops_after_repeated_failures",
+        Tier::Cheap,
+        &workspace,
+    );
+    let (library, _) = create_library(&workspace);
+    seed(&workspace, &library, &mut report, 8);
+    for path in image_files(&workspace, &library) {
+        fs::remove_file(&path).unwrap();
+    }
+
+    let rebuilt = headless(&workspace, "maintenance")
+        .action("thumbnails")
+        .library(&library)
+        .request(json!({ "overwrite": true }))
+        .finish();
+    report.record(&rebuilt);
+    rebuilt.expect_ok();
+    let task = &rebuilt.data()["task"];
+    assert_eq!(task["phase"], "partialFailed", "{task}");
+    assert_eq!(task["failed"], 5, "连续 5 张失败后应当停下：{task}");
+    assert!(
+        task["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("未处理"),
+        "要说明还剩多少张没做：{task}"
+    );
+
+    workspace.assert_within_budget();
+    report.success();
+}
+
 #[test]
 fn zero_tags_are_deleted_and_recorded() {
     if skip_unless(Tier::Cheap, "zero_tags_are_deleted_and_recorded") {

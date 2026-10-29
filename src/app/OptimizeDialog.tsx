@@ -22,6 +22,7 @@ import {
   appendRuntimePoint,
   compareOptimizeEstimate,
   earlySavingsHint,
+  optimizeRunReachedEnd,
   type OptimizeComparisonKey,
   type RuntimeOptimizePoint,
 } from "./optimizeProgress";
@@ -467,7 +468,7 @@ export function OptimizeDialog({
     }
     if (executeTaskId) {
       const previous = list.find((item) => item.taskId === executeTaskId);
-      if (previous && previous.phase === "completed") return;
+      if (previous && optimizeRunReachedEnd(previous.phase)) return;
     }
 
     // 默认配置。

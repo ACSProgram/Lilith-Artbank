@@ -7,6 +7,7 @@ import {
   compareOptimizeEstimate,
   curveAt,
   earlySavingsHint,
+  optimizeRunReachedEnd,
   type RuntimeOptimizePoint,
 } from "./optimizeProgress.ts";
 
@@ -92,6 +93,16 @@ test("预计与实际对照按三项给出实际与预计", () => {
       ["count", 50, 48],
     ],
   );
+});
+
+test("部分失败仍算跑完，取消与失败算中途停止", () => {
+  const partial = compareOptimizeEstimate(
+    { savingsBytes: 1_000, estimatedSeconds: 60, processCount: 50 },
+    { savedBytes: 900, elapsedSeconds: 70, completed: 50, status: "partialFailed" },
+  );
+  assert.equal(partial.completed, true);
+  assert.equal(optimizeRunReachedEnd("failed"), false);
+  assert.equal(optimizeRunReachedEnd("yielded"), false);
 });
 
 test("取消或缺失字段时不崩", () => {

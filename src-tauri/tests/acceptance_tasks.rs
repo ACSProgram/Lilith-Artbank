@@ -149,6 +149,48 @@ fn close_is_refused_while_write_task_runs_then_allowed() {
     report.success();
 }
 
+/// 排队任务在换库（代次前进）后拿到资源时必须直接取消，不能拿着旧句柄开工。
+#[test]
+fn queued_task_is_cancelled_after_the_library_epoch_moves() {
+    if skip_unless(
+        Tier::Cheap,
+        "queued_task_is_cancelled_after_the_library_epoch_moves",
+    ) {
+        return;
+    }
+    let workspace = Workspace::new();
+    let mut report = Report::new(
+        "queued_task_is_cancelled_after_the_library_epoch_moves",
+        Tier::Cheap,
+        &workspace,
+    );
+    let (library, _) = create_library(&workspace);
+
+    let scenario = headless(&workspace, "scenario")
+        .action("epoch_switch")
+        .library(&library)
+        .request(json!({ "holdMs": 400 }))
+        .finish();
+    report.record(&scenario);
+    scenario.expect_ok();
+    let data = scenario.data();
+    let queued = &data["queued"];
+    assert_eq!(queued["phase"], "cancelled", "{data}");
+    assert!(
+        queued["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("图库已切换"),
+        "排队任务要说明是因为换库才没做：{data}"
+    );
+    assert_eq!(data["closed"], true, "{data}");
+    assert_eq!(data["libraryStillOpen"], false, "{data}");
+    assert_eq!(data["idle"], true, "{data}");
+
+    workspace.assert_within_budget();
+    report.success();
+}
+
 #[test]
 fn folder_lock_blocks_rename_until_holder_finishes() {
     if skip_unless(

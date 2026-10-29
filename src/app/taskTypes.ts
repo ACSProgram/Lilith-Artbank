@@ -34,7 +34,9 @@ export type TaskPhase =
   | "cancelled"
   /** 空闲回收让位给用户；不是用户取消。 */
   | "yielded"
-  | "failed";
+  | "failed"
+  /** 做完能做的部分但有失败项：失败张数、未删旧文件数写在 message 里。 */
+  | "partialFailed";
 
 export type ConflictPolicy = "fail" | "queue";
 export type BatchTaskKind =
@@ -266,6 +268,7 @@ export const TASK_PHASE_LABELS: Record<TaskPhase, string> = {
   cancelled: "已取消",
   yielded: "已让位",
   failed: "失败",
+  partialFailed: "部分失败",
 };
 
 /** 取消中要等当前批次收尾；取消不回退已经做完的部分。 */
@@ -275,9 +278,15 @@ export function isTaskActive(task: TaskSnapshot): boolean {
   return !isTerminalPhase(task.phase);
 }
 
-/** 终态：与 Rust 的 `TaskPhase::is_terminal` 一一对应，含「已让位」。 */
+/** 终态：与 Rust 的 `TaskPhase::is_terminal` 一一对应，含「已让位」与「部分失败」。 */
 export function isTerminalPhase(phase: TaskPhase): boolean {
-  return phase === "completed" || phase === "cancelled" || phase === "yielded" || phase === "failed";
+  return (
+    phase === "completed" ||
+    phase === "cancelled" ||
+    phase === "yielded" ||
+    phase === "failed" ||
+    phase === "partialFailed"
+  );
 }
 
 /** 进度条百分比：后端给了加权值就用它，否则按「已完成 + 失败 + 跳过 / 总数」计算。 */

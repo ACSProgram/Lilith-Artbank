@@ -5,6 +5,7 @@
 //! 长任务冲突时默认按资源 FIFO 排队，路径锁写者优先，短操作仍立即失败。
 //! `TaskLane` 只用于任务中心的展示与优先级提示，不再决定冲突。
 //! 任务体 panic、线程起不来或提前返回都在这里落到失败终态，并释放资源。
+//! 排队中的任务不占任何资源；真正开始时还要核对图库代次，换库后直接取消。
 //! 进度通过 `task-progress` / `task-finished` 事件推给前端任务中心。
 
 use std::{
@@ -121,6 +122,9 @@ impl TaskKind {
     }
 
     /// 关闭图库时可以直接取消的任务；其余写任务仍要求用户等待完成。
+    ///
+    /// 释放删除文件也在其中：它按块检查取消，停下时待释放标记还在，
+    /// 下次释放接着删，所以关库不必等它把几十万文件删完。
     pub fn can_cancel_for_close(self) -> bool {
         matches!(
             self,
@@ -134,6 +138,7 @@ impl TaskKind {
                 | Self::CheckLibrary
                 | Self::Export
                 | Self::PackCompact
+                | Self::ReleaseGarbage
         )
     }
 }
@@ -159,13 +164,15 @@ pub enum TaskPhase {
     /// 空闲回收让位给用户；不复用「已取消」，用户没点取消。
     Yielded,
     Failed,
+    /// 做完了能做的部分，但有失败项：失败张数、未删旧文件数或未处理张数写在消息里。
+    PartialFailed,
 }
 
 impl TaskPhase {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Cancelled | Self::Yielded | Self::Failed
+            Self::Completed | Self::Cancelled | Self::Yielded | Self::Failed | Self::PartialFailed
         )
     }
 }
@@ -410,6 +417,11 @@ impl TaskHandle {
         self.failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 已记录的失败条数；失败清单本身最多留 200 条，计数不受这个上限影响。
+    pub fn failed(&self) -> usize {
+        self.failed.load(Ordering::Relaxed)
+    }
+
     pub fn inc_skipped(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
     }
@@ -496,6 +508,13 @@ impl TaskHandle {
             }
         };
         self.finish(phase);
+    }
+
+    /// 部分完成：有失败张数、未删旧文件或未处理张数时用它，
+    /// 让胶囊既不显示「已完成」，也不把做成的部分说成失败。
+    pub fn finish_partial(&self, message: impl Into<String>) {
+        self.set_message(message);
+        self.finish(TaskPhase::PartialFailed);
     }
 
     pub fn snapshot(&self) -> TaskSnapshot {
@@ -720,6 +739,10 @@ pub struct TaskBus {
     inner: Arc<BusInner>,
     resources: Arc<ResourceTable>,
     images: Arc<ImageBudget>,
+    /// 图库代次：开库、换库、关库时递增。排队中的任务在拿到资源时核对代次，
+    /// 发现图库已经换了就直接取消，不会在旧句柄上写库。关库时会前后各递增一次，
+    /// 让关库期间提交的任务也一起作废。
+    epoch: Arc<AtomicU64>,
 }
 
 impl Default for TaskBus {
@@ -738,7 +761,21 @@ impl TaskBus {
             inner: Arc::new(BusInner::default()),
             resources: Arc::new(ResourceTable::new()),
             images,
+            epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 图库换过一代；由开库/关库调用。
+    pub fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn epoch_moved(&self, seen: u64) -> bool {
+        self.epoch.load(Ordering::SeqCst) != seen
     }
 
     pub fn resources(&self) -> Arc<ResourceTable> {
@@ -986,6 +1023,7 @@ impl TaskBus {
         handle: Arc<TaskHandle>,
         request: ResourceRequest,
     ) -> AppResult<LaneGuard> {
+        let stamp = self.epoch();
         self.register(handle.clone());
         spawn_pump(app.clone(), handle.clone());
         let holder = holder_for(&handle, &request);
@@ -1001,10 +1039,13 @@ impl TaskBus {
             .acquire(&request, &holder, None, &|| handle.should_cancel())
         {
             Ok(guard) => {
-                if handle.should_cancel() {
+                if let Err(reason) = self.admit_queued(&handle, stamp) {
                     drop(guard);
+                    if let Some(reason) = reason {
+                        handle.set_message(reason);
+                    }
                     handle.finish(TaskPhase::Cancelled);
-                    return Err(AppError::message("任务已取消"));
+                    return Err(AppError::message(reason.unwrap_or("任务已取消")));
                 }
                 handle.set_message("");
                 handle.set_phase(TaskPhase::Preparing);
@@ -1032,6 +1073,7 @@ impl TaskBus {
     {
         let name = format!("task-{}", handle.id());
         let holder = holder_for(&handle, &request);
+        let stamp = self.epoch();
 
         if policy == ConflictPolicy::Fail {
             match self.resources.try_acquire(&request, &holder) {
@@ -1072,8 +1114,11 @@ impl TaskBus {
                     .acquire(&request, &holder, None, &|| queued.should_cancel())
                 {
                     Ok(guard) => {
-                        if queued.should_cancel() {
+                        if let Err(reason) = bus.admit_queued(&queued, stamp) {
                             drop(guard);
+                            if let Some(reason) = reason {
+                                queued.set_message(reason);
+                            }
                             queued.finish(TaskPhase::Cancelled);
                             return;
                         }
@@ -1090,6 +1135,20 @@ impl TaskBus {
                 task: Box::new(snapshot),
             })
         }
+    }
+
+    /// 排队者在拿到资源那一刻的复核：用户已经取消，或排队期间图库被关掉/换掉。
+    ///
+    /// 返回 `Err(None)` 表示已被取消（消息保持原样），`Err(Some(原因))` 表示代次过期、
+    /// 要把原因写给用户。命中时代次说明任务一行都没写，就地取消是安全的。
+    fn admit_queued(&self, handle: &TaskHandle, stamp: u64) -> Result<(), Option<&'static str>> {
+        if handle.should_cancel() {
+            return Err(None);
+        }
+        if self.epoch_moved(stamp) {
+            return Err(Some("图库已切换，任务未开始"));
+        }
+        Ok(())
     }
 }
 
@@ -1630,10 +1689,11 @@ mod tests {
         assert_eq!(TaskKind::CheckLibrary.label(), "检查图库");
         assert_eq!(TaskKind::Export.label(), "导出图片");
         assert_eq!(TaskKind::OrphanMove.label(), "清理孤儿文件");
-        // 关库时不阻塞的：检查、导出、回收；孤儿移动要等它做完。
+        // 关库时不阻塞的：检查、导出、回收与释放；孤儿移动要等它做完。
         assert!(TaskKind::CheckLibrary.can_cancel_for_close());
         assert!(TaskKind::Export.can_cancel_for_close());
         assert!(TaskKind::PackCompact.can_cancel_for_close());
+        assert!(TaskKind::ReleaseGarbage.can_cancel_for_close());
         assert!(!TaskKind::OrphanMove.can_cancel_for_close());
     }
 
@@ -1651,5 +1711,46 @@ mod tests {
         let tasks = bus.list();
         assert!(tasks.iter().any(|task| task.task_id == "running"));
         assert_eq!(tasks.len(), MAX_TASKS);
+    }
+
+    /// 排队期间换库（关库/开库）：拿到资源时按代次取消，不再碰旧库。
+    #[test]
+    fn a_queued_task_is_dropped_when_the_library_epoch_moves() {
+        let bus = TaskBus::new();
+        let handle = TaskHandle::new("queued", TaskKind::Thumbnail, "选中 3 张");
+        let stamp = bus.epoch();
+        assert!(bus.admit_queued(&handle, stamp).is_ok());
+
+        bus.bump_epoch();
+        let refused = bus.admit_queued(&handle, stamp);
+        assert_eq!(refused, Err(Some("图库已切换，任务未开始")));
+
+        // 新提交的任务拿到的是新代次，不受影响。
+        let fresh = bus.epoch();
+        assert!(bus.admit_queued(&handle, fresh).is_ok());
+    }
+
+    /// 取消优先于代次：用户点过取消的任务不该被写成「图库已切换」。
+    #[test]
+    fn a_cancelled_queued_task_keeps_its_own_message() {
+        let bus = TaskBus::new();
+        let handle = TaskHandle::new("queued", TaskKind::Thumbnail, "选中 3 张");
+        let stamp = bus.epoch();
+        bus.bump_epoch();
+        handle.request_cancel();
+        assert_eq!(bus.admit_queued(&handle, stamp), Err(None));
+    }
+
+    /// 部分失败是终态并保留说明；取消按钮不再出现。
+    #[test]
+    fn partial_failure_is_terminal_and_keeps_the_message() {
+        let handle = TaskHandle::new("partial", TaskKind::PackCompact, "立即回收");
+        handle.set_phase(TaskPhase::Running);
+        handle.finish_partial("已回收 1 个段 · 释放 12 MB · 2 个旧段删除失败");
+        let snapshot = handle.snapshot();
+        assert!(snapshot.phase.is_terminal());
+        assert_eq!(snapshot.phase, TaskPhase::PartialFailed);
+        assert!(snapshot.message.contains("删除失败"));
+        assert!(handle.is_finished());
     }
 }

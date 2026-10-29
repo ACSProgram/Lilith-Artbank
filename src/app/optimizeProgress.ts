@@ -169,6 +169,14 @@ export interface OptimizeComparison {
   completed: boolean;
 }
 
+/**
+ * 是否跑完了全部候选：完成与「部分失败」都算（后者只是个别旧文件没删掉）；
+ * 取消、失败与让位都是中途停止。
+ */
+export function optimizeRunReachedEnd(status: TaskPhase | null | undefined): boolean {
+  return status === "completed" || status === "partialFailed";
+}
+
 /** 预计与实际对照；取消或失败时保留实际部分，不写成“未达预计”的结论。 */
 export function compareOptimizeEstimate(
   estimate: Pick<OptimizeEstimate, "savingsBytes" | "estimatedSeconds" | "processCount">,
@@ -194,5 +202,5 @@ export function compareOptimizeEstimate(
       actual: finite(execution.completed),
     },
   ];
-  return { rows, completed: execution.status === "completed" };
+  return { rows, completed: optimizeRunReachedEnd(execution.status) };
 }
