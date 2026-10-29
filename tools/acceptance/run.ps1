@@ -20,7 +20,10 @@ param(
         'acceptance_history',
         'acceptance_viewer_edit',
         'acceptance_tasks',
-        'acceptance_maintenance'
+        'acceptance_maintenance',
+        'acceptance_optimize',
+        'acceptance_ai',
+        'acceptance_mcp'
     )
 )
 

@@ -174,22 +174,32 @@ pub(super) fn dispatch(
 }
 
 /// 起一个批量任务并等到终态，返回终态快照。
-fn run_batch(
+pub(super) fn run_batch(
     app: &tauri::AppHandle,
     request: BatchTaskRequest,
     cancelled: &Cell<bool>,
+) -> Result<TaskSnapshot, String> {
+    run_batch_with_timeout(app, request, cancelled, super::TASK_TIMEOUT)
+}
+
+/// 同 [`run_batch`]，但允许长任务放宽等待上限。
+pub(super) fn run_batch_with_timeout(
+    app: &tauri::AppHandle,
+    request: BatchTaskRequest,
+    cancelled: &Cell<bool>,
+    timeout: Duration,
 ) -> Result<TaskSnapshot, String> {
     let state = app.state::<AppState>();
     let start = trace::write("start_batch_task", || {
         AppError::command(state.start_batch_task(app.clone(), request))
     })?;
     let task = started_task(start)?;
-    let snapshot = wait_task(&state, &task.task_id)?;
+    let snapshot = wait_task_with_timeout(&state, &task.task_id, timeout)?;
     check_task(&snapshot, cancelled)?;
     Ok(snapshot)
 }
 
-fn started_task(start: TaskStartResult) -> Result<TaskSnapshot, String> {
+pub(super) fn started_task(start: TaskStartResult) -> Result<TaskSnapshot, String> {
     match start {
         TaskStartResult::Started { task } => Ok(*task),
         TaskStartResult::Conflict { active } => {
@@ -218,6 +228,11 @@ fn run_scenario(
         "ai_lock" => scenario_ai_lock(app, options),
         "idle_gc" => scenario_idle_gc(app, options),
         "idle_yield" => scenario_idle_yield(app, options),
+        "mcp_bridge" => super::mcp::scenario_bridge(app, options),
+        "mcp_modes" => super::mcp::scenario_modes(app, options),
+        "optimize_flow" => super::optimize::scenario(app, options, cancelled),
+        "ai_search_flow" => super::ai::scenario(app, options),
+        "ai_temp_flow" => super::ai::temp_scenario(app, options, cancelled),
         other => Err(format!("未知场景：{other}")),
     }
 }

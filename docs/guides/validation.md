@@ -21,7 +21,7 @@
 
 ## 无窗口验收入口（开发期）
 
-`headless` feature 提供 `--headless` 命令面，用于在后台验证图库状态、文件事实、设置、查询、日志与写路径。B1–B2 已落地；范围、档位与预算见[无窗口验收测试计划](../planning/2026-10-29-无窗口验收测试计划.md)。
+`headless` feature 提供 `--headless` 命令面，用于在后台验证图库状态、文件事实、设置、查询、日志、写路径、优化、AI 协议与 MCP。B1–B3 已落地；范围、档位与预算见[归档计划](../planning/archive/2026-10-29-无窗口验收测试计划.md)，实际覆盖与手工边界见[待办](../planning/todo.md)每组标题下的「自动覆盖」行。
 
 ```bash
 cargo build --manifest-path src-tauri/Cargo.toml --features headless
@@ -38,8 +38,9 @@ EXE=src-tauri/target/debug/lilith-artbank.exe
 "$EXE" --headless logs emit --request-json '{"level":"debug","lines":2,"lineBytes":8}'
 ```
 
-- 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`import run|start|cancel|status`、`metadata score|set-score|description|tags|add-tags|remove-tags|rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash`、`folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash`、`collection list|create|rename|delete|reorder|add|remove|combine`、`history list|undo|redo|clear`、`viewer source`、`edit estimate|save`、`task list|wait|cancel`、`maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags`、`scenario <name>`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
-- 场景（同进程编排）：`import_cancel`、`task_queue_cancel`、`task_panic`、`close_during_task`、`folder_lock`、`ai_lock`、`maintenance_check`、`idle_gc`、`idle_yield`。`ai_lock` 用假任务占资源，不接真实 AI。
+- 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`import run|start|cancel|status`、`metadata score|set-score|description|tags|add-tags|remove-tags|rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash`、`folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash`、`collection list|create|rename|delete|reorder|add|remove|combine`、`history list|undo|redo|clear`、`viewer source`、`edit estimate|save`、`task list|wait|cancel`、`maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags`、`optimize estimate`、`ai status|health|ensure|embed-text|shutdown|embed|pose|pose-get|describe|search|similar|groups|keeps|temp-features|features`、`mcp status`、`scenario <name>`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
+- 场景（同进程编排）：`import_cancel`、`task_queue_cancel`、`task_panic`、`close_during_task`、`folder_lock`、`ai_lock`、`maintenance_check`、`idle_gc`、`idle_yield`、`mcp_bridge`、`mcp_modes`、`optimize_flow`、`ai_search_flow`、`ai_temp_flow`。`ai_lock` 用假任务占资源；`acceptance_ai` 里的 `ai_*` 场景只连测试进程内的假 `/v1` 服务，不接真实 AI。
+- 估算凭证、语义/相似结果 token、MCP 审批队列与临时文件夹都是进程内状态，跨进程会失效；这些流程用同进程场景（`optimize_flow`、`ai_search_flow`、`ai_temp_flow`、`mcp_modes`）编排，不拆成多条命令。
 - `LILITH_IDLE_THRESHOLD_MS` / `LILITH_IDLE_POLL_MS` 只在 `features=headless` 构建里生效，用于把自动回收的空闲窗口缩短到秒级；GUI 构建固定 3 分钟 / 30 秒。
 - `--library <path>` 在执行命令前显式打开图库；无头模式不自动打开上次图库。`--result <file>` 另存格式化结果；stdout 始终只有一行 JSON，含 `command/ok/cancelled/elapsedMs/peakWorkingSetBytes/data/error`；退出码 0 成功、1 失败、2 取消。
 - 入口不调用 GUI 的 `run()`，不创建用户可见窗口、不建托盘、不加载 WebView、不经过 IPC。必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出。B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
@@ -49,19 +50,21 @@ EXE=src-tauri/target/debug/lilith-artbank.exe
 验收套件：
 
 ```bash
-# 全部 11 个目标；目标多了以后用后台入口更省事，见下一条
+# 全部 14 个目标；目标多了以后用后台入口更省事，见下一条
 cargo test --manifest-path src-tauri/Cargo.toml --features headless \
   --test acceptance_library --test acceptance_query --test acceptance_settings \
   --test acceptance_logs --test acceptance_import --test acceptance_metadata \
   --test acceptance_folders --test acceptance_history --test acceptance_viewer_edit \
-  --test acceptance_tasks --test acceptance_maintenance -- --test-threads=1
+  --test acceptance_tasks --test acceptance_maintenance --test acceptance_optimize \
+  --test acceptance_ai --test acceptance_mcp -- --test-threads=1
 # 或后台入口（Idle 优先级、单线程、默认 cheap+default）：
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Tier heavy
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Targets acceptance_import
 ```
 
-- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1–B2 共 39 个用例：默认 37 个 cheap/default；2 个 heavy（9,455 文件完整检查、20,000 张移动）只在 `heavy` 档运行。
+- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1–B3 共 48 个用例：默认 45 个 cheap/default；3 个 heavy（9,455 文件完整检查、20,000 张移动、300 张纹理压缩）只在 `heavy` 档运行。
+- `acceptance_ai` 的 `/v1` 服务在测试进程内用 `TcpListener` 启动，返回确定性向量；`acceptance_mcp` 启动真实的 `--mcp-stdio` 子进程，只通过 JSON-RPC 行与磁盘事实断言。两者都不加载模型、不访问外网。
 - 工作区在 `<target>/acceptance/workspaces/`，正常结束自动回收；每个用例向 `<target>/acceptance/report.jsonl` 追加一行（名称、档位、成败、耗时、命令数、峰值工作集、文件数与字节数）。
 - 排查失败用例时设 `LILITH_ACCEPT_KEEP=1`：工作区不再回收，用例会把它打印成 `[keep] <路径>`。`LILITH_ACCEPT_BIN` 换被测二进制，`LILITH_ACCEPT_DISK_BUDGET` 改工作区磁盘预算（默认 2 GiB）。
 - 裸 `cargo test` 下所有验收目标编译为空，不启动子进程；`tests/gate_guard.rs` 强制这一门控。
@@ -104,9 +107,9 @@ git diff --check
 - **浏览/查询**：`cargo test` 覆盖键集分页、多级排序、筛选、搜索、计数、全选 id、集合、子树筛选与直属筛选；性能跑 `perf_metadata_200k`。另有三类结构断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
 - **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件夹整树移入回收站、删除单元恢复、删除单元之间不串恢复、永久删除后释放空目录与行、`trashLoose` 直属图片与文件夹计数；文件操作测试只用临时图库。
 - **查看器/编辑**：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同跑 `test:web` 与 typecheck/build。
-- **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。
-- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。
-- **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录。
+- **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。`acceptance_ai` 用进程内假 `/v1` 跑完整协议、重试、维度校验、语义搜索分页、相似分组与临时区；真实模型质量与显存仍手工。
+- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。`acceptance_mcp` 通过真实 `--mcp-stdio` 子进程验证生命周期、三档、审批拒绝/批准/过期/换库清空、工具列表与调用、口令轮换、端口占用与审计日志；真实第三方客户端与便携包仍手工。
+- **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录；`acceptance_optimize` 在小纹理图上跑估算→改选/漂移→执行，并验证参数/集合指纹、缺失/变化拒绝或裁剪、全部跳过与临时区拒绝。
 - `server/` 只做一次性检查，不加入常驻测试：它依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
 

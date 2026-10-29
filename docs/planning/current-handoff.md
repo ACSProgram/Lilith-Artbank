@@ -20,7 +20,7 @@
 - **维护与检查**：入口是「任务 → 维护与检查…」的四个分区。检查一次目录遍历同时出四类结论（缺失原图 / 孤儿 / 大小不符 / 哈希不符），快速检查只看存在性与大小、完整校验重算 BLAKE3，不持路径锁而容忍扫描期间变动；孤儿可移入 `recycle/orphans/`（一条 `orphanMove` 记录，可撤销）；缩略图包按段统计垃圾率，超过 20% 且空闲 3 分钟时自动回收（让位落「已让位」），也可手动立即回收；导出复制原图到目录并可选写 `manifest.csv`。见[维护与批量工作流](../modules/maintenance.md)。
 - **界面缺口补齐**：标签列表三态（包含 / 排除 / 中性）、「清理 0 张标签」（一条 `tagDelete` 记录）、列表列显示/隐藏（`settings.ui.listColumns`）、`?` 与设置页的快捷键总表。
 - **日志与命令记录**：等级为发布 Info、调试 Debug，`LILITH_ARTBANK_LOG_LEVEL` 覆盖；行前缀是本地时间 + `[run:xxxxxx]`，可按单次运行切分。58 个写命令成对记 `started` / `finished`（带 `elapsed_ms`），34 个读命令只在失败或超阈值时记（默认 500ms，语义搜索与找相似 3000ms），8 个无 `Result` 的命令不包装；不记命令参数。按 4MB 轮转、保留 5 份归档；GUI 显式写 Folder + Stdout，不再受插件默认目标重复输出影响。见[日志与命令记录](../guides/logging.md)。
-- **无窗口验收**：`headless` feature 与 `--headless` 命令面（`library`、`settings`、`query`、`fixture`、`logs`、`import`、`metadata`、`folder`、`collection`、`history`、`viewer`、`edit`、`task`、`maintenance`、`scenario`）；B1–B2 的 11 个目标共 39 个用例（默认 37 个 cheap/default，2 个 heavy），覆盖只读、设置/日志、写路径、任务锁、空闲回收与维护；报告在 `<target>/acceptance/report.jsonl`，裸 `cargo test` 不启动子进程。见[验证策略](../guides/validation.md#无窗口验收入口开发期)。
+- **无窗口验收**：`headless` feature 与 `--headless` 命令面（`library`、`settings`、`query`、`fixture`、`logs`、`import`、`metadata`、`folder`、`collection`、`history`、`viewer`、`edit`、`task`、`maintenance`、`optimize`、`ai`、`mcp`、`scenario`）；B1–B3 的 14 个目标共 48 个用例（默认 45 个 cheap/default，3 个 heavy），覆盖只读、设置/日志、写路径、任务锁、空闲回收、维护、空间优化、假 AI 协议与真实 stdio 桥；报告在 `<target>/acceptance/report.jsonl`，裸 `cargo test` 不启动子进程。见[验证策略](../guides/validation.md#无窗口验收入口开发期)。
 - **前端契约**：`src/modules/<module>/api.ts` 是命令唯一入口，跨模块编排在 `src/app/`，主题只走 `src/styles/tokens.css` 的语义变量，破坏性操作确认文案统一在 `src/shared/confirm.ts`。
 
 ## 基线
@@ -29,7 +29,7 @@
 - 压缩候选：主库按默认参数（JPEG 输出、跳过已处理、非透明、非 GIF、bpp ≥ 0.12）为 127 837 张 / 179.58 GB / 853.24 GP，平均 6.67 MP/张；已优化过 249 767 张。
 - 存储版本：schema v10、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
 - 维护实测（主库）：39.6 万行逐张 `stat` 的快速检查 19.9 s，缺失 0、孤儿 0、非内容寻址文件 1；缩略图 9 段 9.24 GB、未引用字节 0；embedding 1.217 GB 与 pose 43.1 MB 各恰好一条/张、垃圾 0；556 个标签里 382 个图片数为 0。
-- 自动检查（2026-10-29，无窗口 B2 之后）：`cargo fmt --check`、`cargo check --all-targets`（裸与 headless）、`cargo clippy --all-targets`（裸与 headless 均 0 警告）、`cargo test`（471 通过、9 ignored）、`cargo test --features headless` 的 11 个验收目标（默认 37 通过；heavy 2 个各跑一次通过）、`npm run typecheck`、`npm run test:web`（115 通过）、`npm run build`、`git diff --check`。
+- 自动检查（2026-10-29，无窗口 B3 之后）：`cargo fmt --check`、`cargo check --all-targets`（裸与 headless）、`cargo clippy --all-targets`（裸与 headless 均 0 警告）、`cargo test`（473 通过、9 ignored）、`cargo test --features headless` 的 14 个验收目标（默认 45 通过；新增 heavy 300 张纹理未跑）、`npm run typecheck`、`npm run test:web`（115 通过）、`npm run build`、`git diff --check`。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

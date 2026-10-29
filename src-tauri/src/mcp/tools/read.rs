@@ -252,7 +252,7 @@ fn mcp_limits(context: &ReadContext, tool_count: usize) -> Value {
                 "tags_modify（delete / merge）",
             ],
             "queueClearedOnFull": true,
-            "timeoutMinutes": crate::mcp::approval::APPROVAL_TTL.as_secs() / 60,
+            "timeoutMinutes": crate::mcp::approval::ttl().as_secs() / 60,
         },
         "limits": {
             "maxSearchPage": MAX_SEARCH_PAGE,

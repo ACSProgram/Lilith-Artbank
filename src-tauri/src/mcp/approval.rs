@@ -17,6 +17,18 @@ pub const APPROVAL_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_APPROVALS: usize = 50;
 pub const APPROVAL_EVENT: &str = "mcp-approval-changed";
 
+/// 无头验收用 `LILITH_MCP_APPROVAL_TTL_MS` 把确认有效期缩到秒级；GUI 构建固定 10 分钟。
+pub fn ttl() -> Duration {
+    #[cfg(feature = "headless")]
+    if let Ok(value) = std::env::var("LILITH_MCP_APPROVAL_TTL_MS")
+        && let Ok(millis) = value.trim().parse::<u64>()
+        && millis > 0
+    {
+        return Duration::from_millis(millis);
+    }
+    APPROVAL_TTL
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalStatus {
@@ -120,7 +132,7 @@ impl ApprovalQueue {
         let record = ApprovalRecord {
             id: format!("approval-{}", uuid::Uuid::new_v4().simple()),
             created_at: now,
-            expires_at: now + APPROVAL_TTL.as_millis() as i64,
+            expires_at: now + ttl().as_millis() as i64,
             status: ApprovalStatus::Pending,
             title: title.into(),
             action,

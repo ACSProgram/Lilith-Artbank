@@ -8,7 +8,10 @@
 //! `--request`/`--request-json` 传 DTO；`--result` 另存一份格式化结果。退出码：
 //! 0 成功、1 失败、2 取消。
 
+mod ai;
 mod maintenance;
+mod mcp;
+mod optimize;
 mod write;
 
 use std::{
@@ -364,6 +367,9 @@ fn dispatch(
             write::dispatch(app, options, cancelled)
         }
         ("task" | "maintenance" | "scenario", _) => maintenance::dispatch(app, options, cancelled),
+        ("optimize", _) => optimize::dispatch(app, options, cancelled),
+        ("ai", _) => ai::dispatch(app, options, cancelled),
+        ("mcp", _) => mcp::dispatch(app, options, cancelled),
         (command, action) => Err(match action {
             Some(action) => format!("未知命令：{command} {action}"),
             None => format!("未知命令：{command}"),
@@ -545,6 +551,10 @@ struct ImageRequest {
     height: u32,
     format: String,
     transparent: bool,
+    /// 只用于夹具：按位翻转 4×4 格，让同尺寸样本内容不同。
+    seed: u32,
+    /// 只用于夹具：在前几个像素上做 1 级微调，用来造 pHash 相近的近似重复图。
+    tweak: u32,
 }
 
 impl Default for ImageRequest {
@@ -555,6 +565,8 @@ impl Default for ImageRequest {
             height: 16,
             format: "png".into(),
             transparent: false,
+            seed: 0,
+            tweak: 0,
         }
     }
 }
@@ -624,7 +636,7 @@ fn write_image(request: &ImageRequest) -> Result<Value, String> {
     if !path.is_absolute() {
         return Err("--request.path 必须是绝对路径".into());
     }
-    let (bytes, extension) = render_image(request, 0)?;
+    let (bytes, extension) = render_image(request, request.seed)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建目录：{error}"))?;
     }
@@ -657,6 +669,7 @@ fn write_corpus(request: &CorpusRequest) -> Result<Value, String> {
     });
     for index in 0..request.count {
         let format = &formats[index % formats.len()];
+        let seed = base_seed.wrapping_add(index as u32);
         let (bytes, extension) = render_image(
             &ImageRequest {
                 path: String::new(),
@@ -664,8 +677,10 @@ fn write_corpus(request: &CorpusRequest) -> Result<Value, String> {
                 height: request.height.max(1),
                 format: format.clone(),
                 transparent: index % 3 == 1,
+                seed,
+                tweak: 0,
             },
-            base_seed.wrapping_add(index as u32),
+            seed,
         )?;
         let name = format!("sample-{index:03}.{extension}");
         fs::write(directory.join(&name), &bytes)
@@ -713,6 +728,13 @@ fn render_image(request: &ImageRequest, seed: u32) -> Result<(Vec<u8>, String), 
                 Rgba([byte, byte.wrapping_mul(3), byte.wrapping_mul(7), 255]),
             );
         }
+    }
+    // 近似重复图：只动右下角少量像素，pHash 仍与原图接近。
+    for index in 0..request.tweak.min(width) {
+        let x = width - 1 - index;
+        let y = height - 1;
+        let pixel = buffer.get_pixel(x, y);
+        buffer.put_pixel(x, y, Rgba([pixel[0] ^ 1, pixel[1], pixel[2], pixel[3]]));
     }
     let mut cursor = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(buffer)
@@ -786,8 +808,13 @@ fn usage() -> String {
          \x20 edit estimate|save\n\
          \x20 task list|wait|cancel\n\
          \x20 maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags\n\
+         \x20 optimize estimate（执行走 scenario optimize_flow，估算凭证只存在进程内）\n\
+         \x20 ai status|health|ensure|embed-text|shutdown|embed|pose|pose-get|describe\n\
+         \x20    search|similar|groups|keeps|temp-features|features\n\
+         \x20 mcp status\n\
          \x20 scenario import_cancel|task_queue_cancel|task_panic|close_during_task\n\
          \x20          folder_lock|ai_lock|maintenance_check|idle_gc|idle_yield\n\
+         \x20          mcp_bridge|mcp_modes|optimize_flow|ai_search_flow|ai_temp_flow\n\
          \x20 fixture seed-db|write-image|corpus\n\
          \x20 logs emit|path\n\
          \n\
@@ -831,6 +858,8 @@ mod tests {
             height: 3,
             format: "png".into(),
             transparent: false,
+            seed: 0,
+            tweak: 0,
         };
         let (bytes, extension) = render_image(&request, 0).unwrap();
         assert_eq!(extension, "png");

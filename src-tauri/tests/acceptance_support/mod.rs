@@ -6,6 +6,8 @@
 //! `Drop` 补写；`LILITH_ACCEPT_KEEP=1` 时工作区不回收并打印路径。
 #![allow(dead_code)]
 
+pub mod ai_stub;
+
 use std::{
     fs::{self, File},
     io::Write,
