@@ -33,6 +33,7 @@ ai.prewarmImports  默认 true；启动托管服务时加 --prewarm-imports，�
 4. 启动失败按 2s、4s 退避重试，最多 3 次；仍失败则记录状态与错误并保持离线，由用户在设置页或 AI 任务里手动重启。运行中被托管的进程退出时标记为失败，不自动重启；正在执行的任务按单张失败处理，不会因为服务退出而无限重试。
 5. 退出时优先调用 `POST /v1/shutdown`（返回 2xx 即视为已关闭），超时后终止子进程。
 6. 服务只绑定 `127.0.0.1`。v1 不做鉴权；`baseUrl` 不是本机地址时只连接外部服务。
+7. 监督线程用「代次 + 持有者」交接：启动中保存设置或停止服务会让旧线程作废，新线程在同一把锁里接手，旧线程退出时清不掉新一代的标记，所以不会出现「此后自动拉起静默失效」。
 
 模型由首次使用自动加载：批量任务、单张 pose/描述与语义搜索在需要时调用 `/v1/models/ensure`；设置页与批量任务对话框只显示“已加载 / 未加载”，不提供手动加载按钮。
 
@@ -51,10 +52,13 @@ Python 环境与模型文件不打包、不下载；`server/` 代码随便携包
   - 422 输入无法解码或模型未就绪；
   - 500 推理失败；
   - 503 服务忙/模型加载中。
-- 超时：embedding 60s，pose 60s，description 300s，`/v1/models/ensure` 600s；连接超时 5s。
-- 重试：网络错误与 5xx 最多 2 次（250ms、1s 退避）；4xx 不重试。
-- 并发：客户端固定串行（1 个在途推理）；模型通常串行，先保证进度、取消与失败清单正确，需要时再加并发设置。
-- 请求体上限：建议 64 MiB；description 输入应使用降采样预览而不是 100MP 原图。
+- 超时：health 5s，embedding / pose / description 单次尝试 120s，`/v1/models/ensure` 600s；连接超时 5s。
+- 预算：一次逻辑调用最多 3 次尝试、总预算 5 分钟（`ensure` 为 2 次、11 分钟），重试与退避都算在里面。
+- 取消：任务取消时正在飞的请求立即返回，退避等待也会被打断；被打断的那次不算失败，不进失败清单。
+- 重试：网络错误与 5xx 最多 2 次（250ms、1s 退避）；4xx、响应格式错误与超预算不重试。
+- 并发：客户端固定串行（1 个在途推理）；服务端同时最多处理 4 个推理请求，超出的直接回 503 `server_busy`，不排队。
+- 请求体上限：建议 64 MiB；服务端单张解码上限 1 亿像素（与导入一致），超过回 422。
+- description 输入应使用降采样预览而不是 100MP 原图。
 
 ## 能力
 
@@ -197,7 +201,7 @@ Content-Type: application/octet-stream
 - 快照字段：除张数与百分比外，`TaskSnapshot` 还带 `runStartedAt`（第一次进入 `running` 的时间，排队与准备不算）、`currentFile`（图库内相对路径）、`ratePerSecond` 与 `etaSeconds`；压缩任务另有 `originalBytes` / `savedBytes`（只统计已提交并替换的图片）与 `skipBreakdown`（候选内跳过按 6 个原因细分）。速度是运行以来平均每秒结算的张数，含失败与跳过；压缩的 ETA 优先用滚动吞吐，百分比由「已结算 / 候选张数」派生（`progressPercent` 对压缩恒为 `null`）；终态不返回 ETA。
 - 冲突：AI 任务占 `ai.service` 与内容写者，同一时间只运行一个 AI 批量任务，不会与导入、移动、编辑、压缩等内容写任务同时运行；描述任务还占时间线读与元数据写。每张读原图时再按文件夹加短读锁并拿图像预算许可，因此文件夹维护不必等整个 AI 任务结束。默认自动排队：`start_batch_task` 直接返回 `queued` 快照，任务在 `queued` 阶段等待，不需要前端选择排队或取消现有任务。排队中的任务在任务中心可取消；取消排队任务只把它从等待队列移除，不触碰正在运行的任务。
 - 先到先得：同一资源上的等待者按申请顺序启动；路径锁写者优先，避免文件夹改名被持续的读图请求饿死。短写只申请短期资源，不排在长任务后面。
-- 取消：停止调度新请求；在途请求允许完成并保存结果；已保存结果不回滚。
+- 取消：停止调度新请求；正在飞的那次请求约 100 毫秒内被打断，不算失败、不进失败清单；已经保存的结果不回滚。
 - 熔断：连续 5 张失败视为服务不可用，任务以失败结束，避免把整库都记成失败。
 - 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。
 - 已完成的 embedding/pose 写入 feature pack 与 `feature_blobs`；描述写入 `images.description`，并设置 `description_source='ai'`、`description_model`。用户手工编辑后 `description_source='user'`。
@@ -225,10 +229,11 @@ Content-Type: application/octet-stream
 ## 服务端实现（server/）
 
 - 入口 `server/main.py`：标准库 `ThreadingHTTPServer`，只绑 `127.0.0.1`；路由 `/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/shutdown`；`/v1/describe` 返回 404。
+- 推理并发上限 4（`MAX_INFERENCE_CONCURRENCY`）：名额满时立刻回 503 `server_busy`，不排队，避免并发请求一起放大显存与内存；`/v1/health` 与 `/v1/shutdown` 不占名额，并发推理时也能探活与关闭。
 - `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。加载完成后立即 warmup 一次前向。
 - `--prewarm-imports`：启动后在后台线程导入 torch/transformers（实测 7.7–8.0 s、RSS 420 MB），把这段成本从“第一次 AI 请求”挪到“用户还在看图”。没有模型目录时不预热。应用按设置 `ai.prewarmImports`（默认开）决定是否传这个参数。
 - `pose_engine.py`：MediaPipe Pose（`model_complexity=2`、`static_image_mode=True`、`min_detection_confidence=0.3`）。模型随 `python_embeded` 携带，不读 `resources/models`；未检测到人体返回空数组。
-- `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；解码失败返回 422。
+- `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；单张上限 1 亿像素（`MAX_PIXELS`，与导入解码上限一致），超过直接拒绝；解码失败或超限返回 422。
 - 运行环境为 Python 3.11 + torch 2.5.1+cu121 + transformers 4.57.6 + mediapipe 0.10.14，依赖已在 `python_embeded` 内，不做运行时下载。
 - 日志写 `logs/ai-server.log`；只记录启动参数、模型加载/卸载、耗时与错误，不记录图片内容或向量。
 - 描述能力未实现；`/v1/describe` 返回 404，批量任务里的描述项置灰。

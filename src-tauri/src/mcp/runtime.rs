@@ -283,6 +283,9 @@ where
         config,
     );
 
+    // 每条连接单独跟踪：关闭服务时要连已建立的 keep-alive 连接一起断开，
+    // 只停 accept 循环会让客户端继续调用读工具，权限撤回不彻底。
+    let mut connections: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -297,9 +300,11 @@ where
                         continue;
                     }
                 };
+                connections.retain(|handle| !handle.is_finished());
                 let service = service.clone();
                 let token = token.clone();
-                tokio::spawn(async move {
+                let connection_cancel = cancel.clone();
+                connections.push(tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let connection = service_fn(move |request| {
                         let mut service = service.clone();
@@ -313,15 +318,27 @@ where
                             Service::call(&mut service, request).await
                         }
                     });
-                    if let Err(error) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, connection)
-                        .await
-                    {
-                        log::debug!("MCP HTTP 连接结束：{error}");
+                    let serving = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, connection);
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {}
+                        result = serving => {
+                            if let Err(error) = result {
+                                log::debug!("MCP HTTP 连接结束：{error}");
+                            }
+                        }
                     }
-                });
+                }));
             }
         }
+    }
+    // 先 abort 再等一遍，保证返回时所有连接都已关闭（`stop()` 靠这个判断端口已释放）。
+    let pending = std::mem::take(&mut connections);
+    for handle in &pending {
+        handle.abort();
+    }
+    for handle in pending {
+        let _ = handle.await;
     }
     Ok(())
 }
@@ -409,7 +426,7 @@ pub fn read_runtime() -> AppResult<RuntimeFile> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rmcp::{
         ServerHandler,
@@ -559,6 +576,82 @@ mod tests {
         assert!(authorized(&headers, "secret"));
         headers.insert(AUTHORIZATION, "Bearer other".parse().unwrap());
         assert!(!authorized(&headers, "secret"));
+    }
+
+    /// 关闭服务要连已建立的 keep-alive 连接一起断开：只停 accept 循环等于没撤回权限。
+    #[test]
+    fn stopping_the_server_closes_established_connections() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let (stopped_tx, stopped) = channel();
+        let task_cancel = cancel.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _ = runtime.block_on(serve_with(
+                listener,
+                "secret-token".to_owned(),
+                || Ok(EchoServer::new()),
+                task_cancel,
+            ));
+            let _ = stopped_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1" }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret-token\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "握手应拿到响应");
+
+        cancel.cancel();
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("服务应在取消后退出");
+        server.join().unwrap();
+
+        // 把残留响应读完，最终必须读到 EOF 或连接错误，而不是继续可用。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) if Instant::now() >= deadline => {
+                    panic!("连接在服务停止后仍然可用");
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    panic!("连接没有在服务停止后关闭（{error}）");
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     /// `stop()` 靠“服务任务退出”这一信号判断端口已释放；Windows 不允许同端口重复 bind，

@@ -7271,6 +7271,15 @@ body.is-drag-sorting * {
   line-height: 1.5;
 }
 
+.mcp-approval-stalled {
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
 .mcp-warning {
   display: flex;
   align-items: flex-start;

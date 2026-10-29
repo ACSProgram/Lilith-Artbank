@@ -1,4 +1,13 @@
-use std::{collections::HashMap, fmt, io::Read, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    io::Read,
+    sync::{
+        Arc,
+        mpsc::{RecvTimeoutError, channel},
+    },
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,18 +15,33 @@ use crate::library::viewer::{PoseData, PoseLandmark};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
-const POSE_TIMEOUT: Duration = Duration::from_secs(60);
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(300);
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(600);
+/// 数据请求（embedding、pose、描述）单次尝试上限：服务卡死时不再一等等 5 分钟。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// 数据请求的总预算：重试也算在里面，避免「300 秒 × 3 次」把取消拖成十几分钟。
+const REQUEST_BUDGET: Duration = Duration::from_secs(300);
+const MAX_ATTEMPTS: usize = 3;
+/// 模型加载可能确实要几分钟，单独给一份更宽的预算。
+const ENSURE_BUDGET: Duration = Duration::from_secs(660);
+const ENSURE_ATTEMPTS: usize = 2;
+/// 重试退避；取消能打断等待，所以按小片睡。
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
+/// 等待响应与退避时多久看一次取消标记。
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
-/// `/v1` 调用失败。`retryable` 决定 `with_retry` 是否再试：网络错误与 5xx 为 true，4xx 与响应格式错误为 false。
+/// 取消信号：任务取消后为 true。批量任务把它传给客户端，取消能立刻生效。
+pub type CancelSignal = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// `/v1` 调用失败。`retryable` 决定是否再试：网络错误与 5xx 为 true，4xx、超时与响应格式错误为 false。
 #[derive(Debug, Clone)]
 pub struct AiError {
     pub message: String,
     pub retryable: bool,
     /// 连接层失败（进程未启动、端口未监听等）；面向外部的文案不应带出内部地址与 OS 错误。
     pub transport: bool,
+    /// 已被打断（用户取消或超出总预算）：`with_budget` 据此不再重试。
+    /// 它不等于「用户点了取消」——判断后者要看任务自己的取消标记。
+    pub cancelled: bool,
 }
 
 impl AiError {
@@ -26,6 +50,7 @@ impl AiError {
             message: message.into(),
             retryable: true,
             transport: true,
+            cancelled: false,
         }
     }
 
@@ -34,6 +59,7 @@ impl AiError {
             message: message.into(),
             retryable: (500..=599).contains(&code),
             transport: false,
+            cancelled: false,
         }
     }
 
@@ -42,6 +68,25 @@ impl AiError {
             message: message.into(),
             retryable: false,
             transport: false,
+            cancelled: false,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            message: "AI 请求已取消".to_owned(),
+            retryable: false,
+            transport: false,
+            cancelled: true,
+        }
+    }
+
+    fn budget_exhausted() -> Self {
+        Self {
+            message: "AI 服务在总时限内没有响应，已停止等待".to_owned(),
+            retryable: false,
+            transport: false,
+            cancelled: true,
         }
     }
 }
@@ -143,21 +188,50 @@ struct CapabilitiesResponse {
     capabilities: HashMap<String, Capability>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Method {
+    Get,
+    Post,
+}
+
 pub struct AiClient {
     base_url: String,
     agent: ureq::Agent,
+    cancel: Option<CancelSignal>,
+    /// 单次尝试上限与总预算；正常构建用常量，测试用小值避免真等 5 分钟。
+    attempt_timeout: Duration,
+    budget: Duration,
 }
 
 impl AiClient {
     /// `base_url` 去掉首尾空白与结尾斜杠；所有请求共用同一个 agent（连接复用）。
     pub fn new(base_url: &str) -> Self {
+        Self::build(base_url, None)
+    }
+
+    /// 带取消信号的客户端：批量任务用它，取消时正在飞的请求也能立刻返回。
+    pub fn cancellable(base_url: &str, cancel: CancelSignal) -> Self {
+        Self::build(base_url, Some(cancel))
+    }
+
+    fn build(base_url: &str, cancel: Option<CancelSignal>) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
             .build();
         Self {
             base_url: base_url.trim().trim_end_matches('/').to_owned(),
             agent,
+            cancel,
+            attempt_timeout: REQUEST_TIMEOUT,
+            budget: REQUEST_BUDGET,
         }
+    }
+
+    #[cfg(test)]
+    fn with_limits(mut self, attempt_timeout: Duration, budget: Duration) -> Self {
+        self.attempt_timeout = attempt_timeout;
+        self.budget = budget;
+        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -165,74 +239,77 @@ impl AiClient {
     }
 
     pub fn health(&self) -> Result<Health, AiError> {
-        let response = self
-            .agent
-            .get(&self.url("/v1/health"))
-            .timeout(HEALTH_TIMEOUT)
-            .call()
-            .map_err(map_error)?;
-        parse_json(response)
+        let body = self.execute(
+            Method::Get,
+            &self.url("/v1/health"),
+            None,
+            None,
+            HEALTH_TIMEOUT,
+        )?;
+        parse_body(&body)
     }
 
     pub fn ensure_models(
         &self,
         capabilities: &[String],
     ) -> Result<HashMap<String, Capability>, AiError> {
-        let payload = serde_json::json!({ "capabilities": capabilities });
-        with_retry(|| {
-            let response = self
-                .agent
-                .post(&self.url("/v1/models/ensure"))
-                .timeout(ENSURE_TIMEOUT)
-                .set("Content-Type", "application/json; charset=utf-8")
-                .send_string(&payload.to_string())
-                .map_err(map_error)?;
-            let parsed: CapabilitiesResponse = parse_json(response)?;
+        let payload = serde_json::json!({ "capabilities": capabilities }).to_string();
+        let url = self.url("/v1/models/ensure");
+        self.with_budget(ENSURE_TIMEOUT, ENSURE_ATTEMPTS, ENSURE_BUDGET, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/json; charset=utf-8"),
+                Some(payload.as_bytes()),
+                timeout,
+            )?;
+            let parsed: CapabilitiesResponse = parse_body(&body)?;
             Ok(parsed.capabilities)
         })
     }
 
     pub fn embed_image(&self, model: &str, bytes: &[u8]) -> Result<Embedding, AiError> {
         let url = query_url(&self.url("/v1/embed/image"), &[("model", model)]);
-        with_retry(|| {
-            let response = self
-                .agent
-                .post(&url)
-                .timeout(EMBED_TIMEOUT)
-                .set("Content-Type", "application/octet-stream")
-                .send_bytes(bytes)
-                .map_err(map_error)?;
-            let parsed: EmbeddingResponse = parse_json(response)?;
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/octet-stream"),
+                Some(bytes),
+                timeout,
+            )?;
+            let parsed: EmbeddingResponse = parse_body(&body)?;
             embedding_from(parsed)
         })
     }
 
     pub fn embed_text(&self, model: &str, text: &str) -> Result<Embedding, AiError> {
-        let payload = serde_json::json!({ "text": text, "model": model });
-        with_retry(|| {
-            let response = self
-                .agent
-                .post(&self.url("/v1/embed/text"))
-                .timeout(EMBED_TIMEOUT)
-                .set("Content-Type", "application/json; charset=utf-8")
-                .send_string(&payload.to_string())
-                .map_err(map_error)?;
-            let parsed: EmbeddingResponse = parse_json(response)?;
+        let payload = serde_json::json!({ "text": text, "model": model }).to_string();
+        let url = self.url("/v1/embed/text");
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/json; charset=utf-8"),
+                Some(payload.as_bytes()),
+                timeout,
+            )?;
+            let parsed: EmbeddingResponse = parse_body(&body)?;
             embedding_from(parsed)
         })
     }
 
     pub fn pose(&self, model: &str, bytes: &[u8]) -> Result<PoseData, AiError> {
         let url = query_url(&self.url("/v1/pose"), &[("model", model)]);
-        with_retry(|| {
-            let response = self
-                .agent
-                .post(&url)
-                .timeout(POSE_TIMEOUT)
-                .set("Content-Type", "application/octet-stream")
-                .send_bytes(bytes)
-                .map_err(map_error)?;
-            let parsed: PoseResponse = parse_json(response)?;
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/octet-stream"),
+                Some(bytes),
+                timeout,
+            )?;
+            let parsed: PoseResponse = parse_body(&body)?;
             if parsed
                 .status
                 .as_deref()
@@ -275,15 +352,15 @@ impl AiClient {
             query.push(("maxTokens", value));
         }
         let url = query_url(&self.url("/v1/describe"), &query);
-        with_retry(|| {
-            let response = self
-                .agent
-                .post(&url)
-                .timeout(DESCRIBE_TIMEOUT)
-                .set("Content-Type", "application/octet-stream")
-                .send_bytes(bytes)
-                .map_err(map_error)?;
-            let parsed: DescribeResponse = parse_json(response)?;
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/octet-stream"),
+                Some(bytes),
+                timeout,
+            )?;
+            let parsed: DescribeResponse = parse_body(&body)?;
             if parsed
                 .status
                 .as_deref()
@@ -299,13 +376,140 @@ impl AiClient {
     }
 
     pub fn shutdown(&self) -> Result<(), AiError> {
-        self.agent
-            .post(&self.url("/v1/shutdown"))
-            .timeout(Duration::from_secs(2))
-            .send_string("")
-            .map(|_| ())
-            .map_err(map_error)
+        self.execute(
+            Method::Post,
+            &self.url("/v1/shutdown"),
+            None,
+            Some(b""),
+            Duration::from_secs(2),
+        )
+        .map(|_| ())
     }
+
+    /// 一次逻辑调用：按预算切成若干次尝试，每次都有独立超时；取消在请求进行中也能立刻生效。
+    fn with_budget<T>(
+        &self,
+        attempt_timeout: Duration,
+        attempts: usize,
+        budget: Duration,
+        mut call: impl FnMut(Duration) -> Result<T, AiError>,
+    ) -> Result<T, AiError> {
+        let attempts = attempts.max(1);
+        let deadline = Instant::now() + budget;
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                let delay = RETRY_DELAYS[(attempt - 1).min(RETRY_DELAYS.len() - 1)];
+                self.sleep_unless_cancelled(delay)?;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AiError::budget_exhausted());
+            }
+            match call(remaining.min(attempt_timeout)) {
+                Ok(value) => return Ok(value),
+                Err(error) if error.cancelled || !error.retryable => return Err(error),
+                Err(error) if attempt + 1 == attempts => return Err(error),
+                Err(_) => {}
+            }
+        }
+        unreachable!("尝试次数已收敛到至少 1，循环一定返回")
+    }
+
+    /// 退避等待按小片睡，取消能立刻打断。
+    fn sleep_unless_cancelled(&self, delay: Duration) -> Result<(), AiError> {
+        let deadline = Instant::now() + delay;
+        loop {
+            if self.is_cancelled() {
+                return Err(AiError::cancelled());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(CANCEL_POLL));
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|cancel| cancel())
+    }
+
+    /// 发一次请求并读回响应体。
+    ///
+    /// 阻塞客户端没有中断接口，所以带取消信号时把请求放到旁路线程，这里每 100ms 看一次取消：
+    /// 取消后立即返回，旁路线程受单次超时约束，最多再跑完这一次尝试就自行结束。
+    fn execute(
+        &self,
+        method: Method,
+        url: &str,
+        content_type: Option<&'static str>,
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<String, AiError> {
+        if self.is_cancelled() {
+            return Err(AiError::cancelled());
+        }
+        let Some(cancel) = self.cancel.clone() else {
+            return send(&self.agent, method, url, content_type, body, timeout);
+        };
+        let agent = self.agent.clone();
+        let owned_url = url.to_owned();
+        let owned = body.map(<[u8]>::to_vec);
+        let (sender, receiver) = channel();
+        std::thread::Builder::new()
+            .name("ai-request".to_owned())
+            .spawn(move || {
+                let _ = sender.send(send(
+                    &agent,
+                    method,
+                    &owned_url,
+                    content_type,
+                    owned.as_deref(),
+                    timeout,
+                ));
+            })
+            .map_err(|error| AiError::transport(format!("无法启动 AI 请求线程：{error}")))?;
+        loop {
+            if cancel() {
+                return Err(AiError::cancelled());
+            }
+            match receiver.recv_timeout(CANCEL_POLL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(AiError::transport("AI 请求线程异常退出"));
+                }
+            }
+        }
+    }
+}
+
+/// 真正发出请求；超时、状态码与响应体错误都在这里转成 `AiError`。
+fn send(
+    agent: &ureq::Agent,
+    method: Method,
+    url: &str,
+    content_type: Option<&'static str>,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<String, AiError> {
+    let request = match method {
+        Method::Get => agent.get(url),
+        Method::Post => agent.post(url),
+    }
+    .timeout(timeout);
+    let request = match content_type {
+        Some(value) => request.set("Content-Type", value),
+        None => request,
+    };
+    let response = match body {
+        Some(bytes) => request.send_bytes(bytes),
+        None => request.call(),
+    }
+    .map_err(map_error)?;
+    response
+        .into_string()
+        .map_err(|error| AiError::transport(format!("读取 AI 服务响应失败：{error}")))
 }
 
 fn embedding_from(response: EmbeddingResponse) -> Result<Embedding, AiError> {
@@ -343,11 +547,8 @@ fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn parse_json<T: for<'de> Deserialize<'de>>(response: ureq::Response) -> Result<T, AiError> {
-    let body = response
-        .into_string()
-        .map_err(|error| AiError::transport(format!("读取 AI 服务响应失败：{error}")))?;
-    serde_json::from_str(&body)
+fn parse_body<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, AiError> {
+    serde_json::from_str(body)
         .map_err(|error| AiError::invalid(format!("AI 服务响应格式错误：{error}")))
 }
 
@@ -368,22 +569,6 @@ fn map_error(error: ureq::Error) -> AiError {
         }
         ureq::Error::Transport(error) => AiError::transport(format!("无法连接 AI 服务：{error}")),
     }
-}
-
-/// 网络错误与 5xx 重试 2 次（250ms、1s 退避）；4xx 立即失败。
-fn with_retry<T>(mut call: impl FnMut() -> Result<T, AiError>) -> Result<T, AiError> {
-    const DELAYS_MS: [u64; 2] = [250, 1000];
-    for attempt in 0..=DELAYS_MS.len() {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(DELAYS_MS[attempt - 1]));
-        }
-        match call() {
-            Ok(value) => return Ok(value),
-            Err(error) if !error.retryable || attempt == DELAYS_MS.len() => return Err(error),
-            Err(_) => {}
-        }
-    }
-    unreachable!("重试循环最后一次尝试一定返回")
 }
 
 fn query_url(base: &str, params: &[(&str, &str)]) -> String {
@@ -422,6 +607,7 @@ fn encode(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::ai::test_support::{MockResponse, MockServer};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn capability_json() -> String {
         serde_json::json!({
@@ -576,5 +762,72 @@ mod tests {
             url.contains("prompt=%E7%BA%A2%E8%89%B2%20%E6%96%97%E7%AF%B7%2F%E4%BE%A7%E8%BA%AB")
         );
         assert!(url.ends_with("maxTokens=160"));
+    }
+
+    /// 服务卡住时点取消：不能等这次请求自己超时（最长 120 秒），要立刻返回。
+    #[test]
+    fn cancel_interrupts_a_request_in_flight() {
+        let server = MockServer::start(|_, _| {
+            std::thread::sleep(Duration::from_millis(800));
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "status": "success",
+                    "model": "m",
+                    "dim": 2,
+                    "vector": [1.0, 0.0]
+                })
+                .to_string(),
+            )
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag = flag.clone();
+        let client = AiClient::cancellable(
+            &server.url(),
+            Arc::new(move || cancel_flag.load(Ordering::SeqCst)),
+        );
+        let trigger = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            trigger.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = client.embed_image("m", b"x").unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.cancelled, "应返回取消而不是失败：{}", error.message);
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "取消应立刻返回，实际等了 {elapsed:?}"
+        );
+    }
+
+    /// 取消后再调用不再发请求，也不重试。
+    #[test]
+    fn cancelled_client_skips_the_request() {
+        let server = MockServer::start(|_, _| MockResponse::json(200, "{}"));
+        let client = AiClient::cancellable(&server.url(), Arc::new(|| true));
+        let error = client.embed_image("m", b"x").unwrap_err();
+        assert!(error.cancelled);
+        assert!(server.requests().is_empty(), "已取消时不应发出请求");
+    }
+
+    /// 重试也算在总预算里：服务一直不响应时，最坏等的是 5 分钟，不是「单次超时 × 次数」。
+    #[test]
+    fn total_budget_stops_retries() {
+        let server = MockServer::start(|_, _| {
+            std::thread::sleep(Duration::from_millis(400));
+            MockResponse::json(503, r#"{"error":"busy"}"#)
+        });
+        let client = AiClient::new(&server.url())
+            .with_limits(Duration::from_millis(120), Duration::from_millis(260));
+        let started = Instant::now();
+        let error = client.embed_image("m", b"x").unwrap_err();
+        assert!(error.cancelled, "预算用完应停止等待：{}", error.message);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "预算应约束总等待，实际 {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -220,6 +220,11 @@ export function ApprovalCard({
         <div className="mcp-approval-error">{preview.blockedReason}</div>
       ) : null}
       {approval.error ? <div className="mcp-approval-error">{approval.error}</div> : null}
+      {approval.stalled ? (
+        <div className="mcp-approval-stalled">
+          10 分钟没有新进度，疑似卡住；任务仍在运行，可以让 AI 继续等或取消。
+        </div>
+      ) : null}
       {approval.taskId ? (
         <div className="mcp-approval-task">任务 {approval.taskId}</div>
       ) : null}

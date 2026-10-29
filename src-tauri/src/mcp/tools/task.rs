@@ -14,7 +14,7 @@ use crate::{
     app::{
         error::{AppError, AppResult},
         state::AppState,
-        tasks::{TaskKind, TaskPhase, TaskSnapshot},
+        tasks::{TaskKind, TaskSnapshot},
     },
     import::job::ImportSnapshot,
     mcp::approval::ApprovalView,
@@ -31,7 +31,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct TasksGetInput {
     #[schemars(description = "任务 id 或待确认 approvalId；省略时返回活动任务与最近结束的任务")]
     pub task_id: Option<String>,
-    #[schemars(description = "最多等待多少毫秒，0-30000；任务已进入终态时立即返回")]
+    #[schemars(
+        description = "最多等待多少毫秒，0-30000；任务已进入终态、或确认单长时间没有进度时立即返回"
+    )]
     pub wait_ms: Option<u64>,
     #[schemars(description = "是否附带失败清单；默认 false")]
     pub include_failures: Option<bool>,
@@ -273,10 +275,8 @@ fn wait_approval(
                 .into_iter()
                 .find(|task| task.task_id == task_id)
         });
-        let settled = !view.status.is_open()
-            || task
-                .as_ref()
-                .is_some_and(|task| task.phase == TaskPhase::Cancelled);
+        // 执行中但长时间没有进度时不再阻塞等待：把当前进度交给 AI，由它决定继续等还是取消。
+        let settled = !view.status.is_open() || view.stalled;
         let timed_out = Instant::now() >= deadline;
         if settled || timed_out {
             let mut value = json!({

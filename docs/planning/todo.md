@@ -167,6 +167,7 @@
 
 自动覆盖：`acceptance_mcp` 覆盖服务生命周期、口令、端口占用、三档、审批拒绝/批准/过期/换库清空、工具列表与调用、口令轮换与审计日志，服务生命周期条目已归档；以下为真实客户端、便携包、确认卡观感与真实 AI 联调。
 
+- [ ] **关闭服务与执行卡住**：客户端连着时在设置里关掉 MCP，客户端立刻收到连接断开；再调任何工具都被拒绝并提示「MCP 服务已关闭」；重新开启后恢复正常。批准一次长任务后把 AI 服务停掉让它长时间无进度，确认卡片在 10 分钟后出现「疑似卡住」一行、状态仍是执行中，`tasks_get` 立即返回当前进度而不是等满 30 秒。
 - [ ] **窗口与客户端剩余复验**：确认卡片拆行后的观感（操作说明/数量/导入设置三行）、10 分钟未处理自动取消、换库后旧确认单清空、`collections_create` 带 selector 解析为空时返回 `noop`；引擎超时取消；界面同步刷新与查看器关闭（`library-changed` 的 `closeViewer`）；界面任务被 AI 取消的提示；`nextPageToken` 路径；便携目录 exe + `server/` 的 `--mcp-stdio` 实测；`logs/mcp.log` 真实落盘检查。
 - [ ] **接口一致性与规则自描述**：`tags_list` 分页取全 175 个有图标签且不重不漏、`folders_list` 分页取全同级 167 个子文件夹；完全档 `library_info.approval.threshold` 为 null 且 AI 能复述“不需要确认”；只读档 `writeAllowed=false`；`tagPresence=missing` 与 `excludeTagIds` 的筛选结果、面板“无标签”开关；`includeFacets` 的 `facetsNote` 与自排除计数；`tags_modify` 重命名/删除/合并与 `tagMerge` 记录的撤销重做；标签管理器“合并到…”的确认与刷新。步骤见[批次 5 记录](archive/2026-10-27-批次5-MCP接口一致性与规则自描述.md)的“七、用户手工验收”。
 - [ ] **找相似与临时区复验**：`find_similar` 传 `scope`（folder/selection/view/collection/temp）确认结果只在范围内；`targetIds` 两张的平均主色/语义并把参考图排除；`phash`/`pose` 多参考报错；浮点阈值与 `library_info.maxReferenceImages`；临时视图张数、被拒操作不出现在右键与详情侧栏、查看器只读、三种关闭方式都清空；`import_start(target=temp)` 不弹确认卡、回执 `target=temp` 且 `operationId=null`、`view=temp` 可查而 `view=all` 看不到。
@@ -178,6 +179,7 @@
 自动覆盖：`acceptance_ai` 用测试进程内的假 `/v1` 覆盖 health/ensure/embed/text/pose/shutdown、5xx 重试与 4xx 不重试、维度/模型校验、离线文案、语义搜索分页、相似分组范围与保留、临时区；以下为真实模型、真实窗口与性能专项。
 
 - [ ] **真实 AI 服务接入**：health/ensure/embed image/embed text/pose/shutdown 全链路，embedding 维度与模型名校验；描述未实现。
+- [ ] **取消与超时**：AI 服务卡住（例如把 `server/` 指向一个不响应的端口）时跑批量 embedding，点取消后约 1 秒内落到「已取消」，失败清单里没有被打断的那张；单张描述最长等 2 分钟就报错而不是 5 分钟。服务启动中（Python 刚拉起、模型还在加载）改一次 AI 设置并保存，确认状态自动回到在线，不需要手动点「启动」。
 - [ ] **真实模型塔验证**：SigLIP2 图片塔与文本塔分别加载、切换时旧塔让位、空闲卸载后 health 变回 false；记录显存峰值与实际加载耗时。
 - [ ] **真实窗口 AI 任务**：图片塔/文本塔/姿势模型加载、批量 embedding/pose 进度、取消、失败清单；描述待模型到位后再验。
 - [ ] 真实窗口语义搜索：文本输入（英文提示）、结果分页、Ctrl+A、退出语义模式、均值计算状态。
@@ -237,13 +239,12 @@
 
 ## 整改批次（2026-10-29 全量审查）
 
-来源：[全量代码审查报告](Lilith-Artbank-全量代码审查报告-2026-10-29.md)。A、B、C、D 已完成并归档（见[批次 A 记录](archive/2026-10-29-整改批次A-数据安全I.md)、[批次 B 记录](archive/2026-10-29-整改批次B-数据安全II.md)、[批次 C 记录](archive/2026-10-29-整改批次C-释放与导入历史.md)、[批次 D 记录](archive/2026-10-29-整改批次D-任务关库与终态.md)）；本轮继续做 E–G，H 随批次收尾；下一轮项列在最后。批次按“实现 + 测试”计量，机械搬迁不计。
+来源：[全量代码审查报告](Lilith-Artbank-全量代码审查报告-2026-10-29.md)。A、B、C、D、E 已完成并归档（见[批次 A 记录](archive/2026-10-29-整改批次A-数据安全I.md)、[批次 B 记录](archive/2026-10-29-整改批次B-数据安全II.md)、[批次 C 记录](archive/2026-10-29-整改批次C-释放与导入历史.md)、[批次 D 记录](archive/2026-10-29-整改批次D-任务关库与终态.md)、[批次 E 记录](archive/2026-10-29-整改批次E-AI与MCP.md)）；本轮继续做 F、G，H 随批次收尾；下一轮项列在最后。批次按“实现 + 测试”计量，机械搬迁不计。
 
-- [ ] **E AI/MCP**：T6 监督线程代次交接；T7 单次 120 秒、最多 3 次、总预算 5 分钟、取消可打断；T8 执行卡住 10 分钟无进度标“疑似卡住”，返回进度由 AI 决定继续/取消；T9 关闭 MCP 立刻断开已连客户端并拒绝调用。
 - [ ] **F 前端**：F1 补页只补缺的几张；F2 详情按 imageId 清空并校验；F3 缩略图地址带图库 id，切库弹框确认后重启；筛选面板标签输入走后端搜索；6 个高影响 P2（相似上下文、选择裁剪、`tagPresence`/`excludeTagIds` 失效、扩展名 chip、删标签清筛选、查看器内容/范围同步）。
 - [ ] **G 内存预算**：查看器、优化、估算、AI 解码、MCP 拼图接入统一字节预算。
 - [ ] **H 清理与文档**：删 `TaskLane`、`FilterCounts.folders`、`ImportRequest.worker_threads`、`contextRevision`、`BatchTaskKind::PackCompact` 分支；`undo_runs` 保留但 trim/clear 清理；修正缩略图段数（10 段/9.89 GB）与文档指针；撤销失败支持单条重试/跳过，清空记录与释放文件拆开。
-- [ ] **下一轮**：结构去重（文件夹聚合/ID/路径/任务通道/WriteGate）、巨型文件拆分、schema CHECK/迁移链、T12 同步命令改 async、T13 任务快照跨库残留与进度事件背压、Python 服务加固、剩余 5.2 与 mock 语义。
+- [ ] **下一轮**：结构去重（文件夹聚合/ID/路径/任务通道/WriteGate）、巨型文件拆分、schema CHECK/迁移链、T12 同步命令改 async、T13 任务快照跨库残留与进度事件背压、`/v1/shutdown` 鉴权、剩余 5.2 与 mock 语义。
 
 ## 功能待办
 

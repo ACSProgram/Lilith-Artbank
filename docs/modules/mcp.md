@@ -186,10 +186,15 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 ## 询问档确认队列
 
 1. 工具返回 `{ status: "pendingApproval", approvalId, preview }`，不立即执行。
-2. 应用右下角的非模态确认卡片与设置 → MCP 的待确认列表显示操作、范围、数量、示例与后果。
+2. 应用右下角的非模态确认卡片与设置 → MCP 的待确认列表显示操作、范围、数量、示例与后果；执行中长时间没有进度时，卡片多一行「疑似卡住」提示（状态仍是执行中）。
 3. 用户批准后重新解析 selector 并核对 `confirmedCount`；数量或状态变化时确认单标记失败并返回新预览。
 4. 拒绝、10 分钟未处理或关闭应用都会取消；`tasks_cancel(approvalId)` 等同于拒绝。
 5. AI 用 `tasks_get(approvalId)` 等待结果；批准后启动的移动/撤销/重做任务会附带任务快照。
+6. 执行中的记录不自动判失败：任务进度 10 分钟没有变化时，`approval.stalled` 为 `true` 并附最后一次 `progress`（阶段、已完成、失败、跳过与消息），`tasks_get` 立即返回而不是继续等，由 AI 决定继续等还是取消。
+7. 任务进入终态时回写记录（完成、失败、取消都落成对应状态），不依赖任务快照还在不在——任务列表只保留最近 50 条。
+8. 队列上限 50：超出时先淘汰终态记录，再淘汰最老的待确认单；执行中的记录不会被挤掉，否则 AI 拿着 `approvalId` 再查会得到“不存在”。
+
+服务关闭时不只是停止监听：已建立的连接会立即断开，且所有工具入口都会检查 `settings.mcp.enabled`，关闭后即使客户端还持有连接也调不动任何工具。
 
 询问档的拦截条件：
 
@@ -235,7 +240,7 @@ Rust：
 - `src-tauri/src/mcp/runtime.rs`：服务启停、端口、口令、`mcp-runtime.json`、Bearer 校验、stateless Streamable HTTP。
 - `src-tauri/src/mcp/bridge.rs`：`--mcp-stdio` 逐行代理，维护协商版本。
 - `src-tauri/src/mcp/server.rs`：rmcp 工具适配器、工具描述与工具注册。
-- `src-tauri/src/mcp/approval.rs`：待确认队列、状态与 10 分钟过期。
+- `src-tauri/src/mcp/approval.rs`：待确认队列、状态、10 分钟过期与“疑似卡住”标注。
 - `src-tauri/src/mcp/audit.rs`：`logs/mcp.log` 工具调用与导入来源审计。
 - `src-tauri/src/mcp/selection.rs`：selector 解析（分页与全量 id）、排除与去重。
 - `src-tauri/src/mcp/sheet.rs`：拼图映射缓存与缩略图/原图读取。

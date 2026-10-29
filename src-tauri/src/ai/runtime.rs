@@ -314,8 +314,8 @@ struct Inner {
     resources: Arc<ResourceTable>,
     images: Arc<ImageBudget>,
     generation: AtomicU64,
-    supervisor_generation: AtomicU64,
-    supervising: AtomicBool,
+    /// 监督线程的所有权；代次与持有者在同一把锁里交接。
+    supervisor: SupervisorSlot,
     manual_stop: AtomicBool,
 }
 
@@ -351,8 +351,7 @@ impl AiRuntime {
                 resources,
                 images,
                 generation: AtomicU64::new(0),
-                supervisor_generation: AtomicU64::new(0),
-                supervising: AtomicBool::new(false),
+                supervisor: SupervisorSlot::new(),
                 manual_stop: AtomicBool::new(false),
             }),
         }
@@ -447,19 +446,14 @@ impl AiRuntime {
         }
         self.inner.manual_stop.store(false, Ordering::SeqCst);
         self.inner.process.lock().reset_failure();
-        self.inner
-            .supervisor_generation
-            .fetch_add(1, Ordering::SeqCst);
-        self.inner.supervising.store(false, Ordering::SeqCst);
+        self.invalidate_supervisor();
         self.spawn_supervisor(settings.clone());
         Ok(())
     }
 
     pub fn stop_service(&self, settings: &AiSettings) {
         self.inner.manual_stop.store(true, Ordering::SeqCst);
-        self.inner
-            .supervisor_generation
-            .fetch_add(1, Ordering::SeqCst);
+        self.invalidate_supervisor();
         let owned = self.inner.process.lock().is_owned_running();
         if owned {
             let client = AiClient::new(&settings.base_url);
@@ -471,9 +465,7 @@ impl AiRuntime {
     }
 
     pub fn shutdown(&self, settings: &AiSettings) {
-        self.inner
-            .supervisor_generation
-            .fetch_add(1, Ordering::SeqCst);
+        self.invalidate_supervisor();
         let owned = self.inner.process.lock().is_owned_running();
         if owned {
             let client = AiClient::new(&settings.base_url);
@@ -487,9 +479,7 @@ impl AiRuntime {
         if previous == current {
             return;
         }
-        self.inner
-            .supervisor_generation
-            .fetch_add(1, Ordering::SeqCst);
+        self.invalidate_supervisor();
         let owned = self.inner.process.lock().is_owned_running();
         if owned {
             let client = AiClient::new(&previous.base_url);
@@ -1353,19 +1343,23 @@ impl AiRuntime {
         });
     }
 
+    /// 让当前监督线程作废：代次前进后旧线程在下一次检查时退出，且不能清掉新一代的标记。
+    fn invalidate_supervisor(&self) {
+        self.inner.supervisor.invalidate();
+    }
+
     fn spawn_supervisor(&self, settings: AiSettings) {
-        if self.inner.supervising.swap(true, Ordering::SeqCst) {
+        let Some(token) = self.inner.supervisor.claim() else {
             return;
-        }
+        };
         let inner = self.inner.clone();
-        let token = inner.supervisor_generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
-            // 退出时只释放自己这一代，避免把 start_service 新拉起的监督线程标记清掉。
+            // 退出时只释放自己这一代，避免把新拉起的监督线程标记清掉。
             let _guard = SupervisorGuard {
                 inner: inner.clone(),
                 token,
             };
-            let stale = || token != inner.supervisor_generation.load(Ordering::SeqCst);
+            let stale = || inner.supervisor.is_stale(token);
             let client = AiClient::new(&settings.base_url);
             if client.health().is_ok() {
                 inner.process.lock().mark_online(false);
@@ -1474,8 +1468,104 @@ struct SupervisorGuard {
 
 impl Drop for SupervisorGuard {
     fn drop(&mut self) {
-        if self.token == self.inner.supervisor_generation.load(Ordering::SeqCst) {
-            self.inner.supervising.store(false, Ordering::SeqCst);
+        self.inner.supervisor.release(self.token);
+    }
+}
+
+/// 监督线程的所有权。
+///
+/// 代次与持有者必须在同一把锁里交接，否则会出现两种卡死：旧线程因代次变化提前返回，
+/// 却因为 token 不匹配清不掉标志；新线程又被标志挡住，此后自动拉起一直静默失败。
+#[derive(Default)]
+struct SupervisorSlot {
+    generation: AtomicU64,
+    owner: Mutex<Option<u64>>,
+}
+
+impl SupervisorSlot {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 作废当前监督线程；旧线程在下一次检查时退出，且释放不到新一代的标记。
+    ///
+    /// 和 `claim` 用同一把锁：否则「读代次 → 改代次」与 `claim` 的交接可能交错，
+    /// 让刚接手的线程被判成仍然有效。
+    fn invalidate(&self) {
+        let _owner = self.owner.lock();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 取得监督权；同一代次已有线程在监督时返回 `None`（重复调用不再另起线程）。
+    fn claim(&self) -> Option<u64> {
+        let mut owner = self.owner.lock();
+        let current = self.generation.load(Ordering::SeqCst);
+        if *owner == Some(current) {
+            return None;
         }
+        // 新代次直接顶掉旧线程，旧线程的 `release` 因代次不匹配不会清掉这里的标记。
+        let token = current + 1;
+        self.generation.store(token, Ordering::SeqCst);
+        *owner = Some(token);
+        Some(token)
+    }
+
+    fn release(&self, token: u64) {
+        let mut owner = self.owner.lock();
+        if *owner == Some(token) {
+            *owner = None;
+        }
+    }
+
+    fn is_stale(&self, token: u64) -> bool {
+        token != self.generation.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SupervisorSlot;
+
+    /// 状态刷新会反复调用 `spawn_supervisor`：同一代次只能有一个监督线程。
+    #[test]
+    fn supervisor_claims_once_per_generation() {
+        let slot = SupervisorSlot::new();
+        let first = slot.claim().expect("首次应取得监督权");
+        assert!(slot.claim().is_none(), "同一代次不应再起第二个线程");
+        assert!(!slot.is_stale(first));
+    }
+
+    /// 启动过程中保存设置：作废旧代次后必须能立刻接手，而不是被旧标记挡住。
+    #[test]
+    fn invalidate_hands_over_to_a_new_supervisor() {
+        let slot = SupervisorSlot::new();
+        let old = slot.claim().unwrap();
+        slot.invalidate();
+        assert!(slot.is_stale(old));
+        let new = slot.claim().expect("作废后应能取得新的监督权");
+        assert_ne!(new, old);
+        assert!(!slot.is_stale(new));
+    }
+
+    /// 旧线程退出不能清掉新一代的标记，否则后续自动拉起会被静默挡掉。
+    #[test]
+    fn stale_supervisor_release_keeps_new_owner() {
+        let slot = SupervisorSlot::new();
+        let old = slot.claim().unwrap();
+        slot.invalidate();
+        let new = slot.claim().unwrap();
+        slot.release(old);
+        assert!(!slot.is_stale(new), "旧线程释放后新代次仍应有效");
+        assert!(slot.claim().is_none(), "新代次已在监督，不应重复起线程");
+    }
+
+    /// 自己退出后必须能再次被拉起，否则失败一次就永久不再自动启动。
+    #[test]
+    fn released_supervisor_can_be_restarted() {
+        let slot = SupervisorSlot::new();
+        let token = slot.claim().unwrap();
+        slot.release(token);
+        let again = slot.claim().expect("退出后应能重新取得监督权");
+        assert_ne!(again, token);
     }
 }

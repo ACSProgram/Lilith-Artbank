@@ -56,11 +56,16 @@ pub(super) fn scenario_bridge(app: &tauri::AppHandle, options: &Options) -> Resu
     let info = bridge.call_tool("library_info", json!({}))?;
     let search = bridge.call_tool("search_images", json!({ "pageSize": 5, "view": "all" }))?;
     let tags = bridge.call_tool("tags_list", json!({ "limit": 10 }))?;
-    drop(bridge);
 
+    // 关闭服务：小桥还开着，之后再调工具必须被拒绝，不能靠“客户端自觉断开”。
     let state = app.state::<AppState>();
     set_mcp(app, request.port, McpMode::Full, false)?;
     wait_stopped(state.inner(), Duration::from_secs(5))?;
+    let after_disable = bridge.call_tool("library_info", json!({}));
+    let after_disable_rejected = after_disable.is_err();
+    let after_disable_error = after_disable.err().unwrap_or_default();
+    drop(bridge);
+
     let runtime_removed = !paths::mcp_runtime_path().is_file();
     Ok(json!({
         "initialize": initialize,
@@ -68,6 +73,8 @@ pub(super) fn scenario_bridge(app: &tauri::AppHandle, options: &Options) -> Resu
         "libraryInfo": info.to_value(),
         "search": search.to_value(),
         "tags": tags.to_value(),
+        "afterDisableRejected": after_disable_rejected,
+        "afterDisableError": after_disable_error,
         "runtimeRemovedAfterStop": runtime_removed,
     }))
 }

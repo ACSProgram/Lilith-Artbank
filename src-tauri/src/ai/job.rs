@@ -108,10 +108,18 @@ pub struct JobContext {
 }
 
 /// 任务主流程：探活并确保能力 → 过滤缺失项 → 逐张处理。
-/// 取消只在图片之间生效；单张失败记入清单，连续失败达到上限才中止。
+/// 取消在图片之间生效，单次请求进行中也能立刻打断；单张失败记入清单，连续失败达到上限才中止。
 /// 进度、取消与失败清单都由 `TaskHandle` 承载，这里不再保留第二套状态。
-pub fn execute(context: &JobContext, task: &TaskHandle, request: &AiJobRequest) -> AppResult<()> {
-    let client = AiClient::new(&context.settings.base_url);
+pub fn execute(
+    context: &JobContext,
+    task: &Arc<TaskHandle>,
+    request: &AiJobRequest,
+) -> AppResult<()> {
+    let cancel_task = task.clone();
+    let client = AiClient::cancellable(
+        &context.settings.base_url,
+        Arc::new(move || cancel_task.should_cancel()),
+    );
     task.set_phase(TaskPhase::Preparing);
     task.set_message(format!("正在准备{}模型…", request.kind.label()));
     let health = client
@@ -224,6 +232,10 @@ fn run_job(
                 consecutive_failures = 0;
             }
             Err(error) => {
+                // 取消打断的请求不算失败：用户已经不要结果了，不该在失败清单里留一条。
+                if cancel() {
+                    return Ok(());
+                }
                 task.inc_failed();
                 task.add_failure(Some(image_id), "", error.to_string());
                 consecutive_failures += 1;
@@ -384,6 +396,7 @@ pub(crate) fn ensure_capability(
         message: format!("服务没有可用的 {name} 能力"),
         retryable: false,
         transport: false,
+        cancelled: false,
     })
 }
 

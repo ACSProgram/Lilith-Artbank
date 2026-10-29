@@ -31,6 +31,8 @@ LOGGER = logging.getLogger("artbank.server")
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
 TEXT_MAX_LENGTH = 64
+# 同时执行的推理请求数；health 与 shutdown 不占名额。
+MAX_INFERENCE_CONCURRENCY = 4
 POSE_MODEL = "mediapipe-pose"
 CLIP_CAPABILITIES = {"imageEmbedding": "image", "textEmbedding": "text"}
 KNOWN_CAPABILITIES = {"imageEmbedding", "textEmbedding", "pose", "description"}
@@ -88,6 +90,8 @@ class ApiServer(ThreadingHTTPServer):
 
     def __init__(self, server_address, state: ApiState):
         self.state = state
+        # 推理请求的并发上限：超出的直接回 503，不排队——排队只会把显存与内存一起放大。
+        self.inference_slots = threading.BoundedSemaphore(MAX_INFERENCE_CONCURRENCY)
         super().__init__(server_address, ApiHandler)
 
 
@@ -131,6 +135,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         started = time.monotonic()
         status = 500
+        slots = self.server.inference_slots
+        holding_slot = False
         try:
             if path == "/v1/health":
                 raise ApiError(405, "method_not_allowed", "health 只接受 GET")
@@ -139,6 +145,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 status = 200
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
+            # health 与 shutdown 不占名额：并发推理时也要能探活和关闭。
+            holding_slot = slots.acquire(blocking=False)
+            if not holding_slot:
+                raise ApiError(
+                    503,
+                    "server_busy",
+                    f"AI 服务正在处理其他请求（上限 {MAX_INFERENCE_CONCURRENCY} 个），请稍后重试",
+                )
             payload = self._route_post(path)
             self._send_json(200, payload)
             status = 200
@@ -167,6 +181,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 status, {"error": "inference_failed", "message": str(error)}
             )
         finally:
+            if holding_slot:
+                slots.release()
             elapsed = (time.monotonic() - started) * 1000
             if status >= 400:
                 LOGGER.warning("POST %s -> %s %.1fms", path, status, elapsed)

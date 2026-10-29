@@ -539,38 +539,10 @@ impl AppState {
         self.mcp_approvals.clone()
     }
 
-    /// 待确认与执行中的列表；绑定任务的状态按任务总线实时推导。
+    /// 待确认与执行中的列表；执行中的记录先按任务快照回写进度与终态。
     pub fn mcp_approval_views(&self) -> Vec<ApprovalView> {
-        use crate::mcp::approval::ApprovalStatus;
-        let snapshots = self.tasks.list();
-        self.mcp_approvals
-            .list()
-            .into_iter()
-            .map(|mut view| {
-                if view.status == ApprovalStatus::Running
-                    && let Some(task_id) = view.task_id.as_deref()
-                    && let Some(task) = snapshots
-                        .iter()
-                        .find(|snapshot| snapshot.task_id == task_id)
-                {
-                    match task.phase {
-                        TaskPhase::Completed => view.status = ApprovalStatus::Completed,
-                        TaskPhase::PartialFailed | TaskPhase::Failed => {
-                            view.status = ApprovalStatus::Failed;
-                            if view.error.is_none() {
-                                view.error = Some(task.message.clone());
-                            }
-                        }
-                        TaskPhase::Cancelled => {
-                            view.status = ApprovalStatus::Failed;
-                            view.error = Some("任务已取消".to_owned());
-                        }
-                        _ => {}
-                    }
-                }
-                view
-            })
-            .collect()
+        self.mcp_approvals.sync_tasks(&self.tasks.list());
+        self.mcp_approvals.list()
     }
 
     pub fn reject_mcp_approval(&self, id: &str) -> AppResult<()> {

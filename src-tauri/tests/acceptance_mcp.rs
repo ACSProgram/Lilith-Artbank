@@ -46,6 +46,10 @@ fn stdio_bridge_lists_and_calls_tools() {
     );
     assert_eq!(data["search"]["total"], 2, "{data}");
     assert_eq!(data["tags"]["total"], 0, "{data}");
+    assert_eq!(
+        data["afterDisableRejected"], true,
+        "关闭服务后工具调用必须被拒绝：{data}"
+    );
     assert_eq!(data["runtimeRemovedAfterStop"], true, "{data}");
 
     let audit = std::fs::read_to_string(workspace.app_root().join("logs").join("mcp.log"))

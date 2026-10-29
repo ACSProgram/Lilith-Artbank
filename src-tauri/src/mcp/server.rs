@@ -11,7 +11,10 @@ use tauri::{AppHandle, Manager};
 
 use crate::{
     ai::runtime::AiRuntime,
-    app::{error::AppResult, state::AppState},
+    app::{
+        error::{AppError, AppResult},
+        state::AppState,
+    },
 };
 
 use super::{
@@ -79,6 +82,7 @@ impl McpServer {
         let app = self.app.clone();
         let joined = tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
+            ensure_enabled(&state)?;
             let context = state.mcp_context()?;
             operation(&context, &state.ai)
         })
@@ -114,6 +118,7 @@ impl McpServer {
         let app = self.app.clone();
         let joined = tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
+            ensure_enabled(&state)?;
             operation(&state)
         })
         .await;
@@ -132,6 +137,16 @@ impl McpServer {
         }
         Ok(outcome_result(result))
     }
+}
+
+/// 服务关闭后不再执行任何工具调用：keep-alive 连接可能还开着，权限撤回要彻底。
+fn ensure_enabled(state: &AppState) -> AppResult<()> {
+    if state.settings.snapshot().mcp.enabled {
+        return Ok(());
+    }
+    Err(AppError::message(
+        "MCP 服务已关闭，请在设置 → MCP 中重新开启后重试",
+    ))
 }
 
 fn outcome_result(result: AppResult<ToolOutcome>) -> CallToolResult {
@@ -425,7 +440,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务。导入任务额外附带 imported/duplicates/merged/previewIds 回执与 target；includePairs=true 才会返回重复对、批内重复、合并目标与源文件映射数组，默认只给精确计数。三个「重复」口径不同：duplicates 是按重复策略被跳过的源文件数，duplicatePairCount 是命中的库内重复对（merge 策略下 duplicates 为 0 但重复对仍计数），merged 是被合并进已有图片的源文件数；tempReplaced 是图库导入时丢弃掉的临时区同内容行数。completed 在导入任务里是已处理文件数，在移动任务里是已处理张数，移动的 skipped 是其中没有移动的张数。通过 MCP 导入的图片没有 embedding 与描述，语义搜索找不到它们，需要用户在界面上跑批量 AI 任务。"
+        description = "查询任务或待确认单。不带 id 时返回活动任务、最近结束的任务与待确认列表；waitMs 最多 30000。用 approvalId 查询会等待用户批准/拒绝并附上关联任务；执行中 10 分钟没有进度时不再继续等，直接返回 approval.stalled=true 与当前 progress，由你决定继续等还是取消。导入任务额外附带 imported/duplicates/merged/previewIds 回执与 target；includePairs=true 才会返回重复对、批内重复、合并目标与源文件映射数组，默认只给精确计数。三个「重复」口径不同：duplicates 是按重复策略被跳过的源文件数，duplicatePairCount 是命中的库内重复对（merge 策略下 duplicates 为 0 但重复对仍计数），merged 是被合并进已有图片的源文件数；tempReplaced 是图库导入时丢弃掉的临时区同内容行数。completed 在导入任务里是已处理文件数，在移动任务里是已处理张数，移动的 skipped 是其中没有移动的张数。通过 MCP 导入的图片没有 embedding 与描述，语义搜索找不到它们，需要用户在界面上跑批量 AI 任务。"
     )]
     async fn tasks_get(
         &self,

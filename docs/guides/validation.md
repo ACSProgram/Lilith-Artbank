@@ -240,6 +240,8 @@ curl.exe -X POST http://127.0.0.1:18766/v1/shutdown
 
 - 图片塔与文本塔应分别加载；加载另一塔时旧塔让位。
 - 空闲 300 秒后 health 的两个塔都变回 `ready=false`；可用 `--idle-unload-seconds` 调短验证。
+- 并发上限：同时发 5 个以上推理请求时，超出 4 个的部分应立刻返回 `503 {"error":"server_busy"}`，同一时刻 `/v1/health` 仍是 200。
+- 解码上限：超过 1 亿像素的图返回 422 `decode_failed`，不会把进程内存顶上去。
 - Python 服务与模型路径必须由用户环境提供，不要写成 CI 或常驻测试。
 
 ## 发布产物依赖检查

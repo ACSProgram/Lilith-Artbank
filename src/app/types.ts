@@ -77,6 +77,9 @@ export interface McpApproval {
   result: unknown;
   error: string | null;
   taskId: string | null;
+  /** 执行中超过 10 分钟没有进度：只是标注，任务仍在跑。 */
+  stalled: boolean;
+  progress: unknown;
 }
 
 /** 排序方案：全局共享，存设置，数量上限 50 是存储上限。 */
