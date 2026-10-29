@@ -1,6 +1,8 @@
 mod ai;
 mod app;
 mod concurrency;
+#[cfg(feature = "headless")]
+mod headless;
 mod imageops;
 mod import;
 mod library;
@@ -8,6 +10,12 @@ mod mcp;
 mod platform;
 
 use tauri::Manager;
+
+/// `--headless` 分支：不创建用户可见窗口，只装配状态并执行验收命令。
+#[cfg(feature = "headless")]
+pub fn run_headless(args: &[String]) -> i32 {
+    headless::run(args)
+}
 
 /// 单个日志文件的上限。超过即轮转。
 const LOG_MAX_FILE_SIZE: u128 = 4_000_000;

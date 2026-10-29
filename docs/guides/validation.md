@@ -19,6 +19,22 @@
 
 界面视觉、手感与真实窗口行为全部由用户手工检查。代理只报告构建、类型、单测与基准的结论，并把验收步骤写清楚交给用户；未完成与待验收清单在[待办](../planning/todo.md)。
 
+## 无窗口验收入口（开发期）
+
+B0 已加入 `headless` feature 与 `--headless ping`，用于在后台确认最小启动链路：
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml --features headless
+LILITH_ARTBANK_ROOT=<target 下的临时目录> \
+  src-tauri/target/debug/lilith-artbank.exe --headless ping
+```
+
+- 入口不调用 GUI 的 `run()`，不创建用户可见窗口、不建托盘、不加载 WebView、不经过 IPC。
+- 必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出，避免把 `settings.json` 写进仓库根。
+- B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
+- 该 feature 不进 default、不进发布产物；不传 `--headless` 时同一二进制仍是正常 GUI 程序。
+- 当前只有 `ping`，不能作为任何待验收条目的通过依据；`acceptance_*` 套件落地后在此补充命令、档位与产物位置。
+
 ## 日常检查
 
 ```bash

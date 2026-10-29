@@ -10,6 +10,11 @@ publish = false
 name = "lilith_artbank_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 无窗口验收入口：仅供开发期测试以独立进程调用真实可执行文件。
+# 不改变依赖特性，不进发布产物，因此不加入 default。
+[features]
+headless = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
