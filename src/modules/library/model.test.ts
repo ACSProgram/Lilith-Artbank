@@ -5,6 +5,7 @@ import {
   DEFAULT_SORT_LEVELS,
   activeFilterCount,
   browseToFolder,
+  buildQuery,
   defaultBrowseState,
   effectiveSort,
   emptyFilters,
@@ -32,6 +33,7 @@ function row(overrides: Partial<ImageRow> = {}): ImageRow {
     fileExt: "png",
     folderId: 2,
     folderPath: "人物/线稿",
+    folderTrashed: false,
     filePath: "G:/lib/人物/线稿/hash.png",
     fileSize: 1024,
     width: 100,
@@ -274,6 +276,28 @@ test("sort summary names the first levels", () => {
     ]),
     "评分 ↓ + 导入时间 ↑ +1",
   );
+});
+
+test("trash loose filter clears folder scope and only applies to trash view", () => {
+  const filters = {
+    ...emptyFilters(),
+    folderIds: [7],
+    folderDirect: true,
+    trashLoose: true,
+  };
+  const normalized = normalizeFilters(filters);
+  assert.deepEqual(normalized.folderIds, []);
+  assert.equal(normalized.folderDirect, false);
+  assert.equal(normalized.trashLoose, true);
+
+  const trashQuery = buildQuery(state({ view: "trash", filters }));
+  assert.equal(trashQuery.filters.trashLoose, true);
+  assert.deepEqual(trashQuery.filters.folderIds, []);
+
+  const allQuery = buildQuery(state({ view: "all", filters }));
+  assert.equal(allQuery.filters.trashLoose, false);
+  assert.deepEqual(allQuery.filters.folderIds, [7]);
+  assert.equal(allQuery.filters.folderDirect, true);
 });
 
 test("trash actions follow the view, not the row state", () => {

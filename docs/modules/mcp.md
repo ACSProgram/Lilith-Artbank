@@ -51,7 +51,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | 工具 | 输入 | 返回 |
 | --- | --- | --- |
 | `library_info` | — | 图库、普通/回收站/临时计数、schema、特征数量、AI 配置、当前 MCP 档位（`mode` / `writeAllowed` / `approval`）与限制 |
-| `folders_list` | `parentPath?`、`limit?`、`cursor?` | 直接子文件夹、路径、直接/子树计数、`total`、`nextCursor` |
+| `folders_list` | `parentPath?`、`limit?`、`cursor?` | 直接子文件夹、路径、直接/子树计数、`total`、`nextCursor`；只含正常树，不含回收站与待释放文件夹 |
 | `tags_list` | `query?`、`limit?`、`cursor?` | 有图片的标签 id、名称、图片数、`total`、`nextCursor`；0 张标签不返回 |
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
 | `search_images` | 结构化查询（`view` 可含 `temp`）、`pageSize` 1–50、`searchScope`、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述、标签名与文件夹名；`view` 只有 all/trash/collection/temp，跨回收站搜索用 `searchScope=library` |
@@ -91,7 +91,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 临时图片允许 `images_update`（评分、标签、描述），但不产生历史记录，结果里的 `operationId` 为 null；`images_move`、`images_trash` 与集合成员变更会同步拒绝临时图片（选择里有临时图就整批 `rejected`，不再先弹确认卡再让任务失败）。
 - `images_move` 的 `dryRun` 把「已经在目标文件夹」算进 `skipped`（另给 `alreadyInTarget`），全是这种情况直接 `noop`；任务快照的 `completed` 是已处理张数，`skipped` 是其中没有移动的张数，`failed` 与 `failures` 来自同一份移动报告。
 - `tags_modify` 三种动作都走操作记录、都能撤销：`rename` 只改名称，撞同名标签直接报错；`delete` 删除标签并从所有图片上移除它；`merge` 把 `tagId` 的图片全部并到 `targetId`（已存在的关系只去重），然后删除源标签行。`delete` / `merge` 可传 `expectedImages` 核对源标签当前图片数，不一致返回 `rejected`。三种动作不套 100 张阈值（范围是整个标签），询问档下 `delete` / `merge` 需确认、`rename` 直接执行。合并会删除源标签，撤销依赖操作记录。
-- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 只删「无子文件夹、无图片、磁盘目录为空」的文件夹。临时文件夹与根目录不能改名、移动或删除。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认；四种动作真正执行前都要申请该子树路径写资源（新建与移动还锁父级，避免同级序号并发）。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
+- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 把整棵子树移入回收站（含子文件夹与图片，保留原路径，可在界面恢复）。临时文件夹、根目录、已在回收站或正在释放的文件夹不能改名、移动或删除；目标路径落在回收站文件夹时拒绝。`delete` 的 dryRun 返回 `imageCount`、`subfolderCount`、`recoverable: true` 与“原文件留在原路径”的后果说明。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认；四种动作真正执行前都要申请该子树路径写资源（新建与移动还锁父级，避免同级序号并发）。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
 - `collections_create` 带 selector 时在同一事务里建集合并加入图片，只产生一条记录；撤销会删除整个集合，重做按原 id 与条目顺序恢复。
 - selector 可以解析到不存在、已在回收站或不在回收站的图片；出现这类 id 时整批拒绝并返回失败清单，不会静默少做。
 - 产生操作记录时在标题前加 `AI · `。一次 MCP 写入最多 100 万张（query / ids）；相似结果最多 10,000 张；拼图最多 25 格。
@@ -196,7 +196,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `import_start` 且 `target=library`（不论路径数；`target=temp` 不确认）；
 - `images_trash`（不论张数）；
 - `history_undo`、`history_redo`（不论条数）；
-- `folders_modify` 的 `move` 与 `delete`（会成批改动图片路径或删掉目录；`create` / `rename` 直接执行）；
+- `folders_modify` 的 `move` 与 `delete`（会成批改动图片路径或把整棵子树移入回收站；`create` / `rename` 直接执行）；
 - `tags_modify` 的 `delete` 与 `merge`（会成批移除关系）；
 - 任何解析出超过 100 张图片的批量写入（更新、移动、恢复、集合创建/成员变更）。
 
@@ -241,7 +241,7 @@ Rust：
 - `src-tauri/src/mcp/sheet.rs`：拼图映射缓存与缩略图/原图读取。
 - `src-tauri/src/mcp/tools/read.rs`：只读工具、`find_similar` 的 `FindSimilarScope` 与多参考图参数。
 - `src-tauri/src/mcp/tools/write.rs`：写工具、数量核对、询问判定与写后事件；`willChange` 预检（评分/标签/集合成员/目标文件夹）也在这里。
-- `src-tauri/src/mcp/tools/folder.rs`：`folders_modify` 的四种动作、路径解析与删除前置检查。
+- `src-tauri/src/mcp/tools/folder.rs`：`folders_modify` 的四种动作、路径解析与删除前置检查（删除为移入回收站）。
 - `src-tauri/src/mcp/tools/tag.rs`：`tags_modify` 的重命名/删除/合并、`expectedImages` 核对、询问判定与确认预览。
 - `src-tauri/src/mcp/tools/history.rs`：记录列表、撤销/重做预览与批准执行。
 - `src-tauri/src/mcp/tools/task.rs`：任务与确认单查询、等待、取消与导入回执（含 `includePairs` 归因数组）。

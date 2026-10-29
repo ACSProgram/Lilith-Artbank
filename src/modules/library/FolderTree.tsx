@@ -21,6 +21,7 @@ import {
   Images,
   Pencil,
   Plus,
+  RotateCcw,
   Rows2,
   Trash2,
 } from "lucide-react";
@@ -28,6 +29,11 @@ import { IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { useNotices } from "../../app/noticeContext";
 import { errorMessage } from "../../shared/errors";
+import {
+  confirmDeleteFolderPermanently,
+  confirmRestoreFolder,
+  confirmTrashFolder,
+} from "../../shared/confirm";
 import { FOLDER_DRAG_HOVER_EVENT } from "../../shared/useDragSort";
 import { libraryApi } from "./api";
 import { FolderNameDialog, FolderSortDialog } from "./FolderDialogs";
@@ -39,6 +45,7 @@ import {
   expandedPaths,
   flattenVisible,
   hasNestedSortable,
+  isSameOrDescendant,
   needsFolderSort,
   parentFolderPath,
   resolveExpandedPaths,
@@ -57,7 +64,17 @@ interface FolderTreeProps {
   onSelect: (folderIds: number[]) => void;
   onSelectDirect: (folderId: number) => void;
   onFoldersChanged: (folders: FolderInfo[]) => void;
-  onDataChanged: () => void;
+  onDataChanged: (
+    delta?: { images?: number; trash?: number },
+    reason?: string,
+  ) => void;
+  /** 回收站模式：只读树，只提供恢复与永久删除。 */
+  mode?: "normal" | "trash";
+  /** 回收站根行“直属图片”的数量与选中状态。 */
+  trashDirectCount?: number;
+  trashTotalCount?: number;
+  trashDirectSelected?: boolean;
+  onSelectTrashDirect?: () => void;
   onBeginFolderDrag: (
     folderIds: number[],
     label: string,
@@ -125,12 +142,18 @@ export function FolderTree({
   onFoldersChanged,
   onDataChanged,
   onBeginFolderDrag,
+  mode = "normal",
+  trashDirectCount = 0,
+  trashTotalCount = 0,
+  trashDirectSelected = false,
+  onSelectTrashDirect,
   split,
   splitRatio,
   onToggleSplit,
   onSplitRatioChange,
 }: FolderTreeProps) {
   const { notify, confirm } = useNotices();
+  const trashMode = mode === "trash";
   const tree = useMemo(() => buildFolderTree(folders), [folders]);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
   const [anchorId, setAnchorId] = useState<number | null>(null);
@@ -163,9 +186,33 @@ export function FolderTree({
   const rootFolder = folders.find((folder) => folder.path === "");
   const selected = useMemo(() => new Set(selectedFolderIds), [selectedFolderIds]);
   const rows = useMemo(() => flattenVisible(tree.nodes, expanded), [tree, expanded]);
+  const rootSelected = trashMode
+    ? selectedFolderIds.length === 0 && !trashDirectSelected
+    : selectedFolderIds.length === 0;
+
+  // 进入回收站时先展开全部顶层节点；正常树的展开状态暂存，切回后原样恢复。
+  const lastTrashMode = useRef(trashMode);
+  const normalExpandedRef = useRef<Set<number> | null>(null);
+  useEffect(() => {
+    if (lastTrashMode.current !== trashMode) {
+      lastTrashMode.current = trashMode;
+      if (trashMode) {
+        normalExpandedRef.current = expanded;
+        setExpanded(new Set(defaultExpandedIds(tree.nodes)));
+      } else {
+        setExpanded(normalExpandedRef.current ?? new Set(defaultExpandedIds(tree.nodes)));
+        normalExpandedRef.current = null;
+      }
+      return;
+    }
+    if (trashMode && expanded.size === 0 && tree.nodes.length > 0) {
+      setExpanded(new Set(defaultExpandedIds(tree.nodes)));
+    }
+  }, [trashMode, tree]);
 
   // 换库时 Sidebar 用 libraryId 作 key 重新挂载本组件，展开状态无需手动重置。
   useEffect(() => {
+    if (trashMode) return;
     if (hydrated.current || tree.nodes.length === 0) return;
     hydrated.current = true;
     skipPersist.current = true;
@@ -176,7 +223,7 @@ export function FolderTree({
   }, [tree, libraryId]);
 
   useEffect(() => {
-    if (!hydrated.current) return;
+    if (trashMode || !hydrated.current) return;
     if (skipPersist.current) {
       skipPersist.current = false;
       return;
@@ -293,9 +340,13 @@ export function FolderTree({
   };
 
   const refreshAfterOperation = useCallback(
-    (change: FolderChange) => {
+    (
+      change: FolderChange,
+      delta?: { images?: number; trash?: number },
+      reason?: string,
+    ) => {
       onFoldersChanged(applyFolderChange(folders, change));
-      onDataChanged();
+      onDataChanged(delta, reason);
     },
     [folders, onDataChanged, onFoldersChanged],
   );
@@ -337,21 +388,67 @@ export function FolderTree({
   };
 
   const deleteFolder = async (node: FolderNode) => {
-    const accepted = await confirm({
-      title: `删除空文件夹「${node.name}」？`,
-      message: "只删除磁盘上的空目录与文件夹记录，不会删除图片。",
-      confirmLabel: "删除",
-      danger: true,
-    });
+    const accepted = await confirmTrashFolder(confirm, node.path, node.totalImageCount);
     if (!accepted) return;
     try {
       const change = await libraryApi.deleteFolder(node.id);
-      refreshAfterOperation(change);
-      if (selected.has(node.id)) {
-        onSelect(selectedFolderIds.filter((id) => id !== node.id));
+      refreshAfterOperation(
+        change,
+        { images: -change.affectedImages, trash: change.affectedImages },
+        "folderTrash",
+      );
+      notify(
+        change.affectedImages > 0
+          ? `文件夹已移入回收站，共 ${change.affectedImages.toLocaleString()} 张图片`
+          : "文件夹已移入回收站",
+        "success",
+      );
+      if (
+        selectedFolderIds.some((id) => {
+          const path = tree.byId.get(id)?.path;
+          return path != null && isSameOrDescendant(path, node.path);
+        })
+      ) {
+        onSelect([]);
       }
     } catch (cause) {
-      notify("删除文件夹失败", "error", errorMessage(cause));
+      notify("移入回收站失败", "error", errorMessage(cause));
+    }
+  };
+
+  const restoreFolderNode = async (node: FolderNode) => {
+    const accepted = await confirmRestoreFolder(confirm, node.path);
+    if (!accepted) return;
+    try {
+      const change = await libraryApi.restoreFolder(node.id);
+      onDataChanged(
+        { images: change.affectedImages, trash: -change.affectedImages },
+        "folderRestore",
+      );
+      notify(`已恢复文件夹「${node.name}」`, "success");
+      if (selectedFolderIds.some((id) => id === node.id)) onSelect([]);
+    } catch (cause) {
+      notify("恢复文件夹失败", "error", errorMessage(cause));
+    }
+  };
+
+  const deleteFolderPermanently = async (node: FolderNode) => {
+    const accepted = await confirmDeleteFolderPermanently(
+      confirm,
+      node.path,
+      node.totalImageCount,
+    );
+    if (!accepted) return;
+    try {
+      const change = await libraryApi.deleteFolderPermanently(node.id);
+      onDataChanged(
+        { trash: -change.affectedImages },
+        "folderPurge",
+      );
+      notify(`已从回收站移除文件夹「${node.name}」`, "success");
+      if (selectedFolderIds.some((id) => id === node.id)) onSelect([]);
+    } catch (cause) {
+      notify("永久删除文件夹失败", "error", errorMessage(cause));
     }
   };
 
@@ -486,27 +583,65 @@ export function FolderTree({
       }}
     >
       <div
-        className={`folder-tree-row folder-tree-root${
-          selectedFolderIds.length === 0 ? " is-selected" : ""
-        }`}
+        className={`folder-tree-row folder-tree-root${rootSelected ? " is-selected" : ""}`}
         role="treeitem"
-        aria-selected={selectedFolderIds.length === 0}
-        data-drop-root="true"
-        onClick={() => selectRoot(pane)}
-        onContextMenu={(event) => {
-          event.preventDefault();
-          event.stopPropagation();
+        aria-selected={rootSelected}
+        {...(trashMode ? {} : { "data-drop-root": "true" })}
+        onClick={() => {
           activePaneRef.current = pane;
-          setMenu({ x: event.clientX, y: event.clientY, node: null });
+          setMenu(null);
+          if (trashMode) {
+            setAnchorId(null);
+            onSelect([]);
+          } else {
+            selectRoot(pane);
+          }
         }}
+        onContextMenu={
+          trashMode
+            ? undefined
+            : (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                activePaneRef.current = pane;
+                setMenu({ x: event.clientX, y: event.clientY, node: null });
+              }
+        }
       >
         <span className="folder-tree-toggle">
           <span className="folder-tree-spacer" />
         </span>
-        <FolderOpen size={15} />
-        <span className="folder-tree-name">全部图片</span>
-        {rootFolder ? <em>{rootFolder.totalImageCount.toLocaleString()}</em> : null}
+        {trashMode ? <Trash2 size={15} /> : <FolderOpen size={15} />}
+        <span className="folder-tree-name">{trashMode ? "回收站" : "全部图片"}</span>
+        {trashMode ? (
+          <em>{trashTotalCount.toLocaleString()}</em>
+        ) : rootFolder ? (
+          <em>{rootFolder.totalImageCount.toLocaleString()}</em>
+        ) : null}
       </div>
+
+      {trashMode ? (
+        <div
+          className={`folder-tree-row folder-tree-direct${trashDirectSelected ? " is-selected" : ""}`}
+          role="treeitem"
+          aria-selected={trashDirectSelected}
+          style={{ paddingLeft: 6 + 14 }}
+          title="只显示原文件夹仍在图库中的回收站图片"
+          onClick={(event) => {
+            event.stopPropagation();
+            activePaneRef.current = pane;
+            setMenu(null);
+            onSelectTrashDirect?.();
+          }}
+        >
+          <span className="folder-tree-toggle">
+            <span className="folder-tree-spacer" />
+          </span>
+          <Images size={13} />
+          <span className="folder-tree-name">直属图片</span>
+          <em>{trashDirectCount.toLocaleString()}</em>
+        </div>
+      ) : null}
 
       {rows.map((node) => {
         const hasChildren = node.children.length > 0;
@@ -525,20 +660,28 @@ export function FolderTree({
               aria-selected={isSelected}
               aria-expanded={hasChildren ? isExpanded : undefined}
               style={{ paddingLeft: 6 + node.depth * 14 }}
-              title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
-              data-drop-folder={node.id}
-              onPointerDown={(event) => {
-                activePaneRef.current = pane;
-                const ids =
-                  selected.size > 1 && selected.has(node.id)
-                    ? selectedFolderIds.filter((id) => tree.byId.has(id))
-                    : [node.id];
-                onBeginFolderDrag(
-                  ids,
-                  ids.length > 1 ? `${ids.length} 个文件夹` : node.name,
-                  event,
-                );
-              }}
+              title={
+                trashMode
+                  ? `${node.path} · 回收站图片 ${node.totalImageCount} 张`
+                  : `${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`
+              }
+              {...(trashMode ? {} : { "data-drop-folder": node.id })}
+              onPointerDown={
+                trashMode
+                  ? undefined
+                  : (event) => {
+                      activePaneRef.current = pane;
+                      const ids =
+                        selected.size > 1 && selected.has(node.id)
+                          ? selectedFolderIds.filter((id) => tree.byId.has(id))
+                          : [node.id];
+                      onBeginFolderDrag(
+                        ids,
+                        ids.length > 1 ? `${ids.length} 个文件夹` : node.name,
+                        event,
+                      );
+                    }
+              }
               onClick={(event) => selectNode(node, event, pane)}
               onContextMenu={(event) => {
                 event.preventDefault();
@@ -585,7 +728,7 @@ export function FolderTree({
                 aria-selected={directFolderId === node.id}
                 style={{ paddingLeft: 6 + (node.depth + 1) * 14 }}
                 title={`只显示直接放在「${node.path}」的 ${node.directImageCount.toLocaleString()} 张图片`}
-                data-drop-direct={node.id}
+                {...(trashMode ? {} : { "data-drop-direct": node.id })}
                 onClick={(event) => {
                   event.stopPropagation();
                   activePaneRef.current = pane;
@@ -610,29 +753,31 @@ export function FolderTree({
   return (
     <div className="folder-tree">
       <div className="folder-tree-heading">
-        <span>文件夹</span>
-        <div className="folder-tree-heading-actions">
-          <IconButton
-            label={split ? "合并为单视图" : "分为上下两个视图"}
-            className={split ? "is-active" : undefined}
-            aria-pressed={split}
-            onClick={onToggleSplit}
-          >
-            <Rows2 size={14} />
-          </IconButton>
-          <IconButton
-            label="新建文件夹"
-            onClick={() => {
-              setDialogError(null);
-              setCreateParent("");
-            }}
-          >
-            <Plus size={14} />
-          </IconButton>
-        </div>
+        <span>{trashMode ? "回收站" : "文件夹"}</span>
+        {trashMode ? null : (
+          <div className="folder-tree-heading-actions">
+            <IconButton
+              label={split ? "合并为单视图" : "分为上下两个视图"}
+              className={split ? "is-active" : undefined}
+              aria-pressed={split}
+              onClick={onToggleSplit}
+            >
+              <Rows2 size={14} />
+            </IconButton>
+            <IconButton
+              label="新建文件夹"
+              onClick={() => {
+                setDialogError(null);
+                setCreateParent("");
+              }}
+            >
+              <Plus size={14} />
+            </IconButton>
+          </div>
+        )}
       </div>
 
-      {split ? (
+      {!trashMode && split ? (
         <div className="folder-tree-split" ref={splitRef}>
           <div className="folder-tree-pane" style={{ flex: `${ratio} 1 0` }}>
             {renderTree(0)}
@@ -660,7 +805,44 @@ export function FolderTree({
         renderTree(0)
       )}
 
-      {menu ? (
+      {menu && trashMode && menuNode ? (
+        <div
+          ref={menuRef}
+          className="context-menu folder-context-menu"
+          style={{
+            left: Math.min(menu.x, Math.max(8, window.innerWidth - 224)),
+            top: Math.min(menu.y, Math.max(8, window.innerHeight - 160)),
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              const target = menuNode;
+              setMenu(null);
+              if (target) void restoreFolderNode(target);
+            }}
+          >
+            <RotateCcw size={14} />
+            <span>恢复文件夹</span>
+          </button>
+          <button
+            type="button"
+            className="context-menu-item context-menu-danger"
+            onClick={() => {
+              const target = menuNode;
+              setMenu(null);
+              if (target) void deleteFolderPermanently(target);
+            }}
+          >
+            <Trash2 size={14} />
+            <span>永久删除文件夹</span>
+          </button>
+        </div>
+      ) : null}
+
+      {menu && !trashMode ? (
         <div
           ref={menuRef}
           className="context-menu folder-context-menu"
@@ -760,12 +942,6 @@ export function FolderTree({
               <button
                 type="button"
                 className="context-menu-item context-menu-danger"
-                disabled={!menuNode || menuNode.children.length > 0 || menuNode.directImageCount > 0}
-                title={
-                  menuNode && (menuNode.children.length > 0 || menuNode.directImageCount > 0)
-                    ? "只能删除没有子文件夹且没有图片的空文件夹"
-                    : undefined
-                }
                 onClick={() => {
                   const target = menuNode;
                   setMenu(null);
@@ -773,7 +949,7 @@ export function FolderTree({
                 }}
               >
                 <Trash2 size={14} />
-                <span>删除空文件夹</span>
+                <span>移入回收站</span>
               </button>
             </>
           )}

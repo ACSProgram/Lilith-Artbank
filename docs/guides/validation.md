@@ -33,7 +33,7 @@ LILITH_ARTBANK_ROOT=<target 下的临时目录> \
 - 必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出，避免把 `settings.json` 写进仓库根。
 - B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
 - 该 feature 不进 default、不进发布产物；不传 `--headless` 时同一二进制仍是正常 GUI 程序。
-- 当前只有 `ping`，不能作为任何待验收条目的通过依据；`acceptance_*` 套件落地后在此补充命令、档位与产物位置。
+- 当前只有 `ping`，不能作为任何待验收条目的通过依据；`acceptance_*` 套件（B1–B3）尚未实施，范围与档位见[待办](../planning/todo.md)与[归档计划](../planning/archive/2026-10-29-无窗口验收测试计划.md)。
 
 ## 日常检查
 
@@ -53,10 +53,10 @@ git diff --check
 - Rust 改动至少跑 `cargo check` 与 `cargo test`；提交前跑一次 `cargo clippy --all-targets`。
 - **导入**：`cargo test` 覆盖混合格式入库、精确/批内重复、合并策略、取消一致性、pack 缺失；吞吐跑 `perf_import_1000`。
 - **浏览/查询**：`cargo test` 覆盖键集分页、多级排序、筛选、搜索、计数、全选 id、集合、子树筛选与直属筛选；性能跑 `perf_metadata_200k`。另有三类结构断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
-- **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件操作测试只用临时图库。
+- **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件夹整树移入回收站、删除单元恢复、删除单元之间不串恢复、永久删除后释放空目录与行、`trashLoose` 直属图片与文件夹计数；文件操作测试只用临时图库。
 - **查看器/编辑**：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同跑 `test:web` 与 typecheck/build。
 - **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。
-- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作、审计单行截断。
+- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。
 - **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录。
 - `server/` 只做一次性检查，不加入常驻测试：它依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。

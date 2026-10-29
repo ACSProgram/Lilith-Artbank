@@ -30,6 +30,8 @@ interface LibraryContextMenuProps {
   inTemp: boolean;
   hasActive: boolean;
   hasDeleted: boolean;
+  /** 回收站行都属于已删除文件夹：不提供单张恢复/永久删除。 */
+  deletedUnderFolder: boolean;
   onClose: () => void;
   onOpenViewer: () => void;
   onSetSimilarReference: () => void;
@@ -54,6 +56,7 @@ export function LibraryContextMenu({
   inTemp,
   hasActive,
   hasDeleted,
+  deletedUnderFolder,
   onClose,
   onOpenViewer,
   onSetSimilarReference,
@@ -215,7 +218,7 @@ export function LibraryContextMenu({
               <span>移入回收站</span>
             </button>
           ) : null}
-          {hasDeleted ? (
+          {hasDeleted && !deletedUnderFolder ? (
             <>
               <button type="button" className="context-menu-item" onClick={onRestore}>
                 <RotateCcw size={14} />
@@ -230,6 +233,11 @@ export function LibraryContextMenu({
                 <span>永久删除</span>
               </button>
             </>
+          ) : null}
+          {hasDeleted && deletedUnderFolder ? (
+            <span className="context-menu-note">
+              图片随文件夹一起移入回收站；请在左侧回收站树里恢复或永久删除整个文件夹。
+            </span>
           ) : null}
         </MenuSection>
       ) : null}

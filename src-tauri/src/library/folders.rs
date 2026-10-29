@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -19,7 +21,8 @@ use crate::{
             LibraryPaths, join_folder, normalize_folder, normalize_folder_name, parent_path,
             subtree_like_pattern,
         },
-        query::{self, FolderInfo},
+        placeholders,
+        query::{self, FolderChange, FolderInfo},
         service::now_ms,
     },
 };
@@ -48,16 +51,84 @@ fn folder_path(connection: &Connection, id: i64) -> AppResult<String> {
 }
 
 /// 临时文件夹由生命周期管理，禁止重命名、移动、删除或参与同级排序。
+/// 回收站文件夹与待释放文件夹也不参与正常树的写入。
 fn ensure_normal_folder(connection: &Connection, id: i64) -> AppResult<()> {
-    let kind: Option<String> = connection
-        .query_row("SELECT kind FROM folders WHERE id = ?1", [id], |row| {
-            row.get(0)
-        })
+    let state: Option<(String, Option<i64>, Option<i64>)> = connection
+        .query_row(
+            "SELECT kind, trashed_at, purge_operation_id FROM folders WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .optional()?;
-    if kind.as_deref() == Some("temp") {
+    let Some((kind, trashed_at, purge_operation_id)) = state else {
+        return Ok(());
+    };
+    if kind == "temp" {
         return Err(AppError::message("临时文件夹不能重命名、移动、删除或排序"));
     }
+    if purge_operation_id.is_some() {
+        return Err(AppError::message("文件夹正在释放，不能再修改"));
+    }
+    if trashed_at.is_some() {
+        return Err(AppError::message("文件夹在回收站中，请先恢复或永久删除"));
+    }
     Ok(())
+}
+
+/// 只有回收站里的普通文件夹能恢复或永久删除。
+fn ensure_trashed_folder(connection: &Connection, id: i64) -> AppResult<String> {
+    let state: Option<(String, Option<i64>, Option<i64>, String)> = connection
+        .query_row(
+            "SELECT kind, trashed_at, purge_operation_id, path FROM folders WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((kind, trashed_at, purge_operation_id, path)) = state else {
+        return Err(AppError::message("文件夹不存在"));
+    };
+    if kind == "temp" {
+        return Err(AppError::message("临时文件夹不能恢复或永久删除"));
+    }
+    if purge_operation_id.is_some() {
+        return Err(AppError::message("文件夹正在释放，请稍后再试"));
+    }
+    if trashed_at.is_none() {
+        return Err(AppError::message("文件夹不在回收站中"));
+    }
+    Ok(path)
+}
+
+/// 目标路径已被占用时给出可操作的原因：回收站与待释放优先于普通重名。
+fn ensure_target_free(
+    connection: &Connection,
+    path: &str,
+    self_id: i64,
+    conflict: &str,
+) -> AppResult<()> {
+    let state: Option<(i64, Option<i64>, Option<i64>)> = connection
+        .query_row(
+            "SELECT id, trashed_at, purge_operation_id FROM folders
+             WHERE path = ?1 COLLATE NOCASE",
+            [path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((id, trashed_at, purge_operation_id)) = state else {
+        return Ok(());
+    };
+    if id == self_id {
+        return Ok(());
+    }
+    if purge_operation_id.is_some() {
+        return Err(AppError::message("目标文件夹正在释放，请稍后再试"));
+    }
+    if trashed_at.is_some() {
+        return Err(AppError::message(
+            "目标路径的文件夹在回收站中，请先恢复或永久删除",
+        ));
+    }
+    Err(AppError::message(conflict))
 }
 
 fn ensure_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
@@ -88,7 +159,23 @@ pub fn create_with_id(
         db,
         NewOperation::new(HistoryKind::FolderCreate, format!("新建文件夹「{path}」")),
         |transaction, draft| {
-            if folder_id(transaction, &path)?.is_some() {
+            let existing: Option<(Option<i64>, Option<i64>)> = transaction
+                .query_row(
+                    "SELECT trashed_at, purge_operation_id FROM folders
+                     WHERE path = ?1 COLLATE NOCASE",
+                    [&path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((trashed_at, purge_operation_id)) = existing {
+                if purge_operation_id.is_some() {
+                    return Err(AppError::message("文件夹正在释放，请稍后再试"));
+                }
+                if trashed_at.is_some() {
+                    return Err(AppError::message(
+                        "该路径的文件夹在回收站中，请先恢复或永久删除",
+                    ));
+                }
                 return Err(AppError::message("文件夹已存在"));
             }
             // 物理目录先落地；ensure_folder 再从根到叶补齐缺失的数据库行。
@@ -147,11 +234,7 @@ pub fn rename_with_id(
             if old_path == new_path {
                 return Ok(());
             }
-            if let Some(existing) = folder_id(transaction, &new_path)?
-                && existing != folder_id_value
-            {
-                return Err(AppError::message("目标文件夹已存在"));
-            }
+            ensure_target_free(transaction, &new_path, folder_id_value, "目标文件夹已存在")?;
 
             let old_dir = paths.folder_dir(&old_path);
             let new_dir = paths.folder_dir(&new_path);
@@ -241,11 +324,12 @@ pub fn move_to_with_id(
             if new_path == old_path {
                 return Ok(());
             }
-            if let Some(existing) = folder_id(transaction, &new_path)?
-                && existing != folder_id_value
-            {
-                return Err(AppError::message("目标位置已经有同名文件夹"));
-            }
+            ensure_target_free(
+                transaction,
+                &new_path,
+                folder_id_value,
+                "目标位置已经有同名文件夹",
+            )?;
 
             let old_dir = paths.folder_dir(&old_path);
             let new_dir = paths.folder_dir(&new_path);
@@ -339,7 +423,8 @@ pub fn reorder(
             // 同级文件夹一次读出来：手动排序只在拖放时发生，几千行路径的读取代价可以接受。
             let mut statement = transaction.prepare(
                 "SELECT id, path, sort_index FROM folders
-                 WHERE kind = 'normal' ORDER BY sort_index, id",
+                 WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+                 ORDER BY sort_index, id",
             )?;
             let folders = statement
                 .query_map([], |row| {
@@ -424,8 +509,11 @@ impl FolderSortKey {
 }
 
 fn folder_rows_in(connection: &Connection) -> AppResult<Vec<(i64, String, i64)>> {
-    let mut statement = connection
-        .prepare("SELECT id, path, sort_index FROM folders WHERE kind = 'normal' ORDER BY path")?;
+    let mut statement = connection.prepare(
+        "SELECT id, path, sort_index FROM folders
+         WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+         ORDER BY path",
+    )?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -809,70 +897,347 @@ pub fn apply_order(
     query::folder_infos(db, &affected_ids)
 }
 
-pub fn delete(db: &LibraryDb, root: &Path, folder_id_value: i64) -> AppResult<Vec<FolderInfo>> {
-    delete_with_id(db, root, folder_id_value).map(|(folders, _)| folders)
+/// 整棵子树移入回收站：保留原路径与文件，只写 `trashed_at` / `deleted_at`。
+pub fn trash(db: &LibraryDb, folder_id_value: i64) -> AppResult<FolderChange> {
+    trash_with_id(db, folder_id_value).map(|(change, _)| change)
 }
 
-pub fn delete_with_id(
+pub fn trash_with_id(
     db: &LibraryDb,
-    root: &Path,
     folder_id_value: i64,
-) -> AppResult<(Vec<FolderInfo>, Option<i64>)> {
-    let paths = LibraryPaths::new(root);
+) -> AppResult<(FolderChange, Option<i64>)> {
     let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
+    let before = db.with_reader(|connection| info_in(connection, folder_id_value))?;
+    let mut removed_ids = Vec::new();
+    let mut image_count = 0_u64;
     let ((), operation_id) = history::write_with_id(
         db,
         NewOperation::new(
-            HistoryKind::FolderDelete,
-            format!("删除空文件夹「{label_path}」"),
+            HistoryKind::FolderTrash,
+            format!(
+                "把文件夹「{label_path}」移入回收站（{} 张图片）",
+                before.total_image_count
+            ),
         ),
         |transaction, draft| {
             ensure_normal_folder(transaction, folder_id_value)?;
-            let (path, created_at, sort_index): (String, i64, i64) = transaction
+            let path: String = transaction
                 .query_row(
-                    "SELECT path, created_at, sort_index FROM folders WHERE id = ?1",
+                    "SELECT path FROM folders WHERE id = ?1",
                     [folder_id_value],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| row.get(0),
                 )
                 .optional()?
                 .ok_or_else(|| AppError::message("文件夹不存在"))?;
-            // 与 MCP 预检共用同一套判据，避免 dryRun 说能删、真删才报错。
-            if let Some(reason) = deletion_blocker_in(transaction, root, folder_id_value)? {
-                return Err(AppError::message(reason));
+            if path.is_empty() {
+                return Err(AppError::message("不能删除图库根目录"));
             }
-
-            let directory = paths.folder_dir(&path);
-            if directory.exists() {
-                ensure_inside_root(root, &directory)?;
-                if std::fs::read_dir(&directory)?.next().is_some() {
-                    return Err(AppError::message("文件夹目录不是空的，不能删除"));
-                }
-                std::fs::remove_dir(&directory)?;
+            let pattern = subtree_like_pattern(&path);
+            let stamp = next_trash_stamp(transaction, &path)?;
+            let rows: Vec<FolderRow> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, path, created_at, sort_index FROM folders
+                     WHERE (path = ?1 OR path LIKE ?2 ESCAPE '\\')
+                       AND trashed_at IS NULL AND purge_operation_id IS NULL
+                     ORDER BY path",
+                )?;
+                statement
+                    .query_map(params![&path, &pattern], |row| {
+                        Ok(FolderRow {
+                            id: row.get(0)?,
+                            path: row.get(1)?,
+                            created_at: row.get(2)?,
+                            sort_index: row.get(3)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                return Err(AppError::message("文件夹不在正常树中"));
             }
-
-            let changed =
-                transaction.execute("DELETE FROM folders WHERE id = ?1", [folder_id_value])?;
-            if changed == 0 {
-                if let Err(error) = std::fs::create_dir_all(&directory) {
-                    log::error!(
-                        "回滚文件夹删除失败：{error}；目录应位于 {}",
-                        directory.display()
-                    );
-                }
-                return Err(AppError::message("文件夹不存在"));
+            transaction.execute(
+                "UPDATE folders SET trashed_at = ?1
+                 WHERE (path = ?2 OR path LIKE ?3 ESCAPE '\\')
+                   AND trashed_at IS NULL AND purge_operation_id IS NULL",
+                params![stamp, &path, &pattern],
+            )?;
+            let targets: Vec<(i64, i64)> = {
+                let mut statement = transaction.prepare(
+                    "SELECT images.id, images.modified_at FROM images
+                     JOIN folders ON folders.id = images.folder_id
+                     WHERE (folders.path = ?1 OR folders.path LIKE ?2 ESCAPE '\\')
+                       AND images.deleted_at IS NULL AND images.purge_operation_id IS NULL",
+                )?;
+                statement
+                    .query_map(params![&path, &pattern], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for chunk in targets.chunks(4_000) {
+                let marks = placeholders(chunk.len());
+                transaction.execute(
+                    &format!(
+                        "UPDATE images SET deleted_at = ?1, modified_at = ?1
+                         WHERE id IN ({marks})
+                           AND deleted_at IS NULL AND purge_operation_id IS NULL"
+                    ),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(stamp))
+                            .chain(chunk.iter().map(|(id, _)| Value::Integer(*id))),
+                    ),
+                )?;
             }
-            draft.json(&FolderDeleted {
-                id: folder_id_value,
-                path,
-                created_at,
-                sort_index,
-            })?;
-            draft.affected(1);
+            let triples: Vec<(i64, i64, i64)> = targets
+                .iter()
+                .map(|(id, modified)| (*id, 0, *modified))
+                .collect();
+            draft.json(&rows)?;
+            draft.triples(&triples);
+            draft.affected(rows.len() as u64);
+            removed_ids = rows.iter().map(|row| row.id).collect();
+            image_count = targets.len() as u64;
             Ok(())
         },
     )?;
-    // 删除只移除一行；调用方按 id 从本地树里剔除，无需重取整棵树。
-    Ok((Vec::new(), operation_id))
+    let ancestors =
+        db.with_reader(|connection| ancestor_folder_ids(connection, parent_path(&label_path)))?;
+    Ok((
+        FolderChange {
+            folders: query::folder_infos(db, &ancestors)?,
+            removed_ids,
+            affected_images: image_count,
+        },
+        operation_id,
+    ))
+}
+
+/// 恢复回收站文件夹：恢复这次删除的整个单元（同一时间戳的最高一级文件夹及其子树）。
+///
+/// 删除前就已经单独在回收站里的图片不跟着恢复；文件夹恢复后它们归到根行“直属图片”。
+/// 上级文件夹若来自更早的一次删除，拒绝恢复，避免把两个删除单元拆开。
+pub fn restore(db: &LibraryDb, folder_id_value: i64) -> AppResult<FolderChange> {
+    restore_with_id(db, folder_id_value).map(|(change, _)| change)
+}
+
+pub fn restore_with_id(
+    db: &LibraryDb,
+    folder_id_value: i64,
+) -> AppResult<(FolderChange, Option<i64>)> {
+    let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
+    let mut restored_images = 0_u64;
+    let mut restored_path = label_path.clone();
+    let mut restored_ids = Vec::new();
+    let ((), operation_id) = history::write_with_id(
+        db,
+        NewOperation::new(
+            HistoryKind::FolderRestore,
+            format!("恢复文件夹「{label_path}」"),
+        ),
+        |transaction, draft| {
+            let requested = ensure_trashed_folder(transaction, folder_id_value)?;
+            let stamp: i64 = transaction.query_row(
+                "SELECT trashed_at FROM folders WHERE id = ?1",
+                [folder_id_value],
+                |row| row.get(0),
+            )?;
+            // 同一次删除可能包含上级：选中子树里的文件夹时，恢复整个删除单元。
+            let mut path = requested;
+            let mut current = parent_path(&path);
+            while !current.is_empty() {
+                let Some(id) = folder_id(transaction, current)? else {
+                    break;
+                };
+                let (ancestor_path, ancestor_trashed, ancestor_purge): (
+                    String,
+                    Option<i64>,
+                    Option<i64>,
+                ) = transaction.query_row(
+                    "SELECT path, trashed_at, purge_operation_id FROM folders WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if ancestor_purge.is_some() {
+                    return Err(AppError::message("上级文件夹正在释放，请稍后再试"));
+                }
+                match ancestor_trashed {
+                    Some(ancestor_stamp) if ancestor_stamp == stamp => {
+                        path = ancestor_path;
+                        current = parent_path(&path);
+                    }
+                    Some(_) => {
+                        return Err(AppError::message(format!(
+                            "上级文件夹「{ancestor_path}」仍在回收站中，请先恢复它"
+                        )));
+                    }
+                    None => break,
+                }
+            }
+            let pattern = subtree_like_pattern(&path);
+            let rows: Vec<FolderRow> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, path, created_at, sort_index FROM folders
+                     WHERE (path = ?1 OR path LIKE ?2 ESCAPE '\\')
+                       AND trashed_at = ?3 AND purge_operation_id IS NULL
+                     ORDER BY path",
+                )?;
+                statement
+                    .query_map(params![&path, &pattern, stamp], |row| {
+                        Ok(FolderRow {
+                            id: row.get(0)?,
+                            path: row.get(1)?,
+                            created_at: row.get(2)?,
+                            sort_index: row.get(3)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                return Err(AppError::message("文件夹不在回收站中"));
+            }
+            restored_ids = rows.iter().map(|row| row.id).collect();
+            for chunk in rows.chunks(4_000) {
+                let marks = placeholders(chunk.len());
+                let ids: Vec<i64> = chunk.iter().map(|row| row.id).collect();
+                transaction.execute(
+                    &format!("UPDATE folders SET trashed_at = NULL WHERE id IN ({marks})"),
+                    params_from_iter(ids.iter()),
+                )?;
+            }
+            let targets: Vec<(i64, i64, i64)> = {
+                let mut statement = transaction.prepare(
+                    "SELECT images.id, images.deleted_at, images.modified_at FROM images
+                     JOIN folders ON folders.id = images.folder_id
+                     WHERE (folders.path = ?1 OR folders.path LIKE ?2 ESCAPE '\\')
+                       AND images.deleted_at = ?3 AND images.purge_operation_id IS NULL",
+                )?;
+                statement
+                    .query_map(params![&path, &pattern, stamp], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let now = now_ms();
+            for chunk in targets.chunks(4_000) {
+                let marks = placeholders(chunk.len());
+                transaction.execute(
+                    &format!(
+                        "UPDATE images SET deleted_at = NULL, modified_at = ?1
+                         WHERE id IN ({marks}) AND purge_operation_id IS NULL"
+                    ),
+                    params_from_iter(
+                        std::iter::once(Value::Integer(now))
+                            .chain(chunk.iter().map(|(id, _, _)| Value::Integer(*id))),
+                    ),
+                )?;
+            }
+            draft.json(&rows)?;
+            draft.triples(&targets);
+            draft.affected(rows.len() as u64);
+            restored_images = targets.len() as u64;
+            restored_path = path;
+            Ok(())
+        },
+    )?;
+    let mut ids = restored_ids;
+    ids.extend(
+        db.with_reader(|connection| ancestor_folder_ids(connection, parent_path(&restored_path)))?,
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    Ok((
+        FolderChange {
+            folders: query::folder_infos(db, &ids)?,
+            removed_ids: Vec::new(),
+            affected_images: restored_images,
+        },
+        operation_id,
+    ))
+}
+
+/// 永久删除回收站文件夹：只写待释放标记，释放任务删完图片后再清理文件夹行与空目录。
+pub fn delete_permanently(db: &LibraryDb, folder_id_value: i64) -> AppResult<FolderChange> {
+    delete_permanently_with_id(db, folder_id_value).map(|(change, _)| change)
+}
+
+pub fn delete_permanently_with_id(
+    db: &LibraryDb,
+    folder_id_value: i64,
+) -> AppResult<(FolderChange, Option<i64>)> {
+    let label_path = db.with_reader(|connection| folder_path(connection, folder_id_value))?;
+    let mut removed_ids = Vec::new();
+    let mut image_count = 0_u64;
+    let ((), operation_id) = history::write_with_id(
+        db,
+        NewOperation::new(
+            HistoryKind::FolderPurge,
+            format!("永久删除文件夹「{label_path}」"),
+        ),
+        |transaction, draft| {
+            let path = ensure_trashed_folder(transaction, folder_id_value)?;
+            let pattern = subtree_like_pattern(&path);
+            let ids: Vec<i64> = {
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM folders
+                     WHERE (path = ?1 OR path LIKE ?2 ESCAPE '\\')
+                       AND trashed_at IS NOT NULL AND purge_operation_id IS NULL",
+                )?;
+                statement
+                    .query_map(params![&path, &pattern], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if ids.is_empty() {
+                return Err(AppError::message("文件夹已经在释放中"));
+            }
+            transaction.execute(
+                "UPDATE folders SET purge_operation_id = ?1
+                 WHERE (path = ?2 OR path LIKE ?3 ESCAPE '\\')
+                   AND purge_operation_id IS NULL",
+                params![draft.id(), &path, &pattern],
+            )?;
+            image_count = transaction.execute(
+                "UPDATE images SET purge_operation_id = ?1
+                 WHERE folder_id IN (
+                     SELECT purge_folders.id FROM folders purge_folders
+                     WHERE purge_folders.path = ?2 OR purge_folders.path LIKE ?3 ESCAPE '\\'
+                 )
+                   AND deleted_at IS NOT NULL AND purge_operation_id IS NULL",
+                params![draft.id(), &path, &pattern],
+            )? as u64;
+            draft.affected(ids.len() as u64);
+            removed_ids = ids;
+            Ok(())
+        },
+    )?;
+    Ok((
+        FolderChange {
+            folders: Vec::new(),
+            removed_ids,
+            affected_images: image_count,
+        },
+        operation_id,
+    ))
+}
+
+/// 文件夹删除事件的时间戳：必须大于子树里已有的回收站时间，恢复时才能按等值判断“这次一起进来的图片”。
+fn next_trash_stamp(connection: &Connection, path: &str) -> AppResult<i64> {
+    let latest: Option<i64> = connection.query_row(
+        "SELECT MAX(stamp) FROM (
+             SELECT MAX(images.deleted_at) AS stamp FROM images
+              JOIN folders ON folders.id = images.folder_id
+              WHERE folders.path = ?1 OR folders.path LIKE ?2 ESCAPE '\\'
+             UNION ALL
+             SELECT MAX(folders.trashed_at) FROM folders
+              WHERE folders.path = ?1 OR folders.path LIKE ?2 ESCAPE '\\'
+         )",
+        params![path, subtree_like_pattern(path)],
+        |row| row.get(0),
+    )?;
+    Ok(now_ms().max(latest.unwrap_or(0).saturating_add(1)))
 }
 
 /// 按相对路径找文件夹 id；大小写不敏感，与建目录时的解析一致。
@@ -884,6 +1249,31 @@ pub fn find_id(db: &LibraryDb, path: &str) -> AppResult<Option<i64>> {
 /// 单个文件夹的位置与图片数；只查这一棵子树，不做全库扫描。
 pub fn info(db: &LibraryDb, folder_id_value: i64) -> AppResult<FolderInfo> {
     db.with_reader(|connection| info_in(connection, folder_id_value))
+}
+
+/// 子树里的子文件夹数（不含自身）；供 MCP dryRun 说明影响范围。
+pub fn subtree_folder_count(db: &LibraryDb, folder_id_value: i64) -> AppResult<u64> {
+    db.with_reader(|connection| {
+        let path = folder_path(connection, folder_id_value)?;
+        if path.is_empty() {
+            let count: i64 = connection.query_row(
+                "SELECT count(*) FROM folders
+                 WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+                   AND path <> ''",
+                [],
+                |row| row.get(0),
+            )?;
+            return Ok(count as u64);
+        }
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM folders
+             WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+               AND path LIKE ?1 ESCAPE '\\'",
+            [subtree_like_pattern(&path)],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    })
 }
 
 fn info_in(connection: &Connection, folder_id_value: i64) -> AppResult<FolderInfo> {
@@ -921,7 +1311,7 @@ fn info_in(connection: &Connection, folder_id_value: i64) -> AppResult<FolderInf
     })
 }
 
-/// 删除的前置条件：没有子文件夹、没有图片、磁盘目录为空。返回不能删的原因。
+/// 移入回收站的前置条件：存在、普通文件夹、非根、当前在正常树中。
 pub fn deletion_blocker(
     db: &LibraryDb,
     root: &Path,
@@ -932,48 +1322,30 @@ pub fn deletion_blocker(
 
 fn deletion_blocker_in(
     connection: &Connection,
-    root: &Path,
+    _root: &Path,
     folder_id_value: i64,
 ) -> AppResult<Option<String>> {
-    let kind: Option<String> = connection
+    let state: Option<(String, Option<i64>, Option<i64>, String)> = connection
         .query_row(
-            "SELECT kind FROM folders WHERE id = ?1",
+            "SELECT kind, trashed_at, purge_operation_id, path FROM folders WHERE id = ?1",
             [folder_id_value],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if kind.is_none() {
+    let Some((kind, trashed_at, purge_operation_id, path)) = state else {
         return Ok(Some("文件夹不存在".to_owned()));
-    }
-    if kind.as_deref() == Some("temp") {
+    };
+    if kind == "temp" {
         return Ok(Some("临时文件夹不能删除".to_owned()));
     }
-    let path = folder_path(connection, folder_id_value)?;
+    if purge_operation_id.is_some() {
+        return Ok(Some("文件夹正在释放，不能再删除".to_owned()));
+    }
+    if trashed_at.is_some() {
+        return Ok(Some("文件夹已经在回收站中".to_owned()));
+    }
     if path.is_empty() {
         return Ok(Some("不能删除图库根目录".to_owned()));
-    }
-    let children: i64 = connection.query_row(
-        "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
-        [subtree_like_pattern(&path)],
-        |row| row.get(0),
-    )?;
-    if children > 0 {
-        return Ok(Some("文件夹还包含子文件夹，不能删除".to_owned()));
-    }
-    let images: i64 = connection.query_row(
-        "SELECT count(*) FROM images WHERE folder_id = ?1",
-        [folder_id_value],
-        |row| row.get(0),
-    )?;
-    if images > 0 {
-        return Ok(Some("文件夹中还有图片，不能删除".to_owned()));
-    }
-    let directory = LibraryPaths::new(root).folder_dir(&path);
-    if directory.exists() {
-        ensure_inside_root(root, &directory)?;
-        if std::fs::read_dir(&directory)?.next().is_some() {
-            return Ok(Some("文件夹目录不是空的，不能删除".to_owned()));
-        }
     }
     Ok(None)
 }
@@ -1120,6 +1492,130 @@ pub(crate) fn undo_path_change(
             );
         }
         return Err(error);
+    }
+    Ok(())
+}
+
+/// 撤销“文件夹移入回收站”：文件夹行回到正常树，图片恢复旧状态与修改时间。
+pub(crate) fn undo_trash(
+    transaction: &Transaction<'_>,
+    rows: &[FolderRow],
+    triples: &[(i64, i64, i64)],
+) -> AppResult<()> {
+    restore_folder_rows(transaction, rows)?;
+    for (image_id, deleted_at, modified_at) in triples {
+        transaction.execute(
+            "UPDATE images SET deleted_at = ?1, modified_at = ?2
+             WHERE id = ?3 AND purge_operation_id IS NULL",
+            params![
+                if *deleted_at == 0 {
+                    None
+                } else {
+                    Some(*deleted_at)
+                },
+                modified_at,
+                image_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// 重做“文件夹移入回收站”：文件仍在原路径，只重新写隐藏时间。
+pub(crate) fn redo_trash(
+    transaction: &Transaction<'_>,
+    rows: &[FolderRow],
+    triples: &[(i64, i64, i64)],
+) -> AppResult<()> {
+    let stamp = now_ms();
+    trash_folder_rows(transaction, rows, stamp)?;
+    for (image_id, _, _) in triples {
+        transaction.execute(
+            "UPDATE images SET deleted_at = ?1, modified_at = ?1
+             WHERE id = ?2 AND deleted_at IS NULL AND purge_operation_id IS NULL",
+            params![stamp, image_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// 撤销“恢复文件夹”：重新移入回收站，图片回到恢复前的状态。
+pub(crate) fn undo_restore(
+    transaction: &Transaction<'_>,
+    rows: &[FolderRow],
+    triples: &[(i64, i64, i64)],
+) -> AppResult<()> {
+    let stamp = triples
+        .iter()
+        .map(|(_, deleted_at, _)| *deleted_at)
+        .max()
+        .filter(|value| *value > 0)
+        .unwrap_or_else(now_ms);
+    trash_folder_rows(transaction, rows, stamp)?;
+    for (image_id, deleted_at, modified_at) in triples {
+        transaction.execute(
+            "UPDATE images SET deleted_at = ?1, modified_at = ?2
+             WHERE id = ?3 AND purge_operation_id IS NULL",
+            params![
+                if *deleted_at == 0 {
+                    None
+                } else {
+                    Some(*deleted_at)
+                },
+                modified_at,
+                image_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// 重做“恢复文件夹”：文件夹行与图片重新回到正常树。
+pub(crate) fn redo_restore(
+    transaction: &Transaction<'_>,
+    rows: &[FolderRow],
+    triples: &[(i64, i64, i64)],
+) -> AppResult<()> {
+    let now = now_ms();
+    restore_folder_rows(transaction, rows)?;
+    for (image_id, _, _) in triples {
+        transaction.execute(
+            "UPDATE images SET deleted_at = NULL, modified_at = ?1
+             WHERE id = ?2 AND purge_operation_id IS NULL",
+            params![now, image_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_folder_rows(transaction: &Transaction<'_>, rows: &[FolderRow]) -> AppResult<()> {
+    for chunk in rows.chunks(4_000) {
+        let marks = placeholders(chunk.len());
+        transaction.execute(
+            &format!("UPDATE folders SET trashed_at = NULL WHERE id IN ({marks})"),
+            params_from_iter(chunk.iter().map(|row| row.id)),
+        )?;
+    }
+    Ok(())
+}
+
+fn trash_folder_rows(
+    transaction: &Transaction<'_>,
+    rows: &[FolderRow],
+    stamp: i64,
+) -> AppResult<()> {
+    for chunk in rows.chunks(4_000) {
+        let marks = placeholders(chunk.len());
+        transaction.execute(
+            &format!(
+                "UPDATE folders SET trashed_at = ?1
+                 WHERE id IN ({marks}) AND trashed_at IS NULL"
+            ),
+            params_from_iter(
+                std::iter::once(Value::Integer(stamp))
+                    .chain(chunk.iter().map(|row| Value::Integer(row.id))),
+            ),
+        )?;
     }
     Ok(())
 }
@@ -1553,38 +2049,84 @@ mod tests {
     }
 
     #[test]
-    fn deletes_only_empty_folders() {
+    fn trashes_whole_subtree_and_restores_it() {
         let (_temp, db, root) = fixture();
-        create(&db, &root, "空文件夹").unwrap();
-        create(&db, &root, "有子级/子级").unwrap();
-        let empty = db
-            .with_reader(|connection| folder_id(connection, "空文件夹"))
-            .unwrap()
-            .unwrap();
-        let parent = db
-            .with_reader(|connection| folder_id(connection, "有子级"))
-            .unwrap()
-            .unwrap();
+        create(&db, &root, "父/子").unwrap();
+        let parent = id_of(&db, "父");
+        let child = id_of(&db, "父/子");
 
-        assert!(delete(&db, &root, parent).is_err());
-        delete(&db, &root, empty).unwrap();
-        assert!(!root.join("空文件夹").exists());
+        let change = trash(&db, parent).unwrap();
+        assert_eq!(change.removed_ids.len(), 2);
+        assert!(root.join("父").is_dir());
+        assert!(root.join("父").join("子").is_dir());
+        assert_eq!(id_of(&db, "父"), parent, "行保留，只写 trashed_at");
+        assert_eq!(id_of(&db, "父/子"), child);
         assert!(
-            db.with_reader(|connection| folder_id(connection, "空文件夹"))
+            !query::list_folders(&db)
                 .unwrap()
-                .is_none()
+                .iter()
+                .any(|folder| folder.path == "父" || folder.path == "父/子"),
+            "正常树看不到回收站文件夹"
+        );
+        let trash_folders = query::list_trash_folders(&db).unwrap();
+        assert_eq!(trash_folders.folders.len(), 2);
+        assert!(
+            create(&db, &root, "父/新").is_err(),
+            "回收站路径不能新建同名或子文件夹"
         );
 
-        let untracked = root.join("外部目录");
-        fs::create_dir_all(&untracked).unwrap();
-        fs::write(untracked.join("keep.txt"), b"x").unwrap();
-        create(&db, &root, "外部目录").unwrap();
-        let external = db
-            .with_reader(|connection| folder_id(connection, "外部目录"))
-            .unwrap()
+        restore(&db, child).unwrap();
+        assert!(
+            query::list_folders(&db)
+                .unwrap()
+                .iter()
+                .any(|folder| folder.path == "父/子"),
+            "恢复子树里的文件夹会带回整个删除单元"
+        );
+        assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
+
+        trash(&db, parent).unwrap();
+        let change = delete_permanently(&db, parent).unwrap();
+        assert_eq!(change.removed_ids.len(), 2);
+        assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
+        let purged: i64 = db
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM folders
+                     WHERE path IN ('父', '父/子') AND purge_operation_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
             .unwrap();
-        assert!(delete(&db, &root, external).is_err());
-        assert!(untracked.join("keep.txt").exists());
+        assert_eq!(purged, 2, "永久删除只写待释放标记，行等释放任务清理");
+    }
+
+    #[test]
+    fn restore_keeps_separate_deletion_units_apart() {
+        let (_temp, db, root) = fixture();
+        create(&db, &root, "父/子").unwrap();
+        let parent = id_of(&db, "父");
+        let child = id_of(&db, "父/子");
+
+        trash(&db, child).unwrap();
+        trash(&db, parent).unwrap();
+        assert!(
+            restore(&db, child).is_err(),
+            "上级文件夹来自另一次删除时不能单独恢复"
+        );
+
+        restore(&db, parent).unwrap();
+        assert!(
+            query::list_trash_folders(&db)
+                .unwrap()
+                .folders
+                .iter()
+                .any(|folder| folder.path == "父/子"),
+            "更早单独删除的子文件夹不随上级恢复"
+        );
+        restore(&db, child).unwrap();
+        assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
     }
 
     #[test]
@@ -1612,7 +2154,7 @@ mod tests {
             .unwrap()
             .unwrap();
         reorder(&db, &[scenery_id, people], root_id, 0).unwrap();
-        delete(&db, &root, sketch).unwrap();
+        trash(&db, sketch).unwrap();
 
         let entries = history::list(&db).unwrap();
         let target = entries.last().unwrap().id;
@@ -1657,7 +2199,10 @@ mod tests {
         );
         assert!(root.join("人物").is_dir());
         assert!(root.join("风景").is_dir());
-        assert!(!root.join("风景").join("草稿").exists());
+        assert!(
+            root.join("风景").join("草稿").is_dir(),
+            "移入回收站不搬文件，重做后目录仍在原路径"
+        );
         assert!(!root.join("人物").join("速写").exists());
         assert!(!root.join("人物").join("草稿").exists());
         let order: Vec<String> = db
@@ -1881,9 +2426,9 @@ mod tests {
         move_to(&db, &root, 子, 目标).unwrap();
         let entries = history::list(&db).unwrap();
         assert!(entries[0].label.contains("父/子"));
-        delete(&db, &root, id_of(&db, "目标/子")).unwrap();
+        trash(&db, id_of(&db, "目标/子")).unwrap();
         let entries = history::list(&db).unwrap();
-        assert_eq!(entries[0].kind, HistoryKind::FolderDelete);
+        assert_eq!(entries[0].kind, HistoryKind::FolderTrash);
         assert!(entries[0].label.contains("目标/子"));
     }
 }

@@ -21,6 +21,8 @@ interface ViewBarProps {
   collections: CollectionInfo[];
   imageCount: number;
   trashCount: number;
+  /** 回收站里的文件夹数；只有文件夹、没有图片时也能清空。 */
+  trashFolderCount: number;
   tempCount: number;
   emptyingTrash: boolean;
   onShowAll: () => void;
@@ -51,6 +53,7 @@ export function ViewBar({
   collections,
   imageCount,
   trashCount,
+  trashFolderCount,
   tempCount,
   emptyingTrash,
   onShowAll,
@@ -199,7 +202,7 @@ export function ViewBar({
             variant="danger"
             icon={<Trash2 size={13} />}
             loading={emptyingTrash}
-            disabled={trashCount === 0}
+            disabled={trashCount === 0 && trashFolderCount === 0}
             onClick={onEmptyTrash}
           >
             清空回收站

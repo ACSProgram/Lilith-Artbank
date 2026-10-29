@@ -487,8 +487,10 @@ fn load_folders(database: &LibraryDb, scope: &InspectScope) -> AppResult<Vec<(i6
     database.with_reader(|connection| {
         let folders = match &scope.folder_ids {
             None => {
-                let mut statement =
-                    connection.prepare("SELECT id, path FROM folders WHERE kind = 'normal'")?;
+                let mut statement = connection.prepare(
+                    "SELECT id, path FROM folders
+                     WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL",
+                )?;
                 statement
                     .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<Vec<(i64, String)>>>()?
@@ -499,7 +501,8 @@ fn load_folders(database: &LibraryDb, scope: &InspectScope) -> AppResult<Vec<(i6
                     let marks = crate::library::placeholders(chunk.len());
                     let mut statement = connection.prepare(&format!(
                         "SELECT id, path FROM folders
-                         WHERE kind = 'normal' AND id IN ({marks}) AND id > 0"
+                         WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+                           AND id IN ({marks}) AND id > 0"
                     ))?;
                     folders.extend(
                         statement
@@ -524,11 +527,15 @@ fn count_rows(database: &LibraryDb, scope: &InspectScope) -> AppResult<u64> {
                 let mut total = 0_i64;
                 for chunk in ids.chunks(400) {
                     let marks = crate::library::placeholders(chunk.len());
-                    // 与 `load_folders` 同口径：临时文件夹不是图库的一部分，它的行不进分母。
+                    // 与 `load_folders` 同口径：临时文件夹、回收站与待释放文件夹不是图库的一部分。
                     let mut statement = connection.prepare(&format!(
                         "SELECT count(*) FROM images
                          WHERE folder_id IN ({marks})
-                           AND folder_id IN (SELECT id FROM folders WHERE kind = 'normal')"
+                           AND folder_id IN (
+                               SELECT id FROM folders
+                               WHERE kind = 'normal' AND trashed_at IS NULL
+                                 AND purge_operation_id IS NULL
+                           )"
                     ))?;
                     total += statement
                         .query_row(rusqlite::params_from_iter(chunk.iter()), |row| {

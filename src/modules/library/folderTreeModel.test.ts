@@ -102,6 +102,7 @@ test("folder change merges by id without reordering the rest", () => {
   const renamed = applyFolderChange(folders, {
     folders: [folder(3, "甲改", 0, 1, 1)],
     removedIds: [],
+    affectedImages: 0,
   });
   assert.equal(renamed.length, folders.length);
   assert.equal(renamed.find((item) => item.id === 3)?.path, "甲改");
@@ -111,6 +112,7 @@ test("folder change merges by id without reordering the rest", () => {
   const created = applyFolderChange(folders, {
     folders: [folder(6, "丁", 6, 0, 0)],
     removedIds: [],
+    affectedImages: 0,
   });
   assert.equal(created.length, folders.length + 1);
   assert.equal(created.at(-1)?.path, "丁");
@@ -119,6 +121,7 @@ test("folder change merges by id without reordering the rest", () => {
   const removed = applyFolderChange(folders, {
     folders: [folder(2, "乙", 1, 0, 0)],
     removedIds: [3],
+    affectedImages: 0,
   });
   assert.deepEqual(
     removed.map((item) => item.id),
@@ -128,7 +131,7 @@ test("folder change merges by id without reordering the rest", () => {
 
   // 空变更不动任何行。
   assert.deepEqual(
-    applyFolderChange(folders, { folders: [], removedIds: [] }),
+    applyFolderChange(folders, { folders: [], removedIds: [], affectedImages: 0 }),
     folders,
   );
 });

@@ -12,6 +12,7 @@ import {
   mockCreateFolder,
   mockDeleteCollection,
   mockDeleteFolder,
+  mockDeleteFolderPermanently,
   mockDeleteImages,
   mockDeleteTag,
   mockEmptyTrash,
@@ -35,12 +36,14 @@ import {
   mockRenameTag,
   mockReorderCollections,
   mockReorderFolders,
+  mockRestoreFolder,
   mockRestoreImages,
   mockSearchTags,
   mockSelectionTags,
   mockSetImageTags,
   mockSetScores,
   mockTags,
+  mockTrashFolders,
   mockTrashImages,
   mockUndoToOperation,
   mockUpdateDescription,
@@ -69,6 +72,7 @@ import type {
   TagInfo,
   TagMergeReport,
   TagRef,
+  TrashFolders,
 } from "./types";
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -149,6 +153,21 @@ export const libraryApi = {
   async deleteFolder(folderId: number): Promise<FolderChange> {
     if (!isTauri()) return mockDeleteFolder(folderId);
     return invoke<FolderChange>("delete_folder", { folderId });
+  },
+
+  async getTrashFolders(): Promise<TrashFolders> {
+    if (!isTauri()) return mockTrashFolders();
+    return invoke<TrashFolders>("get_trash_folders");
+  },
+
+  async restoreFolder(folderId: number): Promise<FolderChange> {
+    if (!isTauri()) return mockRestoreFolder(folderId);
+    return invoke<FolderChange>("restore_folder", { folderId });
+  },
+
+  async deleteFolderPermanently(folderId: number): Promise<FolderChange> {
+    if (!isTauri()) return mockDeleteFolderPermanently(folderId);
+    return invoke<FolderChange>("delete_folder_permanently", { folderId });
   },
 
   /** `includeEmpty` 只在标签管理器用：把 0 张标签也列出来，方便一次清理。 */

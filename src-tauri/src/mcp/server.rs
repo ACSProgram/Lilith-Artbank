@@ -171,7 +171,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "管理文件夹：action=create 用 path 新建（缺失的上级一起建）；action=rename 用 folderId+name 改名；action=move 用 folderId 加 parentPath 或 parentId 换上级；action=delete 只删空文件夹（无子文件夹、无图片、目录为空）。临时文件夹不能改名、移动或删除。先 dryRun 看 willChange 与后果；询问档下 rename/create 直接执行，move/delete 需要用户确认。全部写操作记录，可以撤销。"
+        description = "管理文件夹：action=create 用 path 新建（缺失的上级一起建）；action=rename 用 folderId+name 改名；action=move 用 folderId 加 parentPath 或 parentId 换上级；action=delete 把整棵子树移入回收站（含子文件夹与图片，原文件留在原路径，可在界面恢复）。临时文件夹、根目录、已在回收站或正在释放的文件夹不能改名、移动或删除。先 dryRun 看 willChange、图片数与子文件夹数；询问档下 rename/create 直接执行，move/delete 需要用户确认。全部写操作记录，可以撤销。"
     )]
     async fn folders_modify(
         &self,

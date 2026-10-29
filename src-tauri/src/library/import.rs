@@ -70,14 +70,31 @@ fn resolve_folder(
     now: i64,
     created: &mut Vec<(i64, String)>,
 ) -> AppResult<i64> {
-    if let Some(id) = connection
+    if let Some((id, trashed_at, purge_operation_id)) = connection
         .query_row(
-            "SELECT id FROM folders WHERE path = ?1 COLLATE NOCASE",
+            "SELECT id, trashed_at, purge_operation_id FROM folders
+             WHERE path = ?1 COLLATE NOCASE",
             [path],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
         )
         .optional()?
     {
+        if purge_operation_id.is_some() {
+            return Err(AppError::message(format!(
+                "文件夹「{path}」正在释放，请稍后再试"
+            )));
+        }
+        if trashed_at.is_some() {
+            return Err(AppError::message(format!(
+                "文件夹「{path}」在回收站中，请先恢复或永久删除"
+            )));
+        }
         return Ok(id);
     }
     let sort_index = next_sort_index(connection, path)?;
@@ -97,7 +114,8 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
         connection
             .query_row(
                 "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
-                 WHERE kind = 'normal' AND path <> '' AND instr(path, '/') = 0",
+                 WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+                   AND path <> '' AND instr(path, '/') = 0",
                 [],
                 |row| row.get(0),
             )
@@ -106,7 +124,7 @@ pub(crate) fn next_sort_index(connection: &Connection, path: &str) -> AppResult<
         connection
             .query_row(
                 "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM folders
-                 WHERE kind = 'normal'
+                 WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
                    AND path LIKE ?1 ESCAPE '\\'
                    AND path <> ?2
                    AND instr(substr(path, length(?2) + 2), '/') = 0",

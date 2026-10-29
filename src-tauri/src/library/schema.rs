@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -19,12 +19,19 @@ CREATE TABLE folders (
     created_at INTEGER NOT NULL,
     sort_index INTEGER NOT NULL DEFAULT 0,
     -- normal=普通文件夹；temp=每个图库唯一的临时文件夹，只通过导入进入。
-    kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal', 'temp'))
+    kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal', 'temp')),
+    -- 非空表示整棵子树在回收站；文件仍留在原路径。
+    trashed_at INTEGER,
+    -- 待释放：文件夹行与空目录在记录过期或清空记录后删除。
+    purge_operation_id INTEGER
 ) STRICT;
 
 -- Windows 下文件夹路径大小写不敏感；NOCASE 只覆盖 ASCII，中文不受影响。
 CREATE UNIQUE INDEX idx_folders_path_nocase ON folders(path COLLATE NOCASE);
 CREATE UNIQUE INDEX idx_folders_single_temp ON folders(kind) WHERE kind = 'temp';
+CREATE INDEX idx_folders_trash ON folders(trashed_at) WHERE trashed_at IS NOT NULL;
+CREATE INDEX idx_folders_purge
+    ON folders(purge_operation_id) WHERE purge_operation_id IS NOT NULL;
 
 CREATE TABLE images (
     id INTEGER PRIMARY KEY,
@@ -268,7 +275,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
@@ -278,7 +286,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
@@ -287,7 +296,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         4 => {
             verify_meta(connection, manifest)?;
@@ -295,29 +305,38 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         5 => {
             verify_meta(connection, manifest)?;
             migrate_v5_to_v6(connection)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         6 => {
             verify_meta(connection, manifest)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         7 => {
             verify_meta(connection, manifest)?;
             migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
         }
         8 => {
             verify_meta(connection, manifest)?;
-            migrate_v8_to_v9(connection)
+            migrate_v8_to_v9(connection)?;
+            migrate_v9_to_v10(connection)
+        }
+        9 => {
+            verify_meta(connection, manifest)?;
+            migrate_v9_to_v10(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -506,6 +525,23 @@ fn migrate_v8_to_v9(connection: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v9 → v10：文件夹增加回收站状态与待释放标记，并补部分索引；不改现有行。
+fn migrate_v9_to_v10(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE folders ADD COLUMN trashed_at INTEGER;
+         ALTER TABLE folders ADD COLUMN purge_operation_id INTEGER;
+         CREATE INDEX IF NOT EXISTS idx_folders_trash
+             ON folders(trashed_at) WHERE trashed_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_folders_purge
+             ON folders(purge_operation_id) WHERE purge_operation_id IS NOT NULL;",
+    )?;
+    mark_version(&transaction, 10)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v9 升级到 v10");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,13 +663,54 @@ mod tests {
             .unwrap();
     }
 
-    fn downgrade_to_v6(connection: &Connection) {
+    fn downgrade_to_v9(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_folders_trash;
+                 DROP INDEX IF EXISTS idx_folders_purge;
+                 ALTER TABLE folders DROP COLUMN trashed_at;
+                 ALTER TABLE folders DROP COLUMN purge_operation_id;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 9).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '9' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v8(connection: &Connection) {
+        downgrade_to_v9(connection);
         connection
             .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
             .unwrap();
+        connection.pragma_update(None, "user_version", 8).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '8' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v7(connection: &Connection) {
+        downgrade_to_v8(connection);
         connection
             .execute("DROP INDEX IF EXISTS idx_images_visible_facets", [])
             .unwrap();
+        connection.pragma_update(None, "user_version", 7).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '7' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn downgrade_to_v6(connection: &Connection) {
+        downgrade_to_v7(connection);
         connection
             .execute("DELETE FROM folders WHERE kind = 'temp'", [])
             .unwrap();
@@ -647,35 +724,6 @@ mod tests {
         connection
             .execute(
                 "UPDATE meta SET value = '6' WHERE key = 'schemaVersion'",
-                [],
-            )
-            .unwrap();
-    }
-
-    fn downgrade_to_v7(connection: &Connection) {
-        connection
-            .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
-            .unwrap();
-        connection
-            .execute("DROP INDEX IF EXISTS idx_images_visible_facets", [])
-            .unwrap();
-        connection.pragma_update(None, "user_version", 7).unwrap();
-        connection
-            .execute(
-                "UPDATE meta SET value = '7' WHERE key = 'schemaVersion'",
-                [],
-            )
-            .unwrap();
-    }
-
-    fn downgrade_to_v8(connection: &Connection) {
-        connection
-            .execute("DROP INDEX IF EXISTS idx_images_visible_bytes", [])
-            .unwrap();
-        connection.pragma_update(None, "user_version", 8).unwrap();
-        connection
-            .execute(
-                "UPDATE meta SET value = '8' WHERE key = 'schemaVersion'",
                 [],
             )
             .unwrap();
@@ -1089,6 +1137,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active, 1, "迁移不改现有行");
+        ensure(&mut connection, &manifest()).unwrap();
+    }
+
+    #[test]
+    fn new_library_has_folder_trash_columns_and_indexes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        let columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('folders')
+                 WHERE name IN ('trashed_at', 'purge_operation_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2);
+        for index in ["idx_folders_trash", "idx_folders_purge"] {
+            let found: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "缺少索引 {index}");
+        }
+    }
+
+    #[test]
+    fn migrates_v9_to_v10_and_keeps_existing_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'jpg', 1, 10, 4, 3, 'jpeg', 0, zeroblob(32), zeroblob(16),
+                           zeroblob(32), 3, '', 1, 1)",
+                [("e".repeat(64))],
+            )
+            .unwrap();
+        downgrade_to_v9(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 9);
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('folders')
+                 WHERE name IN ('trashed_at', 'purge_operation_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2);
+        let index: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_folders_trash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let trashed: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM folders WHERE trashed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trashed, 0, "迁移不改现有行");
         ensure(&mut connection, &manifest()).unwrap();
     }
 

@@ -254,17 +254,25 @@ fn run_folders_modify(
             if let Some(reason) = folders::deletion_blocker(&database, &root, target)? {
                 return Ok(rejected(reason));
             }
+            let subfolder_count = folders::subtree_folder_count(&database, target)?;
             let plan = json!({
-                "operation": format!("删除文件夹「{}」", current.path),
+                "operation": format!("把文件夹「{}」移入回收站", current.path),
                 "target": current.path,
                 "count": 1,
                 "unit": "folder",
                 "folderId": target,
                 "folderPath": current.path,
-                "willChange": 1,
+                "imageCount": current.total_image_count,
+                "subfolderCount": subfolder_count,
+                "recoverable": true,
+                "willChange": 1 + current.total_image_count,
                 "consequences": [
-                    "只删除空文件夹，不会删除任何图片",
-                    "可以撤销",
+                    format!(
+                        "{} 张图片和 {} 个子文件夹会一起移入回收站",
+                        current.total_image_count, subfolder_count
+                    ),
+                    "原文件留在原路径，不会立即删除",
+                    "可以在回收站里恢复整个文件夹",
                 ],
             });
             if input.dry_run {
@@ -274,14 +282,14 @@ fn run_folders_modify(
                 return write::enqueue_approval(
                     state,
                     "folders_modify",
-                    format!("AI · 删除文件夹「{}」", current.path),
+                    format!("AI · 把文件夹「{}」移入回收站", current.path),
                     input,
                     plan,
                 );
             }
             let _guard =
-                state.begin_folder_change("删除文件夹", vec![PathScope::write(&current.path)])?;
-            let (_, operation_id) = folders::delete_with_id(&database, &root, target)?;
+                state.begin_folder_change("移入回收站", vec![PathScope::write(&current.path)])?;
+            let (_, operation_id) = folders::trash_with_id(&database, target)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",
@@ -484,22 +492,36 @@ mod tests {
     }
 
     #[test]
-    fn deletion_needs_an_empty_folder() {
+    fn deletion_moves_non_empty_folders_to_trash() {
         let (_temp, root, database) = fixture();
         folders::create(&database, &root, "空目录").unwrap();
         folders::create(&database, &root, "有子目录/子").unwrap();
         let empty = folders::find_id(&database, "空目录").unwrap().unwrap();
         let parent = folders::find_id(&database, "有子目录").unwrap().unwrap();
+        let root_id = folders::find_id(&database, "").unwrap().unwrap();
 
         assert_eq!(
             folders::deletion_blocker(&database, &root, empty).unwrap(),
             None
         );
+        assert_eq!(
+            folders::deletion_blocker(&database, &root, parent).unwrap(),
+            None,
+            "非空文件夹也能移入回收站"
+        );
+        assert!(
+            folders::deletion_blocker(&database, &root, root_id)
+                .unwrap()
+                .unwrap()
+                .contains("根目录")
+        );
+
+        folders::trash(&database, parent).unwrap();
         assert!(
             folders::deletion_blocker(&database, &root, parent)
                 .unwrap()
                 .unwrap()
-                .contains("子文件夹")
+                .contains("回收站")
         );
     }
 
@@ -515,7 +537,7 @@ mod tests {
         )
         .unwrap();
         let target = folders::find_id(&database, "作品/线稿").unwrap().unwrap();
-        let (_, delete_id) = folders::delete_with_id(&database, &root, target).unwrap();
+        let (_, delete_id) = folders::trash_with_id(&database, target).unwrap();
 
         for operation_id in [create_id, rename_id, delete_id] {
             mark_ai_origin(&database, operation_id);

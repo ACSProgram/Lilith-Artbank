@@ -36,7 +36,9 @@ use crate::{
         },
         optimize_estimate::OptimizeEstimate,
         pack_gc::{CompactMark, FeaturePackStat, SegmentStat},
-        query::{FolderChange, FolderInfo, ImagePage, LibraryQuery, SortSpec, TagInfo},
+        query::{
+            FolderChange, FolderInfo, ImagePage, LibraryQuery, SortSpec, TagInfo, TrashFolders,
+        },
         service::{LibraryCounts, LibraryInfo},
         stats::{StatsRequest, StatsSnapshot},
         viewer::{self, PoseData, ViewerSource},
@@ -478,6 +480,36 @@ pub async fn delete_folder(app: AppHandle, folder_id: i64) -> Result<FolderChang
     trace::write_async(
         "delete_folder",
         run_blocking(app, move |state| state.delete_folder(folder_id)),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_trash_folders(app: AppHandle) -> Result<TrashFolders, String> {
+    trace::read_async(
+        "get_trash_folders",
+        run_blocking(app, |state| state.trash_folders()),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn restore_folder(app: AppHandle, folder_id: i64) -> Result<FolderChange, String> {
+    trace::write_async(
+        "restore_folder",
+        run_blocking(app, move |state| state.restore_folder(folder_id)),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_folder_permanently(
+    app: AppHandle,
+    folder_id: i64,
+) -> Result<FolderChange, String> {
+    trace::write_async(
+        "delete_folder_permanently",
+        run_blocking(app, move |state| state.delete_folder_permanently(folder_id)),
     )
     .await
 }
@@ -1325,6 +1357,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         place_folders,
         apply_folder_order,
         delete_folder,
+        get_trash_folders,
+        restore_folder,
+        delete_folder_permanently,
         get_tags,
         search_tags,
         get_image_detail,

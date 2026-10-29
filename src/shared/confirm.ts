@@ -34,6 +34,53 @@ export function confirmMergeSimilarGroups(
   });
 }
 
+/** 文件夹移入回收站：整棵子树一起进去，原文件不动，可整目录恢复。 */
+export function confirmTrashFolder(
+  confirm: ConfirmFn,
+  path: string,
+  imageCount: number,
+): Promise<boolean> {
+  const message =
+    imageCount > 0
+      ? `文件夹和下面的 ${count(imageCount)} 张图片会一起移入回收站。`
+      : "文件夹及其子文件夹会一起移入回收站。";
+  return confirm({
+    title: `把文件夹「${path}」移入回收站？`,
+    message,
+    detail: "原文件留在原位置，可以整个文件夹恢复。",
+    confirmLabel: "移入回收站",
+  });
+}
+
+/** 恢复文件夹：整个删除单元一起回来，只带回随这次删除一起进去的图片。 */
+export function confirmRestoreFolder(
+  confirm: ConfirmFn,
+  path: string,
+): Promise<boolean> {
+  return confirm({
+    title: `恢复文件夹「${path}」？`,
+    message: "这次一起删除的文件夹与图片会回到原位置。",
+    detail: "删除前已单独在回收站的图片仍留在回收站。",
+    confirmLabel: "恢复",
+  });
+}
+
+/** 永久删除回收站文件夹：延迟释放，清空操作记录后不可撤销。 */
+export function confirmDeleteFolderPermanently(
+  confirm: ConfirmFn,
+  path: string,
+  imageCount: number,
+): Promise<boolean> {
+  const images = imageCount > 0 ? `和 ${count(imageCount)} 张图片` : "";
+  return confirm({
+    title: `永久删除文件夹「${path}」？`,
+    message: `文件夹${images}会从回收站移除；原图文件与文件夹目录要等这条记录从操作记录中清除后才释放。`,
+    detail: "清除操作记录后不能再撤销。",
+    confirmLabel: "永久删除",
+    danger: true,
+  });
+}
+
 /** 永久删除：先移出回收站；文件延迟释放，清空操作记录后不可撤销。 */
 export function confirmDelete(confirm: ConfirmFn, imageCount: number): Promise<boolean> {
   return confirm({
@@ -45,11 +92,18 @@ export function confirmDelete(confirm: ConfirmFn, imageCount: number): Promise<b
   });
 }
 
-/** 清空回收站：同样延迟释放，文件不会立刻消失。 */
-export function confirmEmptyTrash(confirm: ConfirmFn, imageCount: number): Promise<boolean> {
+/** 清空回收站：图片与文件夹一起移出，同样延迟释放。 */
+export function confirmEmptyTrash(
+  confirm: ConfirmFn,
+  imageCount: number,
+  folderCount = 0,
+): Promise<boolean> {
+  const parts = [];
+  if (imageCount > 0) parts.push(`${count(imageCount)} 张图片`);
+  if (folderCount > 0) parts.push(`${count(folderCount)} 个文件夹`);
   return confirm({
     title: "清空回收站？",
-    message: `会把回收站中的 ${count(imageCount)} 张图片移出回收站；原图文件要等这些记录从操作记录中清除后才释放。`,
+    message: `会把回收站中的${parts.join("和") || "内容"}移出回收站；原图文件与空目录要等这些记录从操作记录中清除后才释放。`,
     detail: "清除操作记录后不能再撤销。",
     confirmLabel: "清空回收站",
     danger: true,

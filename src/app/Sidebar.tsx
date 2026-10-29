@@ -5,7 +5,7 @@ import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
 import { errorMessage } from "../shared/errors";
 import { FolderTree } from "../modules/library/FolderTree";
-import type { FolderInfo } from "../modules/library/types";
+import type { FolderInfo, TrashFolders } from "../modules/library/types";
 
 interface SidebarProps {
   onOpenSettings: () => void;
@@ -19,7 +19,15 @@ interface SidebarProps {
   onSelectFolders?: (folderIds: number[]) => void;
   onSelectDirect?: (folderId: number) => void;
   onFoldersChanged?: (folders: FolderInfo[]) => void;
-  onDataChanged?: () => void;
+  onDataChanged?: (
+    delta?: { images?: number; trash?: number },
+    reason?: string,
+  ) => void;
+  /** 回收站视图：左侧显示回收站文件夹树。 */
+  trashMode?: boolean;
+  trashFolders?: TrashFolders | null;
+  trashDirectSelected?: boolean;
+  onSelectTrashDirect?: () => void;
   onBeginFolderDrag?: (
     folderIds: number[],
     label: string,
@@ -41,6 +49,10 @@ export function Sidebar({
   onFoldersChanged,
   onDataChanged,
   onBeginFolderDrag,
+  trashMode = false,
+  trashFolders = null,
+  trashDirectSelected = false,
+  onSelectTrashDirect,
 }: SidebarProps) {
   const { current, settings, saveSettings } = useAppRuntime();
   const { notify } = useNotices();
@@ -85,7 +97,7 @@ export function Sidebar({
         <FolderTree
           key={libraryId}
           libraryId={libraryId}
-          folders={folders}
+          folders={trashMode ? (trashFolders?.folders ?? []) : folders}
           selectedFolderIds={selectedFolderIds}
           directFolderId={directFolderId}
           selectedImageIds={selectedImageIds}
@@ -94,6 +106,11 @@ export function Sidebar({
           onFoldersChanged={onFoldersChanged ?? (() => undefined)}
           onDataChanged={onDataChanged ?? (() => undefined)}
           onBeginFolderDrag={onBeginFolderDrag ?? (() => undefined)}
+          mode={trashMode ? "trash" : "normal"}
+          trashDirectCount={trashFolders?.directImageCount ?? 0}
+          trashTotalCount={trashFolders?.totalImageCount ?? 0}
+          trashDirectSelected={trashDirectSelected}
+          onSelectTrashDirect={onSelectTrashDirect}
           split={folderSplit}
           splitRatio={folderSplitRatio}
           onToggleSplit={() => updateFolderSplit({ folderSplit: !folderSplit })}

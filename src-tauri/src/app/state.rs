@@ -1112,15 +1112,32 @@ impl AppState {
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
-        let (database, root) = self.query_source()?;
+        let (database, _) = self.query_source()?;
         let current = folder_service::info(&database, folder_id)?;
         let _guard =
-            self.begin_folder_change("删除文件夹", vec![PathScope::write(&current.path)])?;
-        self.mutate(|| folder_service::delete(&database, &root, folder_id))?;
-        Ok(FolderChange {
-            folders: Vec::new(),
-            removed_ids: vec![folder_id],
-        })
+            self.begin_folder_change("移入回收站", vec![PathScope::write(&current.path)])?;
+        self.mutate(|| folder_service::trash(&database, folder_id))
+    }
+
+    pub fn restore_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
+        let (database, _) = self.query_source()?;
+        let current = folder_service::info(&database, folder_id)?;
+        let _guard =
+            self.begin_folder_change("恢复文件夹", vec![PathScope::write(&current.path)])?;
+        self.mutate(|| folder_service::restore(&database, folder_id))
+    }
+
+    pub fn delete_folder_permanently(&self, folder_id: i64) -> AppResult<FolderChange> {
+        let (database, _) = self.query_source()?;
+        let current = folder_service::info(&database, folder_id)?;
+        let _guard =
+            self.begin_folder_change("永久删除文件夹", vec![PathScope::write(&current.path)])?;
+        self.mutate(|| folder_service::delete_permanently(&database, folder_id))
+    }
+
+    pub fn trash_folders(&self) -> AppResult<query::TrashFolders> {
+        let (database, _) = self.query_source()?;
+        query::list_trash_folders(&database)
     }
 
     pub fn tags(&self, limit: Option<u32>, include_empty: bool) -> AppResult<Vec<TagInfo>> {
@@ -2770,6 +2787,7 @@ fn folder_change(folders: Vec<FolderInfo>) -> FolderChange {
     FolderChange {
         folders,
         removed_ids: Vec::new(),
+        affected_images: 0,
     }
 }
 
@@ -2793,8 +2811,11 @@ fn check_scope_folder_ids(database: &LibraryDb, scope: &TaskScope) -> AppResult<
             }
             let path = folder_service::info(database, *folder_id)?.path;
             let ids = database.with_reader(|connection| {
-                let mut statement = connection
-                    .prepare("SELECT id FROM folders WHERE id = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+                let mut statement = connection.prepare(
+                    "SELECT id FROM folders
+                         WHERE (id = ?1 OR path LIKE ?2 ESCAPE '\\')
+                           AND trashed_at IS NULL AND purge_operation_id IS NULL",
+                )?;
                 let rows = statement
                     .query_map(
                         rusqlite::params![folder_id, subtree_like_pattern(&path)],

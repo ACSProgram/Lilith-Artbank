@@ -17,6 +17,8 @@ export interface LibraryFilters {
   folderIds: number[];
   /** 选中文件夹只匹配直接位于其中的图片，不包含子文件夹。 */
   folderDirect: boolean;
+  /** 回收站根行的“直属图片”：只匹配原文件夹仍在图库中的回收站图片。 */
+  trashLoose: boolean;
   extensions: string[];
   scores: number[];
   tagIds: number[];
@@ -67,6 +69,8 @@ export interface ImageRow {
   fileExt: string;
   folderId: number;
   folderPath: string;
+  /** 所在文件夹已整目录移入回收站；这类图片不提供单张恢复/永久删除。 */
+  folderTrashed: boolean;
   filePath: string;
   fileSize: number;
   width: number;
@@ -158,6 +162,16 @@ export interface FolderInfo {
 export interface FolderChange {
   folders: FolderInfo[];
   removedIds: number[];
+  /** 这次操作涉及的图片数；其它文件夹写命令为 0。 */
+  affectedImages: number;
+}
+
+/** 回收站文件夹树；计数都是回收站图片数。 */
+export interface TrashFolders {
+  folders: FolderInfo[];
+  /** 原文件夹仍在图库中的回收站图片数（“直属图片”行）。 */
+  directImageCount: number;
+  totalImageCount: number;
 }
 
 export type FolderSortKey = "name" | "total";
@@ -220,6 +234,8 @@ export interface ImageDetails {
   filePath: string;
   folderId: number;
   folderPath: string;
+  /** 所在文件夹已整目录移入回收站；这类图片不提供单张恢复/永久删除。 */
+  folderTrashed: boolean;
   fileSize: number;
   width: number;
   height: number;
@@ -273,6 +289,9 @@ export type HistoryKind =
   | "folderMove"
   | "folderDelete"
   | "folderReorder"
+  | "folderTrash"
+  | "folderRestore"
+  | "folderPurge"
   | "score"
   | "description"
   | "tagSet"

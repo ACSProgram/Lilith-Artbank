@@ -44,6 +44,12 @@ pub enum HistoryKind {
     FolderMove,
     FolderDelete,
     FolderReorder,
+    /// 整棵子树移入回收站；可恢复。
+    FolderTrash,
+    /// 从回收站恢复文件夹；可撤销。
+    FolderRestore,
+    /// 永久删除回收站文件夹；只写待释放标记，清空记录后不可撤销。
+    FolderPurge,
     Score,
     Description,
     TagSet,
@@ -83,6 +89,9 @@ impl HistoryKind {
             Self::FolderMove => "folderMove",
             Self::FolderDelete => "folderDelete",
             Self::FolderReorder => "folderReorder",
+            Self::FolderTrash => "folderTrash",
+            Self::FolderRestore => "folderRestore",
+            Self::FolderPurge => "folderPurge",
             Self::Score => "score",
             Self::Description => "description",
             Self::TagSet => "tagSet",
@@ -119,6 +128,9 @@ impl HistoryKind {
             "folderMove" => Self::FolderMove,
             "folderDelete" => Self::FolderDelete,
             "folderReorder" => Self::FolderReorder,
+            "folderTrash" => Self::FolderTrash,
+            "folderRestore" => Self::FolderRestore,
+            "folderPurge" => Self::FolderPurge,
             "score" => Self::Score,
             "description" => Self::Description,
             "tagSet" => Self::TagSet,
@@ -146,7 +158,10 @@ impl HistoryKind {
 
     /// 记录被裁掉时，这次操作标记的待删除图片失去撤销可能，要安排释放文件。
     pub fn releases_files(self) -> bool {
-        matches!(self, Self::PermanentDelete | Self::EmptyTrash)
+        matches!(
+            self,
+            Self::PermanentDelete | Self::EmptyTrash | Self::FolderPurge
+        )
     }
 }
 
@@ -413,6 +428,9 @@ pub enum RedoRecord {
         items: Vec<ImageState>,
     },
     PurgeIds {
+        ids: Vec<i64>,
+    },
+    PurgeFolderIds {
         ids: Vec<i64>,
     },
     MoveStates {
@@ -1466,10 +1484,13 @@ pub fn clear(database: &LibraryDb, root: &Path) -> AppResult<u64> {
 pub fn has_orphan_purge(database: &LibraryDb) -> AppResult<bool> {
     database.with_reader(|connection| {
         let count: i64 = connection.query_row(
-            "SELECT count(*) FROM images
-             WHERE purge_operation_id IS NOT NULL
-               AND purge_operation_id NOT IN (SELECT id FROM operations)
-             LIMIT 1",
+            "SELECT
+                 EXISTS(SELECT 1 FROM images
+                        WHERE purge_operation_id IS NOT NULL
+                          AND purge_operation_id NOT IN (SELECT id FROM operations))
+              OR EXISTS(SELECT 1 FROM folders
+                        WHERE purge_operation_id IS NOT NULL
+                          AND purge_operation_id NOT IN (SELECT id FROM operations))",
             [],
             |row| row.get(0),
         )?;
@@ -1772,11 +1793,14 @@ fn undo_operation(
         | HistoryKind::FolderRename
         | HistoryKind::FolderMove
         | HistoryKind::FolderDelete
-        | HistoryKind::FolderReorder => undo_folder(database, root, operation_id, kind)?,
+        | HistoryKind::FolderReorder
+        | HistoryKind::FolderTrash
+        | HistoryKind::FolderRestore => undo_folder(database, root, operation_id, kind)?,
         HistoryKind::Trash
         | HistoryKind::Restore
         | HistoryKind::PermanentDelete
-        | HistoryKind::EmptyTrash => undo_visibility(database, operation_id, kind)?,
+        | HistoryKind::EmptyTrash
+        | HistoryKind::FolderPurge => undo_visibility(database, operation_id, kind)?,
         HistoryKind::Score => undo_score(database, operation_id)?,
         HistoryKind::Description | HistoryKind::AiDescription => {
             undo_description(database, operation_id)?
@@ -1819,11 +1843,14 @@ fn redo_operation(
         | HistoryKind::FolderRename
         | HistoryKind::FolderMove
         | HistoryKind::FolderDelete
-        | HistoryKind::FolderReorder => redo_folder(database, root, operation_id, kind)?,
+        | HistoryKind::FolderReorder
+        | HistoryKind::FolderTrash
+        | HistoryKind::FolderRestore => redo_folder(database, root, operation_id, kind)?,
         HistoryKind::Trash
         | HistoryKind::Restore
         | HistoryKind::PermanentDelete
-        | HistoryKind::EmptyTrash => redo_visibility(database, operation_id, kind)?,
+        | HistoryKind::EmptyTrash
+        | HistoryKind::FolderPurge => redo_visibility(database, operation_id, kind)?,
         HistoryKind::Score => redo_score(database, operation_id)?,
         HistoryKind::Description | HistoryKind::AiDescription => {
             redo_description(database, operation_id)?
@@ -1974,11 +2001,31 @@ fn undo_visibility(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -
                         .query_map([operation_id], |row| row.get(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
+                let folder_ids: Vec<i64> = {
+                    let mut statement = transaction.prepare(
+                        "SELECT id FROM folders WHERE purge_operation_id = ?1 ORDER BY id",
+                    )?;
+                    statement
+                        .query_map([operation_id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
                 if !ids.is_empty() {
                     append_redo(&transaction, operation_id, &RedoRecord::PurgeIds { ids })?;
                 }
+                if !folder_ids.is_empty() {
+                    append_redo(
+                        &transaction,
+                        operation_id,
+                        &RedoRecord::PurgeFolderIds { ids: folder_ids },
+                    )?;
+                }
                 transaction.execute(
                     "UPDATE images SET purge_operation_id = NULL
+                     WHERE purge_operation_id = ?1",
+                    [operation_id],
+                )?;
+                transaction.execute(
+                    "UPDATE folders SET purge_operation_id = NULL
                      WHERE purge_operation_id = ?1",
                     [operation_id],
                 )?;
@@ -2016,16 +2063,30 @@ fn redo_visibility(database: &LibraryDb, operation_id: i64, kind: HistoryKind) -
             _ => {
                 let mut applied = false;
                 for record in records {
-                    if let RedoRecord::PurgeIds { ids } = record {
-                        for id in ids {
-                            transaction.execute(
-                                "UPDATE images SET purge_operation_id = ?1
-                                 WHERE id = ?2 AND deleted_at IS NOT NULL
-                                   AND purge_operation_id IS NULL",
-                                params![operation_id, id],
-                            )?;
-                            applied = true;
+                    match record {
+                        RedoRecord::PurgeIds { ids } => {
+                            for id in ids {
+                                transaction.execute(
+                                    "UPDATE images SET purge_operation_id = ?1
+                                     WHERE id = ?2 AND deleted_at IS NOT NULL
+                                       AND purge_operation_id IS NULL",
+                                    params![operation_id, id],
+                                )?;
+                                applied = true;
+                            }
                         }
+                        RedoRecord::PurgeFolderIds { ids } => {
+                            for id in ids {
+                                transaction.execute(
+                                    "UPDATE folders SET purge_operation_id = ?1
+                                     WHERE id = ?2 AND trashed_at IS NOT NULL
+                                       AND purge_operation_id IS NULL",
+                                    params![operation_id, id],
+                                )?;
+                                applied = true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 if !applied {
@@ -3055,7 +3116,29 @@ fn undo_folder(
 ) -> AppResult<()> {
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for chunk in load_chunks(&transaction, operation_id)? {
+        let chunks = load_chunks(&transaction, operation_id)?;
+        if matches!(kind, HistoryKind::FolderTrash | HistoryKind::FolderRestore) {
+            let mut rows: Vec<FolderRow> = Vec::new();
+            let mut triples: Vec<(i64, i64, i64)> = Vec::new();
+            for chunk in &chunks {
+                match chunk.format {
+                    ChunkFormat::Json => rows.extend(decode_json::<Vec<FolderRow>>(&chunk.data)?),
+                    ChunkFormat::Triples => triples.extend(decode_triples(&chunk.data)?),
+                    _ => {}
+                }
+            }
+            if rows.is_empty() {
+                return Err(AppError::message("这条记录缺少重做数据"));
+            }
+            match kind {
+                HistoryKind::FolderTrash => folders::undo_trash(&transaction, &rows, &triples)?,
+                HistoryKind::FolderRestore => folders::undo_restore(&transaction, &rows, &triples)?,
+                _ => {}
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        for chunk in chunks {
             if chunk.format == ChunkFormat::SortJson {
                 if matches!(kind, HistoryKind::FolderRename | HistoryKind::FolderMove) {
                     let change: FolderSortChange = decode_json(&chunk.data)?;
@@ -3152,6 +3235,27 @@ fn redo_folder(
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chunks = load_chunks(&transaction, operation_id)?;
+        if matches!(kind, HistoryKind::FolderTrash | HistoryKind::FolderRestore) {
+            let mut rows: Vec<FolderRow> = Vec::new();
+            let mut triples: Vec<(i64, i64, i64)> = Vec::new();
+            for chunk in &chunks {
+                match chunk.format {
+                    ChunkFormat::Json => rows.extend(decode_json::<Vec<FolderRow>>(&chunk.data)?),
+                    ChunkFormat::Triples => triples.extend(decode_triples(&chunk.data)?),
+                    _ => {}
+                }
+            }
+            if rows.is_empty() {
+                return Err(AppError::message("这条记录缺少重做数据"));
+            }
+            match kind {
+                HistoryKind::FolderTrash => folders::redo_trash(&transaction, &rows, &triples)?,
+                HistoryKind::FolderRestore => folders::redo_restore(&transaction, &rows, &triples)?,
+                _ => {}
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
         match kind {
             HistoryKind::FolderCreate => {
                 let mut rows = Vec::new();
@@ -4491,11 +4595,19 @@ impl BatchReporter for OffsetReporter<'_> {
 pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> AppResult<()> {
     let batches: Vec<(i64, u64)> = database.with_reader(|connection| {
         let mut statement = connection.prepare(
-            "SELECT purge_operation_id, count(*) FROM images
-             WHERE purge_operation_id IS NOT NULL
-               AND purge_operation_id NOT IN (SELECT id FROM operations)
-             GROUP BY purge_operation_id
-             ORDER BY purge_operation_id",
+            "SELECT operation_id, sum(rows) FROM (
+                 SELECT purge_operation_id AS operation_id, count(*) AS rows FROM images
+                 WHERE purge_operation_id IS NOT NULL
+                   AND purge_operation_id NOT IN (SELECT id FROM operations)
+                 GROUP BY purge_operation_id
+                 UNION ALL
+                 SELECT purge_operation_id, count(*) FROM folders
+                 WHERE purge_operation_id IS NOT NULL
+                   AND purge_operation_id NOT IN (SELECT id FROM operations)
+                 GROUP BY purge_operation_id
+             )
+             GROUP BY operation_id
+             ORDER BY operation_id",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -4513,7 +4625,7 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
     let total: u64 = batches.iter().map(|(_, count)| *count).sum();
     task.set_total(total as usize);
     let mut offset = 0_usize;
-    for (operation_id, _) in batches {
+    for (operation_id, count) in batches {
         if task.should_cancel() {
             break;
         }
@@ -4522,8 +4634,8 @@ pub fn run_release(database: &LibraryDb, root: &Path, task: Arc<TaskHandle>) -> 
             offset,
             total: total as usize,
         };
-        let report = metadata::purge_by_operation(database, root, &[operation_id], &reporter)?;
-        offset += report.deleted as usize;
+        metadata::purge_by_operation(database, root, &[operation_id], &reporter)?;
+        offset += count as usize;
         task.report(offset, total as usize);
     }
     task.set_message("");
@@ -4865,6 +4977,108 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+        assert!(!has_orphan_purge(fixture.db()).unwrap());
+    }
+
+    #[test]
+    fn folder_trash_restore_only_revives_images_trashed_with_the_folder() {
+        let fixture = Fixture::new();
+        folders::create(fixture.db(), &fixture.root, "人物/子").unwrap();
+        let child = folders::find_id(fixture.db(), "人物/子").unwrap().unwrap();
+        let fresh = fixture.insert_image("f1");
+        let old = fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO images(
+                        content_hash, file_ext, folder_id, file_size, width, height, format,
+                        has_alpha, phash, colors4, colors8, score, description, imported_at,
+                        modified_at
+                     ) VALUES (?1, 'jpg', ?2, 100, 10, 10, 'jpeg', 0,
+                        zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                    params!["e".repeat(64), child],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        metadata::set_trashed(fixture.db(), &[old], true).unwrap();
+
+        let change = folders::trash(fixture.db(), fixture.folder).unwrap();
+        assert_eq!(
+            change.affected_images, 1,
+            "只把原本正常的图片一起移入回收站"
+        );
+        assert!(
+            metadata::set_trashed(fixture.db(), &[fresh], false).is_err(),
+            "整目录删除的图片不能单张恢复"
+        );
+
+        let trash = crate::library::query::list_trash_folders(fixture.db()).unwrap();
+        assert_eq!(trash.folders.len(), 2, "父与子都在回收站树里");
+
+        let change = folders::restore(fixture.db(), fixture.folder).unwrap();
+        assert_eq!(change.affected_images, 1);
+        let states = metadata::image_states(fixture.db(), &[fresh, old]).unwrap();
+        assert!(
+            states
+                .iter()
+                .any(|state| state.id == fresh && state.deleted_at.is_none())
+        );
+        assert!(
+            states
+                .iter()
+                .any(|state| state.id == old && state.deleted_at.is_some()),
+            "删除前已单独在回收站的图片保持删除"
+        );
+        let trash = crate::library::query::list_trash_folders(fixture.db()).unwrap();
+        assert!(trash.folders.is_empty());
+        assert_eq!(trash.direct_image_count, 1, "留下的图片归到根行直属图片");
+    }
+
+    #[test]
+    fn folder_purge_release_removes_empty_dirs_and_rows() {
+        let fixture = Fixture::new();
+        folders::create(fixture.db(), &fixture.root, "整目录/子").unwrap();
+        let parent = folders::find_id(fixture.db(), "整目录").unwrap().unwrap();
+        let child = folders::find_id(fixture.db(), "整目录/子")
+            .unwrap()
+            .unwrap();
+        let hash = "c".repeat(64);
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO images(
+                        content_hash, file_ext, folder_id, file_size, width, height, format,
+                        has_alpha, phash, colors4, colors8, score, description, imported_at,
+                        modified_at
+                     ) VALUES (?1, 'jpg', ?2, 100, 10, 10, 'jpeg', 0,
+                        zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                    params![hash, child],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let content =
+            LibraryPaths::new(&fixture.root).content_file("整目录/子", &format!("{hash}.jpg"));
+        fs::create_dir_all(content.parent().unwrap()).unwrap();
+        fs::write(&content, b"content").unwrap();
+
+        folders::trash(fixture.db(), parent).unwrap();
+        folders::delete_permanently(fixture.db(), parent).unwrap();
+        trim(fixture.db(), 0).unwrap();
+        assert!(has_orphan_purge(fixture.db()).unwrap());
+
+        run_release(fixture.db(), &fixture.root, task()).unwrap();
+        assert!(!content.exists());
+        assert!(!fixture.root.join("整目录").join("子").exists());
+        assert!(!fixture.root.join("整目录").exists());
+        assert!(folders::find_id(fixture.db(), "整目录").unwrap().is_none());
+        assert!(
+            folders::find_id(fixture.db(), "整目录/子")
+                .unwrap()
+                .is_none()
+        );
         assert!(!has_orphan_purge(fixture.db()).unwrap());
     }
 
@@ -5660,10 +5874,10 @@ mod tests {
         folders::reorder(fixture.db(), &[junk], root_id, 0).unwrap();
         assert_eq!(sort_of("杂物"), 0);
         assert_eq!(sort_of("人物"), 1);
-        folders::delete(fixture.db(), &fixture.root, work).unwrap();
+        folders::trash(fixture.db(), work).unwrap();
         let deleted = list(fixture.db()).unwrap().remove(0).id;
-        assert!(!has("人物/成品"));
-        assert!(!fixture.root.join("人物").join("成品").exists());
+        assert!(has("人物/成品"), "移入回收站保留文件夹行");
+        assert!(fixture.root.join("人物").join("成品").is_dir());
 
         run_undo(
             fixture.db(),
@@ -5700,11 +5914,12 @@ mod tests {
                 .all(|entry| entry.status == OperationStatus::Applied)
         );
         assert!(has("人物") && has("杂物"));
-        assert!(!has("作品") && !has("成品") && !has("人物/成品"));
+        assert!(!has("作品") && !has("成品"));
+        assert!(has("人物/成品"), "重做删除只写回收站状态，行仍在");
         assert_eq!(sort_of("杂物"), 0);
         assert_eq!(sort_of("人物"), 1);
         assert!(fixture.root.join("人物").is_dir());
-        assert!(!fixture.root.join("人物").join("成品").exists());
+        assert!(fixture.root.join("人物").join("成品").is_dir());
     }
 
     fn tag_id(database: &LibraryDb, name: &str) -> i64 {

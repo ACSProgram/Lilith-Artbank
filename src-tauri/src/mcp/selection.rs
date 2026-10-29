@@ -192,6 +192,7 @@ impl McpQuery {
             filters: LibraryFilters {
                 folder_ids: self.filters.folder_ids.clone(),
                 folder_direct: false,
+                trash_loose: false,
                 extensions: self.filters.extensions.clone(),
                 scores: self.filters.scores.clone(),
                 tag_ids: self.filters.tag_ids.clone(),

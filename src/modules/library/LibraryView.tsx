@@ -91,6 +91,7 @@ import type {
   ImageRow,
   LibraryView as LibraryViewType,
   SortKey,
+  TrashFolders,
   ViewMode,
 } from "./types";
 import { useImageQuery } from "./useImageQuery";
@@ -121,6 +122,8 @@ interface LibraryViewProps {
   browse: BrowseState;
   canGoBack: boolean;
   folders: FolderInfo[];
+  /** 回收站视图左侧树的文件夹；只用于面包屑与清空按钮。 */
+  trashFolders?: TrashFolders | null;
   onApplyBrowse: (next: BrowseState, pushHistory?: boolean) => void;
   onGoBack: () => void;
   onFoldersChanged?: () => void | Promise<void>;
@@ -205,6 +208,7 @@ export function LibraryView({
   browse,
   canGoBack,
   folders,
+  trashFolders = null,
   onApplyBrowse,
   onGoBack,
   onFoldersChanged,
@@ -301,11 +305,20 @@ export function LibraryView({
   } | null>(null);
   const applyBrowse = onApplyBrowse;
 
-  const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
-  const breadcrumbs = useMemo(
-    () => breadcrumbsFor(folderTree, browse.filters.folderIds),
-    [folderTree, browse.filters.folderIds],
+  const folderTree = useMemo(
+    () =>
+      buildFolderTree(
+        browse.view === "trash" ? (trashFolders?.folders ?? []) : folders,
+      ),
+    [browse.view, folders, trashFolders],
   );
+  const breadcrumbs = useMemo(() => {
+    const trail = breadcrumbsFor(folderTree, browse.filters.folderIds);
+    if (browse.view === "trash" && trail.length > 0) {
+      trail[0] = { ...trail[0], label: "回收站" };
+    }
+    return trail;
+  }, [folderTree, browse.filters.folderIds, browse.view]);
 
   const effectiveView: LibraryViewType =
     browse.search && browse.searchScope === "library" ? "all" : browse.view;
@@ -935,6 +948,7 @@ export function LibraryView({
       ...sortForViewChange(browseRef.current, "all"),
       view: "all",
       collectionId: null,
+      filters: { ...browseRef.current.filters, trashLoose: false },
     });
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
@@ -945,6 +959,13 @@ export function LibraryView({
       ...sortForViewChange(browseRef.current, "trash"),
       view: "trash",
       collectionId: null,
+      // 左侧会换成回收站树，正常文件夹选择在这里没有落点。
+      filters: {
+        ...browseRef.current.filters,
+        folderIds: [],
+        folderDirect: false,
+        trashLoose: false,
+      },
     });
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
@@ -955,7 +976,7 @@ export function LibraryView({
       ...sortForViewChange(browseRef.current, "temp"),
       view: "temp",
       collectionId: null,
-      filters: { ...browseRef.current.filters, folderIds: [] },
+      filters: { ...browseRef.current.filters, folderIds: [], trashLoose: false },
     });
     similarityClear?.();
   }, [applyBrowse, similarityClear]);
@@ -968,6 +989,7 @@ export function LibraryView({
         ...sortForViewChange(currentState, "collection"),
         view: "collection",
         collectionId,
+        filters: { ...currentState.filters, trashLoose: false },
       });
       similarityClear?.();
     },
@@ -1420,18 +1442,25 @@ export function LibraryView({
   const emptyTrash = useCallback(async () => {
     if (viewBusy) return;
     const count = current?.trashCount ?? 0;
-    const accepted = await confirmEmptyTrash(confirm, count);
+    const folderCount = trashFolders?.folders.length ?? 0;
+    const accepted = await confirmEmptyTrash(confirm, count, folderCount);
     if (!accepted) return;
     setEmptyingTrash(true);
     setViewBusy(true);
     try {
       const report = await libraryApi.emptyTrash();
+      const cleared = [
+        report.deleted > 0 ? `${report.deleted.toLocaleString()} 张图片` : "",
+        folderCount > 0 ? `${folderCount.toLocaleString()} 个文件夹` : "",
+      ]
+        .filter(Boolean)
+        .join("、");
       notify(
-        `已清空回收站：移出 ${report.deleted.toLocaleString()} 张`,
+        `已清空回收站：移出 ${cleared || "0 张"}`,
         report.failures.length > 0 ? "error" : "success",
         report.failures.length > 0
           ? `${report.failures.length} 个文件删除失败：${report.failures[0].reason}`
-          : report.deferred && report.deleted > 0
+          : report.deferred && (report.deleted > 0 || folderCount > 0)
             ? "文件会在操作记录清除后释放。"
             : undefined,
       );
@@ -1449,7 +1478,7 @@ export function LibraryView({
       setEmptyingTrash(false);
       setViewBusy(false);
     }
-  }, [applyChange, confirm, current?.trashCount, notify, viewBusy]);
+  }, [applyChange, confirm, current?.trashCount, notify, trashFolders, viewBusy]);
 
   const removeFromCurrentCollection = useCallback(
     async (ids: number[]): Promise<boolean> => {
@@ -1631,6 +1660,7 @@ export function LibraryView({
       fileExt: details.fileExt,
       folderId: details.folderId,
       folderPath: details.folderPath,
+      folderTrashed: details.folderTrashed,
       filePath: details.filePath,
       fileSize: details.fileSize,
       width: details.width,
@@ -1824,6 +1854,7 @@ export function LibraryView({
           ...currentState.filters,
           folderIds: folderId == null ? [] : [folderId],
           folderDirect: false,
+          trashLoose: false,
         },
       });
     },
@@ -1978,6 +2009,13 @@ export function LibraryView({
   const selectedIds = useMemo(() => [...selected], [selected]);
   const contextHasDeleted = contextMenu?.items.some((item) => item.deletedAt != null) ?? false;
   const contextHasActive = contextMenu?.items.some((item) => item.deletedAt == null) ?? false;
+  const contextItems = contextMenu?.items ?? [];
+  const contextDeletedUnderFolder =
+    contextHasDeleted &&
+    contextItems.length > 0 &&
+    contextItems
+      .filter((item) => item.deletedAt != null)
+      .every((item) => item.folderTrashed);
 
   return (
     <div className="library-view" onKeyDown={handleKeyDown}>
@@ -1991,6 +2029,7 @@ export function LibraryView({
           collections={collections}
           imageCount={current?.imageCount ?? 0}
           trashCount={current?.trashCount ?? 0}
+          trashFolderCount={trashFolders?.folders.length ?? 0}
           tempCount={current?.tempCount ?? 0}
           emptyingTrash={emptyingTrash}
           onShowAll={showAll}
@@ -2118,11 +2157,19 @@ export function LibraryView({
         <div className="folder-breadcrumbs" aria-label="当前文件夹">
           <button
             type="button"
-            className={`folder-crumb${browse.filters.folderIds.length === 0 ? " is-current" : ""}`}
+            className={`folder-crumb${
+              browse.filters.folderIds.length === 0 && !browse.filters.trashLoose
+                ? " is-current"
+                : ""
+            }`}
             onClick={() => showFolder(null)}
           >
             <FolderOpen size={13} />
-            {effectiveView === "temp" ? "临时" : "全部图片"}
+            {effectiveView === "temp"
+              ? "临时"
+              : effectiveView === "trash"
+                ? "回收站"
+                : "全部图片"}
           </button>
           {effectiveView !== "temp" && browse.filters.folderIds.length > 1 ? (
             <>
@@ -2167,7 +2214,8 @@ export function LibraryView({
               </span>
             ))
           )}
-          {browse.filters.folderDirect && browse.filters.folderIds.length === 1 ? (
+          {(browse.filters.folderDirect && browse.filters.folderIds.length === 1) ||
+          browse.filters.trashLoose ? (
             <>
               <ChevronRight size={12} className="folder-crumb-separator" />
               <span className="folder-crumb is-current">直属图片</span>
@@ -2614,6 +2662,7 @@ export function LibraryView({
           inTemp={effectiveView === "temp"}
           hasActive={contextHasActive}
           hasDeleted={contextHasDeleted}
+          deletedUnderFolder={contextDeletedUnderFolder}
           onClose={() => setContextMenu(null)}
           onOpenViewer={() => {
             const item = contextMenu.items[0];

@@ -49,12 +49,12 @@
 
 ## 命令记录
 
-96 个 Tauri 命令里 88 个走包装，分两档：
+100 个 Tauri 命令里 92 个走包装，分两档：
 
 | 档 | 成功 | 失败 | 慢 |
 | --- | --- | --- | --- |
-| 写命令（56） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
-| 读命令（32） | 不记录 | `WARN command failed` | 超过阈值记 `WARN command slow` |
+| 写命令（58） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
+| 读命令（34） | 不记录 | `WARN command failed` | 超过阈值记 `WARN command slow` |
 
 - **写命令**指会改变图库状态或有外部副作用的命令：设置与图库开关、导入、文件夹、标签、
   评分与描述、移动与回收站、撤销与重做、集合、像素编辑、AI 服务、任务、MCP 审批，
@@ -110,7 +110,7 @@ grep 'command failed' logs/lilith-artbank.log      # 只看失败
 ## 验证
 
 - Rust：`cargo fmt --check`、`cargo check`、`cargo test`。
-- 自检：`grep -c "trace::write\|trace::read" src-tauri/src/app/commands.rs` 应为 81；
+- 自检：`grep -c "trace::write\|trace::read" src-tauri/src/app/commands.rs` 应为 92；
   `grep -n "^\s*\.level(" src-tauri/src/lib.rs` 应无输出（只匹配调用，注释里的 `.level()` 不算）；
   `grep -n "timezone_strategy" -A 2 src-tauri/src/lib.rs` 里 `.format(` 必须排在它之后。
 - 提交前：`git diff --check`。

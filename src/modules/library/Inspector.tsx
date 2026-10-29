@@ -211,15 +211,24 @@ export function InspectorPanel({
 
 function TrashActions({
   inTrash,
+  folderTrashed = false,
   onTrash,
   onRestore,
   onDelete,
 }: {
   inTrash: boolean;
+  folderTrashed?: boolean;
   onTrash: () => void;
   onRestore: () => void;
   onDelete: () => void;
 }) {
+  if (inTrash && folderTrashed) {
+    return (
+      <span className="field-hint">
+        图片随文件夹一起移入回收站；请在左侧回收站树里恢复或永久删除整个文件夹。
+      </span>
+    );
+  }
   return imageActions(inTrash).includes("trash") ? (
     <Button size="sm" variant="secondary" icon={<Trash2 size={13} />} onClick={onTrash}>
       移入回收站
@@ -788,7 +797,7 @@ function ImageInspector({
               <FolderInput size={12} /> 文件夹
             </h4>
             <span>{folderLabel(detail.folderPath)}</span>
-            {onOpenFolder && !inTrash ? (
+            {onOpenFolder && !inTrash && !detail.folderTrashed ? (
               <IconButton
                 label="转到所在文件夹"
                 disabled={busy}
@@ -798,49 +807,57 @@ function ImageInspector({
               </IconButton>
             ) : null}
           </div>
-          <div className="inspector-inline-actions">
-            <input
-              className="input"
-              value={folderDraft}
-              list="inspector-folders"
-              placeholder="根目录或 人物/速写"
-              disabled={busy}
-              onChange={(event) => setFolderDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  moveFolder();
-                }
-              }}
-            />
-            <Button size="sm" loading={busy} onClick={() => moveFolder()}>
-              移动
-            </Button>
-            <IconButton
-              label="从文件夹树选择"
-              disabled={busy}
-              onClick={() => setFolderPickerOpen(true)}
-            >
-              <FolderInput size={13} />
-            </IconButton>
-          </div>
-          <datalist id="inspector-folders">
-            {folders.map((folder) => (
-              <option key={folder.id} value={folder.path} />
-            ))}
-          </datalist>
-          <FolderPickerDialog
-            open={folderPickerOpen}
-            title="移动图片"
-            subtitle="选择目标文件夹；图片会移动到该文件夹下。"
-            folders={folders}
-            selectedPath={detail.folderPath}
-            onClose={() => setFolderPickerOpen(false)}
-            onSelect={(target) => {
-              setFolderPickerOpen(false);
-              moveFolder(target.path);
-            }}
-          />
+          {detail.folderTrashed ? (
+            <span className="field-hint">
+              文件夹在回收站中；恢复整个文件夹后才能移动图片。
+            </span>
+          ) : (
+            <>
+              <div className="inspector-inline-actions">
+                <input
+                  className="input"
+                  value={folderDraft}
+                  list="inspector-folders"
+                  placeholder="根目录或 人物/速写"
+                  disabled={busy}
+                  onChange={(event) => setFolderDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      moveFolder();
+                    }
+                  }}
+                />
+                <Button size="sm" loading={busy} onClick={() => moveFolder()}>
+                  移动
+                </Button>
+                <IconButton
+                  label="从文件夹树选择"
+                  disabled={busy}
+                  onClick={() => setFolderPickerOpen(true)}
+                >
+                  <FolderInput size={13} />
+                </IconButton>
+              </div>
+              <datalist id="inspector-folders">
+                {folders.map((folder) => (
+                  <option key={folder.id} value={folder.path} />
+                ))}
+              </datalist>
+              <FolderPickerDialog
+                open={folderPickerOpen}
+                title="移动图片"
+                subtitle="选择目标文件夹；图片会移动到该文件夹下。"
+                folders={folders}
+                selectedPath={detail.folderPath}
+                onClose={() => setFolderPickerOpen(false)}
+                onSelect={(target) => {
+                  setFolderPickerOpen(false);
+                  moveFolder(target.path);
+                }}
+              />
+            </>
+          )}
         </section>
       ) : null}
 
@@ -971,6 +988,7 @@ function ImageInspector({
         <section className="inspector-section inspector-actions">
           <TrashActions
             inTrash={inTrash}
+            folderTrashed={detail.folderTrashed}
             onTrash={onTrash}
             onRestore={onRestore}
             onDelete={onDelete}

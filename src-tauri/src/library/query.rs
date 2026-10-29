@@ -120,6 +120,8 @@ pub struct LibraryFilters {
     pub folder_ids: Vec<i64>,
     /// true 时只匹配直接位于选中文件夹的图片，不展开子文件夹。
     pub folder_direct: bool,
+    /// 回收站视图的“直属图片”：只匹配原文件夹仍在图库中的回收站图片。
+    pub trash_loose: bool,
     pub extensions: Vec<String>,
     pub scores: Vec<i64>,
     pub tag_ids: Vec<i64>,
@@ -185,6 +187,8 @@ pub struct ImageRow {
     pub file_ext: String,
     pub folder_id: i64,
     pub folder_path: String,
+    /// 所在文件夹已整目录移入回收站；这类图片不提供单张恢复/永久删除。
+    pub folder_trashed: bool,
     pub file_path: String,
     pub file_size: i64,
     pub width: i64,
@@ -280,8 +284,21 @@ pub struct FolderInfo {
 pub struct FolderChange {
     /// 受影响文件夹的最新状态；前端按 id 就地合并。
     pub folders: Vec<FolderInfo>,
-    /// 已经删除的文件夹 id。
+    /// 已经从正常树移除的文件夹 id。
     pub removed_ids: Vec<i64>,
+    /// 这次操作涉及的图片数；其它文件夹写命令为 0。
+    pub affected_images: u64,
+}
+
+/// 回收站文件夹树：`folders` 只含已移入回收站的文件夹，计数都是回收站图片数。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashFolders {
+    pub folders: Vec<FolderInfo>,
+    /// 原文件夹仍在图库中的回收站图片数（回收站根行的“直属图片”）。
+    pub direct_image_count: u64,
+    /// 回收站里的全部图片数，含已删除文件夹下的图片。
+    pub total_image_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,7 +354,8 @@ fn page_from_keyset(
                 folders.path, images.file_size, images.width, images.height,
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
-                images.thumb_width, images.thumb_height, {sort_selects}
+                images.thumb_width, images.thumb_height,
+                folders.trashed_at IS NOT NULL, {sort_selects}
          FROM images
          JOIN folders ON folders.id = images.folder_id
          {} WHERE {}
@@ -354,7 +372,7 @@ fn page_from_keyset(
         let item = image_row_from_row(row, root)?;
         let mut sort_values = Vec::with_capacity(sort_count);
         for index in 0..sort_count {
-            sort_values.push(row.get::<_, i64>(17 + index)?);
+            sort_values.push(row.get::<_, i64>(18 + index)?);
         }
         Ok((item, sort_values))
     })?;
@@ -517,7 +535,7 @@ pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<
                 folders.path, images.file_size, images.width, images.height,
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
-                images.thumb_width, images.thumb_height
+                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL
          FROM images
          JOIN folders ON folders.id = images.folder_id
          WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"
@@ -552,7 +570,7 @@ fn rows_for_ids(connection: &Connection, root: &Path, ids: &[i64]) -> AppResult<
                 folders.path, images.file_size, images.width, images.height,
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
-                images.thumb_width, images.thumb_height
+                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL
          FROM images
          JOIN folders ON folders.id = images.folder_id
          WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"
@@ -591,6 +609,7 @@ fn image_row_from_row(row: &rusqlite::Row<'_>, root: &Path) -> rusqlite::Result<
         file_ext,
         folder_id: row.get(3)?,
         folder_path,
+        folder_trashed: row.get::<_, i64>(17)? != 0,
         file_path: file_path.to_string_lossy().into_owned(),
         file_size: row.get(5)?,
         width: row.get(6)?,
@@ -1139,6 +1158,72 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
     })
 }
 
+/// 回收站文件夹树：节点计数都是回收站图片数，正常文件夹不出现在这里。
+pub fn list_trash_folders(database: &LibraryDb) -> AppResult<TrashFolders> {
+    database.with_reader(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT id, path, sort_index FROM folders
+             WHERE kind = 'normal' AND trashed_at IS NOT NULL AND purge_operation_id IS NULL
+             ORDER BY path",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut statement = connection.prepare(
+            "SELECT images.folder_id, count(*) FROM images
+             JOIN folders ON folders.id = images.folder_id
+             WHERE images.deleted_at IS NOT NULL AND images.purge_operation_id IS NULL
+               AND folders.trashed_at IS NOT NULL AND folders.purge_operation_id IS NULL
+             GROUP BY images.folder_id",
+        )?;
+        let direct = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
+        let paths: Vec<(i64, String)> = rows
+            .iter()
+            .map(|(id, path, _)| (*id, path.clone()))
+            .collect();
+        let totals: HashMap<i64, u64> = expand_folder_counts(direct, &paths).into_iter().collect();
+        let folders: Vec<FolderInfo> = rows
+            .into_iter()
+            .map(|(id, path, sort_index)| FolderInfo {
+                id,
+                path,
+                sort_index,
+                direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
+                total_image_count: totals.get(&id).copied().unwrap_or(0),
+            })
+            .collect();
+        let direct_image_count: u64 = connection.query_row(
+            "SELECT count(*) FROM images
+             JOIN folders ON folders.id = images.folder_id
+             WHERE images.deleted_at IS NOT NULL AND images.purge_operation_id IS NULL
+               AND folders.kind = 'normal' AND folders.trashed_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let total_image_count = direct_image_count + totals.values().copied().sum::<u64>();
+        Ok(TrashFolders {
+            folders,
+            direct_image_count,
+            total_image_count,
+        })
+    })
+}
+
 /// 只返回给定 id 的最新 `FolderInfo`；用于文件夹写命令的增量返回。
 ///
 /// 计数仍走一次全库聚合（覆盖索引后是索引内扫描），但前端只收到受影响的行。
@@ -1491,6 +1576,14 @@ fn normalize(mut query: LibraryQuery) -> AppResult<(LibraryQuery, u32)> {
     if query.search.is_empty() {
         query.search_scope = SearchScope::View;
     }
+    if query.view == LibraryView::Trash {
+        if query.filters.trash_loose {
+            query.filters.folder_ids.clear();
+            query.filters.folder_direct = false;
+        }
+    } else {
+        query.filters.trash_loose = false;
+    }
 
     if query.sort.is_empty() {
         query.sort.push(SortSpec::default());
@@ -1767,6 +1860,9 @@ impl PreparedQuery {
                 }
             }
         }
+        if !library_scope && query.view == LibraryView::Trash && query.filters.trash_loose {
+            prepared.require_loose_trash();
+        }
         if !temp_view {
             prepared.filters.clauses.push(temp::EXCLUDE_SQL.to_owned());
         }
@@ -1785,6 +1881,17 @@ impl PreparedQuery {
             .filters
             .push_filters(&query.filters, exclude, folder_paths);
         prepared
+    }
+
+    /// 回收站里的“直属图片”：原文件夹仍在图库（未整目录移入回收站）。
+    fn require_loose_trash(&mut self) {
+        self.filters.clauses.push(
+            "images.folder_id NOT IN (
+                SELECT trashed_folders.id FROM folders trashed_folders
+                WHERE trashed_folders.trashed_at IS NOT NULL
+            )"
+            .to_owned(),
+        );
     }
 
     /// 统计只算正常图片；全库搜索不带视图可见性条件时需要补上。
@@ -2343,9 +2450,12 @@ fn folder_scope_paths(connection: &Connection, ids: &[i64]) -> AppResult<Vec<Str
 }
 
 fn all_folders(connection: &Connection) -> AppResult<Vec<(i64, String)>> {
-    // 按路径排序命中 `folders(path)` 唯一索引；前端树与计数都不依赖顺序，但返回值保持稳定。
-    let mut statement =
-        connection.prepare("SELECT id, path FROM folders WHERE kind = 'normal' ORDER BY path")?;
+    // 只返回正常树里的文件夹：回收站与待释放行对文件夹树、统计与 MCP 都不可见。
+    let mut statement = connection.prepare(
+        "SELECT id, path FROM folders
+         WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
+         ORDER BY path",
+    )?;
     let folders = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -2509,7 +2619,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::library::{import::ensure_folder, service, temp};
+    use crate::library::{folders, import::ensure_folder, service, temp};
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -4912,5 +5022,64 @@ mod tests {
         // 空规则回落到默认值，而不是报错。
         let keeps = group_keeps(database, &groups, &[]).unwrap();
         assert_eq!(keeps, vec![Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn trash_view_separates_folder_trash_from_loose_images() {
+        let fixture = fixture();
+        // fixture 里 id=5 已单独在回收站；整目录移入后 3、4 也进回收站。
+        folders::trash(&fixture.session.db, fixture.folder_scenery).unwrap();
+
+        let mut all = all_ids(
+            LibraryQuery {
+                view: LibraryView::Trash,
+                ..base_query()
+            },
+            &fixture,
+        );
+        all.sort_unstable();
+        assert_eq!(all, vec![3, 4, 5]);
+
+        let mut loose = all_ids(
+            LibraryQuery {
+                view: LibraryView::Trash,
+                filters: LibraryFilters {
+                    trash_loose: true,
+                    ..Default::default()
+                },
+                ..base_query()
+            },
+            &fixture,
+        );
+        loose.sort_unstable();
+        assert_eq!(loose, vec![5], "直属图片只含原文件夹仍在图库中的回收站图片");
+
+        let mut folder = all_ids(
+            LibraryQuery {
+                view: LibraryView::Trash,
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_scenery],
+                    ..Default::default()
+                },
+                ..base_query()
+            },
+            &fixture,
+        );
+        folder.sort_unstable();
+        assert_eq!(folder, vec![3, 4]);
+
+        let trash_folders = list_trash_folders(&fixture.session.db).unwrap();
+        assert_eq!(trash_folders.folders.len(), 1);
+        assert_eq!(trash_folders.folders[0].path, "风景");
+        assert_eq!(trash_folders.folders[0].total_image_count, 2);
+        assert_eq!(trash_folders.direct_image_count, 1);
+        assert_eq!(trash_folders.total_image_count, 3);
+        assert!(
+            list_folders(&fixture.session.db)
+                .unwrap()
+                .iter()
+                .all(|folder| folder.path != "风景"),
+            "正常文件夹列表不含回收站文件夹"
+        );
     }
 }

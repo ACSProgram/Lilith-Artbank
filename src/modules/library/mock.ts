@@ -33,6 +33,7 @@ import type {
   TagInfo,
   TagMergeReport,
   TagRef,
+  TrashFolders,
   ValueCount,
 } from "./types";
 
@@ -60,10 +61,18 @@ const DIMENSIONS: [number, number][] = [
   [900, 1600],
 ];
 
-const folderState = FOLDER_PATHS.map((path, index) => ({
+interface MockFolder {
+  id: number;
+  path: string;
+  sortIndex: number;
+  trashedAt: number | null;
+}
+
+const folderState: MockFolder[] = FOLDER_PATHS.map((path, index) => ({
   id: index + 1,
   path,
   sortIndex: 0,
+  trashedAt: null,
 }));
 {
   const counters = new Map<string, number>();
@@ -116,6 +125,7 @@ function createMockRows(count: number): ImageRow[] {
       fileExt: extension,
       folderId,
       folderPath,
+      folderTrashed: false,
       filePath: filePathOf(contentHash, extension, folderPath),
       fileSize: 180_000 + (index % 37) * 120_000,
       width,
@@ -160,6 +170,7 @@ export function mockFolders(): FolderInfo[] {
     }
   }
   return folderState
+    .filter((folder) => folder.trashedAt == null)
     .map((folder) => ({
       id: folder.id,
       path: folder.path,
@@ -168,6 +179,49 @@ export function mockFolders(): FolderInfo[] {
       totalImageCount: totals.get(folder.id) ?? 0,
     }))
     .sort((left, right) => left.path.localeCompare(right.path, "zh-Hans-CN"));
+}
+
+/** 回收站文件夹树：节点计数都是回收站图片数。 */
+export function mockTrashFolders(): TrashFolders {
+  const trashed = folderState.filter((folder) => folder.trashedAt != null);
+  const trashedIds = new Set(trashed.map((folder) => folder.id));
+  const direct = new Map<number, number>();
+  for (const image of mockImages) {
+    if (image.deletedAt == null) continue;
+    direct.set(image.folderId, (direct.get(image.folderId) ?? 0) + 1);
+  }
+  const byPath = new Map(trashed.map((folder) => [folder.path, folder.id]));
+  const totals = new Map<number, number>(trashed.map((folder) => [folder.id, 0]));
+  for (const folder of trashed) {
+    const count = direct.get(folder.id) ?? 0;
+    if (count === 0) continue;
+    let current: string | null = folder.path;
+    while (current !== null) {
+      const id = byPath.get(current);
+      if (id != null) totals.set(id, (totals.get(id) ?? 0) + count);
+      if (current === "") break;
+      const index = current.lastIndexOf("/");
+      current = index < 0 ? "" : current.slice(0, index);
+    }
+  }
+  const folders = trashed
+    .map((folder) => ({
+      id: folder.id,
+      path: folder.path,
+      sortIndex: folder.sortIndex,
+      directImageCount: direct.get(folder.id) ?? 0,
+      totalImageCount: totals.get(folder.id) ?? 0,
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path, "zh-Hans-CN"));
+  const directCount = mockImages.filter(
+    (image) => image.deletedAt != null && !trashedIds.has(image.folderId),
+  ).length;
+  return {
+    folders,
+    directImageCount: directCount,
+    totalImageCount:
+      directCount + folders.reduce((sum, folder) => sum + folder.totalImageCount, 0),
+  };
 }
 
 export function mockTags(): TagInfo[] {
@@ -237,7 +291,12 @@ function folderPathOf(folderId: number): string | undefined {
   return folderState.find((folder) => folder.id === folderId)?.path;
 }
 
+function folderTrashedOf(folderId: number): boolean {
+  return folderState.find((folder) => folder.id === folderId)?.trashedAt != null;
+}
+
 function matchesFilters(image: ImageRow, filters: LibraryFilters, exclude: Facet): boolean {
+  if (filters.trashLoose && folderTrashedOf(image.folderId)) return false;
   if (exclude !== "folders" && filters.folderIds.length > 0) {
     const matched = filters.folderIds.some((folderId) => {
       const path = folderPathOf(folderId);
@@ -745,7 +804,7 @@ function normalizeMockFolder(value: string): string {
   return value.replaceAll("\\", "/").trim().replace(/^\/+|\/+$/g, "");
 }
 
-function findFolder(id: number): { id: number; path: string; sortIndex: number } {
+function findFolder(id: number): MockFolder {
   const folder = folderState.find((item) => item.id === id);
   if (!folder) throw new Error("文件夹不存在");
   return folder;
@@ -771,7 +830,12 @@ function ensureMockFolder(path: string): number {
   const existing = folderState.find(
     (folder) => folder.path.toLowerCase() === path.toLowerCase(),
   );
-  if (existing) return existing.id;
+  if (existing) {
+    if (existing.trashedAt != null) {
+      throw new Error(`文件夹「${path}」在回收站中，请先恢复或永久删除`);
+    }
+    return existing.id;
+  }
   let id = folderState[0].id;
   let current = "";
   for (const segment of path.split("/")) {
@@ -780,6 +844,9 @@ function ensureMockFolder(path: string): number {
       (folder) => folder.path.toLowerCase() === current.toLowerCase(),
     );
     if (found) {
+      if (found.trashedAt != null) {
+        throw new Error(`文件夹「${current}」在回收站中，请先恢复或永久删除`);
+      }
       id = found.id;
       continue;
     }
@@ -791,7 +858,7 @@ function ensureMockFolder(path: string): number {
           .filter((folder) => parentFolderPath(folder.path) === parent)
           .map((folder) => folder.sortIndex),
       ) + 1;
-    const folder = { id: nextFolderId++, path: current, sortIndex };
+    const folder = { id: nextFolderId++, path: current, sortIndex, trashedAt: null };
     folderState.push(folder);
     id = folder.id;
   }
@@ -816,8 +883,11 @@ function replaceFolderPrefix(oldPath: string, newPath: string) {
   }
 }
 
-function mockFolderChange(removedIds: number[] = []): FolderChange {
-  return { folders: mockFolders(), removedIds };
+function mockFolderChange(
+  removedIds: number[] = [],
+  affectedImages = 0,
+): FolderChange {
+  return { folders: mockFolders(), removedIds, affectedImages };
 }
 
 export function mockCreateFolder(path: string): FolderChange {
@@ -825,8 +895,15 @@ export function mockCreateFolder(path: string): FolderChange {
   if (!normalized) throw new Error("根目录已经存在");
   const segments = normalized.split("/");
   segments.forEach(validateFolderName);
-  if (folderState.some((folder) => folder.path.toLowerCase() === normalized.toLowerCase())) {
-    throw new Error("文件夹已存在");
+  const existing = folderState.find(
+    (folder) => folder.path.toLowerCase() === normalized.toLowerCase(),
+  );
+  if (existing) {
+    throw new Error(
+      existing.trashedAt != null
+        ? "该路径的文件夹在回收站中，请先恢复或永久删除"
+        : "文件夹已存在",
+    );
   }
   ensureMockFolder(normalized);
   return mockFolderChange();
@@ -835,6 +912,7 @@ export function mockCreateFolder(path: string): FolderChange {
 export function mockRenameFolder(id: number, name: string): FolderChange {
   const folder = findFolder(id);
   if (!folder.path) throw new Error("不能重命名图库根目录");
+  if (folder.trashedAt != null) throw new Error("文件夹在回收站中，请先恢复或永久删除");
   const nextName = validateFolderName(name);
   const index = folder.path.lastIndexOf("/");
   const parent = index < 0 ? "" : folder.path.slice(0, index);
@@ -855,6 +933,8 @@ export function mockMoveFolder(id: number, parentId: number): FolderChange {
   const folder = findFolder(id);
   const parent = findFolder(parentId);
   if (!folder.path) throw new Error("不能移动图库根目录");
+  if (folder.trashedAt != null) throw new Error("文件夹在回收站中，请先恢复或永久删除");
+  if (parent.trashedAt != null) throw new Error("目标文件夹在回收站中，请先恢复或永久删除");
   if (parent.path === folder.path || parent.path.startsWith(`${folder.path}/`)) {
     throw new Error("不能把文件夹移动到自身或子文件夹");
   }
@@ -1006,15 +1086,89 @@ export function mockApplyFolderOrder(
 export function mockDeleteFolder(id: number): FolderChange {
   const folder = findFolder(id);
   if (!folder.path) throw new Error("不能删除图库根目录");
-  if (folderState.some((item) => item.path.startsWith(`${folder.path}/`))) {
-    throw new Error("文件夹还包含子文件夹，不能删除");
+  if (folder.trashedAt != null) throw new Error("文件夹已经在回收站中");
+  const stamp = Date.now();
+  const subtree = folderState.filter(
+    (item) => item.path === folder.path || item.path.startsWith(`${folder.path}/`),
+  );
+  const ids = new Set(subtree.map((item) => item.id));
+  for (const item of subtree) {
+    if (item.trashedAt == null) item.trashedAt = stamp;
   }
-  if (mockImages.some((image) => image.folderId === id)) {
-    throw new Error("文件夹中还有图片，不能删除");
+  let affectedImages = 0;
+  for (const image of mockImages) {
+    if (ids.has(image.folderId) && image.deletedAt == null) {
+      image.deletedAt = stamp;
+      affectedImages += 1;
+    }
   }
-  const index = folderState.findIndex((item) => item.id === id);
-  folderState.splice(index, 1);
-  return mockFolderChange([id]);
+  for (const image of mockImages) {
+    image.folderTrashed = folderTrashedOf(image.folderId);
+  }
+  return mockFolderChange(
+    subtree.map((item) => item.id),
+    affectedImages,
+  );
+}
+
+export function mockRestoreFolder(id: number): FolderChange {
+  const folder = findFolder(id);
+  if (folder.trashedAt == null) throw new Error("文件夹不在回收站中");
+  const stamp = folder.trashedAt;
+  // 同一次删除可能包含上级：选中子树里的文件夹时，恢复整个删除单元。
+  let rootPath = folder.path;
+  let parent = parentFolderPath(rootPath);
+  while (parent) {
+    const ancestor = folderState.find((item) => item.path === parent);
+    if (!ancestor || ancestor.trashedAt == null) break;
+    if (ancestor.trashedAt !== stamp) {
+      throw new Error(
+        `上级文件夹「${ancestor.path}」仍在回收站中，请先恢复它`,
+      );
+    }
+    rootPath = ancestor.path;
+    parent = parentFolderPath(rootPath);
+  }
+  const subtree = folderState.filter(
+    (item) => item.path === rootPath || item.path.startsWith(`${rootPath}/`),
+  );
+  const restoreIds = new Set(
+    subtree.filter((item) => item.trashedAt === stamp).map((item) => item.id),
+  );
+  for (const item of folderState) {
+    if (restoreIds.has(item.id)) item.trashedAt = null;
+  }
+  let affectedImages = 0;
+  for (const image of mockImages) {
+    if (restoreIds.has(image.folderId) && image.deletedAt === stamp) {
+      image.deletedAt = null;
+      affectedImages += 1;
+    }
+  }
+  for (const image of mockImages) {
+    image.folderTrashed = folderTrashedOf(image.folderId);
+  }
+  return mockFolderChange([], affectedImages);
+}
+
+export function mockDeleteFolderPermanently(id: number): FolderChange {
+  const folder = findFolder(id);
+  if (folder.trashedAt == null) throw new Error("只能永久删除回收站里的文件夹");
+  const subtree = folderState.filter(
+    (item) => item.path === folder.path || item.path.startsWith(`${folder.path}/`),
+  );
+  const ids = new Set(subtree.map((item) => item.id));
+  let affectedImages = 0;
+  for (let index = mockImages.length - 1; index >= 0; index -= 1) {
+    if (ids.has(mockImages[index].folderId)) {
+      affectedImages += 1;
+      mockImages.splice(index, 1);
+    }
+  }
+  for (let index = folderState.length - 1; index >= 0; index -= 1) {
+    if (ids.has(folderState[index].id)) folderState.splice(index, 1);
+  }
+  return mockFolderChange(subtree.map((item) => item.id), affectedImages);
 }
 
 export function mockMoveImages(ids: number[], folderPath: string): MoveReport {
@@ -1085,10 +1239,14 @@ export function mockDeleteImages(ids: number[], onlyTrashed = false): DeleteRepo
 }
 
 export function mockEmptyTrash(): DeleteReport {
-  return mockDeleteImages(
+  const report = mockDeleteImages(
     mockImages.filter((image) => image.deletedAt != null).map((image) => image.id),
     true,
   );
+  for (let index = folderState.length - 1; index >= 0; index -= 1) {
+    if (folderState[index].trashedAt != null) folderState.splice(index, 1);
+  }
+  return report;
 }
 
 export function mockCollections(): CollectionInfo[] {

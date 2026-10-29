@@ -2261,6 +2261,14 @@ textarea:focus-visible {
   outline-offset: -2px;
 }
 
+.context-menu-note {
+  display: block;
+  padding: 7px 9px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
 .context-menu-item em {
   max-width: 150px;
   margin-left: auto;

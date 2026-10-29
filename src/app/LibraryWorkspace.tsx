@@ -5,7 +5,13 @@ import { ImportDialog } from "../modules/import/ImportDialog";
 import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type { CollectionInfo, FolderChange, FolderInfo, SortSpec } from "../modules/library/types";
+import type {
+  CollectionInfo,
+  FolderChange,
+  FolderInfo,
+  SortSpec,
+  TrashFolders,
+} from "../modules/library/types";
 import {
   DEFAULT_KEEP_SORT,
   browseToFolder,
@@ -122,6 +128,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null);
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
+  const [trashFolders, setTrashFolders] = useState<TrashFolders | null>(null);
   const [selectedImageIds, setSelectedImageIds] = useState<number[]>([]);
   const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
   const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
@@ -228,11 +235,36 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   }, [notify]);
 
   useEffect(() => {
+    setTrashFolders(null);
     void reloadFolders();
   }, [reloadFolders, current?.id]);
 
+  const trashGeneration = useRef(0);
+  const reloadTrashFolders = useCallback(async () => {
+    const generation = trashGeneration.current + 1;
+    trashGeneration.current = generation;
+    try {
+      const next = await libraryApi.getTrashFolders();
+      if (generation !== trashGeneration.current) return;
+      setTrashFolders(next);
+    } catch (cause) {
+      if (generation !== trashGeneration.current) return;
+      notify("读取回收站文件夹失败", "error", errorMessage(cause));
+    }
+  }, [notify]);
+
   useEffect(() => {
-    if (!foldersLoaded) return;
+    if (browse.browse.view !== "trash") return;
+    void reloadTrashFolders();
+  }, [browse.browse.view, current?.id, reloadTrashFolders]);
+
+  useEffect(() => {
+    if (browse.browse.view !== "trash" || !changeSignal) return;
+    void reloadTrashFolders();
+  }, [changeSignal, browse.browse.view, reloadTrashFolders]);
+
+  useEffect(() => {
+    if (!foldersLoaded || browse.browse.view === "trash") return;
     const selected = browse.browse.filters.folderIds;
     if (selected.length === 0) return;
     const existing = new Set(folders.map((folder) => folder.id));
@@ -251,6 +283,28 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       );
     }
   }, [folders, foldersLoaded, browse]);
+
+  // 回收站树刷新后，已恢复/永久删除的文件夹要从选择里移除。
+  useEffect(() => {
+    if (browse.browse.view !== "trash" || !trashFolders) return;
+    const selected = browse.browse.filters.folderIds;
+    if (selected.length === 0) return;
+    const existing = new Set(trashFolders.folders.map((folder) => folder.id));
+    const next = selected.filter((id) => existing.has(id));
+    if (next.length !== selected.length) {
+      browse.applyBrowse(
+        {
+          ...browse.browse,
+          filters: {
+            ...browse.browse.filters,
+            folderIds: next,
+            folderDirect: next.length > 0 && browse.browse.filters.folderDirect,
+          },
+        },
+        false,
+      );
+    }
+  }, [trashFolders, browse]);
 
   useEffect(() => {
     if (browserPreview) return;
@@ -546,14 +600,28 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     });
   };
 
-  const handleDataChanged = () => {
-    // FolderTree 已经通过 onFoldersChanged 送回新的计数，只需刷新图片路径相关结果。
+  const handleDataChanged = (
+    delta?: { images?: number; trash?: number },
+    reason?: string,
+  ) => {
+    if (delta && ((delta.images ?? 0) !== 0 || (delta.trash ?? 0) !== 0)) {
+      // 文件夹整棵移入/移出回收站：图片可见性也变了，按回收站变化刷新列表与计数。
+      emitChange({
+        kind: "membership",
+        source: "local",
+        reason: reason ?? "folderTrash",
+        countDelta: delta,
+        clearSelection: true,
+        similarity: "clear",
+      });
+      return;
+    }
+    // 空文件夹的恢复/永久删除没有图片增量，也要重取正常树与回收站树。
     emitChange({
       kind: "folder",
       source: "local",
       reason: "folderCatalog",
       fields: ["folder"],
-      foldersAlreadyLoaded: true,
       similarity: "keep",
     });
   };
@@ -565,12 +633,27 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       ...(leavingTemp ? sortForViewChange(browse.browse, "all") : {}),
       view: leavingTemp ? "all" : browse.browse.view,
       collectionId: leavingTemp ? null : browse.browse.collectionId,
-      filters: { ...browse.browse.filters, folderIds, folderDirect },
+      filters: { ...browse.browse.filters, folderIds, folderDirect, trashLoose: false },
     });
   };
 
   const selectFolders = (folderIds: number[]) => {
     selectFolderScope(folderIds, false);
+  };
+
+  /** 回收站根行的“直属图片”：原文件夹仍在图库中的回收站图片。 */
+  const selectTrashDirect = () => {
+    browse.applyBrowse({
+      ...browse.browse,
+      view: "trash",
+      collectionId: null,
+      filters: {
+        ...browse.browse.filters,
+        folderIds: [],
+        folderDirect: false,
+        trashLoose: true,
+      },
+    });
   };
 
   /** 查看器里跳到文件夹：退出回收站/临时视图并清空其它条件；查看器由 ViewerHost 关闭。 */
@@ -623,6 +706,10 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
         onBeginFolderDrag={(folderIds, label, event) =>
           beginDrag({ kind: "folders", folderIds, label }, event)
         }
+        trashMode={browse.browse.view === "trash"}
+        trashFolders={trashFolders}
+        trashDirectSelected={browse.browse.filters.trashLoose}
+        onSelectTrashDirect={selectTrashDirect}
       />
       <main className="app-main">
         <div className={`workspace${hasImages ? " workspace-browse" : ""}`}>
@@ -633,6 +720,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 browse={browse.browse}
                 canGoBack={browse.canGoBack}
                 folders={folders}
+                trashFolders={trashFolders}
                 onApplyBrowse={browse.applyBrowse}
                 onGoBack={browse.goBack}
                 onFoldersChanged={() => reloadFolders()}

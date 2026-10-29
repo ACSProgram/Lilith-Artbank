@@ -158,6 +158,7 @@ export function emptyFilters(): LibraryFilters {
   return {
     folderIds: [],
     folderDirect: false,
+    trashLoose: false,
     extensions: [],
     scores: [],
     tagIds: [],
@@ -175,9 +176,14 @@ export function emptyFilters(): LibraryFilters {
 }
 
 export function normalizeFilters(filters: LibraryFilters): LibraryFilters {
+  const trashLoose = filters.trashLoose === true;
   return {
-    folderIds: [...new Set(filters.folderIds)].sort((a, b) => a - b),
-    folderDirect: filters.folderIds.length > 0 && filters.folderDirect === true,
+    folderIds: trashLoose
+      ? []
+      : [...new Set(filters.folderIds)].sort((a, b) => a - b),
+    folderDirect:
+      !trashLoose && filters.folderIds.length > 0 && filters.folderDirect === true,
+    trashLoose,
     extensions: [...new Set(filters.extensions)].sort(),
     scores: [...new Set(filters.scores)].sort((a, b) => a - b),
     tagIds: filters.tagPresence === "missing"
@@ -206,7 +212,11 @@ export function buildQuery(
     collectionId: state.view === "collection" ? state.collectionId : null,
     search,
     searchScope: search ? state.searchScope : "view",
-    filters: normalizeFilters(state.filters),
+    filters: normalizeFilters({
+      ...state.filters,
+      // “直属图片”只属于回收站视图；切到其它视图时自动失效。
+      trashLoose: state.view === "trash" && state.filters.trashLoose,
+    }),
     sort: effectiveSort(state),
     cursor,
     limit: PAGE_SIZE,
