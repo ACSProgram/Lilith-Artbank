@@ -161,6 +161,8 @@ struct CommitStats {
     temp_replaced: usize,
     optimized: usize,
     optimized_bytes: u64,
+    /// 本批新增行（不含重复与合并）的最终字节总和。
+    written_bytes: u64,
     duplicate_pairs: Vec<(String, i64, bool)>,
     batch_duplicate_pairs: Vec<(String, String)>,
     merged_image_ids: Vec<i64>,
@@ -751,6 +753,7 @@ fn flush(
             temp_replaced: 0,
             optimized: 0,
             optimized_bytes: 0,
+            written_bytes: 0,
             duplicate_pairs: Vec::new(),
             batch_duplicate_pairs: Vec::new(),
             merged_image_ids: Vec::new(),
@@ -836,6 +839,8 @@ fn flush(
                     stats
                         .imported_pairs
                         .push((item.source_path.to_string_lossy().into_owned(), id));
+                    // 压缩成功时 file_size 已是压缩结果，天然代表“最终新增体积”。
+                    stats.written_bytes += item.file_size;
                     if let Some(saved) = item.optimized_savings {
                         stats.optimized += 1;
                         stats.optimized_bytes += saved;
@@ -966,6 +971,7 @@ fn flush(
     match commit {
         Ok(stats) => {
             job.inc_imported(stats.inserted.len());
+            job.inc_written_bytes(stats.written_bytes);
             job.inc_duplicates(stats.duplicates);
             job.inc_merged(stats.merged);
             job.inc_temp_replaced(stats.temp_replaced);
@@ -1258,6 +1264,8 @@ mod tests {
         assert_eq!(snapshot.progress.imported, 1, "{snapshot:?}");
         assert_eq!(snapshot.progress.optimized, 1, "{snapshot:?}");
         assert!(snapshot.progress.optimized_bytes > 0, "{snapshot:?}");
+        // 新增体积取压缩后的最终字节，等于落盘文件大小。
+        assert!(snapshot.progress.written_bytes > 0, "{snapshot:?}");
 
         let (hash, ext, format, size, optimized_at): (String, String, String, i64, i64) =
             session
@@ -1279,6 +1287,7 @@ mod tests {
         let content = library_root.join("导入").join(format!("{hash}.jpg"));
         assert!(content.is_file(), "缺少压缩后的内容文件");
         assert_eq!(std::fs::metadata(&content).unwrap().len(), size as u64);
+        assert_eq!(snapshot.progress.written_bytes, size as u64);
         assert!(
             !library_root
                 .join("导入")

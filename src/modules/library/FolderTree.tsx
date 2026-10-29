@@ -2,9 +2,11 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
@@ -19,6 +21,7 @@ import {
   Images,
   Pencil,
   Plus,
+  Rows2,
   Trash2,
 } from "lucide-react";
 import { IconButton } from "../../shared/components/Button";
@@ -60,6 +63,19 @@ interface FolderTreeProps {
     label: string,
     event: ReactPointerEvent<HTMLDivElement>,
   ) => void;
+  /** 上下双窗格：共享展开与选中，各自滚动。 */
+  split: boolean;
+  /** 上窗格占树高度的比例。 */
+  splitRatio: number;
+  onToggleSplit: () => void;
+  onSplitRatioChange: (ratio: number) => void;
+}
+
+const MIN_SPLIT_RATIO = 0.2;
+const MAX_SPLIT_RATIO = 0.8;
+
+function clampSplitRatio(value: number): number {
+  return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, value));
 }
 
 interface FolderMenu {
@@ -109,6 +125,10 @@ export function FolderTree({
   onFoldersChanged,
   onDataChanged,
   onBeginFolderDrag,
+  split,
+  splitRatio,
+  onToggleSplit,
+  onSplitRatioChange,
 }: FolderTreeProps) {
   const { notify, confirm } = useNotices();
   const tree = useMemo(() => buildFolderTree(folders), [folders]);
@@ -124,6 +144,19 @@ export function FolderTree({
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const splitRef = useRef<HTMLDivElement>(null);
+  const paneRefs = useRef<Array<HTMLDivElement | null>>([null, null]);
+  /** 两个窗格各自的行元素，供外部跳转时把目标滚进可见区域。 */
+  const rowRefs = useRef<[Map<number, HTMLDivElement>, Map<number, HTMLDivElement>]>([
+    new Map(),
+    new Map(),
+  ]);
+  /** 最近一次交互的窗格；外部跳转只滚动它，另一窗格保持原位。 */
+  const activePaneRef = useRef(0);
+  const lastScrollTop = useRef(0);
+  const [ratioDraft, setRatioDraft] = useState<number | null>(null);
+  const [dividerDragging, setDividerDragging] = useState(false);
+  const dragRatioRef = useRef<number | null>(null);
   const hydrated = useRef(false);
   const skipPersist = useRef(true);
 
@@ -171,6 +204,23 @@ export function FolderTree({
     });
   }, [selectedFolderIds, tree]);
 
+  const ratio = ratioDraft ?? splitRatio;
+
+  // 切换单/双视图时把原来的滚动位置交给可见窗格，避免一开双视图就跳回顶部。
+  useLayoutEffect(() => {
+    const pane = paneRefs.current[0];
+    if (pane) pane.scrollTop = lastScrollTop.current;
+  }, [split]);
+
+  // 外部跳转（详情“转到所在文件夹”）后把目标行滚进可见区域；只动最近交互的窗格。
+  const scrollTargetId = selectedFolderIds.length === 1 ? selectedFolderIds[0] : null;
+  useEffect(() => {
+    if (scrollTargetId == null) return;
+    for (const pane of split ? [activePaneRef.current] : [0]) {
+      rowRefs.current[pane].get(scrollTargetId)?.scrollIntoView({ block: "nearest" });
+    }
+  }, [scrollTargetId, rows, split]);
+
   useEffect(() => {
     const onHover = (event: Event) => {
       const folderId = (event as CustomEvent<{ folderId: number | null }>).detail?.folderId;
@@ -209,7 +259,8 @@ export function FolderTree({
     });
   };
 
-  const selectNode = (node: FolderNode, event: ReactMouseEvent) => {
+  const selectNode = (node: FolderNode, event: ReactMouseEvent, pane: number) => {
+    activePaneRef.current = pane;
     setMenu(null);
     if (event.shiftKey && anchorId != null) {
       const ids = rows.map((row) => row.id);
@@ -234,7 +285,8 @@ export function FolderTree({
     setAnchorId(node.id);
   };
 
-  const selectRoot = () => {
+  const selectRoot = (pane: number) => {
+    activePaneRef.current = pane;
     setMenu(null);
     setAnchorId(null);
     onSelect([]);
@@ -381,11 +433,193 @@ export function FolderTree({
   const canSortRoot = tree.rootId != null && needsFolderSort(tree, tree.rootId);
   const sortDisabled = menuIsRoot ? !canSortRoot : !canSort;
 
+  const onDividerPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRatioRef.current = ratio;
+    setRatioDraft(ratio);
+    setDividerDragging(true);
+  };
+
+  const onDividerPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (dragRatioRef.current == null) return;
+    const rect = splitRef.current?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return;
+    const next = clampSplitRatio((event.clientY - rect.top) / rect.height);
+    dragRatioRef.current = next;
+    setRatioDraft(next);
+  };
+
+  const finishDividerDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const next = dragRatioRef.current;
+    if (next == null) return;
+    dragRatioRef.current = null;
+    setDividerDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (next !== splitRatio) onSplitRatioChange(next);
+  };
+
+  const onDividerKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step =
+      event.key === "ArrowUp" ? -0.05 : event.key === "ArrowDown" ? 0.05 : 0;
+    if (step === 0) return;
+    event.preventDefault();
+    const next = clampSplitRatio(ratio + step);
+    setRatioDraft(next);
+    onSplitRatioChange(next);
+  };
+
+  /** 两个窗格渲染同一份行；展开、选中与菜单共享，滚动位置各自独立。 */
+  const renderTree = (pane: number) => (
+    <div
+      ref={(element) => {
+        paneRefs.current[pane] = element;
+      }}
+      className="folder-tree-scroll"
+      role="tree"
+      aria-label={pane === 0 ? (split ? "文件夹树（上）" : "文件夹树") : "文件夹树（下）"}
+      data-drag-scroll="true"
+      onScroll={(event) => {
+        lastScrollTop.current = event.currentTarget.scrollTop;
+      }}
+    >
+      <div
+        className={`folder-tree-row folder-tree-root${
+          selectedFolderIds.length === 0 ? " is-selected" : ""
+        }`}
+        role="treeitem"
+        aria-selected={selectedFolderIds.length === 0}
+        data-drop-root="true"
+        onClick={() => selectRoot(pane)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          activePaneRef.current = pane;
+          setMenu({ x: event.clientX, y: event.clientY, node: null });
+        }}
+      >
+        <span className="folder-tree-toggle">
+          <span className="folder-tree-spacer" />
+        </span>
+        <FolderOpen size={15} />
+        <span className="folder-tree-name">全部图片</span>
+        {rootFolder ? <em>{rootFolder.totalImageCount.toLocaleString()}</em> : null}
+      </div>
+
+      {rows.map((node) => {
+        const hasChildren = node.children.length > 0;
+        const isExpanded = expanded.has(node.id);
+        const isSelected = selected.has(node.id);
+        const showDirect = hasChildren && isExpanded && node.directImageCount > 0;
+        return (
+          <Fragment key={node.id}>
+            <div
+              ref={(element) => {
+                if (element) rowRefs.current[pane].set(node.id, element);
+                else rowRefs.current[pane].delete(node.id);
+              }}
+              className={`folder-tree-row${isSelected ? " is-selected" : ""}`}
+              role="treeitem"
+              aria-selected={isSelected}
+              aria-expanded={hasChildren ? isExpanded : undefined}
+              style={{ paddingLeft: 6 + node.depth * 14 }}
+              title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
+              data-drop-folder={node.id}
+              onPointerDown={(event) => {
+                activePaneRef.current = pane;
+                const ids =
+                  selected.size > 1 && selected.has(node.id)
+                    ? selectedFolderIds.filter((id) => tree.byId.has(id))
+                    : [node.id];
+                onBeginFolderDrag(
+                  ids,
+                  ids.length > 1 ? `${ids.length} 个文件夹` : node.name,
+                  event,
+                );
+              }}
+              onClick={(event) => selectNode(node, event, pane)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                activePaneRef.current = pane;
+                if (!selected.has(node.id)) {
+                  onSelect([node.id]);
+                  setAnchorId(node.id);
+                }
+                setMenu({ x: event.clientX, y: event.clientY, node });
+              }}
+            >
+              <button
+                type="button"
+                className="folder-tree-toggle"
+                aria-label={isExpanded ? "折叠" : "展开"}
+                disabled={!hasChildren}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  activePaneRef.current = pane;
+                  if (hasChildren) toggleExpanded(node.id);
+                }}
+              >
+                {hasChildren ? (
+                  isExpanded ? (
+                    <ChevronDown size={13} />
+                  ) : (
+                    <ChevronRight size={13} />
+                  )
+                ) : (
+                  <span className="folder-tree-spacer" />
+                )}
+              </button>
+              {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
+              <span className="folder-tree-name">{node.name}</span>
+              <em>{node.totalImageCount.toLocaleString()}</em>
+            </div>
+            {showDirect ? (
+              <div
+                className={`folder-tree-row folder-tree-direct${
+                  directFolderId === node.id ? " is-selected" : ""
+                }`}
+                role="treeitem"
+                aria-selected={directFolderId === node.id}
+                style={{ paddingLeft: 6 + (node.depth + 1) * 14 }}
+                title={`只显示直接放在「${node.path}」的 ${node.directImageCount.toLocaleString()} 张图片`}
+                data-drop-direct={node.id}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  activePaneRef.current = pane;
+                  setMenu(null);
+                  onSelectDirect(node.id);
+                }}
+              >
+                <span className="folder-tree-toggle">
+                  <span className="folder-tree-spacer" />
+                </span>
+                <Images size={13} />
+                <span className="folder-tree-name">直属图片</span>
+                <em>{node.directImageCount.toLocaleString()}</em>
+              </div>
+            ) : null}
+          </Fragment>
+        );
+      })}
+    </div>
+  );
+
   return (
     <div className="folder-tree">
       <div className="folder-tree-heading">
         <span>文件夹</span>
         <div className="folder-tree-heading-actions">
+          <IconButton
+            label={split ? "合并为单视图" : "分为上下两个视图"}
+            className={split ? "is-active" : undefined}
+            aria-pressed={split}
+            onClick={onToggleSplit}
+          >
+            <Rows2 size={14} />
+          </IconButton>
           <IconButton
             label="新建文件夹"
             onClick={() => {
@@ -398,123 +632,33 @@ export function FolderTree({
         </div>
       </div>
 
-      <div
-        className="folder-tree-scroll"
-        role="tree"
-        aria-label="文件夹树"
-        data-drag-scroll="true"
-      >
-        <div
-          className={`folder-tree-row folder-tree-root${
-            selectedFolderIds.length === 0 ? " is-selected" : ""
-          }`}
-          role="treeitem"
-          aria-selected={selectedFolderIds.length === 0}
-          data-drop-root="true"
-          onClick={selectRoot}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setMenu({ x: event.clientX, y: event.clientY, node: null });
-          }}
-        >
-          <span className="folder-tree-toggle">
-            <span className="folder-tree-spacer" />
-          </span>
-          <FolderOpen size={15} />
-          <span className="folder-tree-name">全部图片</span>
-          {rootFolder ? <em>{rootFolder.totalImageCount.toLocaleString()}</em> : null}
+      {split ? (
+        <div className="folder-tree-split" ref={splitRef}>
+          <div className="folder-tree-pane" style={{ flex: `${ratio} 1 0` }}>
+            {renderTree(0)}
+          </div>
+          <div
+            className={`folder-tree-divider${dividerDragging ? " is-dragging" : ""}`}
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="调整上下两个视图的高度"
+            aria-valuenow={Math.round(ratio * 100)}
+            aria-valuemin={MIN_SPLIT_RATIO * 100}
+            aria-valuemax={MAX_SPLIT_RATIO * 100}
+            tabIndex={0}
+            onPointerDown={onDividerPointerDown}
+            onPointerMove={onDividerPointerMove}
+            onPointerUp={finishDividerDrag}
+            onPointerCancel={finishDividerDrag}
+            onKeyDown={onDividerKeyDown}
+          />
+          <div className="folder-tree-pane" style={{ flex: `${1 - ratio} 1 0` }}>
+            {renderTree(1)}
+          </div>
         </div>
-
-        {rows.map((node) => {
-          const hasChildren = node.children.length > 0;
-          const isExpanded = expanded.has(node.id);
-          const isSelected = selected.has(node.id);
-          const showDirect = hasChildren && isExpanded && node.directImageCount > 0;
-          return (
-            <Fragment key={node.id}>
-              <div
-                className={`folder-tree-row${isSelected ? " is-selected" : ""}`}
-                role="treeitem"
-                aria-selected={isSelected}
-                aria-expanded={hasChildren ? isExpanded : undefined}
-                style={{ paddingLeft: 6 + node.depth * 14 }}
-                title={`${node.path} · 直接 ${node.directImageCount} 张 · 含子文件夹 ${node.totalImageCount} 张`}
-                data-drop-folder={node.id}
-                onPointerDown={(event) => {
-                  const ids =
-                    selected.size > 1 && selected.has(node.id)
-                      ? selectedFolderIds.filter((id) => tree.byId.has(id))
-                      : [node.id];
-                  onBeginFolderDrag(
-                    ids,
-                    ids.length > 1 ? `${ids.length} 个文件夹` : node.name,
-                    event,
-                  );
-                }}
-                onClick={(event) => selectNode(node, event)}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if (!selected.has(node.id)) {
-                    onSelect([node.id]);
-                    setAnchorId(node.id);
-                  }
-                  setMenu({ x: event.clientX, y: event.clientY, node });
-                }}
-              >
-                <button
-                  type="button"
-                  className="folder-tree-toggle"
-                  aria-label={isExpanded ? "折叠" : "展开"}
-                  disabled={!hasChildren}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    if (hasChildren) toggleExpanded(node.id);
-                  }}
-                >
-                  {hasChildren ? (
-                    isExpanded ? (
-                      <ChevronDown size={13} />
-                    ) : (
-                      <ChevronRight size={13} />
-                    )
-                  ) : (
-                    <span className="folder-tree-spacer" />
-                  )}
-                </button>
-                {isExpanded ? <FolderOpen size={14} /> : <Folder size={14} />}
-                <span className="folder-tree-name">{node.name}</span>
-                <em>{node.totalImageCount.toLocaleString()}</em>
-              </div>
-              {showDirect ? (
-                <div
-                  className={`folder-tree-row folder-tree-direct${
-                    directFolderId === node.id ? " is-selected" : ""
-                  }`}
-                  role="treeitem"
-                  aria-selected={directFolderId === node.id}
-                  style={{ paddingLeft: 6 + (node.depth + 1) * 14 }}
-                  title={`只显示直接放在「${node.path}」的 ${node.directImageCount.toLocaleString()} 张图片`}
-                  data-drop-direct={node.id}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setMenu(null);
-                    onSelectDirect(node.id);
-                  }}
-                >
-                  <span className="folder-tree-toggle">
-                    <span className="folder-tree-spacer" />
-                  </span>
-                  <Images size={13} />
-                  <span className="folder-tree-name">直属图片</span>
-                  <em>{node.directImageCount.toLocaleString()}</em>
-                </div>
-              ) : null}
-            </Fragment>
-          );
-        })}
-      </div>
+      ) : (
+        renderTree(0)
+      )}
 
       {menu ? (
         <div

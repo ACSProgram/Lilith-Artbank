@@ -966,7 +966,7 @@ export function OptimizeDialog({
       <div className="batch-task">
         {!estimate && !execution ? (
           <>
-            <Field label="处理范围">
+            <Field label="处理范围" plain>
               <ScopePicker
                 name="optimize-scope"
                 value={scope}
@@ -995,7 +995,11 @@ export function OptimizeDialog({
             </div>
 
             <div className="settings-grid">
-              <Field label="输出格式" hint="WebP 更省，但不保留 EXIF 与色彩配置；选 JPEG 时透明图会被跳过。">
+              <Field
+                label="输出格式"
+                plain
+                hint="WebP 更省，但不保留 EXIF 与色彩配置；选 JPEG 时透明图会被跳过。"
+              >
                 <div className="optimize-choice-row">
                   {OUTPUT_FORMATS.map((item) => (
                     <button
@@ -1009,7 +1013,7 @@ export function OptimizeDialog({
                   ))}
                 </div>
               </Field>
-              <Field label="长边上限" hint="超过上限的图片会被缩小，像素永久丢失。">
+              <Field label="长边上限" plain hint="超过上限的图片会被缩小，像素永久丢失。">
                 <div className="input-row">
                   <input
                     className={`input${edge.invalid && edgeTouched ? " is-invalid" : ""}`}

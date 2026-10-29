@@ -50,6 +50,8 @@ const defaultSettings: Settings = {
     sort: [{ key: "importedAt", descending: true }],
     sortProfiles: [],
     viewerFilmstrip: true,
+    folderSplit: false,
+    folderSplitRatio: 0.5,
     listColumns: [...LIST_COLUMNS],
     similarityKeepSort: [...DEFAULT_KEEP_SORT],
   },

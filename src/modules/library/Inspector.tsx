@@ -5,6 +5,7 @@ import {
   Copy,
   FileText,
   FolderInput,
+  FolderOpen,
   Hash,
   ImageOff,
   Layers,
@@ -78,6 +79,8 @@ interface InspectorPanelProps {
   /** 当前集合；为空表示“当前集合”范围不可用。 */
   collectionScopeLabel?: string | null;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
+  /** 跳到图片所在文件夹；不传或回收站中时隐藏入口。 */
+  onOpenFolder?: (folderId: number) => void;
   /** 空选且有选中文件夹时显示文件夹概览；查看器不传。 */
   statsContext?: InspectorStatsContext | null;
 }
@@ -114,15 +117,29 @@ export function InspectorPanel({
   folderScopeLabel = null,
   collectionScopeLabel = null,
   onGenerateDescription,
+  onOpenFolder,
   statsContext = null,
 }: InspectorPanelProps) {
   const single = selectedIds.length === 1 ? selectedIds[0] : null;
   const empty = selectedIds.length === 0;
   // 空选与单张都是“详情”，多选才是“批量编辑”。
   const detail = empty || single != null;
-  const folderOverview =
-    empty && statsContext != null && statsContext.query.filters.folderIds.length > 0;
-  const title = folderOverview ? "文件夹概览" : detail ? "图片详情" : "批量编辑";
+  // 有文件夹条件时是文件夹概览；全部图片视图没有文件夹条件时是整库概览。
+  const overviewQuery =
+    empty &&
+    statsContext != null &&
+    (statsContext.query.filters.folderIds.length > 0 || statsContext.query.view === "all")
+      ? statsContext.query
+      : null;
+  const folderOverview = overviewQuery != null;
+  const libraryWide = overviewQuery != null && overviewQuery.filters.folderIds.length === 0;
+  const title = folderOverview
+    ? libraryWide
+      ? "图库概览"
+      : "文件夹概览"
+    : detail
+      ? "图片详情"
+      : "批量编辑";
   return (
     <aside className="inspector" aria-label={title}>
       <header className="inspector-head">
@@ -130,7 +147,9 @@ export function InspectorPanel({
           <strong>{title}</strong>
           <span>
             {folderOverview
-              ? (folderScopeLabel ?? "已选文件夹")
+              ? libraryWide
+                ? "全部图片"
+                : (folderScopeLabel ?? "已选文件夹")
               : empty
                 ? "未选择"
                 : single
@@ -142,8 +161,8 @@ export function InspectorPanel({
           <X size={15} />
         </IconButton>
       </header>
-      {folderOverview && statsContext ? (
-        <FolderInspector query={statsContext.query} />
+      {overviewQuery != null ? (
+        <FolderInspector query={overviewQuery} />
       ) : empty ? (
         <div className="inspector-placeholder">
           <PanelRight size={22} />
@@ -168,6 +187,7 @@ export function InspectorPanel({
           folderScopeLabel={folderScopeLabel}
           collectionScopeLabel={collectionScopeLabel}
           onGenerateDescription={onGenerateDescription}
+          onOpenFolder={onOpenFolder}
         />
       ) : (
         <BatchInspector
@@ -234,6 +254,7 @@ interface ImageInspectorProps {
   folderScopeLabel: string | null;
   collectionScopeLabel: string | null;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
+  onOpenFolder?: (folderId: number) => void;
 }
 
 function ImageInspector({
@@ -254,6 +275,7 @@ function ImageInspector({
   folderScopeLabel,
   collectionScopeLabel,
   onGenerateDescription,
+  onOpenFolder,
 }: ImageInspectorProps) {
   const { notify, confirm } = useNotices();
   const tagMenuAnchorRef = useRef<HTMLDivElement>(null);
@@ -766,6 +788,15 @@ function ImageInspector({
               <FolderInput size={12} /> 文件夹
             </h4>
             <span>{folderLabel(detail.folderPath)}</span>
+            {onOpenFolder && !inTrash ? (
+              <IconButton
+                label="转到所在文件夹"
+                disabled={busy}
+                onClick={() => onOpenFolder(detail.folderId)}
+              >
+                <FolderOpen size={13} />
+              </IconButton>
+            ) : null}
           </div>
           <div className="inspector-inline-actions">
             <input

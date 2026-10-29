@@ -41,12 +41,15 @@ export function FolderInspector({ query }: FolderInspectorProps) {
   const extensions = donutSegments(data.extensions, 5);
   const scores = scoreSegments(data.scores);
   const multipleFolders = query.filters.folderIds.length > 1;
+  const libraryWide = query.filters.folderIds.length === 0;
   const emptyText =
     query.search.trim().length > 0 || hasActiveFilters(query.filters)
       ? "没有匹配的图片"
       : multipleFolders
         ? "所选文件夹没有图片"
-        : "这个文件夹没有图片";
+        : libraryWide
+          ? "图库里还没有图片"
+          : "这个文件夹没有图片";
   const scopeNote = multipleFolders
     ? `已选 ${query.filters.folderIds.length} 个文件夹`
     : query.filters.folderDirect
@@ -66,7 +69,7 @@ export function FolderInspector({ query }: FolderInspectorProps) {
           <FolderStatTile
             icon={<Folder size={13} />}
             value={data.subfolderCount.toLocaleString()}
-            label="子文件夹"
+            label={libraryWide ? "文件夹" : "子文件夹"}
           />
           <FolderStatTile
             icon={<HardDrive size={13} />}

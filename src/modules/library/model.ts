@@ -126,6 +126,20 @@ export function sortForViewChange(
   return { sort: state.sort, collectionSort: state.collectionSort };
 }
 
+/** 跳到某个文件夹：离开回收站与临时视图，清空搜索和其它筛选；集合视图保持不变。 */
+export function browseToFolder(state: BrowseState, folderId: number): BrowseState {
+  const leaving = state.view === "temp" || state.view === "trash";
+  return {
+    ...state,
+    ...(leaving ? sortForViewChange(state, "all") : {}),
+    view: leaving ? "all" : state.view,
+    collectionId: leaving ? null : state.collectionId,
+    search: "",
+    searchScope: "view",
+    filters: { ...emptyFilters(), folderIds: [folderId], folderDirect: false },
+  };
+}
+
 export function sortSummary(sort: SortSpec[]): string {
   if (sort.length === 0) return SORT_LABELS.importedAt;
   const [first, second] = sort;

@@ -132,10 +132,11 @@ export function useDragSort({ onDrop, canDrop, onReject }: DropOptions) {
     for (const container of containers) {
       const rect = container.getBoundingClientRect();
       if (drag.x < rect.left - 40 || drag.x > rect.right + 40) continue;
-      if (drag.y > rect.top - EDGE && drag.y < rect.bottom + EDGE) {
-        if (drag.y < rect.top + EDGE) container.scrollTop -= SCROLL_STEP;
-        else if (drag.y > rect.bottom - EDGE) container.scrollTop += SCROLL_STEP;
-      }
+      // 上下堆叠的文件夹窗格共享 x 范围，指针必须真正落在容器内；
+      // 否则靠近下方窗格顶部时会把上方窗格也一起滚动。
+      if (drag.y < rect.top || drag.y > rect.bottom) continue;
+      if (drag.y < rect.top + EDGE) container.scrollTop -= SCROLL_STEP;
+      else if (drag.y > rect.bottom - EDGE) container.scrollTop += SCROLL_STEP;
     }
     rafRef.current = requestAnimationFrame(autoScroll);
   };

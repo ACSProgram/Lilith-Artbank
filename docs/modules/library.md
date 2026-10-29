@@ -125,8 +125,8 @@ history            { maxSteps }  每个图库保留的操作记录步数，默�
 import             { optimize }  「导入时压缩」选项；null 表示关闭（默认）
 mcp                { enabled, port, mode }  MCP 服务；默认关闭、18767、ask
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
-                     sort, sortProfiles, viewerFilmstrip, listColumns,
-                     similarityKeepSort }
+                     sort, sortProfiles, viewerFilmstrip, folderSplit,
+                     folderSplitRatio, listColumns, similarityKeepSort }
 ```
 
 - 不使用旧 `%APPDATA%\com.lilith.artbank\settings.json`，也不做迁移；第一次启动在程序目录生成新文件。
@@ -151,11 +151,11 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - `readerConnections` 1-16；`workerThreads` 1-128，为空表示自动（逻辑核数 − 1）。它是全局后台图像工作预算，导入、压缩、估算、缩略图、查看器预览、AI 解码与 MCP 拼图共用；保存后对之后开始的工作立即生效。
 - `history.maxSteps` 10-500；历史保存在各图库自己的 SQLite 中，上限是全局设置，换库后仍使用同一上限。
 - `mcp.port` 1-65535；`mcp.mode` 只能是 `readOnly` / `ask` / `full`，工具按当前档位实时判定。
-- `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192。
+- `theme` 只能是 `light` / `dark` / `system`；`gridThumbPx` 96-512；`thumbFit` 只能是 `cover` / `contain`；`thumbCacheCount` 256-8192；`folderSplit` 默认 `false`，`folderSplitRatio` 0.2-0.8（默认 0.5）。这两个字段缺失时按默认值补齐，不升版本号。
 - `sort` 至少一级、最多 7 级，指标只能取自 `importedAt` / `modifiedAt` / `score` / `size` / `pixels` / `folder` / `collectionPosition`，同一指标不能重复；`sortProfiles` 最多 50 个，名称非空且不区分大小写唯一，每个方案的 `sort` 同样校验。
 - `ui.listColumns` 只能从 `pixels` / `format` / `size` / `score` / `tags` / `importedAt` / `folder` 里选（缩略图列固定显示，不在其中），至少要保留一列，认不出的列按不显示处理。
 - `ui.similarityKeepSort` 是相似组合并的保留规则，默认 `[评分降序, 导入时间降序]`；可以留空（读取时回落默认值），但不能用 `collectionPosition`，其余校验同 `sort`。
-- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案；`similarityKeepSort` 由相似分组对话框的“保留规则”编辑并即时写入。
+- 生效范围：`theme` 由 `src/app/theme.ts` 解析并写到 `html[data-theme]`，`system` 跟随 `prefers-color-scheme` 实时切换；`thumbFit` 由浏览工具栏的“裁剪 / 适应”切换并即时写入；`thumbCacheCount` 由 `src/shared/thumbCache.ts` 作为缩略图 LRU 上限消费（改动后立即收缩）；`viewerFilmstrip` 由查看器状态栏的“胶片带”按钮消费；`folderSplit` / `folderSplitRatio` 由侧栏文件夹树标题栏的开关与分隔条消费，拖动结束或按键调整后写入；`sort` 是图库浏览的全局排序（集合内顺序离开集合时暂存，不写入设置），`sortProfiles` 是排序弹层里可保存的方案；`similarityKeepSort` 由相似分组对话框的“保留规则”编辑并即时写入。
 - 设置文件损坏时备份为 `settings.bad-<时间>.json` 并使用默认值，不阻塞启动。
 - 主日志为 `logs/lilith-artbank.log`；AI 服务 stdout/stderr 为 `logs/ai-server.log`；stdio 小桥诊断为 `logs/mcp.log`。
 

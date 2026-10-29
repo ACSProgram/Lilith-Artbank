@@ -104,6 +104,12 @@ pub struct ImportProgress {
     pub optimized: usize,
     /// 这些图片省下的字节数。
     pub optimized_bytes: u64,
+    /// 已入库新增图片的最终字节总和（压缩后的按压缩结果算）。
+    pub written_bytes: u64,
+    /// 进入处理阶段后按已写入张数折算的速度；样本不足或未开始时为空。
+    pub rate_per_second: Option<f64>,
+    /// 按当前速度估算的剩余秒数；终态为空。
+    pub eta_seconds: Option<u64>,
     /// 压缩编码出错、已按原图入库的张数。
     pub optimize_failed: usize,
     pub current: String,
@@ -181,6 +187,7 @@ pub struct ImportJob {
     similar: AtomicUsize,
     optimized: AtomicUsize,
     optimized_bytes: AtomicU64,
+    written_bytes: AtomicU64,
     /// 勾选压缩后编码器报错、按原图入库的张数。
     optimize_failed: AtomicUsize,
     current: Mutex<String>,
@@ -226,6 +233,7 @@ impl ImportJob {
             similar: AtomicUsize::new(0),
             optimized: AtomicUsize::new(0),
             optimized_bytes: AtomicU64::new(0),
+            written_bytes: AtomicU64::new(0),
             optimize_failed: AtomicUsize::new(0),
             current: Mutex::new(String::new()),
             failures: Mutex::new(Vec::new()),
@@ -295,6 +303,11 @@ impl ImportJob {
 
     pub fn inc_imported(&self, count: usize) {
         self.imported.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// 写线程提交一批新增图片后累加它们的最终字节数。
+    pub fn inc_written_bytes(&self, bytes: u64) {
+        self.written_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn inc_duplicates(&self, count: usize) {
@@ -439,13 +452,36 @@ impl ImportJob {
     }
 
     pub fn progress(&self) -> ImportProgress {
+        let phase = self.effective_phase();
+        let total = self.total.load(Ordering::Relaxed);
+        let written = self.written.load(Ordering::Relaxed);
+        // 与任务总线同一口径：运行时间从第一次进入 Running 算起，样本不足时不给速度。
+        let rate_per_second = self.handle.run_started_at().and_then(|start| {
+            let finished_at = *self.finished_at.lock();
+            let elapsed = (finished_at.unwrap_or_else(now_ms) - start) as f64 / 1000.0;
+            (written > 0 && elapsed >= 0.5).then(|| written as f64 / elapsed)
+        });
+        let terminal = matches!(
+            phase,
+            ImportPhase::Completed | ImportPhase::Cancelled | ImportPhase::Failed
+        );
+        let eta_seconds = if terminal {
+            None
+        } else {
+            rate_per_second.and_then(|rate| {
+                let remaining = total.saturating_sub(written);
+                (remaining > 0 && rate > 0.0)
+                    .then(|| ((remaining as f64 / rate).ceil() as u64).max(1))
+            })
+        };
+
         ImportProgress {
             job_id: self.handle.id().to_owned(),
-            phase: self.effective_phase(),
+            phase,
             target: self.target,
-            total: self.total.load(Ordering::Relaxed),
+            total,
             processed: self.processed.load(Ordering::Relaxed),
-            written: self.written.load(Ordering::Relaxed),
+            written,
             percent: self.percent(),
             imported: self.imported.load(Ordering::Relaxed),
             duplicates: self.duplicates.load(Ordering::Relaxed),
@@ -455,6 +491,9 @@ impl ImportJob {
             similar: self.similar.load(Ordering::Relaxed),
             optimized: self.optimized.load(Ordering::Relaxed),
             optimized_bytes: self.optimized_bytes.load(Ordering::Relaxed),
+            written_bytes: self.written_bytes.load(Ordering::Relaxed),
+            rate_per_second,
+            eta_seconds,
             optimize_failed: self.optimize_failed.load(Ordering::Relaxed),
             current: self.current.lock().clone(),
             elapsed_ms: now_ms().saturating_sub(self.started_at),
@@ -537,6 +576,26 @@ mod tests {
         job.inc_written(5);
         job.set_phase(ImportPhase::Completed);
         assert_eq!(job.progress().percent, 100);
+    }
+
+    #[test]
+    fn progress_reports_written_bytes_rate_and_eta() {
+        let job = ImportJob::new("job-rate", "1 个路径", ImportTarget::Library);
+        job.set_total(10);
+        job.set_phase(ImportPhase::Processing);
+        job.inc_written(2);
+        job.inc_written_bytes(1024);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        let progress = job.progress();
+        assert_eq!(progress.written_bytes, 1024);
+        assert!(progress.rate_per_second.is_some_and(|rate| rate > 0.0));
+        assert!(progress.eta_seconds.is_some());
+
+        job.set_phase(ImportPhase::Completed);
+        let finished = job.progress();
+        assert!(finished.eta_seconds.is_none());
+        assert!(finished.rate_per_second.is_some());
     }
 
     #[test]

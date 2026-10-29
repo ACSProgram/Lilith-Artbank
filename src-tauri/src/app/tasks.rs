@@ -309,6 +309,11 @@ impl TaskHandle {
         *self.phase.lock()
     }
 
+    /// 第一次进入运行阶段的时间；排队与准备阶段为空。
+    pub fn run_started_at(&self) -> Option<i64> {
+        *self.run_started_at.lock()
+    }
+
     pub fn is_finished(&self) -> bool {
         self.phase().is_terminal()
     }

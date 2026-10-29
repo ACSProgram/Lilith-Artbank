@@ -55,6 +55,12 @@ export interface ImportProgress {
   /** 勾选「导入时压缩」后实际被压缩替换的新增图片数。 */
   optimized: number;
   optimizedBytes: number;
+  /** 已入库新增图片的最终字节总和（压缩后的按压缩结果算）。 */
+  writtenBytes: number;
+  /** 按已写入张数折算的速度；样本不足或未开始时为空。 */
+  ratePerSecond: number | null;
+  /** 按当前速度估算的剩余秒数；终态为空。 */
+  etaSeconds: number | null;
   /** 压缩编码出错、已按原图入库的张数。 */
   optimizeFailed: number;
   current: string;

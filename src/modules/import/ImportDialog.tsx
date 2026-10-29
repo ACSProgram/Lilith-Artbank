@@ -85,6 +85,13 @@ function formatDuration(milliseconds: number): string {
   return `${minutes} 分 ${Math.round(seconds % 60)} 秒`;
 }
 
+function formatEta(seconds: number): string {
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} 秒`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} 分`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
 export function ImportDialog({
   open,
   initialPaths,
@@ -444,7 +451,7 @@ export function ImportDialog({
 
           <div className="import-options-grid">
             {!temp ? (
-              <Field label="目标文件夹" hint="图库内相对路径，留空表示根目录">
+              <Field label="目标文件夹" hint="图库内相对路径，留空表示根目录" plain>
                 <div className="input-row">
                   <input
                     className="input"
@@ -477,7 +484,7 @@ export function ImportDialog({
             </Field>
           </div>
 
-          <Field label="初始标签" hint="最多 32 个">
+          <Field label="初始标签" hint="最多 32 个" plain>
             <TagInput
               ref={tagInputRef}
               value={tags}
@@ -558,6 +565,7 @@ export function ImportDialog({
                 <div className="import-optimize">
                   <Field
                     label="输出格式"
+                    plain
                     hint={
                       optimizeFormat === "webp"
                         ? "WebP 不保留 EXIF 与色彩配置；超过 16383 px 的图会保留原图。"
@@ -677,7 +685,7 @@ export function ImportDialog({
           {!temp && summary && (summary.optimized > 0 || optimizeEnabled) ? (
             <div className="import-note">
               {summary.optimized > 0
-                ? `其中 ${summary.optimized} 张已压缩，省 ${formatBytes(summary.optimizedBytes)}。`
+                ? `其中 ${summary.optimized} 张已压缩，最终新增 ${formatBytes(summary.writtenBytes)}，省 ${formatBytes(summary.optimizedBytes)}。`
                 : "没有图片被压缩：都已足够紧凑，或不满足压缩条件。"}
             </div>
           ) : null}
@@ -698,6 +706,17 @@ export function ImportDialog({
             <span>
               {progress?.processed ?? 0} / {progress?.total ?? 0} 个文件
             </span>
+            {progress && progress.writtenBytes > 0 ? (
+              <span>已写入 {formatBytes(progress.writtenBytes)}</span>
+            ) : null}
+            {view === "running" && progress?.ratePerSecond != null ? (
+              <span>
+                {progress.ratePerSecond.toFixed(1)} 张/秒
+                {progress.etaSeconds != null
+                  ? ` · 预计还需 ${formatEta(progress.etaSeconds)}`
+                  : ""}
+              </span>
+            ) : null}
             <span>{formatDuration(progress?.elapsedMs ?? 0)}</span>
           </div>
 

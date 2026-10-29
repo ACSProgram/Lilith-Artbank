@@ -1,7 +1,9 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Database, FolderOpen, Settings } from "lucide-react";
 import { Button } from "../shared/components/Button";
+import { useNotices } from "./noticeContext";
 import { useAppRuntime } from "./runtimeContext";
+import { errorMessage } from "../shared/errors";
 import { FolderTree } from "../modules/library/FolderTree";
 import type { FolderInfo } from "../modules/library/types";
 
@@ -40,8 +42,24 @@ export function Sidebar({
   onDataChanged,
   onBeginFolderDrag,
 }: SidebarProps) {
-  const { current } = useAppRuntime();
+  const { current, settings, saveSettings } = useAppRuntime();
+  const { notify } = useNotices();
   const browsing = current != null && folders != null;
+  const folderSplit = settings?.ui.folderSplit ?? false;
+  const folderSplitRatio = settings?.ui.folderSplitRatio ?? 0.5;
+
+  const updateFolderSplit = (update: {
+    folderSplit?: boolean;
+    folderSplitRatio?: number;
+  }) => {
+    if (!settings) return;
+    void saveSettings(
+      { ...settings, ui: { ...settings.ui, ...update } },
+      { silent: true },
+    ).catch((cause: unknown) => {
+      notify("保存界面偏好失败", "error", errorMessage(cause));
+    });
+  };
 
   return (
     <aside className="sidebar">
@@ -76,6 +94,10 @@ export function Sidebar({
           onFoldersChanged={onFoldersChanged ?? (() => undefined)}
           onDataChanged={onDataChanged ?? (() => undefined)}
           onBeginFolderDrag={onBeginFolderDrag ?? (() => undefined)}
+          split={folderSplit}
+          splitRatio={folderSplitRatio}
+          onToggleSplit={() => updateFolderSplit({ folderSplit: !folderSplit })}
+          onSplitRatioChange={(ratio) => updateFolderSplit({ folderSplitRatio: ratio })}
         />
       ) : (
         <div className="library-list">

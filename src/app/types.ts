@@ -95,6 +95,10 @@ export interface UiSettings {
   sort: SortSpec[];
   sortProfiles: SortProfile[];
   viewerFilmstrip: boolean;
+  /** 文件夹树拆成上下两个窗格；展开状态共享，滚动位置独立。 */
+  folderSplit: boolean;
+  /** 上窗格占文件夹树高度的比例，0.2–0.8。 */
+  folderSplitRatio: number;
   /** 列表视图显示哪些列；缩略图列不在其中，永远显示。 */
   listColumns: ListColumn[];
   /** 相似分组合并时的保留规则；空数组表示按默认规则（评分 → 导入时间）。 */

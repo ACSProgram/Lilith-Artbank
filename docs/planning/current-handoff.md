@@ -9,8 +9,8 @@
 每条只给结论与契约入口；实现细节在对应模块文档里。
 
 - **图库与元数据**：单库会话，设置 v7（存一个 `libraryPath` 与导入压缩选项），schema v9（v1→…→v9 链式迁移），多级文件夹与磁盘目录一一对应，临时文件夹为会话级暂存区，操作记录与线性撤销/重做（线性回退、灰色重做分支、延迟释放）。见[图库与元数据](../modules/library.md)。
-- **导入**：文件/目录/拖放输入，BLAKE3 内容寻址与原子发布，EXIF 方向，512px WebP 缩略图写入追加式 pack，pHash 与 4/8 主色，精确/批内/感知三类重复，进度-取消-失败清单，可选的导入即压缩（选项持久化在设置的 `import.optimize`，动画/多页源保留原图，编码失败单独计数）。见[导入与缩略图](../modules/import.md)。
-- **浏览与检索**：键集游标与 id 列表游标分页，7 个排序指标、最多 7 级，搜索（描述/标签名/文件夹路径，当前视图或全库），筛选分面计数，文件夹概览（子树/多选并集、类型与评分分布、常见标签，先旧值后台刷新），集合 CRUD 与集合运算，回收站；分面与概览共用 `get_library_stats` 与前端统计缓存（容量 48），所有写入统一走 `DataChange` + `planDataChange` 决定失效范围，刷新保留旧行并按活动图锚定滚动。见[浏览与检索](../modules/browse-and-query.md)。
+- **导入**：文件/目录/拖放输入，BLAKE3 内容寻址与原子发布，EXIF 方向，512px WebP 缩略图写入追加式 pack，pHash 与 4/8 主色，精确/批内/感知三类重复，进度-取消-失败清单（进度含已写入体积、速度与预计剩余），可选的导入即压缩（选项持久化在设置的 `import.optimize`，动画/多页源保留原图，编码失败单独计数）。见[导入与缩略图](../modules/import.md)。
+- **浏览与检索**：键集游标与 id 列表游标分页，7 个排序指标、最多 7 级，搜索（描述/标签名/文件夹路径，当前视图或全库），筛选分面计数，文件夹概览与全库概览（子树/多选并集、类型与评分分布、常见标签，先旧值后台刷新），文件夹树可拆成上下双视图（展开与选中共享、滚动独立），集合 CRUD 与集合运算，回收站；分面与概览共用 `get_library_stats` 与前端统计缓存（容量 48），所有写入统一走 `DataChange` + `planDataChange` 决定失效范围，刷新保留旧行并按活动图锚定滚动。见[浏览与检索](../modules/browse-and-query.md)。
 - **查看器与编辑**：全屏查看、缩放平移、胶片带、姿势叠加，切换图片时先用 512px 缩略图占位、高清层就绪后淡入；GIF 在查看器播放动画（超大图走静态预览并说明），网格/列表缩略图为首帧静态并带 `GIF` 角标；翻转→旋转→裁剪→缩放可组合，输出 JPEG/PNG/WebP，保存走“新内容发布”（新哈希文件、就地更新行、旧图暂存供撤销）。见[查看器与几何编辑](../modules/viewer-and-editor.md)。
 - **相似与语义检索**：pHash、4/8 主色、embedding、pose 四类找相似与相似分组（范围可选，组内只含范围内图片）；分组结果分页浏览，可按勾选把每组只留一张、其余移入回收站（保留规则可编辑并持久化）；语义搜索用打开图库时算出的全库均值做中心化余弦，向量 mmap 扫描。见[AI 服务](../modules/ai-service.md#本地检索)。
 - **AI 服务**：本机 `/v1` HTTP 服务的进程托管（探活、退避重启、优雅退出），feature pack 存 embedding（fp16）与 pose（f32），批量任务挂任务总线。描述不实现，`/v1/describe` 返回 404。见[AI 服务](../modules/ai-service.md)。
@@ -28,7 +28,7 @@
 - 压缩候选：主库按默认参数（JPEG 输出、跳过已处理、非透明、非 GIF、bpp ≥ 0.12）为 127 837 张 / 179.58 GB / 853.24 GP，平均 6.67 MP/张；已优化过 249 767 张。
 - 存储版本：schema v9、设置 v7。设置、主日志与 `ai-server.log` 都在程序目录，不读旧 AppData 设置；MCP 运行时文件是程序目录的 `mcp-runtime.json`（本地凭据，已 gitignore）。
 - 维护实测（主库）：39.6 万行逐张 `stat` 的快速检查 19.9 s，缺失 0、孤儿 0、非内容寻址文件 1；缩略图 9 段 9.24 GB、未引用字节 0；embedding 1.217 GB 与 pose 43.1 MB 各恰好一条/张、垃圾 0；556 个标签里 382 个图片数为 0。
-- 自动检查（2026-10-28，S8 之后）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test`（455 通过、9 ignored）、`npx tsc --noEmit`、`npm run test:web`（109 通过）、`npm run build`、`git diff --check`。
+- 自动检查（2026-10-29，第三轮批次 1 之后）：`cargo fmt --check`、`cargo check --all-targets`、`cargo clippy --all-targets`（0 警告）、`cargo test`（458 通过、9 ignored）、`npm run typecheck`、`npm run test:web`（112 通过）、`npm run build`、`git diff --check`。
 - 排序指标 7 个（导入时间 / 修改时间 / 评分 / 文件大小 / 像素尺寸 / 文件夹 / 集合内顺序），最多 7 级；单级且非文件夹走键集游标，其余走进程内有序 id 列表。
 - 性能数字不在这里重复：方法与全部实测见[性能基准](../guides/performance.md)。
 

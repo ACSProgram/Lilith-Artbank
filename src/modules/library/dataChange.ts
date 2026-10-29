@@ -402,24 +402,33 @@ function pathInFolderScope(target: string, folderPaths: string[], direct: boolea
   );
 }
 
-/** 从当前选择中按这次变化移除已不在结果里的图片。 */
+/**
+ * 从当前选择中按这次变化移除已不在结果里的图片。
+ *
+ * `changeIds` 是调用方预先构好的 `Set`；批量变化时复用同一份，避免对每个选中
+ * id 调用数组 `includes`（两万级选择与两万级变化会退化成数亿次比较）。
+ */
 export function selectionAfterChange(
   selected: Set<number>,
   change: DataChange,
   query: LibraryQuery,
   folderPaths: string[],
+  changeIds?: ReadonlySet<number>,
 ): Set<number> {
   if (selected.size === 0 || change.kind === "none") return selected;
   if (change.clearSelection || change.kind === "unknown") return new Set();
 
+  const ids = changeIds ?? (change.ids?.length ? new Set(change.ids) : null);
+
   if (change.kind === "membership") {
     if (change.source !== "local" || !change.ids) return new Set();
-    return new Set([...selected].filter((id) => !change.ids!.includes(id)));
+    if (!ids) return new Set(selected);
+    return new Set([...selected].filter((id) => !ids.has(id)));
   }
 
   if (change.kind === "folder") {
     if (
-      change.ids?.length &&
+      ids &&
       change.targetFolderPath != null &&
       query.filters.folderIds.length > 0 &&
       !pathInFolderScope(
@@ -428,14 +437,14 @@ export function selectionAfterChange(
         query.filters.folderDirect === true,
       )
     ) {
-      return new Set([...selected].filter((id) => !change.ids!.includes(id)));
+      return new Set([...selected].filter((id) => !ids.has(id)));
     }
     return selected;
   }
 
   if (change.kind === "collection") {
-    if (collectionAffectsQuery(query) && change.ids?.length) {
-      return new Set([...selected].filter((id) => !change.ids!.includes(id)));
+    if (collectionAffectsQuery(query) && ids) {
+      return new Set([...selected].filter((id) => !ids.has(id)));
     }
     return selected;
   }
@@ -453,17 +462,16 @@ export function selectionAfterChange(
 
   if (change.kind === "features") {
     if (!featureAffectsQuery(change.feature, query)) return selected;
-    if (!change.ids?.length) return new Set();
-    return new Set([...selected].filter((id) => !change.ids!.includes(id)));
+    if (!ids) return new Set();
+    return new Set([...selected].filter((id) => !ids.has(id)));
   }
 
   if (change.kind !== "metadata") return selected;
   if (!changeAffectsQuery(change, query)) return selected;
-  if (change.source !== "local" && !change.ids?.length) return new Set();
+  if (change.source !== "local" && !ids) return new Set();
 
   const fields = change.fields ?? [];
-  const ids = new Set(change.ids ?? []);
-  if (ids.size === 0) return selected;
+  if (!ids) return selected;
 
   if (fields.includes("score") && query.filters.scores.length > 0) {
     if (change.score == null || !query.filters.scores.includes(change.score)) {

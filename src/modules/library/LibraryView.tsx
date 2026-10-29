@@ -64,6 +64,7 @@ import { breadcrumbsFor, buildFolderTree } from "./folderTreeModel";
 import {
   COLLECTION_SORT_LEVELS,
   activeFilterCount,
+  browseToFolder,
   buildQuery,
   effectiveViewOf,
   emptyFilters,
@@ -591,7 +592,8 @@ export function LibraryView({
       const previousSelected = selectedRef.current;
       let nextSelected = previousSelected;
       for (const change of meaningful) {
-        nextSelected = selectionAfterChange(nextSelected, change, query, folderPaths);
+        const changeIds = change.ids?.length ? new Set(change.ids) : undefined;
+        nextSelected = selectionAfterChange(nextSelected, change, query, folderPaths, changeIds);
       }
       if (
         nextSelected.size !== previousSelected.size ||
@@ -1755,6 +1757,16 @@ export function LibraryView({
     [applyBrowse],
   );
 
+  /** 从详情跳到所在文件夹：退出回收站/临时视图，清空搜索与其它筛选。 */
+  const openFolderLocation = useCallback(
+    (folderId: number) => {
+      applyBrowse(browseToFolder(browseRef.current, folderId));
+      clearSelection();
+      similarityClear?.();
+    },
+    [applyBrowse, clearSelection, similarityClear],
+  );
+
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
     const key = event.key;
@@ -2515,6 +2527,7 @@ export function LibraryView({
             folderScopeLabel={folderScopeLabel}
             collectionScopeLabel={collectionScopeLabel}
             onGenerateDescription={onGenerateDescription}
+            onOpenFolder={openFolderLocation}
             statsContext={folderStatsContext}
           />
         ) : null}

@@ -153,16 +153,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_folder_detail_without_scope_or_in_trash() {
-        let (_temp, db, _folder_id) = library();
-        let empty = library_stats(
+    fn folder_detail_supports_whole_library_and_rejects_trash() {
+        let (_temp, db, folder_id) = library();
+        db.with_writer(|connection| {
+            insert_image(connection, "a", folder_id);
+            Ok(())
+        })
+        .unwrap();
+
+        let whole = library_stats(
             &db,
             StatsRequest {
                 profile: StatsProfile::FolderDetail,
                 query: LibraryQuery::default(),
             },
-        );
-        assert!(empty.is_err());
+        )
+        .unwrap();
+        match whole {
+            StatsSnapshot::FolderDetail(stats) => {
+                assert_eq!(stats.image_count, 1);
+                assert_eq!(stats.subfolder_count, 1);
+            }
+            _ => panic!("expected folder detail"),
+        }
 
         let trash = library_stats(
             &db,

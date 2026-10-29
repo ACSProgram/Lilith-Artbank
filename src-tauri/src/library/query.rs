@@ -959,12 +959,10 @@ pub(crate) fn normalize_scope_ids(ids: &[i64]) -> AppResult<Vec<i64>> {
     Ok(result)
 }
 
-/// 选中文件夹的概览统计；应用全部筛选，始终排除回收站与临时区。
+/// 文件夹概览统计；`folder_ids` 为空表示整个图库（或当前集合）。
+/// 应用全部筛选，始终排除回收站与临时区。
 pub fn folder_stats(database: &LibraryDb, query: LibraryQuery) -> AppResult<FolderStats> {
     let (mut query, _) = normalize(query)?;
-    if query.filters.folder_ids.is_empty() {
-        return Err(AppError::message("请选择一个文件夹"));
-    }
     if !matches!(query.view, LibraryView::All | LibraryView::Collection) {
         return Err(AppError::message("文件夹统计只在图库视图可用"));
     }
@@ -1048,6 +1046,11 @@ fn pin_stats_indexes(query: &LibraryQuery) -> bool {
 
 fn subfolder_count(connection: &Connection, folder_ids: &[i64]) -> AppResult<u64> {
     let folders = all_folders(connection)?;
+    if folder_ids.is_empty() {
+        // 全库概览：根目录自身不算“子文件夹”。
+        let count = folders.iter().filter(|(_, path)| !path.is_empty()).count();
+        return Ok(count as u64);
+    }
     let selected_ids: HashSet<i64> = folder_ids.iter().copied().collect();
     let selected_paths: HashSet<&str> = folders
         .iter()

@@ -260,6 +260,22 @@ test("合并掉正在筛选的源标签也清空选择", () => {
   assert.equal(planDataChange(merge, current, context).tagOptions, true);
 });
 
+test("五万张选择与五万条变化按集合过滤，不出现平方级退化", () => {
+  const selected = new Set(Array.from({ length: 50_000 }, (_, index) => index));
+  const ids = Array.from({ length: 50_000 }, (_, index) => index * 2);
+  const remove = change({ kind: "membership", source: "local", ids });
+
+  const started = Date.now();
+  const next = selectionAfterChange(selected, remove, query(), []);
+  const elapsed = Date.now() - started;
+
+  assert.equal(next.size, 25_000);
+  assert.equal(next.has(0), false);
+  assert.equal(next.has(1), true);
+  // 只防明显退化：线性过滤远低于这个上界，平方级实现会远超。
+  assert.ok(elapsed < 5_000, `选择过滤耗时 ${elapsed} ms，疑似退化为平方级`);
+});
+
 test("任务与 MCP 变化映射到对应的变化类型", () => {
   assert.equal(dataChangeForTaskKind("thumbnail").kind, "thumbnails");
   assert.equal(dataChangeForTaskKind("aiPose").similarity, "clear");

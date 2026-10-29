@@ -6,7 +6,11 @@ import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
 import type { CollectionInfo, FolderChange, FolderInfo, SortSpec } from "../modules/library/types";
-import { DEFAULT_KEEP_SORT, sortForViewChange } from "../modules/library/model";
+import {
+  DEFAULT_KEEP_SORT,
+  browseToFolder,
+  sortForViewChange,
+} from "../modules/library/model";
 import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
 import {
@@ -569,6 +573,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     selectFolderScope(folderIds, false);
   };
 
+  /** 查看器里跳到文件夹：退出回收站/临时视图并清空其它条件；查看器由 ViewerHost 关闭。 */
+  const openFolderFromViewer = (folderId: number) => {
+    similarity.clear();
+    browse.applyBrowse(browseToFolder(browse.browse, folderId));
+  };
+
   const handleCopyImage = async (imageId: number) => {
     try {
       await viewerApi.copyImage(imageId);
@@ -709,6 +719,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
               revalidateRevision={changeSignal?.revision ?? 0}
               onGenerateDescription={generateDescription}
               onGeneratePose={generatePose}
+              onOpenFolder={openFolderFromViewer}
             />
           ) : null}
           <BatchTaskDialog

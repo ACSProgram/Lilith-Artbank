@@ -17,6 +17,8 @@ interface ViewerHostProps {
   revalidateRevision?: number;
   onGenerateDescription?: (imageId: number) => Promise<{ text: string; model: string }>;
   onGeneratePose?: (imageId: number) => Promise<PoseData>;
+  /** 关闭查看器并跳到图片所在文件夹；由工作区提供。 */
+  onOpenFolder?: (folderId: number) => void;
 }
 
 /** 当前图是否仍属于查看器的数据源：临时区不区分回收站，其余按打开时的来源判断。 */
@@ -33,6 +35,7 @@ export function ViewerHost({
   revalidateRevision = 0,
   onGenerateDescription,
   onGeneratePose,
+  onOpenFolder,
 }: ViewerHostProps) {
   const { settings, saveSettings, fullscreen, setFullscreen, toggleFullscreen } =
     useAppRuntime();
@@ -151,6 +154,14 @@ export function ViewerHost({
           folderScopeLabel={session.folderScopeLabel}
           collectionScopeLabel={session.collectionScopeLabel}
           onGenerateDescription={onGenerateDescription}
+          onOpenFolder={
+            onOpenFolder
+              ? (folderId) => {
+                  close();
+                  onOpenFolder(folderId);
+                }
+              : undefined
+          }
         />
       }
     />

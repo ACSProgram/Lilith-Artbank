@@ -60,7 +60,7 @@
 - 去重语义：内容哈希变成压缩后字节的哈希。同一源图用同样参数重复导入仍判重复（第二次会重新编码后在入库时命中同内容）；改档位或格式会变成两条记录。
 - 不生成独立的 `optimize` 操作记录；导入撤销仍按 `origin_operation_id` 处理，压缩结果与原图走同一条导入记录。
 - MCP 的 `import_start` 固定传 `optimize: null`，也不接受 `workerThreads`；`tasks_get` 的导入回执不返回 `optimized` / `optimizedBytes`，AI 不能触发或感知压缩。回执默认只给重复计数；`tasks_get(includePairs=true)` 才附带精确重复对、批内重复对、合并目标与源文件映射（各自上限 200，`similarPairs` 上限 100）。
-- 完成页在勾选过压缩时显示「其中 N 张已压缩，省 X」；`N` 只统计真正入库的压缩版本，重复项不计。有编码失败时另起一行「N 张压缩失败，已保留原图」。
+- 完成页在勾选过压缩时显示「其中 N 张已压缩，最终新增 X，省 Y」；`N` 只统计真正入库的压缩版本，重复项不计；`X` 是本次新增图片的最终字节总和，压缩过的按压缩结果算。有编码失败时另起一行「N 张压缩失败，已保留原图」。
 
 ### pHash（256 位）
 
@@ -110,6 +110,7 @@
 - 像素工作走全局图像预算：线程数取设置里的 `workerThreads`，为空时使用逻辑核数 - 1；每处理一张前拿一个许可，导入、压缩、估算、缩略图、查看器、AI 解码与 MCP 拼图共用同一个上限。
 - 结果是深度 128 的有界通道送入唯一写线程；每 64 张或 250ms 批量提交；重复项最多攒 128 条。工作线程用原子索引动态取下一个文件，每个文件恰好处理一次。
 - 每张图的阶段：读取/哈希 → 解码/特征 → 发布 → 入库。进度按文件数加权：处理阶段 0–90；工作线程结束后进入收尾，按写线程已处理（成功、重复或失败）的条数推进 90–99，`phase=completed` 才 100%。
+- 进度另给出“最终新增体积”与预计剩余：写线程每批提交后，把本批新增行（不含重复与合并）的 `file_size` 求和累加；压缩成功行的 `file_size` 已是压缩结果，因此口径就是最终增加的字节。`ratePerSecond` 从第一次进入运行阶段起按“已写入张数 / 已运行秒数”折算，不足 0.5 秒或尚未写入时为空；`etaSeconds = (total − written) / rate`，终态为空。计时起点与任务总线一致，不做滑动窗口。
 - `import-progress` 事件每 150ms 推送一次；`import-finished` 在结束时推送完整快照。导入同时挂在任务总线上，右下角任务中心也能看到它与取消入口。
 - 默认排队：`start_import` 立即返回快照，`phase` 为 `queued`（等待资源）或 `scanning`；图库导入申请会话读、时间线读、内容写者与目标文件夹子树读，临时导入不占时间线。其他导入、压缩、AI 批量任务与目标子树内的文件夹写会等待，其他子树的文件夹操作可以并行。可以同时排队多个导入，但运行中的导入仍只有一个。
 - 取消：工作线程在文件边界停止取新文件；已准备好的批次继续由写线程落库，临时文件清理后结束，终态为已取消。
@@ -134,7 +135,8 @@
 
 - 命令入口：`src/modules/import/api.ts`。
 - 类型：`src/modules/import/types.ts`。
-- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。运行中弹窗模态阻塞，右上角关闭、Esc 与点击遮罩都不可用，只能“取消导入”；标题显示阶段名，正文显示当前文件与百分比。目标文件夹使用与侧栏相同的 `FolderPickerDialog`，打开时预填当前浏览的单选文件夹（多选或根目录时为空）；目录层级用“平铺 / 保留源目录”两个按钮切换。初始标签使用共享 `TagInput`，标签建议由 `LibraryWorkspace` 注入的 `searchTags` 提供（返回名称与图片数，聚焦空输入显示常用标签），导入模块不直接依赖 `libraryApi`。
+- 界面：`src/modules/import/ImportDialog.tsx`，由 `src/app/LibraryWorkspace.tsx` 打开；拖放监听在工作区，弹窗打开时由弹窗接管新增路径。运行中弹窗模态阻塞，右上角关闭、Esc 与点击遮罩都不可用，只能“取消导入”；标题显示阶段名，正文显示当前文件与百分比，进度行同时显示已写入体积、运行中速度与预计还需。
+- 字段里含多个可聚焦控件（初始标签的 chip 删除按钮、目标文件夹输入框与选择按钮、输出格式按钮组）时使用 `Field` 的 `plain` 模式渲染成 `div` 而不是 `<label>`：`<label>` 会把字段内任意点击转发给第一个可聚焦后代，曾导致点提示文字误删标签。单输入框字段仍用 `<label>` 保留点击聚焦。目标文件夹使用与侧栏相同的 `FolderPickerDialog`，打开时预填当前浏览的单选文件夹（多选或根目录时为空）；目录层级用“平铺 / 保留源目录”两个按钮切换。初始标签使用共享 `TagInput`，标签建议由 `LibraryWorkspace` 注入的 `searchTags` 提供（返回名称与图片数，聚焦空输入显示常用标签），导入模块不直接依赖 `libraryApi`。
 - 导入完成时工作区递增浏览刷新令牌，`LibraryView` 重新查询第一页并刷新图库计数；筛选条件保留，图片选择清空。结果弹窗仍显示最近 24 张预览，关闭后回到网格。
 
 | 命令 | 输入 | 输出 |
@@ -160,7 +162,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 `workerThreads` 不由前端传入：导入的工作线程数取全局图像预算（设置里的 `performance.workerThreads`，为空时取逻辑核数 - 1，上限 128）；请求里的 `workerThreads` 字段仅为反序列化兼容保留，不再生效。
 
-`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`optimizeFailed`、`current`、`elapsedMs`。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
+`ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`writtenBytes`、`ratePerSecond`、`etaSeconds`、`optimizeFailed`、`current`、`elapsedMs`。`writtenBytes` 是已入库新增图片的最终字节总和；`ratePerSecond` 为 `null` 表示样本不足或尚未开始，`etaSeconds` 在终态或没有速度时为空。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
 
 `tempReplaced` 只统计图库导入时被丢弃的临时区同内容行（见上面的“重复策略”），临时导入恒为 0。
 

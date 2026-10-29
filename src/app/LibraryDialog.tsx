@@ -151,7 +151,7 @@ export function LibraryDialog({ open: isOpen, onClose }: { open: boolean; onClos
       }
     >
       <div className="dialog-form">
-        <Field label="图库目录">
+        <Field label="图库目录" plain>
           <div className="input-row">
             <input
               className="input"

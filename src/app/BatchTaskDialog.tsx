@@ -358,7 +358,7 @@ export function BatchTaskDialog({
           })}
         </div>
 
-        <Field label="处理范围">
+        <Field label="处理范围" plain>
           <ScopePicker
             name="batch-scope"
             value={scope}

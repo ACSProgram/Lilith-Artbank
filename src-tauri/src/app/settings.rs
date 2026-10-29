@@ -271,6 +271,10 @@ pub struct UiSettings {
     pub sort: Vec<SortSpec>,
     pub sort_profiles: Vec<SortProfile>,
     pub viewer_filmstrip: bool,
+    /// 文件夹树拆成上下两个窗格；展开状态共享，滚动位置独立。
+    pub folder_split: bool,
+    /// 上窗格占文件夹树高度的比例，限制在 0.2–0.8。
+    pub folder_split_ratio: f32,
     /// 列表视图显示哪些列；缺键或为空时按默认全显示。
     pub list_columns: Vec<String>,
     /// 相似分组合并时的保留规则；缺键时按「评分降序 → 导入时间降序」。
@@ -319,6 +323,8 @@ impl Default for UiSettings {
             sort: vec![SortSpec::default()],
             sort_profiles: Vec::new(),
             viewer_filmstrip: true,
+            folder_split: false,
+            folder_split_ratio: 0.5,
             list_columns: default_list_columns(),
             similarity_keep_sort: default_similarity_keep_sort(),
         }
@@ -418,6 +424,9 @@ impl Settings {
         }
         if !(256..=8192).contains(&self.ui.thumb_cache_count) {
             return Err(AppError::message("缩略图缓存张数必须在 256-8192 之间"));
+        }
+        if !(0.2..=0.8).contains(&self.ui.folder_split_ratio) {
+            return Err(AppError::message("文件夹双视图分隔位置必须在 20%-80% 之间"));
         }
         validate_sort(&self.ui.sort)?;
         if self
@@ -923,6 +932,8 @@ mod tests {
         assert_eq!(loaded.ui.thumb_fit, "cover");
         assert_eq!(loaded.ui.thumb_cache_count, 1024);
         assert!(loaded.ui.viewer_filmstrip);
+        assert!(!loaded.ui.folder_split);
+        assert_eq!(loaded.ui.folder_split_ratio, 0.5);
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("thumbnailCacheMb"));
@@ -1177,6 +1188,19 @@ mod tests {
         std::fs::write(&path, r#"{"settingsVersion": 3, "ui": {"theme": "sepia"}}"#).unwrap();
         let error = SettingsStore::load_or_create(path).err().unwrap();
         assert!(error.to_string().contains("主题"));
+    }
+
+    #[test]
+    fn rejects_folder_split_ratio_out_of_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settingsVersion": 7, "ui": {"folderSplitRatio": 0.95}}"#,
+        )
+        .unwrap();
+        let error = SettingsStore::load_or_create(path).err().unwrap();
+        assert!(error.to_string().contains("文件夹双视图"));
     }
 
     #[test]

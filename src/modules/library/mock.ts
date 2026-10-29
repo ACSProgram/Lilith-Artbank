@@ -465,12 +465,16 @@ function mockFolderStats(query: LibraryQuery): FolderStats {
     }
   }
 
-  const folders = folderState.filter((folder) =>
-    query.filters.folderIds.some((id) => {
-      const path = folderPathOf(id);
-      return path != null && folder.path !== path && isSameOrDescendant(folder.path, path);
-    }),
-  );
+  // 没有文件夹条件时表示全库：数正常文件夹（不含根目录），与后端一致。
+  const folders =
+    query.filters.folderIds.length === 0
+      ? folderState.filter((folder) => folder.path !== "")
+      : folderState.filter((folder) =>
+          query.filters.folderIds.some((id) => {
+            const path = folderPathOf(id);
+            return path != null && folder.path !== path && isSameOrDescendant(folder.path, path);
+          }),
+        );
   const selected = new Set(query.filters.folderIds);
   const subfolderCount = folders.filter((folder) => !selected.has(folder.id)).length;
 

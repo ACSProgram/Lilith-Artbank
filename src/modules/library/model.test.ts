@@ -4,6 +4,7 @@ import {
   COLLECTION_SORT_LEVELS,
   DEFAULT_SORT_LEVELS,
   activeFilterCount,
+  browseToFolder,
   defaultBrowseState,
   effectiveSort,
   emptyFilters,
@@ -235,6 +236,32 @@ test("collection order is dropped from the effective sort outside a collection",
     }),
     DEFAULT_SORT_LEVELS,
   );
+});
+
+test("jumping to a folder leaves trash and temp and clears other conditions", () => {
+  const trash = state({
+    view: "trash",
+    search: "狐狸",
+    searchScope: "library",
+    sort: COLLECTION_SORT_LEVELS,
+    filters: { ...emptyFilters(), tagIds: [3], folderDirect: true },
+  });
+  const next = browseToFolder(trash, 7);
+  assert.equal(next.view, "all");
+  assert.equal(next.search, "");
+  assert.equal(next.searchScope, "view");
+  assert.deepEqual(next.filters, { ...emptyFilters(), folderIds: [7] });
+  assert.deepEqual(next.sort, DEFAULT_SORT_LEVELS);
+  assert.deepEqual(next.collectionSort, COLLECTION_SORT_LEVELS);
+});
+
+test("jumping to a folder keeps the current collection", () => {
+  const inCollection = state({ view: "collection", collectionId: 4, search: "猫" });
+  const next = browseToFolder(inCollection, 9);
+  assert.equal(next.view, "collection");
+  assert.equal(next.collectionId, 4);
+  assert.equal(next.search, "");
+  assert.deepEqual(next.filters.folderIds, [9]);
 });
 
 test("sort summary names the first levels", () => {
