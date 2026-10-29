@@ -1,3 +1,4 @@
+import type { ImportTarget } from "../modules/import/types";
 import type { TaskScope } from "../shared/scope";
 
 export type { TaskScope };
@@ -194,6 +195,12 @@ export interface TaskSnapshot {
   cancellable: boolean;
   /** 任务最终写入的操作记录 id；进行中通常为空。 */
   operationId: number | null;
+  /** 任务写入的新图片数；目前只有导入任务非 0。 */
+  addedImages: number;
+  /** 图库导入丢弃的临时区同内容行数；其他任务为 0。 */
+  removedTempImages: number;
+  /** 导入目标；只有导入任务有值。 */
+  importTarget: ImportTarget | null;
 }
 
 export interface TaskSummary {

@@ -2002,6 +2002,11 @@ textarea:focus-visible {
   margin: 0;
 }
 
+.filter-refreshing {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
 .filter-mode {
   display: inline-flex;
   overflow: hidden;

@@ -168,6 +168,8 @@ pub struct ImportSource {
     /// 运行中的短路径锁（删临时区重复文件）与图像预算。
     pub resources: Arc<crate::concurrency::resources::ResourceTable>,
     pub images: Arc<crate::concurrency::budget::ImageBudget>,
+    /// 解码内存额度；大图少并发，避免同时持有过多全尺寸像素。
+    pub memory: Arc<crate::concurrency::budget::ImageMemoryBudget>,
     pub holder: crate::concurrency::resources::HolderInfo,
 }
 

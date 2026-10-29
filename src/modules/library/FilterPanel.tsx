@@ -32,6 +32,8 @@ interface FilterPanelProps {
   /** 标签选项版本；标签目录变化才递增。 */
   tagOptionsVersion: number;
   featureSummary?: FeatureSummary | null;
+  /** 数据变化后正在重取覆盖率；旧值继续用，不闪空。 */
+  featureSummaryLoading?: boolean;
   onFiltersChange: (filters: LibraryFilters) => void;
   onClose: () => void;
   onReset: () => void;
@@ -44,6 +46,7 @@ export function FilterPanel({
   query,
   tagOptionsVersion,
   featureSummary = null,
+  featureSummaryLoading = false,
   onFiltersChange,
   onClose,
   onReset,
@@ -322,7 +325,12 @@ export function FilterPanel({
         </section>
 
         <section className="filter-section">
-          <h4>内容状态</h4>
+          <div className="filter-section-heading">
+            <h4>内容状态</h4>
+            {featureSummaryLoading ? (
+              <span className="filter-refreshing">更新中…</span>
+            ) : null}
+          </div>
           <div className="filter-presence">
             {[
               { key: "description" as const, label: "描述" },

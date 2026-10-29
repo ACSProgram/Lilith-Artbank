@@ -575,12 +575,44 @@ pub fn encode_ladder(
     original_bytes: u64,
     source_jpeg: Option<&[u8]>,
 ) -> AppResult<LadderOutcome> {
+    encode_buffered(
+        PixelBuffer::from_image(prepared),
+        plan,
+        options,
+        original_bytes,
+        source_jpeg,
+    )
+}
+
+/// 与 [`encode_ladder`] 相同，但直接消费已解码图：导入路径不再多复制一份全尺寸像素。
+pub fn encode_ladder_owned(
+    prepared: DynamicImage,
+    plan: &OptimizePlan,
+    options: &OptimizeOptions,
+    original_bytes: u64,
+    source_jpeg: Option<&[u8]>,
+) -> AppResult<LadderOutcome> {
+    encode_buffered(
+        PixelBuffer::from_image_owned(prepared),
+        plan,
+        options,
+        original_bytes,
+        source_jpeg,
+    )
+}
+
+/// 阶梯编码本体：像素只转换一次，每轮编码与 PSNR 比对都复用同一份 buffer。
+fn encode_buffered(
+    source: PixelBuffer,
+    plan: &OptimizePlan,
+    options: &OptimizeOptions,
+    original_bytes: u64,
+    source_jpeg: Option<&[u8]>,
+) -> AppResult<LadderOutcome> {
     options.validate()?;
-    if prepared.color().has_alpha() && options.output_format == OptimizeFormat::Jpeg {
+    if source.has_alpha() && options.output_format == OptimizeFormat::Jpeg {
         return Ok(LadderOutcome::Skipped(SkipReason::Transparent));
     }
-    // 像素只转换一次：每轮编码与 PSNR 比对都复用同一份 buffer。
-    let source = PixelBuffer::from_image(prepared);
     for quality in quality_ladder(plan.start_quality) {
         let bytes = source.encode(
             options.output_format,
@@ -625,6 +657,19 @@ impl PixelBuffer {
         } else {
             Self::Rgb(image.to_rgb8())
         }
+    }
+
+    /// 常见解码结果本身就是 RGB8/RGBA8：直接接管所有权，不再复制一份像素。
+    fn from_image_owned(image: DynamicImage) -> Self {
+        match image {
+            DynamicImage::ImageRgb8(buffer) => Self::Rgb(buffer),
+            DynamicImage::ImageRgba8(buffer) => Self::Rgba(buffer),
+            other => Self::from_image(&other),
+        }
+    }
+
+    fn has_alpha(&self) -> bool {
+        matches!(self, Self::Rgba(_))
     }
 
     fn dimensions(&self) -> (u32, u32) {

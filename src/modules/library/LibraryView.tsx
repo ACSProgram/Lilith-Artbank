@@ -1,4 +1,5 @@
 import {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -100,6 +101,7 @@ import {
   combinePlans,
   planDataChange,
   selectionAfterChange,
+  sumCountDelta,
   touchesTags,
   type DataChange,
   type DataChangeSignal,
@@ -222,7 +224,7 @@ export function LibraryView({
   onGenerateDescription,
   semanticBlockedReason = null,
 }: LibraryViewProps) {
-  const { settings, current, refreshStatus, saveSettings } = useAppRuntime();
+  const { settings, current, refreshStatus, adjustCounts, saveSettings } = useAppRuntime();
   const { notify, confirm } = useNotices();
   const { count: activeTaskCount, label: activeTaskLabel } = useTaskActive();
 
@@ -243,7 +245,6 @@ export function LibraryView({
   const [detailVersion, setDetailVersion] = useState(0);
   const [tagVersion, setTagVersion] = useState(0);
   const [tagOptionsVersion, setTagOptionsVersion] = useState(0);
-  const [featureVersion, setFeatureVersion] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [collectionsLoaded, setCollectionsLoaded] = useState(false);
   const [collectionManagerOpen, setCollectionManagerOpen] = useState(false);
@@ -269,6 +270,11 @@ export function LibraryView({
   const [lastFindSimilar, setLastFindSimilar] =
     useState<FindSimilarConfig | null>(null);
   const [featureSummary, setFeatureSummary] = useState<FeatureSummary | null>(null);
+  /** 数据变化时递增；摘要读过的版本落后就视为过期。 */
+  const [featureEpoch, setFeatureEpoch] = useState(0);
+  const [featureSummaryEpoch, setFeatureSummaryEpoch] = useState(-1);
+  const [featureSummaryLoading, setFeatureSummaryLoading] = useState(false);
+  const changeMarkSeq = useRef(0);
 
   const viewRef = useRef<VirtualViewHandle>(null);
   const filterAnchorRef = useRef<HTMLDivElement>(null);
@@ -542,11 +548,31 @@ export function LibraryView({
   /**
    * 统一应用数据变化。列表刷新保留旧行；只有换结果集才清空。
    * 文件夹/集合/状态/特征/分面按 plan 各自刷新，不再让所有面板订阅同一个版本号。
+   * 列表刷新是唯一必须等待的步骤；文件夹树与计数在后台过渡更新，先恢复交互。
    */
   const applyChanges = useCallback(
     async (changes: DataChange[]) => {
       const meaningful = changes.filter((change) => change.kind !== "none");
       if (meaningful.length === 0) return;
+
+      const markId = `library-change-${(changeMarkSeq.current += 1)}`;
+      performance.mark(`${markId}:start`);
+      const stageTimes: string[] = [];
+      const measureStage = async <T,>(name: string, work: Promise<T>): Promise<T> => {
+        const start = `${markId}:${name}:start`;
+        const end = `${markId}:${name}:end`;
+        performance.mark(start);
+        try {
+          return await work;
+        } finally {
+          performance.mark(end);
+          const measure = performance.measure(`${markId}:${name}`, start, end);
+          stageTimes.push(`${name} ${measure.duration.toFixed(0)}ms`);
+          performance.clearMarks(start);
+          performance.clearMarks(end);
+          performance.clearMeasures(`${markId}:${name}`);
+        }
+      };
 
       const plans = meaningful.map((change) =>
         planDataChange(change, query, { hasMore: hasMoreRef.current }),
@@ -580,10 +606,6 @@ export function LibraryView({
         if (similarityActive && similarity) {
           for (const patch of patches) similarity.patchItem(patch.id, patch.update);
         }
-      }
-
-      if (plan.list === "refresh") {
-        await refreshKeepingRows();
       }
 
       const folderPaths = folders
@@ -625,23 +647,49 @@ export function LibraryView({
         similarityClear?.();
         setSimilarityTarget(null);
       }
-      if (plan.folders) await onFoldersChanged?.();
-      if (plan.collections) void reloadCollections();
-      if (plan.status) {
-        await refreshStatus().catch((cause: unknown) => {
-          notify("刷新图库状态失败", "error", errorMessage(cause));
+
+      // 文件夹树、集合、计数都不阻塞列表刷新；它们放到过渡更新里，先让界面可操作。
+      if (plan.folders) {
+        startTransition(async () => {
+          await onFoldersChanged?.();
         });
       }
-      if (plan.features) setFeatureVersion((value) => value + 1);
-      if (plan.facets) stats.invalidate();
-      if (plan.tagOptions) setTagOptionsVersion((value) => value + 1);
-      if (meaningful.some(touchesTags)) {
-        setTagVersion((value) => value + 1);
+      if (plan.collections) {
+        startTransition(() => {
+          void reloadCollections();
+        });
       }
-      if (plan.detail) setDetailVersion((value) => value + 1);
-      if (plan.folders || plan.collections || plan.status || plan.detail) {
-        setFindSimilarContextVersion((value) => value + 1);
+      if (plan.status) {
+        const delta = sumCountDelta(meaningful);
+        if (delta) {
+          adjustCounts(delta);
+        } else {
+          startTransition(async () => {
+            try {
+              await refreshStatus();
+            } catch (cause) {
+              notify("刷新图库状态失败", "error", errorMessage(cause));
+            }
+          });
+        }
       }
+
+      if (plan.list === "refresh") {
+        await measureStage("list", refreshKeepingRows());
+      }
+
+      const touchesTagData = meaningful.some(touchesTags);
+      startTransition(() => {
+        // 特征摘要只递增版本；筛选面板打开时才真正查询。
+        if (plan.features) setFeatureEpoch((value) => value + 1);
+        if (plan.facets) stats.invalidate();
+        if (plan.tagOptions) setTagOptionsVersion((value) => value + 1);
+        if (touchesTagData) setTagVersion((value) => value + 1);
+        if (plan.detail) setDetailVersion((value) => value + 1);
+        if (plan.folders || plan.collections || plan.status || plan.detail) {
+          setFindSimilarContextVersion((value) => value + 1);
+        }
+      });
       if (plan.facets || plan.folders || plan.collections || plan.status) {
         onContextsChanged?.();
       }
@@ -656,8 +704,20 @@ export function LibraryView({
       ) {
         void prunedInvalidSimilarityInputs(meaningful);
       }
+
+      performance.mark(`${markId}:end`);
+      const total = performance.measure(markId, `${markId}:start`, `${markId}:end`).duration;
+      performance.clearMarks(`${markId}:start`);
+      performance.clearMarks(`${markId}:end`);
+      performance.clearMeasures(markId);
+      if (total >= 120) {
+        console.debug(
+          `[图库] 数据变化 ${total.toFixed(0)}ms${stageTimes.length > 0 ? `（${stageTimes.join("，")}）` : ""}`,
+        );
+      }
     },
     [
+      adjustCounts,
       folders,
       notify,
       onContextsChanged,
@@ -704,21 +764,30 @@ export function LibraryView({
     void reloadCollections();
   }, [reloadCollections]);
 
-  // 全库特征覆盖情况只随数据变化重查；用于筛选面板与工具栏置灰。
+  // 全库特征覆盖只在筛选面板打开且数据变过时读取；旧值继续显示，不闪空。
   useEffect(() => {
+    if (!filterOpen || featureSummaryEpoch === featureEpoch) return;
+    const epoch = featureEpoch;
     let disposed = false;
+    setFeatureSummaryLoading(true);
     void libraryApi
       .getFeatureSummary()
       .then((summary) => {
-        if (!disposed) setFeatureSummary(summary);
+        if (disposed) return;
+        setFeatureSummary(summary);
+        setFeatureSummaryEpoch(epoch);
       })
       .catch(() => {
-        // 统计失败时不置灰，避免把暂时读不到当成“没有特征”。
+        // 失败保留旧值，也不把暂时读不到当成“没有特征”；下次打开面板再试。
+      })
+      .finally(() => {
+        if (!disposed) setFeatureSummaryLoading(false);
       });
     return () => {
       disposed = true;
+      setFeatureSummaryLoading(false);
     };
-  }, [featureVersion]);
+  }, [featureEpoch, featureSummaryEpoch, filterOpen]);
 
   useEffect(() => {
     // 标签筛选是“从当前图片跳转”，保留选择；其它筛选/视图变化仍清空。
@@ -1271,6 +1340,7 @@ export function LibraryView({
           source: "local",
           reason: "trash",
           ids,
+          countDelta: { images: -changed, trash: changed },
           similarity: "clear",
         });
         return changed > 0;
@@ -1296,6 +1366,7 @@ export function LibraryView({
           source: "local",
           reason: "restore",
           ids,
+          countDelta: { images: changed, trash: -changed },
           similarity: "clear",
         });
         return changed > 0;
@@ -1332,6 +1403,7 @@ export function LibraryView({
           source: "local",
           reason: "permanentDelete",
           ids,
+          countDelta: { trash: -report.deleted },
           similarity: "clear",
         });
         return report.deleted > 0;
@@ -1368,6 +1440,7 @@ export function LibraryView({
         source: "local",
         reason: "emptyTrash",
         clearSelection: true,
+        countDelta: { trash: -report.deleted },
         similarity: "clear",
       });
     } catch (cause) {
@@ -2243,6 +2316,7 @@ export function LibraryView({
               query={query}
               tagOptionsVersion={tagOptionsVersion}
               featureSummary={featureSummary}
+              featureSummaryLoading={featureSummaryLoading}
               onFiltersChange={(filters) =>
                 applyBrowse({ ...browseRef.current, filters })
               }

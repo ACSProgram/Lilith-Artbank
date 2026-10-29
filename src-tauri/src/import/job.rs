@@ -218,6 +218,7 @@ impl ImportJob {
     pub fn new(id: impl Into<String>, scope: impl Into<String>, target: ImportTarget) -> Self {
         let id = id.into();
         let handle = TaskHandle::new(id.clone(), TaskKind::Import, scope);
+        handle.set_import_target(target);
         Self {
             handle,
             target,
@@ -302,7 +303,12 @@ impl ImportJob {
     }
 
     pub fn inc_imported(&self, count: usize) {
-        self.imported.fetch_add(count, Ordering::Relaxed);
+        if count == 0 {
+            return;
+        }
+        let total = self.imported.fetch_add(count, Ordering::Relaxed) + count;
+        // 任务快照带上新增数量，前端刷新时可以直接改计数，不必重查全库。
+        self.handle.set_added_images(total);
     }
 
     /// 写线程提交一批新增图片后累加它们的最终字节数。
@@ -320,7 +326,11 @@ impl ImportJob {
 
     /// 图库导入把同内容的临时行丢弃后，这张图是正常入库的，不算重复。
     pub fn inc_temp_replaced(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
         self.temp_replaced.fetch_add(count, Ordering::Relaxed);
+        self.handle.inc_removed_temp_images(count);
     }
 
     pub fn inc_failed(&self) {

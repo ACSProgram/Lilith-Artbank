@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     app::error::{AppError, AppResult},
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget, estimate_working_bytes},
         resources::{HolderInfo, ResourceTable},
     },
     imageops::{
@@ -142,6 +142,9 @@ struct WorkerContext {
     index: Arc<RwLock<PhashIndex>>,
     sender: mpsc::SyncSender<Outcome>,
     images: Arc<ImageBudget>,
+    memory: Arc<ImageMemoryBudget>,
+    /// 本任务单张图片的最大估算；只用于收尾日志。
+    max_estimate: AtomicU64,
     #[cfg(test)]
     cancel_after: Option<usize>,
 }
@@ -285,6 +288,8 @@ fn run_inner(
             index,
             sender,
             images: source.images.clone(),
+            memory: source.memory.clone(),
+            max_estimate: AtomicU64::new(0),
             #[cfg(test)]
             cancel_after: request.cancel_after,
         };
@@ -304,6 +309,13 @@ fn run_inner(
                 }
             });
         });
+        let mib = 1024 * 1024;
+        log::debug!(
+            "导入内存预算：{threads} 线程，上限 {} MiB，峰值占用 {} MiB，单张最大估算 {} MiB",
+            context.memory.limit() / mib,
+            context.memory.peak() / mib,
+            context.max_estimate.load(Ordering::Relaxed) / mib,
+        );
     }
 
     job.set_phase(ImportPhase::Finishing);
@@ -427,7 +439,37 @@ fn build_prepared(
         return Ok(None);
     }
 
+    // 先按文件头估算峰值，再申请解码内存额度；大图会排队，小图照常并行。
+    let estimate = match decode::probe_dimensions(&staged.path) {
+        Ok((width, height)) => {
+            estimate_working_bytes(width, height, staged.size, context.optimize.is_some())
+        }
+        Err(error) => {
+            // 少数格式要读到完整数据才知道尺寸；按保守额度放行，解码器仍会做最终限制。
+            log::debug!(
+                "无法预读尺寸，按保守额度估算：{}：{error}",
+                staged.path.display()
+            );
+            if context.optimize.is_some() {
+                256 * 1024 * 1024
+            } else {
+                64 * 1024 * 1024
+            }
+        }
+    };
+    context.max_estimate.fetch_max(estimate, Ordering::Relaxed);
+    let Ok(memory) = context
+        .memory
+        .acquire(estimate, &|| context.job.should_cancel())
+    else {
+        return Ok(None);
+    };
+
     let decoded = decode::decode(&staged.path)?;
+    let decoded_format = decoded.format;
+    let width = decoded.width;
+    let height = decoded.height;
+    let source_has_alpha = decoded.has_alpha;
     let thumb = thumbnail::encode(&decoded.image)?;
     let hash = phash::compute(&decoded.image);
     let (colors4, colors8) = colors::dominant(&decoded.image);
@@ -452,14 +494,14 @@ fn build_prepared(
     // 所以这三样不需要因为压缩而重算。任何一步不满足判据都保留原图。
     let mut content = staged.path.clone();
     let mut content_hash = staged.hash.clone();
-    let mut file_ext = content_extension(decoded.format).to_owned();
+    let mut file_ext = content_extension(decoded_format).to_owned();
     let mut file_size = staged.size;
-    let mut format = decoded.format.to_owned();
-    let mut has_alpha = decoded.has_alpha;
+    let mut format = decoded_format.to_owned();
+    let mut has_alpha = source_has_alpha;
     let mut optimized_at = 0_i64;
     let mut optimized_savings = None;
     if let Some(options) = &context.optimize {
-        match optimize_for_import(&staged.path, &decoded, options) {
+        match optimize_for_import(&staged.path, decoded, options) {
             Ok(Some(candidate)) => {
                 let bytes = candidate.bytes;
                 content = write_encoded(&bytes, &staged.path)?;
@@ -468,7 +510,7 @@ fn build_prepared(
                 file_size = bytes.len() as u64;
                 format = options.output_format.name().to_owned();
                 // JPEG 装不下透明通道；能在这一步拿到结果的带 alpha 图只会是 WebP。
-                has_alpha = options.output_format != OptimizeFormat::Jpeg && decoded.has_alpha;
+                has_alpha = options.output_format != OptimizeFormat::Jpeg && source_has_alpha;
                 optimized_at = now_ms();
                 optimized_savings = Some(staged.size.saturating_sub(file_size));
             }
@@ -483,7 +525,11 @@ fn build_prepared(
                 );
             }
         }
+    } else {
+        drop(decoded);
     }
+    // 特征与压缩都已结束：先还解码额度，再发布文件，写线程积压不再占解码内存。
+    drop(memory);
 
     let file_name = format!("{content_hash}.{file_ext}");
     let destination = context.paths.content_file(&folder, &file_name);
@@ -497,8 +543,8 @@ fn build_prepared(
         content_hash,
         file_ext,
         file_size,
-        width: decoded.width,
-        height: decoded.height,
+        width,
+        height,
         format,
         has_alpha,
         phash: hash,
@@ -517,7 +563,7 @@ fn build_prepared(
 /// 返回 `Err` 表示编码器真的出错，调用方要单独计数，不能当「压不动」静默吞掉。
 fn optimize_for_import(
     staged: &Path,
-    decoded: &decode::DecodedImage,
+    decoded: decode::DecodedImage,
     options: &OptimizeOptions,
 ) -> AppResult<Option<optimize::EncodedCandidate>> {
     // ICC 判据与 JPEG→JPEG 的 EXIF 搬运都要原始字节，所以这里再读一遍临时副本。
@@ -546,7 +592,17 @@ fn optimize_for_import(
     let source_jpeg = (options.output_format == OptimizeFormat::Jpeg
         && matches!(decoded.format, "jpeg" | "jpg"))
     .then_some(source_bytes.as_slice());
-    match optimize::encode_ladder(&decoded.image, &plan, options, source_size, source_jpeg)? {
+    // 不搬 EXIF 时源文件字节到这里就没用了，先释放，别和编码峰值叠在一起。
+    let outcome = match source_jpeg {
+        Some(jpeg) => {
+            optimize::encode_ladder_owned(decoded.image, &plan, options, source_size, Some(jpeg))?
+        }
+        None => {
+            drop(source_bytes);
+            optimize::encode_ladder_owned(decoded.image, &plan, options, source_size, None)?
+        }
+    };
+    match outcome {
         LadderOutcome::Encoded(candidate) => Ok(Some(candidate)),
         LadderOutcome::Skipped(_) => Ok(None),
     }
@@ -1164,6 +1220,7 @@ mod tests {
             operation_id: None,
             resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
             images: Arc::new(crate::concurrency::budget::ImageBudget::new(4)),
+            memory: Arc::new(crate::concurrency::budget::ImageMemoryBudget::default()),
             holder: crate::concurrency::resources::HolderInfo::new("import-test", "导入"),
         }
     }

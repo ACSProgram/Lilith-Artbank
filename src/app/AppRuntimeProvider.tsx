@@ -5,6 +5,7 @@ import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
 import { setThumbCacheLimit } from "../shared/thumbCache";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
+import type { LibraryCountDelta } from "../modules/library/dataChange";
 import { errorMessage } from "../shared/errors";
 
 /** 计数不在开库路径上计算；拿到状态后再单独补齐，界面先出现、数字稍后到。 */
@@ -191,6 +192,20 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setCurrent(status ? await withCounts(status) : null);
   }, []);
 
+  /** 本地写入已知道增删数量：先改缓存，侧栏数字立即跟上，不必全库计数。 */
+  const adjustCounts = useCallback((delta: LibraryCountDelta) => {
+    setCurrent((previous) =>
+      previous
+        ? {
+            ...previous,
+            imageCount: Math.max(0, previous.imageCount + (delta.images ?? 0)),
+            trashCount: Math.max(0, previous.trashCount + (delta.trash ?? 0)),
+            tempCount: Math.max(0, previous.tempCount + (delta.temp ?? 0)),
+          }
+        : previous,
+    );
+  }, []);
+
   const value = useMemo<AppRuntime>(
     () => ({
       settings,
@@ -207,6 +222,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       renameLibrary,
       saveSettings,
       refreshStatus,
+      adjustCounts,
     }),
     [
       settings,
@@ -223,6 +239,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       renameLibrary,
       saveSettings,
       refreshStatus,
+      adjustCounts,
     ],
   );
 

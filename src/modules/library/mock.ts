@@ -1301,6 +1301,9 @@ function mockHistoryTask(kind: TaskKind, label: string, scope: string): TaskSnap
     failures: [],
     cancellable: false,
     operationId: null,
+    addedImages: 0,
+    removedTempImages: 0,
+    importTarget: null,
   };
 }
 

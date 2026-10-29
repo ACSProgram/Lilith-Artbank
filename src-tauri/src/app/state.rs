@@ -30,7 +30,7 @@ use crate::{
         },
     },
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget},
         resources::{
             Access, Conflict, HolderInfo, PathScope, ResourceGuard, ResourceRequest, WaitError,
         },
@@ -83,6 +83,8 @@ pub struct AppState {
     pub tasks: TaskBus,
     pub mcp: McpRuntime,
     app: AppHandle,
+    /// 导入解码内存额度；按估算字节排队，避免大图并发撑高峰值。
+    import_memory: Arc<ImageMemoryBudget>,
     library: Mutex<Option<LibrarySession>>,
     /// 最近发起的导入；允许排队后可能同时存在多个未结束的导入。
     import_jobs: Mutex<VecDeque<Arc<ImportJob>>>,
@@ -125,6 +127,7 @@ impl AppState {
             tasks,
             mcp: McpRuntime::new(),
             app,
+            import_memory: Arc::new(ImageMemoryBudget::default()),
             library: Mutex::new(None),
             import_jobs: Mutex::new(VecDeque::new()),
             import_receipts: Mutex::new(VecDeque::new()),
@@ -295,6 +298,7 @@ impl AppState {
             operation_id,
             resources: self.resources(),
             images: self.images(),
+            memory: self.import_memory(),
             holder: HolderInfo::new(job.id(), "导入")
                 .with_reason("正在导入")
                 .with_path_note("正在导入到"),
@@ -377,6 +381,10 @@ impl AppState {
 
     pub(crate) fn images(&self) -> Arc<ImageBudget> {
         self.tasks.images()
+    }
+
+    pub(crate) fn import_memory(&self) -> Arc<ImageMemoryBudget> {
+        self.import_memory.clone()
     }
 
     pub(crate) fn move_task_request(

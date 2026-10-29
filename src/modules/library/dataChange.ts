@@ -24,6 +24,13 @@ export interface RowPatch {
   update: Partial<ImageRow>;
 }
 
+/** 本地写入已知的图库计数变化；有值时不再做全库计数查询。 */
+export interface LibraryCountDelta {
+  images?: number;
+  trash?: number;
+  temp?: number;
+}
+
 /** 一次写入引起的图库变化；由 app 层构造，LibraryView 只负责执行。 */
 export interface DataChange {
   kind: ChangeKind;
@@ -45,6 +52,8 @@ export interface DataChange {
   rowPatches?: RowPatch[];
   /** 外部范围变化：调用方确认选择已经无法可靠保留。 */
   clearSelection?: boolean;
+  /** 已知的图片/回收站/临时区计数变化；缺一条就回退到重新计数。 */
+  countDelta?: LibraryCountDelta;
   /** 文件夹列表已由调用方更新，无需再次读取。 */
   foldersAlreadyLoaded?: boolean;
   similarity: "keep" | "clear";
@@ -644,6 +653,26 @@ export function dataChangeForMcp(payload: McpChangePayload): DataChange {
     clearSelection,
     similarity: payload.invalidateSimilarity ? "clear" : "keep",
   };
+}
+
+/**
+ * 计数变化的合并结果：所有成员变化都带 `countDelta` 时才返回增量，
+ * 只要有一条数量未知（外部任务、MCP、撤销/重做），就返回 `null` 走重新计数。
+ */
+export function sumCountDelta(changes: DataChange[]): Required<LibraryCountDelta> | null {
+  const total = { images: 0, trash: 0, temp: 0 };
+  let counted = 0;
+  for (const change of changes) {
+    // 撤销/重做可能同时改了三档计数，前端拿不到数量，只能重新计数。
+    if (change.kind === "unknown") return null;
+    if (change.kind !== "membership") continue;
+    if (!change.countDelta) return null;
+    total.images += change.countDelta.images ?? 0;
+    total.trash += change.countDelta.trash ?? 0;
+    total.temp += change.countDelta.temp ?? 0;
+    counted += 1;
+  }
+  return counted > 0 ? total : null;
 }
 
 /** 同一批变化里每个维度取最保守的动作：refresh > patch > none、clear > prune > keep。 */

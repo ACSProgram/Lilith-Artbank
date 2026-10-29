@@ -78,6 +78,17 @@ export function TaskCenterProvider({ children }: { children: ReactNode }) {
           setDataVersion((value) => value + 1);
           const change = dataChangeForTaskKind(event.payload.kind);
           if (change.kind !== "none") {
+            // 导入快照带新增数量与临时区替换数：直接增量更新计数，不再做全库 count(*)。
+            // 新增与替换都为 0（整批重复）时也走增量，省掉一次没有变化的重新计数。
+            if (event.payload.kind === "import") {
+              change.countDelta =
+                event.payload.importTarget === "temp"
+                  ? { temp: event.payload.addedImages }
+                  : {
+                      images: event.payload.addedImages,
+                      temp: -event.payload.removedTempImages,
+                    };
+            }
             changeRevision.current += 1;
             setLastChange({
               revision: changeRevision.current,

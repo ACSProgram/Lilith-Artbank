@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import type { LibraryCountDelta } from "../modules/library/dataChange";
 import type { AppInfo, LibraryInfo, Settings } from "./types";
 
 export interface AppRuntime {
@@ -16,6 +17,8 @@ export interface AppRuntime {
   renameLibrary: (name: string) => Promise<void>;
   saveSettings: (next: Settings, options?: { silent?: boolean }) => Promise<Settings>;
   refreshStatus: () => Promise<void>;
+  /** 本地写入已知数量时直接改缓存计数，不再重查全库。 */
+  adjustCounts: (delta: LibraryCountDelta) => void;
 }
 
 export const AppRuntimeContext = createContext<AppRuntime | null>(null);

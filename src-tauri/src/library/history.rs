@@ -5441,6 +5441,7 @@ mod tests {
                 operation_id: Some(operation_id),
                 resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
                 images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
+                memory: Arc::new(crate::concurrency::budget::ImageMemoryBudget::default()),
                 holder: crate::concurrency::resources::HolderInfo::new("import-history", "导入"),
             };
             let job = Arc::new(ImportJob::new(

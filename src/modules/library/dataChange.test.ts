@@ -15,6 +15,7 @@ import {
   needsCursorRefresh,
   planDataChange,
   selectionAfterChange,
+  sumCountDelta,
   touchesTags,
   type DataChange,
 } from "./dataChange.ts";
@@ -344,4 +345,32 @@ test("标签候选只随标签变化与未知变化重算", () => {
   assert.equal(touchesTags(change({ fields: ["score", "description"] })), false);
   assert.equal(touchesTags(change({ kind: "folder", fields: ["folder"] })), false);
   assert.equal(touchesTags(change({ kind: "features", feature: "pose" })), false);
+});
+
+test("已知数量的成员变化合并成计数增量", () => {
+  const merged = sumCountDelta([
+    change({ kind: "membership", source: "local", countDelta: { trash: 3, images: -3 } }),
+    change({ kind: "membership", source: "local", countDelta: { trash: -1 } }),
+    change({ kind: "folder", fields: ["folder"] }),
+  ]);
+  assert.deepEqual(merged, { images: -3, trash: 2, temp: 0 });
+});
+
+test("有一条成员变化数量未知时回退到重新计数", () => {
+  assert.equal(
+    sumCountDelta([
+      change({ kind: "membership", source: "local", countDelta: { images: 5 } }),
+      change({ kind: "membership", source: "import" }),
+    ]),
+    null,
+  );
+  assert.equal(
+    sumCountDelta([
+      change({ kind: "unknown", source: "task", similarity: "clear" }),
+      change({ kind: "membership", source: "local", countDelta: { images: 5 } }),
+    ]),
+    null,
+    "撤销/重做可能改三档计数，不能按已知增量估算",
+  );
+  assert.equal(sumCountDelta([change({ kind: "folder" })]), null);
 });

@@ -224,6 +224,12 @@ pub struct TaskSnapshot {
     pub cancellable: bool,
     /// 这条任务最终写入的操作记录 id；任务进行中通常为空。
     pub operation_id: Option<i64>,
+    /// 任务写入的新图片数；目前只有导入任务使用，其他任务为 0。
+    pub added_images: usize,
+    /// 图库导入时丢弃的临时区同内容行数；其他任务为 0。
+    pub removed_temp_images: usize,
+    /// 导入目标；只有导入任务有值。
+    pub import_target: Option<crate::import::ImportTarget>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +269,12 @@ pub struct TaskHandle {
     started_at: i64,
     finished_at: Mutex<Option<i64>>,
     operation_id: Mutex<Option<i64>>,
+    /// 任务写入的新图片数；目前只有导入任务使用。
+    added_images: AtomicUsize,
+    /// 导入时丢弃的临时区同内容行数；用于同步临时区计数。
+    removed_temp_images: AtomicUsize,
+    /// 导入目标；只有导入任务有值。
+    import_target: Mutex<Option<crate::import::ImportTarget>>,
 }
 
 impl TaskHandle {
@@ -290,7 +302,24 @@ impl TaskHandle {
             started_at: now_ms(),
             finished_at: Mutex::new(None),
             operation_id: Mutex::new(None),
+            added_images: AtomicUsize::new(0),
+            removed_temp_images: AtomicUsize::new(0),
+            import_target: Mutex::new(None),
         })
+    }
+
+    /// 导入写入新行后更新累计数；前端据此增量更新图库计数。
+    pub fn set_added_images(&self, added: usize) {
+        self.added_images.store(added, Ordering::Relaxed);
+    }
+
+    /// 图库导入丢弃临时区同内容行后累加；这些行要从临时区计数里扣掉。
+    pub fn inc_removed_temp_images(&self, count: usize) {
+        self.removed_temp_images.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn set_import_target(&self, target: crate::import::ImportTarget) {
+        *self.import_target.lock() = Some(target);
     }
 
     pub fn set_operation_id(&self, operation_id: Option<i64>) {
@@ -531,6 +560,9 @@ impl TaskHandle {
             failures: self.failures.lock().clone(),
             cancellable: self.is_cancellable(),
             operation_id: *self.operation_id.lock(),
+            added_images: self.added_images.load(Ordering::Relaxed),
+            removed_temp_images: self.removed_temp_images.load(Ordering::Relaxed),
+            import_target: *self.import_target.lock(),
         }
     }
 

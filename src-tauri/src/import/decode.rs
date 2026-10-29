@@ -17,6 +17,30 @@ pub struct DecodedImage {
     pub height: u32,
 }
 
+/// 只读文件头拿尺寸，不解码像素；导入在申请内存额度前用它估算峰值。
+///
+/// 格式判断与 [`decode`] 保持一致：魔数优先，认不出来时用扩展名兜底。
+pub fn probe_dimensions(path: &Path) -> AppResult<(u32, u32)> {
+    let mut reader = ImageReader::open(path)
+        .map_err(|error| AppError::message(format!("无法打开图片：{error}")))?
+        .with_guessed_format()
+        .map_err(|error| AppError::message(format!("无法识别图片格式：{error}")))?;
+    if reader.format().is_none()
+        && let Some(format) = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .and_then(ImageFormat::from_extension)
+    {
+        reader.set_format(format);
+    }
+    let decoder = reader
+        .into_decoder()
+        .map_err(|error| AppError::message(format!("图片解码器初始化失败：{error}")))?;
+    let (width, height) = decoder.dimensions();
+    validate_dimensions(width, height)?;
+    Ok((width, height))
+}
+
 /// 解码并应用 EXIF 方向；方向只影响派生数据与显示，不改原图字节。
 ///
 /// 格式优先按魔数判断；魔数不认识时（TGA 没有稳定魔数）用文件扩展名兜底，
@@ -270,6 +294,27 @@ mod tests {
         bytes.extend_from_slice(&ihdr);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         assert!(decode_bytes(&bytes, Some("png")).is_err());
+    }
+
+    #[test]
+    fn probes_dimensions_without_decoding_pixels() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sample.png");
+        RgbImage::new(320, 240).save(&path).unwrap();
+        assert_eq!(probe_dimensions(&path).unwrap(), (320, 240));
+
+        let tga = temp.path().join("sample.tga");
+        let image = RgbImage::from_fn(24, 16, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 40]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, ImageFormat::Tga)
+            .unwrap();
+        std::fs::write(&tga, encoded.into_inner()).unwrap();
+        assert_eq!(probe_dimensions(&tga).unwrap(), (24, 16));
+
+        let fake = temp.path().join("fake.png");
+        std::fs::write(&fake, b"not an image").unwrap();
+        assert!(probe_dimensions(&fake).is_err());
     }
 
     #[test]
