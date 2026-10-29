@@ -17,7 +17,7 @@ use crate::{
             self, ChunkFormat, DescriptionRecord, HistoryKind, NewOperation, TagRecord,
             TagRefRecord,
         },
-        import::{ensure_folder_tracked, ensure_tags_tracked},
+        import::{ensure_folder_path, ensure_tags_tracked},
         paths::{LibraryPaths, normalize_content_extension, normalize_folder},
         placeholders,
         service::now_ms,
@@ -1263,14 +1263,15 @@ pub fn move_images_with_id(
         |transaction, draft| {
             let mut report = MoveReport::default();
             let mut created_folders = Vec::new();
-            let target_folder =
-                ensure_folder_tracked(transaction, &folder_path, now_ms(), &mut created_folders)?;
-            let target_dir = if folder_path.is_empty() {
+            // 目标文件夹可能已存在但大小写与请求不同：文件与行都必须落到库里的规范路径上。
+            let (target_folder, target_path) =
+                ensure_folder_path(transaction, &folder_path, now_ms(), &mut created_folders)?;
+            let target_dir = if target_path.is_empty() {
                 paths.root.clone()
             } else {
                 paths
                     .root
-                    .join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                    .join(target_path.replace('/', std::path::MAIN_SEPARATOR_STR))
             };
             std::fs::create_dir_all(&target_dir)?;
             ensure_dir_inside_root(&paths.root, &target_dir)?;
@@ -1317,12 +1318,12 @@ pub fn move_images_with_id(
                     }
                     done += 1;
                     reporter.report(done, total);
-                    if old_folder == folder_path {
+                    if old_folder == target_path {
                         report.skipped += 1;
                         continue;
                     }
                     let old_path = content_path(&paths, &old_folder, &content_hash, &file_ext)?;
-                    let new_path = content_path(&paths, &folder_path, &content_hash, &file_ext)?;
+                    let new_path = content_path(&paths, &target_path, &content_hash, &file_ext)?;
                     if let Err(error) = std::fs::rename(&old_path, &new_path) {
                         report.failures.push(BatchFailure {
                             image_id: Some(image_id),

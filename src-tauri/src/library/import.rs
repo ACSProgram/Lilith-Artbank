@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::{
     app::error::{AppError, AppResult},
     library::{
-        paths::{escape_like, normalize_folder, parent_path},
+        paths::{escape_like, join_folder, normalize_folder, parent_path},
         thumbs::ThumbLocation,
     },
 };
@@ -48,38 +48,52 @@ pub fn ensure_folder_tracked(
     now: i64,
     created: &mut Vec<(i64, String)>,
 ) -> AppResult<i64> {
-    let path = normalize_folder(path)?;
-    if path.is_empty() {
-        return resolve_folder(connection, "", now, created);
-    }
-    let mut current = String::new();
-    let mut id = resolve_folder(connection, "", now, created)?;
-    for segment in path.split('/') {
-        if !current.is_empty() {
-            current.push('/');
-        }
-        current.push_str(segment);
-        id = resolve_folder(connection, &current, now, created)?;
-    }
-    Ok(id)
+    ensure_folder_path(connection, path, now, created).map(|(id, _)| id)
 }
 
+/// 与 `ensure_folder_tracked` 相同，并返回数据库里的规范路径。
+///
+/// 已存在的祖先可能以另一种大小写存着（例如库里是 `Art`、请求是 `art/sub`）；
+/// 子路径必须拼在规范路径后面，否则同一棵子树会出现两种前缀写法，
+/// 按路径前缀聚合的计数与祖先/子树判断都会漏掉它。
+pub fn ensure_folder_path(
+    connection: &Connection,
+    path: &str,
+    now: i64,
+    created: &mut Vec<(i64, String)>,
+) -> AppResult<(i64, String)> {
+    let path = normalize_folder(path)?;
+    let (mut id, mut current) = resolve_folder(connection, "", now, created)?;
+    if path.is_empty() {
+        return Ok((id, current));
+    }
+    for segment in path.split('/') {
+        let candidate = join_folder(&current, segment);
+        let (next_id, canonical) = resolve_folder(connection, &candidate, now, created)?;
+        id = next_id;
+        current = canonical;
+    }
+    Ok((id, current))
+}
+
+/// 解析单个路径：已存在就返回库里那一行的路径，不存在就按传入路径新建。
 fn resolve_folder(
     connection: &Connection,
     path: &str,
     now: i64,
     created: &mut Vec<(i64, String)>,
-) -> AppResult<i64> {
-    if let Some((id, trashed_at, purge_operation_id)) = connection
+) -> AppResult<(i64, String)> {
+    if let Some((id, stored_path, trashed_at, purge_operation_id)) = connection
         .query_row(
-            "SELECT id, trashed_at, purge_operation_id FROM folders
+            "SELECT id, path, trashed_at, purge_operation_id FROM folders
              WHERE path = ?1 COLLATE NOCASE",
             [path],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             },
         )
@@ -95,7 +109,7 @@ fn resolve_folder(
                 "文件夹「{path}」在回收站中，请先恢复或永久删除"
             )));
         }
-        return Ok(id);
+        return Ok((id, stored_path));
     }
     let sort_index = next_sort_index(connection, path)?;
     connection.execute(
@@ -104,7 +118,7 @@ fn resolve_folder(
     )?;
     let id = connection.last_insert_rowid();
     created.push((id, path.to_owned()));
-    Ok(id)
+    Ok((id, path.to_owned()))
 }
 
 /// 新文件夹追加到同一父级的末尾，避免手动排序里新文件夹与已有项并列 0。
@@ -562,6 +576,41 @@ mod tests {
             .with_reader(|connection| {
                 // 图库行拿到的是新的 rowid；这里只关心它确实存在且不再是临时行。
                 assert!(find_by_hash_state(connection, &hash, false)?.is_some());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn child_paths_follow_the_stored_parent_case() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = service::create(&root, "测试", 1).unwrap();
+        session
+            .db
+            .with_writer(|connection| {
+                let mut created = Vec::new();
+                let (_, parent_path) = ensure_folder_path(connection, "Art", 1, &mut created)?;
+                assert_eq!(parent_path, "Art");
+                assert_eq!(created.len(), 1);
+
+                // 子路径拼在库里的规范路径后面，不再沿用调用方的大小写。
+                let (child, child_path) =
+                    ensure_folder_path(connection, "art/sub", 2, &mut created)?;
+                assert_eq!(child_path, "Art/sub");
+                let stored: String = connection.query_row(
+                    "SELECT path FROM folders WHERE id = ?1",
+                    [child],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(stored, "Art/sub");
+
+                // 已存在的路径原样返回，不新建行。
+                let (again, again_path) =
+                    ensure_folder_path(connection, "ART/SUB", 3, &mut created)?;
+                assert_eq!(again, child);
+                assert_eq!(again_path, "Art/sub");
+                assert_eq!(created.len(), 2);
                 Ok(())
             })
             .unwrap();

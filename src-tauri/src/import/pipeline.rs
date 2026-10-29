@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -253,16 +254,8 @@ fn run_inner(
         holder: source.holder.clone(),
     };
 
-    let writer = {
-        let database = source.database.clone();
-        let pack = source.thumbs.clone();
-        let job = job.clone();
-        let index = index.clone();
-        std::thread::spawn(move || {
-            write_loop(receiver, database, pack, writer_options, job, index);
-        })
-    };
-
+    // 工作池必须在写线程启动前建好：建池失败提前返回时 sender 还活着，
+    // WriterGuard 的 Drop 会等一个永远不结束的写线程。
     let threads = source
         .images
         .current_limit()
@@ -272,6 +265,16 @@ fn run_inner(
         .thread_name(|index| format!("import-{index}"))
         .build()
         .map_err(|error| AppError::message(format!("无法创建导入工作池：{error}")))?;
+
+    let mut writer = WriterGuard::new({
+        let database = source.database.clone();
+        let pack = source.thumbs.clone();
+        let job = job.clone();
+        let index = index.clone();
+        std::thread::spawn(move || {
+            write_loop(receiver, database, pack, writer_options, job, index);
+        })
+    });
 
     {
         let context = WorkerContext {
@@ -326,6 +329,37 @@ fn run_inner(
             job.add_failure("", "入库线程异常终止，部分结果可能未写入");
             job.inc_failed();
             Ok(())
+        }
+    }
+}
+
+/// 入库线程的 join 守卫。
+///
+/// 工作线程 panic 会在 `pool.install` 处展开，正常路径的 `join` 就执行不到了；
+/// 写线程仍持有通道接收端，会继续把已排队的结果写进库，甚至在本任务收尾之后还在写。
+/// 交给 Drop 兜底，保证任何退出路径都先排空写线程，再让调用方 `finish`。
+/// 写线程只在 sender 全部释放后退出，所以 `WriterGuard` 必须声明在 `context`（持有
+/// sender）之前：drop 时 context 先释放，最后才轮到 guard 的 join。
+struct WriterGuard(Option<JoinHandle<()>>);
+
+impl WriterGuard {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// 显式等待；重复调用直接返回成功。
+    fn join(&mut self) -> std::thread::Result<()> {
+        match self.0.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        if self.join().is_err() {
+            log::error!("导入入库线程异常终止");
         }
     }
 }
@@ -2041,5 +2075,23 @@ mod tests {
         assert_eq!(snapshot.progress.imported, 1000);
         assert_eq!(snapshot.progress.failed, 0);
         assert!(rate >= 20.0, "导入吞吐 {rate:.1}/s 低于 20/s");
+    }
+
+    #[test]
+    fn writer_guard_joins_when_the_worker_unwinds() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_flag = finished.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WriterGuard::new(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                worker_flag.store(true, Ordering::SeqCst);
+            }));
+            panic!("工作线程 panic");
+        }));
+        assert!(outcome.is_err());
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "写线程必须在外层 panic 展开时被 join 掉"
+        );
     }
 }

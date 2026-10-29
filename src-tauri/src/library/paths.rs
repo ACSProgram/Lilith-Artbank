@@ -214,6 +214,31 @@ pub fn parent_path(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
+/// 两个已规范化的文件夹路径是否指同一个目录。
+///
+/// Windows 文件系统大小写不敏感，数据库的唯一索引也建在 `COLLATE NOCASE` 上；
+/// 判断路径相等必须用同一口径，否则同一目录会同时以两种写法存在。
+pub fn same_folder(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// `path` 是否位于 `ancestor` 之内（含自身）。空 `ancestor` 表示图库根，包含全部。
+///
+/// 按路径段比较、忽略 ASCII 大小写：直接 `starts_with` 会把 `Art/sub` 判成不在 `ART` 内，
+/// 让“移动到自身子树”的守卫失效。
+pub fn folder_within(path: &str, ancestor: &str) -> bool {
+    if ancestor.is_empty() {
+        return true;
+    }
+    let (path_bytes, ancestor_bytes) = (path.as_bytes(), ancestor.as_bytes());
+    if path_bytes.len() < ancestor_bytes.len()
+        || !path_bytes[..ancestor_bytes.len()].eq_ignore_ascii_case(ancestor_bytes)
+    {
+        return false;
+    }
+    path_bytes.len() == ancestor_bytes.len() || path_bytes[ancestor_bytes.len()] == b'/'
+}
+
 pub fn normalize_content_extension(value: &str) -> AppResult<String> {
     let ext = value.trim().trim_start_matches('.').to_ascii_lowercase();
     if ext.is_empty() || ext.len() > 16 || !ext.chars().all(|ch| ch.is_ascii_alphanumeric()) {
@@ -276,5 +301,18 @@ mod tests {
         );
         assert_eq!(join_folder("人物", "速写"), "人物/速写");
         assert_eq!(join_folder("", "速写"), "速写");
+    }
+
+    #[test]
+    fn compares_folders_ignoring_ascii_case() {
+        assert!(same_folder("Art/Sub", "art/sub"));
+        assert!(!same_folder("Art/Sub", "Art"));
+        assert!(folder_within("Art/Sub", ""));
+        assert!(folder_within("Art/Sub", "ART"));
+        assert!(folder_within("Art", "art"));
+        assert!(!folder_within("Artwork", "Art"));
+        assert!(!folder_within("Art/Sub", "Artwork"));
+        assert!(!folder_within("Art", "Art/Sub"));
+        assert!(folder_within("人物/速写", "人物"));
     }
 }

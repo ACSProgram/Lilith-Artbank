@@ -18,7 +18,7 @@ use crate::{
     library::{
         db::LibraryDb,
         folders,
-        paths::{join_folder, normalize_folder, normalize_folder_name, parent_path},
+        paths::{folder_within, join_folder, normalize_folder, normalize_folder_name, parent_path},
         query::FolderInfo,
     },
 };
@@ -185,8 +185,7 @@ fn run_folders_modify(
             reject_temp_folder(&database, &current.path)?;
             let parent = resolve_parent(&database, input)?;
             reject_temp_folder(&database, &parent.path)?;
-            if parent.path == current.path || parent.path.starts_with(&format!("{}/", current.path))
-            {
+            if folder_within(&parent.path, &current.path) {
                 return Ok(rejected("不能把文件夹移动到自身或子文件夹里"));
             }
             let leaf = current

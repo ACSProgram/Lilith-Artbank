@@ -1071,10 +1071,11 @@ fn subfolder_count(connection: &Connection, folder_ids: &[i64]) -> AppResult<u64
         return Ok(count as u64);
     }
     let selected_ids: HashSet<i64> = folder_ids.iter().copied().collect();
-    let selected_paths: HashSet<&str> = folders
+    // 库里可能存在同一子树两种大小写前缀的旧行，祖先比较必须与 SQL 的 NOCASE 同口径。
+    let selected_paths: HashSet<String> = folders
         .iter()
         .filter(|(id, _)| selected_ids.contains(id))
-        .map(|(_, path)| path.as_str())
+        .map(|(_, path)| path.to_ascii_lowercase())
         .collect();
     if selected_paths.is_empty() {
         return Ok(0);
@@ -1085,6 +1086,8 @@ fn subfolder_count(connection: &Connection, folder_ids: &[i64]) -> AppResult<u64
             if selected_ids.contains(id) {
                 return false;
             }
+            // 统一小写后逐级回溯，每一级都复用同一份字符串。
+            let path = path.to_ascii_lowercase();
             let mut current = Some(path.as_str());
             while let Some(prefix) = current {
                 if selected_paths.contains(prefix) {
@@ -2467,10 +2470,12 @@ fn all_folders(connection: &Connection) -> AppResult<Vec<(i64, String)>> {
 /// 把“直接位于该文件夹”的计数累加到自身与全部祖先，得到子树计数。
 ///
 /// 只返回计数非零的文件夹；空文件夹由调用方按 0 补齐。
+/// 前缀比较忽略 ASCII 大小写：旧数据里子路径可能与祖先大小写不同，
+/// 按精确字符串查祖先会让这部分计数整段丢失。
 fn expand_folder_counts(direct: Vec<(i64, u64)>, folders: &[(i64, String)]) -> Vec<(i64, u64)> {
-    let by_path: HashMap<&str, i64> = folders
+    let by_path: HashMap<String, i64> = folders
         .iter()
-        .map(|(id, path)| (path.as_str(), *id))
+        .map(|(id, path)| (path.to_ascii_lowercase(), *id))
         .collect();
     let path_by_id: HashMap<i64, &str> = folders
         .iter()
@@ -2481,7 +2486,8 @@ fn expand_folder_counts(direct: Vec<(i64, u64)>, folders: &[(i64, String)]) -> V
         let Some(path) = path_by_id.get(&folder_id).copied() else {
             continue;
         };
-        let mut current = Some(path);
+        let path = path.to_ascii_lowercase();
+        let mut current = Some(path.as_str());
         while let Some(prefix) = current {
             if let Some(id) = by_path.get(prefix) {
                 *totals.entry(*id).or_default() += count;
@@ -5081,5 +5087,71 @@ mod tests {
                 .all(|folder| folder.path != "风景"),
             "正常文件夹列表不含回收站文件夹"
         );
+    }
+
+    #[test]
+    fn subtree_counts_survive_mismatched_path_case() {
+        let fixture = fixture();
+        // 旧数据可能把子路径写成另一种大小写：祖先计数不能因此整段丢失。
+        let child = fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "INSERT INTO folders(path, created_at, sort_index) VALUES ('人物/速写', 1, 0)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO folders(path, created_at, sort_index) VALUES ('人物/速写/手部', 1, 0)",
+                    [],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .unwrap();
+        fixture
+            .session
+            .db
+            .with_writer(|connection| {
+                insert_image(
+                    connection,
+                    "f",
+                    "jpg",
+                    4,
+                    child,
+                    4_000,
+                    400,
+                    640,
+                    480,
+                    None,
+                    &[],
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let folders = list_folders(&fixture.session.db).unwrap();
+        let total = |path: &str| {
+            folders
+                .iter()
+                .find(|folder| folder.path == path)
+                .map(|folder| folder.total_image_count)
+                .unwrap_or(0)
+        };
+        assert_eq!(total("人物/速写/手部"), 1);
+        assert_eq!(total("人物/速写"), 1, "大小写不同也要算进祖先");
+        assert_eq!(total("人物"), 3, "原有 2 张加新增 1 张");
+
+        let stats = folder_stats(
+            &fixture.session.db,
+            LibraryQuery {
+                filters: LibraryFilters {
+                    folder_ids: vec![fixture.folder_people],
+                    ..Default::default()
+                },
+                ..base_query()
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.subfolder_count, 2, "子文件夹数按祖先关系算");
     }
 }

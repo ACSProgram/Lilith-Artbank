@@ -838,12 +838,24 @@ pub fn discard_redo_in_tx(tx: &Transaction<'_>) -> AppResult<()> {
 }
 
 /// 已持有写事务（导入批次、撤销/重做）时使用，避免再次加写锁造成死锁。
+///
+/// 记录行已经不在了（例如收尾已把空记录删掉）就跳过：逆数据写不进去，
+/// 不能让整批已入库的图片因为一个外键失败一起回滚。
 pub fn append_live_in_tx(
     tx: &Transaction<'_>,
     op_id: i64,
     format: ChunkFormat,
     data: &[u8],
 ) -> AppResult<()> {
+    let exists: i64 = tx.query_row(
+        "SELECT count(*) FROM operations WHERE id = ?1",
+        [op_id],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        log::warn!("操作记录 {op_id} 已不存在，跳过逆数据写入");
+        return Ok(());
+    }
     let seq: i64 = tx.query_row(
         "SELECT coalesce(max(seq), -1) + 1 FROM operation_chunks WHERE operation_id = ?1",
         [op_id],
@@ -1398,33 +1410,36 @@ pub fn recover_on_open(database: &LibraryDb) -> AppResult<RecoveryPlan> {
 }
 
 /// 删除没有对应记录引用的 `.artbank/undo/<id>` 目录。
+///
+/// 必须在写连接上执行：编辑保存会在自己的写事务里新建暂存目录、提交后 `operations`
+/// 行才可见；用读连接枚举会把这种“在建”目录当成无主目录删掉，编辑就永远不可撤销。
 pub fn cleanup_undo_dirs(database: &LibraryDb, root: &Path) -> AppResult<()> {
-    let known: HashSet<i64> = database.with_reader(|connection| {
-        let mut statement = connection.prepare("SELECT id FROM operations")?;
-        let ids = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<HashSet<_>>>()?;
-        Ok(ids)
-    })?;
     let undo_dir = LibraryPaths::new(root).undo;
     if !undo_dir.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(&undo_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name.to_str().and_then(|value| value.parse::<i64>().ok()) else {
-            continue;
-        };
-        if known.contains(&id) {
-            continue;
+    database.with_writer(|connection| {
+        let mut statement = connection.prepare("SELECT id FROM operations")?;
+        let known: HashSet<i64> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        drop(statement);
+        for entry in std::fs::read_dir(&undo_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|value| value.parse::<i64>().ok()) else {
+                continue;
+            };
+            if known.contains(&id) {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                log::warn!("清理无主撤销暂存目录失败 {}：{error}", path.display());
+            }
         }
-        let path = entry.path();
-        if let Err(error) = std::fs::remove_dir_all(&path) {
-            log::warn!("清理无主撤销暂存目录失败 {}：{error}", path.display());
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn undo_dir(root: &Path, operation_id: i64) -> PathBuf {
@@ -3139,66 +3154,79 @@ fn undo_folder(
             transaction.commit()?;
             return Ok(());
         }
-        for chunk in chunks {
-            if chunk.format == ChunkFormat::SortJson {
-                if matches!(kind, HistoryKind::FolderRename | HistoryKind::FolderMove) {
-                    let change: FolderSortChange = decode_json(&chunk.data)?;
-                    folders::undo_sort_change(&transaction, &change)?;
-                }
-                continue;
-            }
-            if chunk.format != ChunkFormat::Json {
-                continue;
-            }
-            match kind {
-                HistoryKind::FolderCreate => {
-                    let rows: Vec<FolderRef> = decode_json(&chunk.data)?;
-                    let existing = folder_rows(&transaction, &rows)?;
-                    if !existing.is_empty() {
-                        append_redo(
-                            &transaction,
-                            operation_id,
-                            &RedoRecord::FolderRows { items: existing },
-                        )?;
+        // 一次操作可能有多条文件夹路径变更；任何一条失败都算整次失败：
+        // 已改过的目录逆序改回去，和随后回滚的数据库事务回到同一状态。
+        let mut journal = folders::FolderFsJournal::default();
+        let applied = (|| -> AppResult<()> {
+            for chunk in chunks {
+                if chunk.format == ChunkFormat::SortJson {
+                    if matches!(kind, HistoryKind::FolderRename | HistoryKind::FolderMove) {
+                        let change: FolderSortChange = decode_json(&chunk.data)?;
+                        folders::undo_sort_change(&transaction, &change)?;
                     }
-                    folders::undo_create(&transaction, root, &rows)?;
+                    continue;
                 }
-                HistoryKind::FolderRename | HistoryKind::FolderMove => {
-                    let change: FolderPathChange = decode_json(&chunk.data)?;
-                    folders::undo_path_change(&transaction, root, &change)?;
+                if chunk.format != ChunkFormat::Json {
+                    continue;
                 }
-                HistoryKind::FolderDelete => {
-                    let deleted: FolderDeleted = decode_json(&chunk.data)?;
-                    folders::undo_delete(&transaction, root, &deleted)?;
-                }
-                HistoryKind::FolderReorder => {
-                    let reorder: FolderReorder = decode_json(&chunk.data)?;
-                    let mut current = Vec::new();
-                    for (id, _) in &reorder.rows {
-                        let sort_index: Option<i64> = transaction
-                            .query_row(
-                                "SELECT sort_index FROM folders WHERE id = ?1",
-                                [id],
-                                |row| row.get(0),
-                            )
-                            .optional()?;
-                        if let Some(sort_index) = sort_index {
-                            current.push((*id, sort_index));
+                match kind {
+                    HistoryKind::FolderCreate => {
+                        let rows: Vec<FolderRef> = decode_json(&chunk.data)?;
+                        let existing = folder_rows(&transaction, &rows)?;
+                        if !existing.is_empty() {
+                            append_redo(
+                                &transaction,
+                                operation_id,
+                                &RedoRecord::FolderRows { items: existing },
+                            )?;
                         }
+                        folders::undo_create(&transaction, root, &rows, &mut journal)?;
                     }
-                    if !current.is_empty() {
-                        append_redo(
-                            &transaction,
-                            operation_id,
-                            &RedoRecord::FolderSort { rows: current },
-                        )?;
+                    HistoryKind::FolderRename | HistoryKind::FolderMove => {
+                        let change: FolderPathChange = decode_json(&chunk.data)?;
+                        folders::undo_path_change(&transaction, root, &change, &mut journal)?;
                     }
-                    folders::undo_reorder(&transaction, &reorder)?;
+                    HistoryKind::FolderDelete => {
+                        let deleted: FolderDeleted = decode_json(&chunk.data)?;
+                        folders::undo_delete(&transaction, root, &deleted, &mut journal)?;
+                    }
+                    HistoryKind::FolderReorder => {
+                        let reorder: FolderReorder = decode_json(&chunk.data)?;
+                        let mut current = Vec::new();
+                        for (id, _) in &reorder.rows {
+                            let sort_index: Option<i64> = transaction
+                                .query_row(
+                                    "SELECT sort_index FROM folders WHERE id = ?1",
+                                    [id],
+                                    |row| row.get(0),
+                                )
+                                .optional()?;
+                            if let Some(sort_index) = sort_index {
+                                current.push((*id, sort_index));
+                            }
+                        }
+                        if !current.is_empty() {
+                            append_redo(
+                                &transaction,
+                                operation_id,
+                                &RedoRecord::FolderSort { rows: current },
+                            )?;
+                        }
+                        folders::undo_reorder(&transaction, &reorder)?;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            journal.rollback();
+            return Err(error);
         }
-        transaction.commit()?;
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })
 }
@@ -3257,64 +3285,76 @@ fn redo_folder(
             transaction.commit()?;
             return Ok(());
         }
-        match kind {
-            HistoryKind::FolderCreate => {
-                let mut rows = Vec::new();
-                for record in load_redo_records(&transaction, operation_id)? {
-                    if let RedoRecord::FolderRows { items } = record {
-                        rows.extend(items);
+        // 与撤销对称：任一条失败都逆序撤回已经落地的目录动作。
+        let mut journal = folders::FolderFsJournal::default();
+        let applied = (|| -> AppResult<()> {
+            match kind {
+                HistoryKind::FolderCreate => {
+                    let mut rows = Vec::new();
+                    for record in load_redo_records(&transaction, operation_id)? {
+                        if let RedoRecord::FolderRows { items } = record {
+                            rows.extend(items);
+                        }
+                    }
+                    if rows.is_empty() {
+                        return Err(AppError::message("这条记录缺少重做数据"));
+                    }
+                    folders::redo_create(&transaction, root, &rows, &mut journal)?;
+                }
+                HistoryKind::FolderRename | HistoryKind::FolderMove => {
+                    for chunk in chunks
+                        .iter()
+                        .filter(|chunk| chunk.format == ChunkFormat::Json)
+                    {
+                        let change: FolderPathChange = decode_json(&chunk.data)?;
+                        folders::redo_path_change(&transaction, root, &change, &mut journal)?;
+                    }
+                    for chunk in chunks
+                        .iter()
+                        .filter(|chunk| chunk.format == ChunkFormat::SortJson)
+                    {
+                        let change: FolderSortChange = decode_json(&chunk.data)?;
+                        folders::redo_sort_change(&transaction, &change)?;
                     }
                 }
-                if rows.is_empty() {
-                    return Err(AppError::message("这条记录缺少重做数据"));
-                }
-                folders::redo_create(&transaction, root, &rows)?;
-            }
-            HistoryKind::FolderRename | HistoryKind::FolderMove => {
-                for chunk in chunks
-                    .iter()
-                    .filter(|chunk| chunk.format == ChunkFormat::Json)
-                {
-                    let change: FolderPathChange = decode_json(&chunk.data)?;
-                    folders::redo_path_change(&transaction, root, &change)?;
-                }
-                for chunk in chunks
-                    .iter()
-                    .filter(|chunk| chunk.format == ChunkFormat::SortJson)
-                {
-                    let change: FolderSortChange = decode_json(&chunk.data)?;
-                    folders::redo_sort_change(&transaction, &change)?;
-                }
-            }
-            HistoryKind::FolderDelete => {
-                let mut found = false;
-                for chunk in chunks
-                    .iter()
-                    .filter(|chunk| chunk.format == ChunkFormat::Json)
-                {
-                    let deleted: FolderDeleted = decode_json(&chunk.data)?;
-                    folders::redo_delete(&transaction, root, &deleted)?;
-                    found = true;
-                }
-                if !found {
-                    return Err(AppError::message("这条记录缺少重做数据"));
-                }
-            }
-            HistoryKind::FolderReorder => {
-                let mut rows = Vec::new();
-                for record in load_redo_records(&transaction, operation_id)? {
-                    if let RedoRecord::FolderSort { rows: items } = record {
-                        rows.extend(items);
+                HistoryKind::FolderDelete => {
+                    let mut found = false;
+                    for chunk in chunks
+                        .iter()
+                        .filter(|chunk| chunk.format == ChunkFormat::Json)
+                    {
+                        let deleted: FolderDeleted = decode_json(&chunk.data)?;
+                        folders::redo_delete(&transaction, root, &deleted, &mut journal)?;
+                        found = true;
+                    }
+                    if !found {
+                        return Err(AppError::message("这条记录缺少重做数据"));
                     }
                 }
-                if rows.is_empty() {
-                    return Err(AppError::message("这条记录缺少重做数据"));
+                HistoryKind::FolderReorder => {
+                    let mut rows = Vec::new();
+                    for record in load_redo_records(&transaction, operation_id)? {
+                        if let RedoRecord::FolderSort { rows: items } = record {
+                            rows.extend(items);
+                        }
+                    }
+                    if rows.is_empty() {
+                        return Err(AppError::message("这条记录缺少重做数据"));
+                    }
+                    folders::redo_reorder(&transaction, &rows)?;
                 }
-                folders::redo_reorder(&transaction, &rows)?;
+                _ => {}
             }
-            _ => {}
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            journal.rollback();
+            return Err(error);
         }
-        transaction.commit()?;
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })
 }
@@ -3327,6 +3367,7 @@ fn undo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut created_folders: Vec<FolderRef> = Vec::new();
         let mut redo_moves = Vec::new();
+        let mut journal = folders::FolderFsJournal::default();
         let result = (|| -> AppResult<()> {
             for chunk in load_chunks(&transaction, operation_id)? {
                 if chunk.format == ChunkFormat::Json {
@@ -3414,6 +3455,7 @@ fn undo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
                     let _ = fs::rename(new_path, old_path);
                 }
             }
+            journal.rollback();
             return Err(error);
         }
         if !redo_moves.is_empty() {
@@ -3431,8 +3473,16 @@ fn undo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
                 &RedoRecord::FolderRows { items: folder_rows },
             )?;
         }
-        folders::cleanup_created(&transaction, root, &created_folders)?;
-        transaction.commit()?;
+        if let Err(error) =
+            folders::cleanup_created(&transaction, root, &created_folders, &mut journal)
+        {
+            journal.rollback();
+            return Err(error);
+        }
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })
 }
@@ -3454,10 +3504,11 @@ fn redo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
         if moves.is_empty() && folders.is_empty() {
             return Err(AppError::message("这条记录缺少重做数据"));
         }
-        folders::redo_create(&transaction, root, &folders)?;
-
+        let mut journal = folders::FolderFsJournal::default();
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
         let result = (|| -> AppResult<()> {
+            // 与撤销对称：任一条失败都逆序撤回已经落地的目录动作。
+            folders::redo_create(&transaction, root, &folders, &mut journal)?;
             for item in &moves {
                 let current: Option<(i64, String, String, String)> = transaction
                     .query_row(
@@ -3522,9 +3573,13 @@ fn redo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
                     let _ = fs::rename(new_path, old_path);
                 }
             }
+            journal.rollback();
             return Err(error);
         }
-        transaction.commit()?;
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })
 }
@@ -4028,27 +4083,38 @@ fn undo_import(
                 },
             )?;
         }
-        folders::cleanup_created(&transaction, root, &created_folders)?;
-        for tag in &created_tags {
-            let name: Option<String> = transaction
-                .query_row("SELECT name FROM tags WHERE id = ?1", [tag.id], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            // 标签 id 也可能被复用；名字对不上就保留，避免删掉别的标签。
-            if !name.is_some_and(|name| name.eq_ignore_ascii_case(&tag.name)) {
-                continue;
+        let mut journal = folders::FolderFsJournal::default();
+        let result = (|| -> AppResult<()> {
+            folders::cleanup_created(&transaction, root, &created_folders, &mut journal)?;
+            for tag in &created_tags {
+                let name: Option<String> = transaction
+                    .query_row("SELECT name FROM tags WHERE id = ?1", [tag.id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                // 标签 id 也可能被复用；名字对不上就保留，避免删掉别的标签。
+                if !name.is_some_and(|name| name.eq_ignore_ascii_case(&tag.name)) {
+                    continue;
+                }
+                let used: i64 = transaction.query_row(
+                    "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
+                    [tag.id],
+                    |row| row.get(0),
+                )?;
+                if used == 0 {
+                    transaction.execute("DELETE FROM tags WHERE id = ?1", [tag.id])?;
+                }
             }
-            let used: i64 = transaction.query_row(
-                "SELECT count(*) FROM image_tags WHERE tag_id = ?1",
-                [tag.id],
-                |row| row.get(0),
-            )?;
-            if used == 0 {
-                transaction.execute("DELETE FROM tags WHERE id = ?1", [tag.id])?;
-            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            journal.rollback();
+            return Err(error);
         }
-        transaction.commit()?;
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })
 }
@@ -4079,9 +4145,20 @@ fn redo_import(
 
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        folders::redo_create(&transaction, root, &folders)?;
-        ensure_import_tags(&transaction, &tags)?;
-        transaction.commit()?;
+        let mut journal = folders::FolderFsJournal::default();
+        let result = (|| -> AppResult<()> {
+            folders::redo_create(&transaction, root, &folders, &mut journal)?;
+            ensure_import_tags(&transaction, &tags)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            journal.rollback();
+            return Err(error);
+        }
+        if let Err(error) = transaction.commit() {
+            journal.rollback();
+            return Err(error.into());
+        }
         Ok(())
     })?;
 
@@ -5410,6 +5487,57 @@ mod tests {
         cleanup_undo_dirs(fixture.db(), &fixture.root).unwrap();
         assert!(kept.exists());
         assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn cleanup_waits_for_an_open_write_transaction() {
+        let fixture = Fixture::new();
+        let pending_id = 4_242_i64;
+        let directory = undo_dir(&fixture.root, pending_id);
+        fs::create_dir_all(&directory).unwrap();
+
+        // 模拟编辑保存：暂存目录先落地，operations 行要到提交后才对读连接可见。
+        let (ready, wait) = std::sync::mpsc::channel();
+        let db = fixture.session.db.clone();
+        let writer = std::thread::spawn(move || {
+            db.with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT INTO operations(id, kind, label, created_at, status, affected, error)
+                     VALUES (?1, 'edit', '在建', 1, 'pending', 0, '')",
+                    [pending_id],
+                )?;
+                ready.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                transaction.commit()?;
+                Ok(())
+            })
+        });
+        wait.recv().unwrap();
+        cleanup_undo_dirs(fixture.db(), &fixture.root).unwrap();
+        assert!(
+            directory.exists(),
+            "在建记录的暂存目录不能被当成无主目录删掉"
+        );
+        writer.join().unwrap().unwrap();
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn appending_chunks_skips_records_that_are_gone() {
+        let fixture = Fixture::new();
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // 记录已被收尾删除时，逆数据写不进去也不能让整批入库回滚。
+                append_live_in_tx(&transaction, 9_999, ChunkFormat::Json, b"[]")?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
