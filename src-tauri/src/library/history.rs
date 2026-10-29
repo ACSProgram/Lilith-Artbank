@@ -149,6 +149,7 @@ impl HistoryKind {
             "similarityGroups" => Self::SimilarityGroups,
             "aiDescription" => Self::AiDescription,
             "optimize" => Self::Optimize,
+            "orphanMove" => Self::OrphanMove,
             other => {
                 return Err(AppError::message(format!("未知的操作类型：{other}")));
             }

@@ -8,11 +8,15 @@
 //! `--request`/`--request-json` 传 DTO；`--result` 另存一份格式化结果。退出码：
 //! 0 成功、1 失败、2 取消。
 
+mod maintenance;
+mod write;
+
 use std::{
+    cell::Cell,
     fs,
     io::{Cursor, Write},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -26,9 +30,11 @@ use crate::{
         error::AppError,
         settings::{Settings, SettingsStore},
         state::AppState,
+        tasks::{TaskPhase, TaskSnapshot},
         trace,
     },
     library::{
+        BatchReporter,
         fixture::{self, SeedSpec},
         manifest::LibraryInspection,
         query::LibraryQuery,
@@ -59,7 +65,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let outcome = run_command(&options);
     let (ok, cancelled, error, data) = match outcome {
-        Ok(data) => (true, false, None, data),
+        Ok((data, cancelled)) => (true, cancelled, None, data),
         Err(error) => (false, false, Some(error), Value::Null),
     };
     let result = HeadlessResult {
@@ -114,7 +120,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     fs::write(path, bytes).map_err(|error| format!("无法写入结果文件：{error}"))
 }
 
-fn run_command(options: &Options) -> Result<Value, String> {
+fn run_command(options: &Options) -> Result<(Value, bool), String> {
     let root = require_root()?;
     let settings_path = app::paths::settings_path();
     if let Some(parent) = settings_path.parent() {
@@ -137,11 +143,12 @@ fn run_command(options: &Options) -> Result<Value, String> {
     let _ = app.manage(state);
     app.state::<AppState>().after_manage();
 
+    let cancelled = Cell::new(false);
     let outcome = (|| {
         if let Some(path) = options.library.as_deref() {
             open_library(app.handle(), path)?;
         }
-        dispatch(app.handle(), options, &root)
+        dispatch(app.handle(), options, &root, &cancelled)
     })();
 
     {
@@ -152,10 +159,75 @@ fn run_command(options: &Options) -> Result<Value, String> {
         state.mcp.stop();
     }
     drop(app);
-    outcome
+    outcome.map(|data| (data, cancelled.get()))
 }
 
-fn dispatch(app: &tauri::AppHandle, options: &Options, root: &Path) -> Result<Value, String> {
+/// 批量任务在命令里同步等到终态，超时即报错而不是一直挂着。
+const TASK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 领域批量写函数只关心取消标志，命令行不需要逐张进度。
+pub(super) struct NullReporter;
+
+impl BatchReporter for NullReporter {
+    fn report(&self, _completed: usize, _total: usize) {}
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// 用默认上限等任务结束。
+pub(super) fn wait_task(state: &AppState, task_id: &str) -> Result<TaskSnapshot, String> {
+    wait_task_with_timeout(state, task_id, TASK_TIMEOUT)
+}
+
+/// 轮询任务快照，直到进入终态或超时。
+///
+/// 任务结束后会从总线里摘掉，此时只剩「超时」一条路；调用方据此报错即可。
+pub(super) fn wait_task_with_timeout(
+    state: &AppState,
+    task_id: &str,
+    timeout: Duration,
+) -> Result<TaskSnapshot, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(snapshot) = state
+            .tasks_snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.task_id == task_id)
+            && snapshot.phase.is_terminal()
+        {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("等待任务 {task_id} 结束超时"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 失败翻成命令错误；取消置位取消标志，让入口以退出码 2 收尾。
+pub(super) fn check_task(snapshot: &TaskSnapshot, cancelled: &Cell<bool>) -> Result<(), String> {
+    match snapshot.phase {
+        TaskPhase::Failed => Err(if snapshot.message.is_empty() {
+            "任务失败".to_owned()
+        } else {
+            snapshot.message.clone()
+        }),
+        TaskPhase::Cancelled => {
+            cancelled.set(true);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn dispatch(
+    app: &tauri::AppHandle,
+    options: &Options,
+    root: &Path,
+    cancelled: &Cell<bool>,
+) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let state = state.inner();
     match (options.command.as_str(), options.action.as_deref()) {
@@ -288,6 +360,10 @@ fn dispatch(app: &tauri::AppHandle, options: &Options, root: &Path) -> Result<Va
             "logDir": app::paths::log_dir().display().to_string(),
             "logPath": log_file_path().display().to_string(),
         })),
+        ("import" | "metadata" | "folder" | "collection" | "history" | "viewer" | "edit", _) => {
+            write::dispatch(app, options, cancelled)
+        }
+        ("task" | "maintenance" | "scenario", _) => maintenance::dispatch(app, options, cancelled),
         (command, action) => Err(match action {
             Some(action) => format!("未知命令：{command} {action}"),
             None => format!("未知命令：{command}"),
@@ -325,7 +401,7 @@ fn open_library(app: &tauri::AppHandle, path: &Path) -> Result<LibraryInfo, Stri
     })
 }
 
-fn value_of<T: Serialize>(value: Result<T, String>) -> Result<Value, String> {
+pub(super) fn value_of<T: Serialize>(value: Result<T, String>) -> Result<Value, String> {
     serde_json::to_value(value?).map_err(|error| format!("无法序列化结果：{error}"))
 }
 
@@ -347,12 +423,12 @@ fn require_root() -> Result<PathBuf, String> {
     Ok(root)
 }
 
-struct Options {
-    command: String,
-    action: Option<String>,
-    library: Option<PathBuf>,
-    result: Option<PathBuf>,
-    request: Option<Value>,
+pub(super) struct Options {
+    pub(super) command: String,
+    pub(super) action: Option<String>,
+    pub(super) library: Option<PathBuf>,
+    pub(super) result: Option<PathBuf>,
+    pub(super) request: Option<Value>,
 }
 
 impl Options {
@@ -411,7 +487,7 @@ impl Options {
         })
     }
 
-    fn request<T: DeserializeOwned>(&self) -> Result<T, String> {
+    pub(super) fn request<T: DeserializeOwned>(&self) -> Result<T, String> {
         let value = self
             .request
             .clone()
@@ -419,7 +495,7 @@ impl Options {
         serde_json::from_value(value).map_err(|error| format!("请求字段无效：{error}"))
     }
 
-    fn request_or_default<T: DeserializeOwned + Default>(&self) -> Result<T, String> {
+    pub(super) fn request_or_default<T: DeserializeOwned + Default>(&self) -> Result<T, String> {
         match &self.request {
             Some(value) => serde_json::from_value(value.clone())
                 .map_err(|error| format!("请求字段无效：{error}")),
@@ -548,7 +624,7 @@ fn write_image(request: &ImageRequest) -> Result<Value, String> {
     if !path.is_absolute() {
         return Err("--request.path 必须是绝对路径".into());
     }
-    let (bytes, extension) = render_image(request)?;
+    let (bytes, extension) = render_image(request, 0)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建目录：{error}"))?;
     }
@@ -574,15 +650,23 @@ fn write_corpus(request: &CorpusRequest) -> Result<Value, String> {
         request.formats.clone()
     };
     let mut files = Vec::with_capacity(request.count);
+    // 每个样本目录给一个稳定偏移：同一目录重复生成仍得到同一批内容（判重可复现），
+    // 不同目录之间则不会撞成同一批哈希。
+    let base_seed = request.directory.bytes().fold(0_u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u32)
+    });
     for index in 0..request.count {
         let format = &formats[index % formats.len()];
-        let (bytes, extension) = render_image(&ImageRequest {
-            path: String::new(),
-            width: request.width.max(1),
-            height: request.height.max(1),
-            format: format.clone(),
-            transparent: index % 3 == 1,
-        })?;
+        let (bytes, extension) = render_image(
+            &ImageRequest {
+                path: String::new(),
+                width: request.width.max(1),
+                height: request.height.max(1),
+                format: format.clone(),
+                transparent: index % 3 == 1,
+            },
+            base_seed.wrapping_add(index as u32),
+        )?;
         let name = format!("sample-{index:03}.{extension}");
         fs::write(directory.join(&name), &bytes)
             .map_err(|error| format!("无法写入样本：{error}"))?;
@@ -596,20 +680,39 @@ fn write_corpus(request: &CorpusRequest) -> Result<Value, String> {
     }))
 }
 
-fn render_image(request: &ImageRequest) -> Result<(Vec<u8>, String), String> {
+fn render_image(request: &ImageRequest, seed: u32) -> Result<(Vec<u8>, String), String> {
     let format = image_format(&request.format)?;
     let width = request.width.max(1);
     let height = request.height.max(1);
     let mut buffer = RgbaImage::new(width, height);
     for (x, y, pixel) in buffer.enumerate_pixels_mut() {
-        let red = (x * 255 / width) as u8;
-        let green = (y * 255 / height) as u8;
+        let mut red = (x * 255 / width) as u8;
+        let mut green = (y * 255 / height) as u8;
+        // 4×4 大格按种子位翻转明暗：让不同样本的感知哈希也有明显差异，
+        // 否则导入会把一批渐变图当成相似重复。
+        let cell = (y * 4 / height) * 4 + x * 4 / width;
+        if (seed >> (cell % 16)) & 1 == 1 {
+            red = 255 - red;
+            green = 255 - green;
+        }
+        let blue = (seed.wrapping_mul(37).wrapping_add(96) % 256) as u8;
         let alpha = if request.transparent {
-            ((x + y) % 256) as u8
+            ((x.wrapping_add(y).wrapping_add(seed)) % 256) as u8
         } else {
             255
         };
-        *pixel = Rgba([red, green, 96, alpha]);
+        *pixel = Rgba([red, green, blue, alpha]);
+    }
+    // 把种子写进前 4 个像素的最低位，保证不同样本即使渐变相同也不会撞哈希。
+    if width >= 4 && height >= 1 {
+        for index in 0..4_u32 {
+            let byte = (seed >> (index * 8)) as u8;
+            buffer.put_pixel(
+                index,
+                0,
+                Rgba([byte, byte.wrapping_mul(3), byte.wrapping_mul(7), 255]),
+            );
+        }
     }
     let mut cursor = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(buffer)
@@ -673,6 +776,18 @@ fn usage() -> String {
          \x20 library create|open|open-configured|close|info|counts|inspect-path\n\
          \x20 settings get|save\n\
          \x20 query images|ids|stats|folders|tags|detail|states|selection-tags\n\
+         \x20 import run|start|cancel|status\n\
+         \x20 metadata score|set-score|description|tags|add-tags|remove-tags\n\
+         \x20          rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash\n\
+         \x20 folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash\n\
+         \x20 collection list|create|rename|delete|reorder|add|remove|combine\n\
+         \x20 history list|undo|redo|clear\n\
+         \x20 viewer source\n\
+         \x20 edit estimate|save\n\
+         \x20 task list|wait|cancel\n\
+         \x20 maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags\n\
+         \x20 scenario import_cancel|task_queue_cancel|task_panic|close_during_task\n\
+         \x20          folder_lock|ai_lock|maintenance_check|idle_gc|idle_yield\n\
          \x20 fixture seed-db|write-image|corpus\n\
          \x20 logs emit|path\n\
          \n\
@@ -717,7 +832,7 @@ mod tests {
             format: "png".into(),
             transparent: false,
         };
-        let (bytes, extension) = render_image(&request).unwrap();
+        let (bytes, extension) = render_image(&request, 0).unwrap();
         assert_eq!(extension, "png");
         assert!(bytes.starts_with(b"\x89PNG"));
     }

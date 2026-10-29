@@ -7,6 +7,7 @@ use crate::{
     library::{
         db::LibraryDb,
         manifest::{LibraryInspection, LibraryManifest, inspect},
+        pack_gc,
         paths::LibraryPaths,
         schema::{self, SCHEMA_VERSION},
         temp,
@@ -121,10 +122,17 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
     let paths = LibraryPaths::new(path);
     paths.ensure_runtime_dirs()?;
     clean_temporary_directory(path)?;
-    let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
     let database = LibraryDb::open(&paths.database, read_connections)?;
     database.with_writer(|connection| schema::ensure(connection, &manifest))?;
     temp::ensure(&database, path)?;
+    // 段文件必须在打开缩略图包之前清理：`ThumbPack::open` 会读磁盘上编号最大的
+    // `.pack` 的头，残留的 `9999.pack` 会直接让图库打不开。
+    match pack_gc::cleanup_orphan_segments(&database, path) {
+        Ok(0) => {}
+        Ok(removed) => log::info!("清理了 {removed} 个残留缩略图包"),
+        Err(error) => log::warn!("清理残留缩略图包失败：{error}"),
+    }
+    let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
 
     Ok(LibrarySession {
         info: LibraryInfo {

@@ -1,4 +1,4 @@
-# 无窗口验收套件入口：后台运行、Idle 优先级、单测试线程、默认 cheap+default。
+﻿# 无窗口验收套件入口：后台运行、Idle 优先级、单测试线程、默认 cheap+default。
 #
 # 用法（在任意目录）：
 #   powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1
@@ -13,7 +13,14 @@ param(
         'acceptance_library',
         'acceptance_query',
         'acceptance_settings',
-        'acceptance_logs'
+        'acceptance_logs',
+        'acceptance_import',
+        'acceptance_metadata',
+        'acceptance_folders',
+        'acceptance_history',
+        'acceptance_viewer_edit',
+        'acceptance_tasks',
+        'acceptance_maintenance'
     )
 )
 
@@ -49,11 +56,18 @@ $cargoArgs = @(
 
 Write-Host "tiers: $env:LILITH_ACCEPT_TIERS"
 Write-Host "targets: $($Targets -join ', ')"
+# 报告是追加写的，汇总只看本轮的条目；容 5 秒时钟误差。
+$startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 5000
 & cargo @cargoArgs
 $code = $LASTEXITCODE
 
 # 报告路径跟随实际 target 目录，避免硬编码 src-tauri/target。
-$targetDir = (& cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+# cargo metadata 必须带 --manifest-path：仓库根没有 Cargo.toml，直接调用会报错退出。
+$targetDir = (& cargo metadata --manifest-path 'src-tauri/Cargo.toml' --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+if (-not $targetDir) {
+    Write-Warning "无法确定 target 目录，跳过报告汇总（测试退出码 $code）"
+    exit $code
+}
 $report = Join-Path $targetDir 'acceptance/report.jsonl'
 if (Test-Path $report) {
     Write-Host "report: $report"
@@ -61,7 +75,7 @@ if (Test-Path $report) {
     Get-Content $report | ForEach-Object {
         try {
             $entry = $_ | ConvertFrom-Json
-            if (-not $entry.ok) { $failed += $entry }
+            if ($entry.at -ge $startedAt -and -not $entry.ok) { $failed += $entry }
         }
         catch { }
     }

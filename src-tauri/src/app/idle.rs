@@ -9,6 +9,9 @@
 //! 顺序是有意的：前两条都是内存判断，零成本；只有它们都满足才去查第 3 条的 SQL。
 //! 平时一次数据库查询都不跑，不会为了「有没有垃圾」每 30 秒扫一遍几十万行。
 //!
+//! 阈值与轮询间隔都走 `tuned()`：GUI 构建固定 3 分钟 / 30 秒，只有 `headless` 构建
+//! 会被 `LILITH_IDLE_THRESHOLD_MS` / `LILITH_IDLE_POLL_MS` 覆盖，供验收把窗口缩到秒级。
+//!
 //! 不做「一次空闲窗口只跑一批」的代次计数：任务本身压到干净或被打断就结束，
 //! 天然自限，不需要再套一层窗口状态。
 
@@ -32,6 +35,30 @@ const POLL: Duration = Duration::from_secs(30);
 /// 关库时轮询的退出延迟上限。
 const TICK: Duration = Duration::from_secs(1);
 
+/// 当前构建生效的判定阈值：GUI 固定用 `IDLE_THRESHOLD`，无头构建可按环境变量缩短。
+pub fn idle_threshold() -> Duration {
+    tuned("LILITH_IDLE_THRESHOLD_MS", IDLE_THRESHOLD)
+}
+
+/// 当前构建生效的轮询间隔：GUI 固定用 `POLL`。
+fn poll_interval() -> Duration {
+    tuned("LILITH_IDLE_POLL_MS", POLL)
+}
+
+#[cfg(feature = "headless")]
+fn tuned(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+#[cfg(not(feature = "headless"))]
+fn tuned(_name: &str, default: Duration) -> Duration {
+    default
+}
+
 pub struct IdleLoop {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -45,6 +72,7 @@ impl IdleLoop {
             .name("idle-compact".to_owned())
             .spawn(move || {
                 let mut waited = Duration::ZERO;
+                let poll = poll_interval();
                 loop {
                     // 1 秒切片：关库时不必等满 30 秒。
                     std::thread::sleep(TICK);
@@ -52,7 +80,7 @@ impl IdleLoop {
                         break;
                     }
                     waited += TICK;
-                    if waited < POLL {
+                    if waited < poll {
                         continue;
                     }
                     waited = Duration::ZERO;
@@ -82,7 +110,7 @@ fn gate(auto: bool, idle: Option<Duration>, busy: bool) -> bool {
     let Some(idle) = idle else {
         return false;
     };
-    idle >= IDLE_THRESHOLD && !busy
+    idle >= idle_threshold() && !busy
 }
 
 fn tick(app: &AppHandle) {

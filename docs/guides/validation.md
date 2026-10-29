@@ -21,7 +21,7 @@
 
 ## 无窗口验收入口（开发期）
 
-`headless` feature 提供 `--headless` 命令面，用于在后台验证图库状态、文件事实、设置、查询与日志。B1 已落地；范围、档位与预算见[无窗口验收测试计划](../planning/2026-10-29-无窗口验收测试计划.md)。
+`headless` feature 提供 `--headless` 命令面，用于在后台验证图库状态、文件事实、设置、查询、日志与写路径。B1–B2 已落地；范围、档位与预算见[无窗口验收测试计划](../planning/2026-10-29-无窗口验收测试计划.md)。
 
 ```bash
 cargo build --manifest-path src-tauri/Cargo.toml --features headless
@@ -38,7 +38,9 @@ EXE=src-tauri/target/debug/lilith-artbank.exe
 "$EXE" --headless logs emit --request-json '{"level":"debug","lines":2,"lineBytes":8}'
 ```
 
-- 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
+- 命令面：`ping/help`、`library create|open|open-configured|close|info|counts|inspect-path`、`settings get|save`、`query images|ids|stats|folders|tags|detail|states|selection-tags`、`import run|start|cancel|status`、`metadata score|set-score|description|tags|add-tags|remove-tags|rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash`、`folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash`、`collection list|create|rename|delete|reorder|add|remove|combine`、`history list|undo|redo|clear`、`viewer source`、`edit estimate|save`、`task list|wait|cancel`、`maintenance thumbnails|check|export|orphan-move|save-report|pack|compact|zero-tags`、`scenario <name>`、`fixture seed-db|write-image|corpus`、`logs emit|path`。
+- 场景（同进程编排）：`import_cancel`、`task_queue_cancel`、`task_panic`、`close_during_task`、`folder_lock`、`ai_lock`、`maintenance_check`、`idle_gc`、`idle_yield`。`ai_lock` 用假任务占资源，不接真实 AI。
+- `LILITH_IDLE_THRESHOLD_MS` / `LILITH_IDLE_POLL_MS` 只在 `features=headless` 构建里生效，用于把自动回收的空闲窗口缩短到秒级；GUI 构建固定 3 分钟 / 30 秒。
 - `--library <path>` 在执行命令前显式打开图库；无头模式不自动打开上次图库。`--result <file>` 另存格式化结果；stdout 始终只有一行 JSON，含 `command/ok/cancelled/elapsedMs/peakWorkingSetBytes/data/error`；退出码 0 成功、1 失败、2 取消。
 - 入口不调用 GUI 的 `run()`，不创建用户可见窗口、不建托盘、不加载 WebView、不经过 IPC。必须设置 `LILITH_ARTBANK_ROOT`；未设置或为空时直接报错退出。B0 实测 tao 会建立一个 15×15、无标题、无任务栏入口的事件循环窗口，用户不可见；它不是应用界面。
 - 该 feature 不进 default、不进发布产物；不传 `--headless` 时同一二进制仍是正常 GUI 程序。
@@ -47,16 +49,21 @@ EXE=src-tauri/target/debug/lilith-artbank.exe
 验收套件：
 
 ```bash
+# 全部 11 个目标；目标多了以后用后台入口更省事，见下一条
 cargo test --manifest-path src-tauri/Cargo.toml --features headless \
-  --test acceptance_library --test acceptance_query \
-  --test acceptance_settings --test acceptance_logs -- --test-threads=1
+  --test acceptance_library --test acceptance_query --test acceptance_settings \
+  --test acceptance_logs --test acceptance_import --test acceptance_metadata \
+  --test acceptance_folders --test acceptance_history --test acceptance_viewer_edit \
+  --test acceptance_tasks --test acceptance_maintenance -- --test-threads=1
 # 或后台入口（Idle 优先级、单线程、默认 cheap+default）：
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1
 powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Tier heavy
+powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Targets acceptance_import
 ```
 
-- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1 的 12 个用例里 11 个是 cheap，日志轮转 1 个是 default。
+- 档位由 `LILITH_ACCEPT_TIERS=cheap|default|heavy` 选择，未设置时 cheap+default；heavy 必须显式打开。B1–B2 共 39 个用例：默认 37 个 cheap/default；2 个 heavy（9,455 文件完整检查、20,000 张移动）只在 `heavy` 档运行。
 - 工作区在 `<target>/acceptance/workspaces/`，正常结束自动回收；每个用例向 `<target>/acceptance/report.jsonl` 追加一行（名称、档位、成败、耗时、命令数、峰值工作集、文件数与字节数）。
+- 排查失败用例时设 `LILITH_ACCEPT_KEEP=1`：工作区不再回收，用例会把它打印成 `[keep] <路径>`。`LILITH_ACCEPT_BIN` 换被测二进制，`LILITH_ACCEPT_DISK_BUDGET` 改工作区磁盘预算（默认 2 GiB）。
 - 裸 `cargo test` 下所有验收目标编译为空，不启动子进程；`tests/gate_guard.rs` 强制这一门控。
 
 ## 高成本测试（不用于日常检查）

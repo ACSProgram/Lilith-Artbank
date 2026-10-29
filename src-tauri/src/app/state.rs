@@ -778,8 +778,6 @@ impl AppState {
         if let Err(error) = temp::clear(&session.db, Path::new(&session.info.path)) {
             log::warn!("清空临时文件夹失败：{error}");
         }
-        // 让位、提交失败与进程崩溃都会在 thumbs/ 留下没登记的段文件。
-        self.cleanup_pack_residue(&session.db, Path::new(&session.info.path));
         let info = session.info.clone();
         self.settings.set_library_path(Some(info.path.clone()))?;
         self.clear_previous_temp();
@@ -806,17 +804,6 @@ impl AppState {
             self.after_library_open();
         }
         Ok(info)
-    }
-
-    /// 打开图库时清理缩略图包残留：`thumbs/` 里不在 `thumb_segments` 表里的 `.pack` 都删。
-    ///
-    /// 覆盖三种来源：让位时没删成的、提交失败留下的、进程崩溃留在磁盘上的。
-    fn cleanup_pack_residue(&self, database: &LibraryDb, root: &Path) {
-        match pack_gc::cleanup_orphan_segments(database, root) {
-            Ok(0) => {}
-            Ok(removed) => log::info!("清理了 {removed} 个残留缩略图包"),
-            Err(error) => log::warn!("清理残留缩略图包失败：{error}"),
-        }
     }
 
     /// 开库时起空闲回收线程；换库时先停旧的，避免两个循环同时提交任务。
@@ -2322,7 +2309,7 @@ impl AppState {
                         if !automatic {
                             return false;
                         }
-                        matches!(activity::idle_for(), Some(idle) if idle < idle_loop::IDLE_THRESHOLD)
+                        matches!(activity::idle_for(), Some(idle) if idle < idle_loop::idle_threshold())
                     };
                     match pack_gc::compact(&database, &root, &thumbs, &*worker, &user_back) {
                         Ok(report) => {
