@@ -6,6 +6,7 @@
 
 | 日期 | 文档 | 说明 |
 | --- | --- | --- |
+| 2026-10-29 | [整改批次 B：数据安全 II](2026-10-29-整改批次B-数据安全II.md) | 全量审查 L2/L4/L10：新增 `library/fs_journal.rs` 的 `FileJournal`，写事务与撤销/重做里的文件动作（搬移原图/目录、发布编辑结果、建删目录）统一记账，提交失败或中途报错时逆序撤回，图片移动、文件夹新建/重命名/移动、编辑保存与孤儿清理共用一套补偿（合并批次 A 的 `FolderFsJournal`）；孤儿清理改为先搬文件、再用短事务写一条 `orphanMove` 记录，记账失败搬回原位；缩略图段与特征包追加只 `flush`，累积阈值、换段、指针提交前与关闭图库时 `sync_all`，打开图库时按 `thumb_segments.size` 校验段长度并清掉越界指针，特征包重开写句柄时截掉半条尾部记录。新增 8 个单测，`cargo test --lib` 487 通过、clippy 0 警告；`acceptance_folders` / `acceptance_history` / `acceptance_maintenance` / `acceptance_import` / `acceptance_metadata` / `acceptance_viewer_edit` / `acceptance_ai` / `acceptance_optimize` / `acceptance_library` 共 31 个用例通过，其余 5 个目标与真实窗口未做。 |
 | 2026-10-29 | [整改批次 A：数据安全 I](2026-10-29-整改批次A-数据安全I.md) | 全量审查 L1/T1/L3/L9：文件夹撤销与重做的磁盘动作整次回退（`FolderFsJournal`，覆盖路径变更、空目录删除与新建）；导入工作线程 panic 时由 `WriterGuard` 强制 join 写线程，记录被删后 `append_live_in_tx` 跳过逆数据；撤销暂存目录清理改到写连接，避免删掉“在建”目录；文件夹子路径以库里规范路径为准，祖先/子树判断与计数统一忽略 ASCII 大小写。新增 8 个单测，`cargo test --lib` 479 通过、clippy 0 警告；`acceptance_folders` / `acceptance_history` / `acceptance_import` 共 7 个用例通过，完整套件与真实窗口未做。 |
 | 2026-10-29 | [无窗口验收 B3 与逐条归档](2026-10-29-无窗口验收B3与逐条归档.md) | B3 落地 `optimize`、`ai`、`mcp` 三组无头命令与五个同进程场景：小纹理估算/执行与指纹核对、测试进程内假 `/v1` 的协议/重试/语义/相似分组/临时区、真实 `--mcp-stdio` 桥的三档/审批/审计/端口占用；14 个目标共 48 个用例（默认 45、heavy 3）。`todo.md` 逐组标注自动覆盖与手工原因，4 个可完全自动判定的条目归档；heavy 300 张纹理未跑。 |
 | 2026-10-29 | [无窗口验收测试计划](2026-10-29-无窗口验收测试计划.md) | 把 `todo.md` 中不依赖真实窗口、渲染、模型与外部数据的条目改成后台测试的目标、命令面、场景、数据策略、档位、预算与覆盖矩阵；B0–B3 全部完成，实施记录见各批次与 B3 归档。 |

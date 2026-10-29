@@ -94,9 +94,9 @@
 - 缩略图最长边 512px、WebP quality 80；透明图走 RGBA。
 - 追加式 `.pack`：`0001.pack` 起、16 字节段头（`ARTBTHM1` + u32 版本 + 4 字节保留）、默认 1 GiB/段。
 - 写入由单写通道串行执行，每个 blob 后 flush；读取按 segment 缓存句柄并定位读，单 blob 上限 32 MiB。
-- pack 不做逐 blob fsync。进程崩溃只会留下未引用 blob；断电后指针可能失效，按缓存缺失处理，由维护任务重建。
+- 不做逐 blob fsync：累积 8 MiB、换段、指针事务提交前（每批入库、缩略图重建、编辑保存）与关闭图库时 `sync_all`。掉电最多丢掉最后一段未落盘的字节，打开图库时按 `thumb_segments.size` 比对磁盘长度，把越界指针清成 `thumb_segment = 0`，这些图重新算「缺缩略图」并由重建任务补上。
 - 每批事务内写入 `thumb_segment / thumb_offset / thumb_length / thumb_format / thumb_width / thumb_height / thumb_version = 1`，同时维护 `thumb_segments` 行与段文件尺寸。
-- 崩溃最多留下未引用的 blob；已提交行不受影响。pack 丢失或指针失效时协议返回 404，由前端显示占位，不会崩溃。
+- 进程崩溃最多留下未引用的 blob；已提交行不受影响。pack 丢失或指针失效时协议返回 404，由前端显示占位，不会崩溃。
 
 ### `thumb://` 协议
 

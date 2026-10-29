@@ -24,8 +24,9 @@ use crate::{
     imageops::thumbnail,
     import::decode,
     library::{
-        BatchReporter, content, db::LibraryDb, folders, import as repository, metadata,
-        paths::LibraryPaths, service::now_ms, thumbs::ThumbPack, viewer,
+        BatchReporter, content, db::LibraryDb, folders, fs_journal::FileJournal,
+        import as repository, metadata, paths::LibraryPaths, service::now_ms, thumbs::ThumbPack,
+        viewer,
     },
 };
 
@@ -263,15 +264,25 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-pub struct OperationDraft {
+/// 一次写事务的草稿：逆数据、影响行数与文件补偿日志。
+///
+/// `fs` 由 [`write_with_id_mode`] 提供并在事务失败时统一撤回，写闭包只负责
+/// “做了什么就记什么”，不再各自写回滚分支。
+pub struct OperationDraft<'a> {
     id: i64,
     affected: u64,
     chunks: Vec<Chunk>,
+    fs: &'a mut FileJournal,
 }
 
-impl OperationDraft {
+impl OperationDraft<'_> {
     pub fn id(&self) -> i64 {
         self.id
+    }
+
+    /// 文件补偿日志：搬移、发布、建/删目录都记在这里。
+    pub fn journal(&mut self) -> &mut FileJournal {
+        self.fs
     }
 
     pub fn affected(&mut self, n: u64) {
@@ -739,10 +750,13 @@ pub struct CollectionItemsRecord {
 
 /// 同步写操作：`work` 与记录写入处在同一个事务里。
 /// `affected == 0` 且没有逆数据时整条回滚：既不留空记录，也不清空重做分支。
+///
+/// 写闭包里的文件动作通过 `draft.journal()` 记账；业务错误、SQL 失败、提交失败与
+/// panic 展开都会在文件补偿日志析构时逆序撤回，提交成功才保留这些动作。
 pub fn write<T>(
     database: &LibraryDb,
     op: NewOperation<'_>,
-    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
+    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft<'_>) -> AppResult<T>,
 ) -> AppResult<T> {
     write_with_id(database, op, work).map(|(value, _)| value)
 }
@@ -752,7 +766,7 @@ pub fn write<T>(
 pub fn write_with_id<T>(
     database: &LibraryDb,
     op: NewOperation<'_>,
-    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
+    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft<'_>) -> AppResult<T>,
 ) -> AppResult<(T, Option<i64>)> {
     write_with_id_mode(database, op, true, work)
 }
@@ -763,15 +777,18 @@ pub fn write_with_id_mode<T>(
     database: &LibraryDb,
     op: NewOperation<'_>,
     record: bool,
-    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft) -> AppResult<T>,
+    work: impl FnOnce(&Transaction<'_>, &mut OperationDraft<'_>) -> AppResult<T>,
 ) -> AppResult<(T, Option<i64>)> {
-    database.with_writer(|connection| {
+    // 装填的补偿日志：只有提交成功才 `disarm()`，其余退出路径（含 panic）都会撤回。
+    let mut journal = FileJournal::armed();
+    let outcome = database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !record {
             let mut draft = OperationDraft {
                 id: 0,
                 affected: 0,
                 chunks: Vec::new(),
+                fs: &mut journal,
             };
             let value = work(&transaction, &mut draft)?;
             transaction.commit()?;
@@ -788,10 +805,12 @@ pub fn write_with_id_mode<T>(
             id: transaction.last_insert_rowid(),
             affected: 0,
             chunks: Vec::new(),
+            fs: &mut journal,
         };
         let value = work(&transaction, &mut draft)?;
         if draft.affected == 0 && draft.chunks.is_empty() {
-            // 事务随 drop 回滚。
+            // 事务随 drop 回滚；已经落地的文件动作也必须一起撤回，否则磁盘比库新。
+            draft.fs.rollback();
             return Ok((value, None));
         }
         transaction.execute(
@@ -802,7 +821,11 @@ pub fn write_with_id_mode<T>(
         let operation_id = draft.id;
         transaction.commit()?;
         Ok((value, Some(operation_id)))
-    })
+    });
+    if outcome.is_ok() {
+        journal.disarm();
+    }
+    outcome
 }
 
 /// 长任务先建 `pending` 记录，再在每批写入时追加逆数据；任务结束后 `finish_live`。
@@ -3156,7 +3179,7 @@ fn undo_folder(
         }
         // 一次操作可能有多条文件夹路径变更；任何一条失败都算整次失败：
         // 已改过的目录逆序改回去，和随后回滚的数据库事务回到同一状态。
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let applied = (|| -> AppResult<()> {
             for chunk in chunks {
                 if chunk.format == ChunkFormat::SortJson {
@@ -3286,7 +3309,7 @@ fn redo_folder(
             return Ok(());
         }
         // 与撤销对称：任一条失败都逆序撤回已经落地的目录动作。
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let applied = (|| -> AppResult<()> {
             match kind {
                 HistoryKind::FolderCreate => {
@@ -3367,7 +3390,7 @@ fn undo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut created_folders: Vec<FolderRef> = Vec::new();
         let mut redo_moves = Vec::new();
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let result = (|| -> AppResult<()> {
             for chunk in load_chunks(&transaction, operation_id)? {
                 if chunk.format == ChunkFormat::Json {
@@ -3504,7 +3527,7 @@ fn redo_move(database: &LibraryDb, root: &Path, operation_id: i64) -> AppResult<
         if moves.is_empty() && folders.is_empty() {
             return Err(AppError::message("这条记录缺少重做数据"));
         }
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
         let result = (|| -> AppResult<()> {
             // 与撤销对称：任一条失败都逆序撤回已经落地的目录动作。
@@ -4083,7 +4106,7 @@ fn undo_import(
                 },
             )?;
         }
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let result = (|| -> AppResult<()> {
             folders::cleanup_created(&transaction, root, &created_folders, &mut journal)?;
             for tag in &created_tags {
@@ -4145,7 +4168,7 @@ fn redo_import(
 
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut journal = folders::FolderFsJournal::default();
+        let mut journal = FileJournal::default();
         let result = (|| -> AppResult<()> {
             folders::redo_create(&transaction, root, &folders, &mut journal)?;
             ensure_import_tags(&transaction, &tags)?;
@@ -5538,6 +5561,61 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn write_rolls_back_file_actions_when_the_work_fails() {
+        let fixture = Fixture::new();
+        let source = fixture.write_content("a");
+        let target = fixture.root.join("风景");
+        fs::create_dir_all(&target).unwrap();
+        let destination = target.join("moved.jpg");
+
+        let result: AppResult<()> = write(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Move, "测试搬移"),
+            |_, draft| {
+                fs::rename(&source, &destination)?;
+                draft.journal().renamed(&source, &destination);
+                Err(AppError::message("模拟写失败"))
+            },
+        );
+        assert!(result.is_err());
+        assert!(source.exists(), "写失败后文件要回到原位");
+        assert!(!destination.exists());
+        let records: i64 =
+            fixture
+                .db()
+                .with_reader(|connection| {
+                    Ok(connection
+                        .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))?)
+                })
+                .unwrap();
+        assert_eq!(records, 0, "失败的事务不留空记录");
+    }
+
+    #[test]
+    fn write_keeps_file_actions_after_commit() {
+        let fixture = Fixture::new();
+        let source = fixture.write_content("b");
+        let target = fixture.root.join("风景");
+        fs::create_dir_all(&target).unwrap();
+        let destination = target.join("moved.jpg");
+
+        write(
+            fixture.db(),
+            NewOperation::new(HistoryKind::Move, "测试搬移"),
+            |_, draft| {
+                fs::rename(&source, &destination)?;
+                draft.journal().renamed(&source, &destination);
+                draft.affected(1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(destination.exists(), "提交成功后文件留在新位置");
+        assert!(!source.exists());
+        assert_eq!(list(fixture.db()).unwrap().len(), 1);
     }
 
     #[test]

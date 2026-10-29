@@ -11,7 +11,7 @@ use crate::{
         paths::LibraryPaths,
         schema::{self, SCHEMA_VERSION},
         temp,
-        thumbs::ThumbPack,
+        thumbs::{self, ThumbPack},
     },
 };
 
@@ -133,6 +133,17 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
         Err(error) => log::warn!("清理残留缩略图包失败：{error}"),
     }
     let thumbs = Arc::new(ThumbPack::open(&paths.thumbs)?);
+    // 掉电后段文件可能短于记录长度：先把越界指针清掉，这些行会在下次重建缩略图时补上。
+    match thumbs::validate_segments(&database, &paths.thumbs) {
+        Ok(report) if report.cleared_pointers > 0 => log::warn!(
+            "缩略图段校验：缺段 {}、截断 {}，清空 {} 张图片的缩略图指针",
+            report.missing_segments,
+            report.truncated_segments,
+            report.cleared_pointers
+        ),
+        Ok(_) => {}
+        Err(error) => log::warn!("校验缩略图段失败：{error}"),
+    }
 
     Ok(LibrarySession {
         info: LibraryInfo {

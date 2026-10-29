@@ -21,6 +21,12 @@ const HEADER_VERSION: u32 = 1;
 pub const HEADER_LEN: u64 = 16;
 pub const DEFAULT_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
 pub const MAX_THUMBNAIL_BYTES: u32 = 32 * 1024 * 1024;
+/// 累积这么多新字节就同步一次段文件。
+///
+/// 每条缩略图都 `sync_all` 会把导入变成逐张 fsync；完全不同步则掉电后数据库里
+/// 的指针可能指向段文件末尾之外。取一个字节阈值：最坏丢一个批次的尾部，
+/// 由打开图库时的段长度校验把越界指针清掉、下次重建补上。
+const SYNC_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThumbLocation {
@@ -57,6 +63,8 @@ struct PackState {
     segment: u32,
     offset: u64,
     file: Option<File>,
+    /// 自上次 `sync_all` 以来追加的字节数；段轮换与 `sync()` 时清零。
+    unsynced: u64,
 }
 
 impl ThumbPack {
@@ -98,6 +106,7 @@ impl ThumbPack {
                 segment: latest,
                 offset,
                 file: None,
+                unsynced: 0,
             }),
             readers: RwLock::new(HashMap::new()),
         })
@@ -116,12 +125,12 @@ impl ThumbPack {
 
         let length = bytes.len() as u64;
         if state.offset > HEADER_LEN && state.offset + length > self.segment_size {
-            if let Some(file) = state.file.as_mut() {
-                file.flush()?;
-            }
+            // 换段前先把旧段落盘：指针已经指向它，丢了就再也读不回来。
+            state.sync()?;
             state.segment += 1;
             state.offset = HEADER_LEN;
             state.file = Some(create_segment(&self.directory, state.segment)?);
+            state.unsynced = 0;
         }
 
         let offset = state.offset;
@@ -129,6 +138,10 @@ impl ThumbPack {
         file.write_all(bytes)?;
         file.flush()?;
         state.offset += length;
+        state.unsynced += length;
+        if state.unsynced >= SYNC_INTERVAL_BYTES {
+            state.sync()?;
+        }
 
         Ok(ThumbLocation {
             segment: state.segment,
@@ -137,8 +150,22 @@ impl ThumbPack {
         })
     }
 
+    /// 把当前段的写入落到磁盘；没有待同步字节时什么也不做。
+    ///
+    /// 指针事务提交前调用，让「库里说有缩略图」尽量等于「磁盘上真有这些字节」；
+    /// 关闭或切换图库时由析构兜底。
+    pub fn sync(&self) -> AppResult<()> {
+        self.state.lock().sync()
+    }
+
     pub fn segment_size_bytes(&self, segment: u32) -> AppResult<u64> {
         Ok(std::fs::metadata(segment_path(&self.directory, segment))?.len())
+    }
+
+    /// 段文件所在目录；只有测试需要按目录定位段文件。
+    #[cfg(test)]
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
 
     /// 包被重写后重新读最新段头，让写指针落到新段末尾。
@@ -164,9 +191,14 @@ impl ThumbPack {
         };
         {
             let mut state = self.state.lock();
+            // 写句柄马上丢弃：先把尾巴落盘，再按新段重设写指针。
+            if let Err(error) = state.sync() {
+                log::warn!("缩略图段落盘失败：{error}");
+            }
             state.file = None;
             state.segment = latest;
             state.offset = offset;
+            state.unsynced = 0;
         }
         self.readers.write().clear();
         Ok(())
@@ -205,6 +237,14 @@ impl ThumbPack {
     }
 }
 
+impl Drop for ThumbPack {
+    fn drop(&mut self) {
+        if let Err(error) = self.sync() {
+            log::warn!("关闭缩略图包时落盘失败：{error}");
+        }
+    }
+}
+
 impl PackState {
     fn ensure_file(&mut self, directory: &Path) -> AppResult<()> {
         if self.file.is_some() {
@@ -220,6 +260,19 @@ impl PackState {
             self.offset = file.metadata()?.len();
             self.file = Some(file);
         }
+        self.unsynced = 0;
+        Ok(())
+    }
+
+    /// 当前段落盘；没有待同步字节时是空操作。
+    fn sync(&mut self) -> AppResult<()> {
+        if self.unsynced == 0 {
+            return Ok(());
+        }
+        let file = self.file.as_mut().expect("有未落盘字节时写句柄必然存在");
+        file.flush()?;
+        file.sync_all()?;
+        self.unsynced = 0;
         Ok(())
     }
 }
@@ -264,6 +317,75 @@ fn read_header(path: &Path) -> AppResult<u64> {
         )));
     }
     Ok(size)
+}
+
+/// 段长度校验的结果；只在真的修过东西时非零。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbRepair {
+    /// 整段文件不见了。
+    pub missing_segments: u32,
+    /// 段文件比 `thumb_segments.size` 记录的短（掉电后尾部丢失）。
+    pub truncated_segments: u32,
+    /// 被清掉指针的图片行数。
+    pub cleared_pointers: u64,
+}
+
+/// 打开图库时校验段文件长度，把指向段尾之外的缩略图指针清掉。
+///
+/// 指针事务是持久的，而段文件在掉电时可能丢掉最后一截；不清掉这些指针，
+/// 网格会一直 404 且没有任何东西会去修它。清空后这些行重新算“缺缩略图”，
+/// 下一次重建缩略图任务就会补上。
+pub fn validate_segments(database: &LibraryDb, directory: &Path) -> AppResult<ThumbRepair> {
+    let segments: Vec<(u32, i64)> = database.with_reader(|connection| {
+        let mut statement =
+            connection.prepare("SELECT id, size FROM thumb_segments WHERE id > 0")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })?;
+
+    let mut report = ThumbRepair::default();
+    let mut repairs: Vec<(u32, u64)> = Vec::new();
+    for (segment, recorded) in segments {
+        let recorded = u64::try_from(recorded).unwrap_or(0);
+        match std::fs::metadata(segment_path(directory, segment)) {
+            Ok(metadata) => {
+                let actual = metadata.len();
+                if actual < recorded {
+                    log::warn!(
+                        "缩略图段 {segment:04} 只有 {actual} 字节，记录是 {recorded} 字节；清掉越界指针"
+                    );
+                    report.truncated_segments += 1;
+                    repairs.push((segment, actual));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::warn!("缩略图段 {segment:04} 的段文件不见了；清空这一段的指针");
+                report.missing_segments += 1;
+                repairs.push((segment, 0));
+            }
+            Err(error) => log::warn!("读取缩略图段 {segment:04} 失败：{error}"),
+        }
+    }
+    if repairs.is_empty() {
+        return Ok(report);
+    }
+
+    database.with_writer(|connection| {
+        let transaction = connection.transaction()?;
+        for (segment, usable) in &repairs {
+            report.cleared_pointers += transaction.execute(
+                "UPDATE images
+                 SET thumb_segment = 0, thumb_offset = 0, thumb_length = 0
+                 WHERE thumb_segment = ?1 AND thumb_offset + thumb_length > ?2",
+                rusqlite::params![segment, i64::try_from(*usable).unwrap_or(i64::MAX)],
+            )? as u64;
+        }
+        transaction.commit()?;
+        Ok(())
+    })?;
+    Ok(report)
 }
 
 pub fn load_pointer(database: &LibraryDb, image_id: i64) -> AppResult<Option<ThumbPointer>> {
@@ -380,6 +502,10 @@ pub fn rebuild(
         repository::ensure_thumb_segment(&transaction, location.segment, now)?;
         if let Ok(size) = pack.segment_size_bytes(location.segment) {
             repository::update_thumb_segment_size(&transaction, location.segment, size)?;
+        }
+        // 指针提交前落盘：重建是后台任务，多一次 fsync 换来掉电后不用整库重来。
+        if let Err(error) = pack.sync() {
+            log::warn!("缩略图段落盘失败：{error}");
         }
         transaction.commit()?;
         Ok(())
@@ -585,6 +711,67 @@ mod tests {
             b"thumbnail-bytes"
         );
         assert!(load_pointer(&session.db, 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn clears_pointers_past_a_truncated_segment() {
+        use rusqlite::params;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = crate::library::service::create(&root, "段校验", 1).unwrap();
+        let first = session.thumbs.append(b"first-thumbnail").unwrap();
+        let second = session.thumbs.append(b"second-thumbnail").unwrap();
+        assert_eq!(first.segment, second.segment);
+        session.thumbs.sync().unwrap();
+
+        let ids = session
+            .db
+            .with_writer(|connection| {
+                let mut ids = Vec::new();
+                for (index, location) in [first, second].iter().enumerate() {
+                    connection.execute(
+                        "INSERT INTO images(
+                            content_hash, file_ext, folder_id, file_size, width, height, format,
+                            has_alpha, phash, colors4, colors8, score, description, imported_at,
+                            modified_at, thumb_segment, thumb_offset, thumb_length, thumb_format,
+                            thumb_width, thumb_height, thumb_version
+                         ) VALUES (?1, 'webp', 1, 100, 512, 512, 'webp', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1,
+                            ?2, ?3, ?4, 'webp', 512, 512, 1)",
+                        params![
+                            format!("{index:0>64}"),
+                            location.segment,
+                            location.offset,
+                            location.length
+                        ],
+                    )?;
+                    ids.push(connection.last_insert_rowid());
+                }
+                crate::library::import::ensure_thumb_segment(connection, first.segment, 1)?;
+                crate::library::import::update_thumb_segment_size(
+                    connection,
+                    first.segment,
+                    HEADER_LEN + 30,
+                )?;
+                Ok(ids)
+            })
+            .unwrap();
+
+        // 模拟掉电：段文件只剩第一条缩略图。
+        let path = segment_path(session.thumbs.directory(), first.segment);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(HEADER_LEN + u64::from(first.length)).unwrap();
+        drop(file);
+
+        let report = validate_segments(&session.db, session.thumbs.directory()).unwrap();
+        assert_eq!(report.truncated_segments, 1);
+        assert_eq!(report.cleared_pointers, 1);
+        assert!(load_pointer(&session.db, ids[0]).unwrap().is_some());
+        assert!(
+            load_pointer(&session.db, ids[1]).unwrap().is_none(),
+            "越界指针必须被清掉，否则网格会一直 404"
+        );
     }
 
     #[test]

@@ -89,6 +89,7 @@ origin_operation_id 导入批次；用于撤销导入时找回本次新增的行
 - 永久删除与清空回收站不再立即删行删文件，只写 `purge_operation_id`。这些图片与文件夹行不出现在回收站、回收站树、普通视图与全库搜索中；记录过期或清空操作记录后，`ReleaseGarbage` 任务才删行删原图与空目录。
 - `operations.id` 使用 `AUTOINCREMENT`，记录清理后不复用；`purge_operation_id`、`origin_operation_id` 不建外键，记录行删除后标记仍可用于释放扫描。
 - `thumb_segment = 0` 表示还没有缩略图；`thumb_version` 用于 URL 缓存失效。缩略图包追加写入，永久删除图片不会回收包内字节。
+- 缩略图段在追加 8 MiB、换段、指针事务提交前与切换/关闭图库时 `sync_all`，其余追加只 `flush`；打开图库时按 `thumb_segments.size` 与磁盘实际长度比对，缺段或截断时把越界指针清成 `thumb_segment = 0`，这些行重新算「缺缩略图」并由重建任务补上。
 - `feature_blobs` 只存位置与模型/维度，不存向量本体；避免主库膨胀。
 - FTS5 使用 `trigram` tokenizer，支持中文子串；查询少于 3 个字符时回退 `LIKE`。
 - 描述、标签、回收站、集合关系与 FTS 索引由 schema 触发器/外键维护；应用不手工写 FTS 表。
@@ -302,6 +303,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 已接入：移入回收站、恢复、永久删除、清空回收站；文件夹移入回收站（`folderTrash`）、恢复回收站文件夹（`folderRestore`）、永久删除回收站文件夹（`folderPurge`）；导入、编辑保存、图片移动、文件夹创建/重命名/移动/删除/排序；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除/合并（`kind='tagMerge'`）、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述；图片空间优化（`kind='optimize'`，只记结果，不可撤销）；孤儿移入回收站（`kind='orphanMove'`，可撤销）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
 - `orphanMove` 的 `data` 是 `(源绝对路径, 目标绝对路径)[]` 的 JSON 数组，整次清理写**一条**记录，撤销一次移回整批；原路径已被占用时跳过该条并计入「无法恢复」。它不改变图库内容，`releases_files()` 返回 `false`，不参与待释放统计。
 - 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，既不留下空记录，也不清空重做分支（没有实际改动的操作不算新时间线）。`write` 在同一个事务里删除 `undone` / `redoing` 记录：确实写入的新操作开启新时间线，灰色记录与其暂存文件不再可重做。
+- 写事务里的文件动作（搬移原图或目录、发布编辑结果、新建目录）通过 `draft.journal()` 记进 `library/fs_journal.rs` 的 `FileJournal`。事务提交成功才 `disarm()`；业务错误、SQL 失败、提交失败与 panic 展开都会在日志析构时逆序撤回，撤回失败只记日志。搬移文件、图片移动、编辑保存、文件夹新建/重命名/移动与孤儿清理都走这一条补偿路径，不再各写一套局部回滚。
 - 长任务用 `history::LiveOperation` 包住 `begin_live`：每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据，正常结束、取消、失败与 panic 都通过 `finish_live` 收尾；导入、批量 AI 描述与图片空间优化使用。排队取消或线程起不来时 guard 随闭包丢弃，空记录删除；进程被强杀时 Drop 不执行，仍由下次打开恢复。
 - `begin_live` 不结束重做分支：导入可能整批都是重复跳过，或排队未启动；只有确实写入内容的批次（导入批次、AI 描述写入与压缩批次）才调用 `discard_redo_in_tx`。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。撤销/重做运行中 panic 会把 `undo_runs` 标为失败；`undoing` / `redoing` 记录保留给下次打开续做，本次不自动重试。
 - 图片空间优化不写任何逆数据：每批事务内更新 `images` 并累加 `affected`，完成后用 `history::update_label` 把「N 张 · 省 X」写进标题。`run_undo` 在标记 `undoing` 之前预检链中含 `optimize` 就返回“压缩操作不可撤销，原图已删除”，不会留下假的 `undoFailed`；记录面板同样禁用撤销。
@@ -326,7 +328,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 永久删除回收站文件夹：撤销先记下 `purge_operation_id` 的文件夹 id（`PurgeFolderIds`）与图片 id，再清空标记；重做按原 id 重新写标记。释放任务已经删掉的行无法恢复，这一点由“过期或清空记录后不可撤销”的现有协议保证。
 - `moves`：`(imageId, fromFolderId, toFolderId, oldModifiedAt)`。撤销按当前 `folder_id` 判断：已是源文件夹就跳过，仍是目标文件夹才把文件移回并恢复 `modified_at`；文件移动失败会回滚本记录已完成的移动。重做按相反方向执行，并恢复撤销时的修改时间。移动时隐式新建的目标文件夹会在撤销后按空文件夹清理；重做按捕获的完整文件夹行重建。
 - 文件夹：创建记录本次新建的全部 `(id, path)`（多级路径会同时新建祖先）；撤销时从深到浅，仅在仍为空时删目录与行，重做用原 id、路径、`created_at`、`sort_index` 补回。重命名/移动记录旧/新路径与旧/新 `sort_index`；撤销与重做都以当前路径判断方向。旧的 `folderDelete`（空文件夹物理删除）记录 `id`、路径、`created_at`、`sort_index`，撤销用原 id 重建行与目录，重做在仍为空时再次删除。排序记录同级发生变化的旧 `sort_index`，撤销逐个恢复，重做使用撤销时捕获的目标排序位。批量移动（`place_folders`）另外写一条 `sortJson`，记录目标父级被挤动的兄弟 `(id, 旧位, 新位)`：撤销恢复旧位、重做恢复新位，不依赖 `redo` 捕获；没有 `sortJson` 的旧记录行为不变。
-- 文件夹撤销/重做的磁盘动作是整次性的：一条记录可能包含多条 `FolderPathChange`，全部文件系统动作记在 `folders::FolderFsJournal` 里（已搬移、已删空目录、已新建目录）；任一条失败或事务提交失败时逆序撤回，数据库随事务回滚，磁盘也回到同一起点。单项失败不再留下“行还在、目录已搬走”的半截状态。
+- 文件夹撤销/重做的磁盘动作是整次性的：一条记录可能包含多条 `FolderPathChange`，全部文件系统动作记在 `library/fs_journal.rs` 的 `FileJournal` 里（已搬移、已删空目录、已新建目录）；任一条失败或事务提交失败时逆序撤回，数据库随事务回滚，磁盘也回到同一起点。单项失败不再留下“行还在、目录已搬走”的半截状态。同步写入里的文件补偿用同一个类型（见下节），只是那条路径由事务成功与否决定是否撤回。
 - 编辑：保存时在事务内暂存旧原图到 `.artbank/undo/<operationId>/`、写入编辑前完整内容快照（含 pHash / 主色 / `modified_at`）与本次新哈希。撤销要求当前哈希等于本次新哈希，用暂存文件恢复内容、重新编码缩略图、递增 `thumb_version`、清空 `feature_blobs`，并把新原图移入暂存目录（不删除）；重做使用撤销时捕获的完整内容状态，把新原图移回、恢复行与缩略图。撤销/重做都会删除另一侧的预览缓存；旧图暂存会保留以便再次撤销。
 - 导入：新增行带 `origin_operation_id`；chunk 记录新建文件夹、新建标签与合并前快照。撤销按 origin 分块把原图移入 `.artbank/undo/<op>/`、捕获完整行（含标签、集合位置、缩略图指针）后删行，恢复合并项，再删除本次新建且仍为空的文件夹与无引用的标签。重做用原 id 插回行、移回原图、补标签/集合位置并恢复合并后的评分/时间，再重建本次新建的文件夹与标签。
 - 评分：`triples(imageId, oldScore, oldModifiedAt)`。撤销恢复旧评分与修改时间，重做使用撤销时捕获的新值。

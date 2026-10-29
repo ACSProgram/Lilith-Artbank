@@ -1159,7 +1159,7 @@ pub fn tag_image_count(database: &LibraryDb, tag_id: i64) -> AppResult<u64> {
 
 fn merge_in_transaction(
     transaction: &Transaction<'_>,
-    draft: &mut history::OperationDraft,
+    draft: &mut history::OperationDraft<'_>,
     source_id: i64,
     target_id: i64,
 ) -> AppResult<MergeReport> {
@@ -1273,7 +1273,7 @@ pub fn move_images_with_id(
                     .root
                     .join(target_path.replace('/', std::path::MAIN_SEPARATOR_STR))
             };
-            std::fs::create_dir_all(&target_dir)?;
+            draft.journal().create_dir_all(&target_dir)?;
             ensure_dir_inside_root(&paths.root, &target_dir)?;
 
             let now = now_ms();
@@ -1337,6 +1337,8 @@ pub fn move_images_with_id(
                         params![target_folder, now, image_id],
                     ) {
                         Ok(changed) if changed > 0 => {
+                            // 单张成功即记账；整批失败时由补偿日志逆序搬回。
+                            draft.journal().renamed(&old_path, &new_path);
                             report.moved += 1;
                             moves.push((image_id, old_folder_id, target_folder, old_modified_at));
                         }

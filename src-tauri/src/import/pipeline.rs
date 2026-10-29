@@ -1054,6 +1054,11 @@ fn flush(
             }
         }
 
+        // 指针事务一旦提交就是持久的；先把本批追加的缩略图字节落盘，
+        // 否则掉电后这批行会指向段尾之外。
+        if let Err(error) = pack.sync() {
+            log::warn!("缩略图段落盘失败：{error}");
+        }
         transaction.commit()?;
         Ok(stats)
     });

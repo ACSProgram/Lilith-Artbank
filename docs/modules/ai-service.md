@@ -216,6 +216,7 @@ Content-Type: application/octet-stream
 - 文件名由 kind、模型 slug（小写、非字母数字折叠为 `-`、最多 48 字符）、维度、dtype 与模型名 BLAKE3 前 8 位组成，同一模型名始终落到同一个包。
 - 包头 32 字节：magic `ARTBFTR1`、version、kind、dtype、dim、record_len、创建时间（14-15 字节保留）；`record_len` 必须等于 `dim × 2`（f16）或 `dim × 4`（f32）。
 - 追加式写入，`feature_blobs` 记录 `(image_id, kind, model, dim, pack_name, pack_offset, pack_length)`；同一图片重算时追加新记录并更新指针。旧字节不回收，只在维护页的「特征包」里统计（实测 0 垃圾；模型切换会让整包作废重算，压了没有意义）。
+- 追加只 `flush`，累积 4 MiB 或关闭/切换图库时 `sync_all`；重新打开写句柄时若文件末尾不足一条记录（掉电留下半条），先截到整条边界再继续追加。读取按偏移校验长度，越界即报错，不会返回半条向量。
 - `feature_blobs.dim` 对 embedding 是向量维度，对 pose 是 landmark 个数（33）；pose 包的 `dim` 是 f32 元素数 132（33 × 4），两者不要混用。
 - embedding 磁盘上每条 `dim × 2` 字节（仅存 fp16）；读入后立即转 fp32，均值、点积、范数与余弦全部用 f32 在 CPU 计算。pose 每条 33 × 4 × 4 字节（f32，x/y/z/visibility）。
 - 读取向量不整体载入：扫描按 `pack_offset` 排序后 mmap 顺序读，数据库只做一次批量查询；单条读取（查看器 pose）按偏移定位。

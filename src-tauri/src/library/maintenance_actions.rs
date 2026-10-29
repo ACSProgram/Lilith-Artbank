@@ -17,6 +17,7 @@ use crate::{
     library::{
         BatchReporter,
         db::LibraryDb,
+        fs_journal::{self, FileJournal},
         history::{self, HistoryKind},
         inspect::{InspectionReport, absolute_path},
         paths::{LibraryPaths, RECYCLE_DIR},
@@ -54,6 +55,11 @@ pub struct OrphanMoveReport {
 /// 只接受**当次报告里列出的路径**：任意路径列表会让这条命令变成「按用户给的路径
 /// 随便搬文件」的口子。重名追加 `-1`、`-2`；跨卷时退化为复制 + 删源。
 /// 整次操作写**一条**记录，撤销一次退回整次清理。
+///
+/// 顺序是「先搬文件，再用短事务记账」：单写连接不会被几百 GB 的搬移长期占住，
+/// 导入 flush 与元数据写入不必等整次清理。代价是进程在两步之间被强杀时，文件已经
+/// 在回收站里而没有记录——这种情况下文件仍可手工找回，且不影响库内一致性；
+/// 反过来（先记账后搬文件）则会出现记录指向没搬走的文件，撤销会失败。
 pub fn move_orphans(
     database: &LibraryDb,
     root: &Path,
@@ -76,82 +82,66 @@ pub fn move_orphans(
     }
 
     let target_dir = root.join(RECYCLE_DIR).join(ORPHAN_DIR);
-    fs::create_dir_all(&target_dir)?;
+    // 记账失败时把已经搬走的文件搬回原位；只有记录写成功才 `disarm()`。
+    let mut journal = FileJournal::armed();
+    journal.create_dir_all(&target_dir)?;
     reporter.report(0, sources.len());
-
     let mut failed: Vec<OrphanFailure> = Vec::new();
     let mut moved_pairs: Vec<(String, String)> = Vec::with_capacity(sources.len());
     let mut moved_paths: Vec<String> = Vec::with_capacity(sources.len());
     let mut done = 0_u64;
     let mut cancelled = false;
 
-    let label = format!("清理孤儿文件 · {} 个", sources.len());
-    let operation_id = database.with_writer(|connection| {
-        let transaction =
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // 与 `history::write` 同一套新时间线语义：新写入丢弃被撤销的重做分支。
-        history::discard_redo_in_tx(&transaction)?;
-        transaction.execute(
-            "INSERT INTO operations(kind, label, created_at, status, task_id, affected, error)
-             VALUES (?1, ?2, ?3, 'pending', NULL, 0, '')",
-            rusqlite::params![
-                HistoryKind::OrphanMove.as_str(),
-                label,
-                crate::library::service::now_ms()
-            ],
-        )?;
-        let operation_id = transaction.last_insert_rowid();
-        for (relative, source) in &sources {
-            if reporter.cancelled() {
-                cancelled = true;
-                break;
-            }
-            done += 1;
-            if done.is_multiple_of(CANCEL_CHECK_EVERY) {
-                reporter.report(done as usize, sources.len());
-            }
-            let name = relative.rsplit('/').next().unwrap_or(relative);
-            let Some(destination) = unique_destination(&target_dir, name) else {
-                failed.push(OrphanFailure {
-                    path: relative.clone(),
-                    reason: "无法生成不重名的目标文件名".to_owned(),
-                });
-                continue;
-            };
-            match move_file(source, &destination) {
-                Ok(()) => {
-                    moved_paths.push(relative.clone());
-                    moved_pairs.push((
-                        source.to_string_lossy().into_owned(),
-                        destination.to_string_lossy().into_owned(),
-                    ));
-                }
-                Err(error) => failed.push(OrphanFailure {
-                    path: relative.clone(),
-                    reason: error.to_string(),
-                }),
-            }
+    for (relative, source) in &sources {
+        if reporter.cancelled() {
+            cancelled = true;
+            break;
         }
-        reporter.report(done as usize, sources.len());
+        done += 1;
+        if done.is_multiple_of(CANCEL_CHECK_EVERY) {
+            reporter.report(done as usize, sources.len());
+        }
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        let Some(destination) = unique_destination(&target_dir, name) else {
+            failed.push(OrphanFailure {
+                path: relative.clone(),
+                reason: "无法生成不重名的目标文件名".to_owned(),
+            });
+            continue;
+        };
+        match fs_journal::move_file(source, &destination) {
+            Ok(()) => {
+                journal.renamed(source, &destination);
+                moved_paths.push(relative.clone());
+                moved_pairs.push((
+                    source.to_string_lossy().into_owned(),
+                    destination.to_string_lossy().into_owned(),
+                ));
+            }
+            Err(error) => failed.push(OrphanFailure {
+                path: relative.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    reporter.report(done as usize, sources.len());
 
-        if moved_pairs.is_empty() {
-            // 一个都没搬成：事务随 drop 回滚，不留空记录。
-            return Ok(None);
-        }
-        let data = serde_json::to_vec(&moved_pairs)?;
-        history::append_live_in_tx(
-            &transaction,
-            operation_id,
-            history::ChunkFormat::Json,
-            &data,
+    let label = format!("清理孤儿文件 · {} 个", sources.len());
+    let operation_id = if moved_pairs.is_empty() {
+        None
+    } else {
+        let ((), operation_id) = history::write_with_id(
+            database,
+            history::NewOperation::new(HistoryKind::OrphanMove, label),
+            |_, draft| {
+                draft.json(&moved_pairs)?;
+                draft.affected(moved_pairs.len() as u64);
+                Ok(())
+            },
         )?;
-        transaction.execute(
-            "UPDATE operations SET status = 'applied', affected = ?1 WHERE id = ?2",
-            rusqlite::params![moved_pairs.len() as i64, operation_id],
-        )?;
-        transaction.commit()?;
-        Ok(Some(operation_id))
-    })?;
+        operation_id
+    };
+    journal.disarm();
 
     if cancelled {
         log::info!("清理孤儿在下标 {done} 处取消，已搬走的保留在回收站");
@@ -183,28 +173,6 @@ fn unique_destination(directory: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// 同卷用 rename；跨卷（`EXDEV`）退化为复制 + 删源。
-fn move_file(source: &Path, destination: &Path) -> io::Result<()> {
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if is_cross_device(&error) => {
-            fs::copy(source, destination)?;
-            fs::remove_file(source)?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn is_cross_device(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(18)
-}
-
-#[cfg(not(unix))]
-fn is_cross_device(_error: &io::Error) -> bool {
-    // Windows 的 `MoveFileEx` 在跨卷时由标准库自行退化，不会返回这个错误。
-    false
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -399,7 +367,7 @@ pub(crate) fn move_pairs(pairs: &[(String, String)]) -> Vec<String> {
             skipped.push(format!("{}：{error}", to.display()));
             continue;
         }
-        if let Err(error) = move_file(from, to) {
+        if let Err(error) = fs_journal::move_file(from, to) {
             skipped.push(format!("{}：{error}", to.display()));
         }
     }

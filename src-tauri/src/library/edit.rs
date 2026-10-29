@@ -198,8 +198,6 @@ pub fn save(
     let file_size =
         i64::try_from(new_size).map_err(|_| AppError::message("编辑结果大小超出数据库范围"))?;
 
-    let mut published = false;
-    let mut operation_id = None;
     let commit = history::write(
         database,
         NewOperation::new(HistoryKind::Edit, "编辑图片"),
@@ -218,13 +216,17 @@ pub fn save(
             }
 
             let id = draft.id();
-            operation_id = Some(id);
             let staged_dir = history::undo_dir(root, id);
             std::fs::create_dir_all(&staged_dir)?;
+            draft.journal().created_tree(&staged_dir);
             let staged = staged_dir.join(format!("{}.{}", row.content_hash, row.file_ext));
             stage_original(&source, &staged)?;
 
-            published = publish(temp.path(), &destination)?;
+            // 目标已存在说明相同内容已在库里，不是本次发布的新文件，不能记进日志，
+            // 否则回滚会删掉别的行正在引用的文件。
+            if publish(temp.path(), &destination)? {
+                draft.journal().published(&destination);
+            }
             let location = thumbs.append(&thumb.bytes)?;
             let now = now_ms();
 
@@ -288,19 +290,15 @@ pub fn save(
                 new_file_ext: file_ext.to_owned(),
             })?;
             draft.affected(1);
+            // 指针提交前落盘，避免掉电后这张图的缩略图指向段尾之外。
+            if let Err(error) = thumbs.sync() {
+                log::warn!("缩略图段落盘失败：{error}");
+            }
             Ok(())
         },
     );
 
-    if let Err(error) = commit {
-        if published {
-            let _ = std::fs::remove_file(&destination);
-        }
-        if let Some(id) = operation_id {
-            let _ = std::fs::remove_dir_all(history::undo_dir(root, id));
-        }
-        return Err(error);
-    }
+    commit?;
     temp.disarm();
 
     // 旧哈希已不再被任何行引用；删除失败不影响保存结果，留给后续维护清理。

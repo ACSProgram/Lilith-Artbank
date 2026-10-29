@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use rusqlite::{
@@ -12,6 +12,7 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
+        fs_journal::{self, FileJournal},
         history::{
             self, FolderDeleted, FolderPathChange, FolderRef, FolderReorder, FolderRow,
             FolderSortChange, HistoryKind, NewOperation,
@@ -186,7 +187,7 @@ pub fn create_with_id(
                 return Err(AppError::message("文件夹已存在"));
             }
             let target = paths.folder_dir(&canonical);
-            std::fs::create_dir_all(&target)?;
+            draft.journal().create_dir_all(&target)?;
             ensure_inside_root(root, &target)?;
             affected_ids = created.iter().map(|(id, _)| *id).collect();
             let rows: Vec<FolderRef> = created
@@ -250,20 +251,11 @@ pub fn rename_with_id(
             if !case_only && new_dir.exists() {
                 return Err(AppError::message("目标文件夹目录已存在"));
             }
-            rename_directory(&old_dir, &new_dir, case_only)?;
+            fs_journal::rename_path(&old_dir, &new_dir, case_only)?;
+            draft.journal().renamed(&old_dir, &new_dir);
             ensure_inside_root(root, &new_dir)?;
 
-            if let Err(error) =
-                update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)
-            {
-                if let Err(rollback) = rename_directory(&new_dir, &old_dir, true) {
-                    log::error!(
-                        "回滚文件夹重命名失败：{rollback}；目录位于 {}",
-                        new_dir.display()
-                    );
-                }
-                return Err(error);
-            }
+            update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)?;
             let sort_index: i64 = transaction.query_row(
                 "SELECT sort_index FROM folders WHERE id = ?1",
                 [folder_id_value],
@@ -342,41 +334,27 @@ pub fn move_to_with_id(
                 )));
             }
             if let Some(parent) = new_dir.parent() {
-                std::fs::create_dir_all(parent)?;
+                draft.journal().create_dir_all(parent)?;
                 ensure_inside_root(root, parent)?;
             }
             if new_dir.exists() {
                 return Err(AppError::message("目标文件夹目录已存在"));
             }
-            std::fs::rename(&old_dir, &new_dir)?;
+            fs_journal::rename_path(&old_dir, &new_dir, false)?;
+            draft.journal().renamed(&old_dir, &new_dir);
             ensure_inside_root(root, &new_dir)?;
 
-            let result = (|| -> AppResult<(i64, i64)> {
-                let old_sort_index: i64 = transaction.query_row(
-                    "SELECT sort_index FROM folders WHERE id = ?1",
-                    [folder_id_value],
-                    |row| row.get(0),
-                )?;
-                let new_sort_index = next_sort_index(transaction, &new_path)?;
-                update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)?;
-                transaction.execute(
-                    "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
-                    params![new_sort_index, folder_id_value],
-                )?;
-                Ok((old_sort_index, new_sort_index))
-            })();
-            let (old_sort_index, new_sort_index) = match result {
-                Ok(values) => values,
-                Err(error) => {
-                    if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
-                        log::error!(
-                            "回滚文件夹移动失败：{rollback}；目录位于 {}",
-                            new_dir.display()
-                        );
-                    }
-                    return Err(error);
-                }
-            };
+            let old_sort_index: i64 = transaction.query_row(
+                "SELECT sort_index FROM folders WHERE id = ?1",
+                [folder_id_value],
+                |row| row.get(0),
+            )?;
+            let new_sort_index = next_sort_index(transaction, &new_path)?;
+            update_subtree_paths(transaction, &old_path, &new_path, folder_id_value)?;
+            transaction.execute(
+                "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                params![new_sort_index, folder_id_value],
+            )?;
             draft.json(&FolderPathChange {
                 id: folder_id_value,
                 old_path: old_path.clone(),
@@ -558,76 +536,6 @@ fn ancestor_folder_ids(connection: &Connection, path: &str) -> AppResult<Vec<i64
     Ok(ids)
 }
 
-fn rollback_renames(done: &[(PathBuf, PathBuf)]) {
-    for (old, new) in done.iter().rev() {
-        if let Err(error) = std::fs::rename(new, old) {
-            log::error!("回滚文件夹移动失败：{error}；目录位于 {}", new.display());
-        }
-    }
-}
-
-/// 撤销/重做里已经落地的文件系统动作；任一步失败时逆序撤回。
-///
-/// 一次 `place_many` 会写多条 `FolderPathChange`，撤销/重做在同一个事务里逐条处理。
-/// 后一项失败时数据库整体回滚，前面已经改过的目录必须一起改回去，否则行指向的目录
-/// 在磁盘上已经不存在。
-#[derive(Default)]
-pub(crate) struct FolderFsJournal {
-    steps: Vec<FolderFsStep>,
-}
-
-enum FolderFsStep {
-    /// 目录已从 `from` 搬到 `to`。
-    Renamed { from: PathBuf, to: PathBuf },
-    /// 空目录已删除。
-    Removed(PathBuf),
-    /// 目录已新建。
-    Created(PathBuf),
-}
-
-impl FolderFsJournal {
-    fn renamed(&mut self, from: &Path, to: &Path) {
-        self.steps.push(FolderFsStep::Renamed {
-            from: from.to_path_buf(),
-            to: to.to_path_buf(),
-        });
-    }
-
-    fn removed(&mut self, path: &Path) {
-        self.steps.push(FolderFsStep::Removed(path.to_path_buf()));
-    }
-
-    fn created(&mut self, path: &Path) {
-        self.steps.push(FolderFsStep::Created(path.to_path_buf()));
-    }
-
-    /// 逆序撤回全部动作；回滚失败只记日志，不掩盖原始错误。
-    pub(crate) fn rollback(&mut self) {
-        for step in self.steps.drain(..).rev() {
-            match step {
-                FolderFsStep::Renamed { from, to } => {
-                    let case_only = to
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&from.to_string_lossy());
-                    if let Err(error) = rename_directory(&to, &from, case_only) {
-                        log::error!("回滚文件夹搬移失败：{error}；目录位于 {}", to.display());
-                    }
-                }
-                FolderFsStep::Removed(path) => {
-                    if let Err(error) = std::fs::create_dir_all(&path) {
-                        log::error!("回滚文件夹删除失败：{error}；目录位于 {}", path.display());
-                    }
-                }
-                FolderFsStep::Created(path) => {
-                    if let Err(error) = std::fs::remove_dir(&path) {
-                        log::warn!("回滚文件夹新建失败：{error}；目录位于 {}", path.display());
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// 一次把多个文件夹移动/插入到目标父级；只写一条操作记录。
 pub fn place_many(
     db: &LibraryDb,
@@ -652,9 +560,8 @@ pub fn place_many(
         format!("「{label_parent}」")
     };
     let paths = LibraryPaths::new(root);
-    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut affected_ids: Vec<i64> = Vec::new();
-    let result = history::write_with_id(
+    history::write_with_id(
         db,
         NewOperation::new(
             HistoryKind::FolderMove,
@@ -771,80 +678,64 @@ pub fn place_many(
 
             if !target_parent_path.is_empty() {
                 let parent_dir = paths.folder_dir(&target_parent_path);
-                std::fs::create_dir_all(&parent_dir)?;
+                draft.journal().create_dir_all(&parent_dir)?;
                 ensure_inside_root(root, &parent_dir)?;
             }
             for (_, old_path, _, new_path, old_dir, new_dir) in &targets {
                 if old_path == new_path {
                     continue;
                 }
-                if let Err(error) = std::fs::rename(old_dir, new_dir) {
-                    rollback_renames(&done);
-                    done.clear();
-                    return Err(error.into());
-                }
-                done.push((old_dir.clone(), new_dir.clone()));
+                fs_journal::rename_path(old_dir, new_dir, same_folder(old_path, new_path))?;
+                draft.journal().renamed(old_dir, new_dir);
             }
 
-            let write_result = (|| -> AppResult<()> {
-                for (id, old_path, _, new_path, _, _) in &targets {
-                    if old_path != new_path {
-                        ensure_inside_root(root, &paths.folder_dir(new_path))?;
-                        update_subtree_paths(transaction, old_path, new_path, *id)?;
-                    }
+            for (id, old_path, _, new_path, _, _) in &targets {
+                if old_path != new_path {
+                    ensure_inside_root(root, &paths.folder_dir(new_path))?;
+                    update_subtree_paths(transaction, old_path, new_path, *id)?;
                 }
-                for (id, position) in &positions {
-                    transaction.execute(
-                        "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
-                        params![position, id],
-                    )?;
-                }
-                for (id, old_path, old_sort_index, new_path, _, _) in &targets {
-                    if old_path == new_path
-                        && old_sort_index == positions.get(id).unwrap_or(old_sort_index)
-                    {
-                        continue;
-                    }
-                    draft.json(&FolderPathChange {
-                        id: *id,
-                        old_path: old_path.clone(),
-                        new_path: new_path.clone(),
-                        old_sort_index: *old_sort_index,
-                        new_sort_index: *positions.get(id).unwrap_or(old_sort_index),
-                    })?;
-                }
-                let sort_rows: Vec<(i64, i64, i64)> = siblings
-                    .iter()
-                    .filter_map(|(id, old_index)| {
-                        let new_index = *positions.get(id)?;
-                        (*old_index != new_index).then_some((*id, *old_index, new_index))
-                    })
-                    .collect();
-                draft.sort_changes(&FolderSortChange { rows: sort_rows })?;
-                affected_ids.extend(positions.keys().copied());
-                for (_, old_path, _, new_path, _, _) in &targets {
-                    if old_path == new_path {
-                        continue;
-                    }
-                    affected_ids.extend(subtree_folder_ids(transaction, new_path)?);
-                    affected_ids.extend(ancestor_folder_ids(transaction, parent_path(old_path))?);
-                }
-                affected_ids.extend(ancestor_folder_ids(transaction, &target_parent_path)?);
-                draft.affected(kept.len() as u64);
-                Ok(())
-            })();
-            if let Err(error) = write_result {
-                rollback_renames(&done);
-                done.clear();
-                return Err(error);
             }
+            for (id, position) in &positions {
+                transaction.execute(
+                    "UPDATE folders SET sort_index = ?1 WHERE id = ?2",
+                    params![position, id],
+                )?;
+            }
+            for (id, old_path, old_sort_index, new_path, _, _) in &targets {
+                if old_path == new_path
+                    && old_sort_index == positions.get(id).unwrap_or(old_sort_index)
+                {
+                    continue;
+                }
+                draft.json(&FolderPathChange {
+                    id: *id,
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                    old_sort_index: *old_sort_index,
+                    new_sort_index: *positions.get(id).unwrap_or(old_sort_index),
+                })?;
+            }
+            let sort_rows: Vec<(i64, i64, i64)> = siblings
+                .iter()
+                .filter_map(|(id, old_index)| {
+                    let new_index = *positions.get(id)?;
+                    (*old_index != new_index).then_some((*id, *old_index, new_index))
+                })
+                .collect();
+            draft.sort_changes(&FolderSortChange { rows: sort_rows })?;
+            affected_ids.extend(positions.keys().copied());
+            for (_, old_path, _, new_path, _, _) in &targets {
+                if old_path == new_path {
+                    continue;
+                }
+                affected_ids.extend(subtree_folder_ids(transaction, new_path)?);
+                affected_ids.extend(ancestor_folder_ids(transaction, parent_path(old_path))?);
+            }
+            affected_ids.extend(ancestor_folder_ids(transaction, &target_parent_path)?);
+            draft.affected(kept.len() as u64);
             Ok(())
         },
-    );
-    if result.is_err() {
-        rollback_renames(&done);
-    }
-    result?;
+    )?;
     query::folder_infos(db, &affected_ids)
 }
 
@@ -1415,7 +1306,7 @@ pub(crate) fn undo_create(
     transaction: &Transaction<'_>,
     root: &Path,
     created: &[FolderRef],
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
     let mut rows = created.to_vec();
@@ -1450,7 +1341,7 @@ pub(crate) fn cleanup_created(
     transaction: &Transaction<'_>,
     root: &Path,
     created: &[FolderRef],
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
     let mut rows = created.to_vec();
@@ -1487,7 +1378,7 @@ fn remove_folder_if_empty(
     id: i64,
     path: &str,
     strict: bool,
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let children: i64 = transaction.query_row(
         "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
@@ -1526,7 +1417,7 @@ pub(crate) fn undo_path_change(
     transaction: &Transaction<'_>,
     root: &Path,
     change: &FolderPathChange,
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let current = folder_path(transaction, change.id)?;
     if same_folder(&current, &change.old_path) {
@@ -1553,7 +1444,7 @@ pub(crate) fn undo_path_change(
         if !case_only && old_dir.exists() {
             return Err(AppError::message("原位置已经有同名文件夹，无法撤销"));
         }
-        rename_directory(&new_dir, &old_dir, case_only)?;
+        fs_journal::rename_path(&new_dir, &old_dir, case_only)?;
         journal.renamed(&new_dir, &old_dir);
         ensure_inside_root(root, &old_dir)?;
     }
@@ -1698,7 +1589,7 @@ pub(crate) fn undo_delete(
     transaction: &Transaction<'_>,
     root: &Path,
     deleted: &FolderDeleted,
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let existing: Option<String> = transaction
         .query_row(
@@ -1799,7 +1690,7 @@ pub(crate) fn redo_create(
     transaction: &Transaction<'_>,
     root: &Path,
     rows: &[FolderRow],
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
     let mut rows = rows.to_vec();
@@ -1848,7 +1739,7 @@ pub(crate) fn redo_path_change(
     transaction: &Transaction<'_>,
     root: &Path,
     change: &FolderPathChange,
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let current = folder_path(transaction, change.id)?;
     if same_folder(&current, &change.new_path) {
@@ -1874,7 +1765,7 @@ pub(crate) fn redo_path_change(
         if !case_only && new_dir.exists() {
             return Err(AppError::message("目标位置已经有同名文件夹，无法重做"));
         }
-        rename_directory(&old_dir, &new_dir, case_only)?;
+        fs_journal::rename_path(&old_dir, &new_dir, case_only)?;
         journal.renamed(&old_dir, &new_dir);
         ensure_inside_root(root, &new_dir)?;
     }
@@ -1895,7 +1786,7 @@ pub(crate) fn redo_delete(
     transaction: &Transaction<'_>,
     root: &Path,
     deleted: &FolderDeleted,
-    journal: &mut FolderFsJournal,
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let existing: Option<String> = transaction
         .query_row(
@@ -1951,23 +1842,6 @@ pub(crate) fn redo_reorder(transaction: &Transaction<'_>, rows: &[(i64, i64)]) -
         }
     }
     Ok(())
-}
-
-fn rename_directory(old: &Path, new: &Path, case_only: bool) -> AppResult<()> {
-    if !case_only {
-        return std::fs::rename(old, new).map_err(AppError::from);
-    }
-    // Windows 不允许直接把 Foo 改成 foo（目标被视为已存在），用临时名中转。
-    let parent = old.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = parent.join(format!(".artbank-rename-{}", uuid::Uuid::new_v4()));
-    std::fs::rename(old, &temporary)?;
-    match std::fs::rename(&temporary, new) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::rename(&temporary, old);
-            Err(error.into())
-        }
-    }
 }
 
 fn update_subtree_paths(
