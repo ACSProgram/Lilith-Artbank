@@ -203,6 +203,12 @@ fn folder_trash_restore_and_permanent_delete() {
         .finish();
     report.record(&cleared);
     cleared.expect_ok();
+    let released = headless(&workspace, "history")
+        .action("release")
+        .library(&library)
+        .finish();
+    report.record(&released);
+    released.expect_ok();
     let paths = folder_paths(&workspace, &library, &mut report);
     assert!(!paths.contains(&"场景".to_owned()), "{paths:?}");
 

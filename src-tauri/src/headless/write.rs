@@ -295,6 +295,12 @@ pub(super) fn dispatch(
             })?;
             finish_history_task(state, start, cancelled, "清空操作记录")
         }
+        ("history", Some("release")) => {
+            let start = trace::write("release_pending_files", || {
+                AppError::command(state.release_pending())
+            })?;
+            finish_history_task(state, start, cancelled, "释放待删文件")
+        }
         ("viewer", Some("source")) => {
             let request: ImageIdRequest = options.request()?;
             value_of(trace::read("get_viewer_source", || {

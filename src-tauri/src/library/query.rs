@@ -213,13 +213,6 @@ pub struct ImagePage {
     pub next_page_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FolderCount {
-    pub folder_id: i64,
-    pub count: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueCount {
@@ -238,7 +231,6 @@ pub struct TagCount {
 #[serde(rename_all = "camelCase")]
 pub struct FilterCounts {
     pub total: u64,
-    pub folders: Vec<FolderCount>,
     pub extensions: Vec<ValueCount>,
     pub scores: Vec<ValueCount>,
     pub tags: Vec<TagCount>,
@@ -1790,7 +1782,6 @@ fn keyset_condition(sort: &[SortSpec], values: &[i64], cursor_id: i64) -> (Strin
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Facet {
-    Folders,
     Extensions,
     Scores,
     Tags,
@@ -1994,7 +1985,7 @@ impl FilterSet {
         exclude: Option<Facet>,
         folder_paths: &[String],
     ) {
-        if exclude != Some(Facet::Folders) && !filters.folder_ids.is_empty() {
+        if !filters.folder_ids.is_empty() {
             if filters.folder_direct {
                 let marks = placeholders(filters.folder_ids.len());
                 self.clauses.push(format!("images.folder_id IN ({marks})"));
@@ -2189,30 +2180,6 @@ fn build_filter_counts(
         count_rows(connection, &sql, &params)?
     };
 
-    let folders = {
-        let prepared =
-            PreparedQuery::new(query, Some(Facet::Folders), SearchMode::Count, folder_paths);
-        let (sql, params) = grouped_sql(
-            &prepared,
-            None,
-            "images.folder_id, count(*)",
-            "GROUP BY images.folder_id ORDER BY count(*) DESC, images.folder_id",
-        );
-        let direct = grouped_i64(connection, &sql, &params)?;
-        let all = all_folders(connection)?;
-        let mut folders: Vec<FolderCount> = expand_folder_counts(direct, &all)
-            .into_iter()
-            .map(|(folder_id, count)| FolderCount { folder_id, count })
-            .collect();
-        folders.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then(left.folder_id.cmp(&right.folder_id))
-        });
-        folders
-    };
-
     let extensions = {
         let prepared = PreparedQuery::new(
             query,
@@ -2259,7 +2226,6 @@ fn build_filter_counts(
 
     Ok(FilterCounts {
         total,
-        folders,
         extensions,
         scores,
         tags,
@@ -2284,25 +2250,17 @@ fn build_materialized_counts(
 
     let filters = &query.filters;
     let total = filters_only(filters, None, folder_paths);
-    let folders = filters_only(filters, Some(Facet::Folders), folder_paths);
     let extensions = filters_only(filters, Some(Facet::Extensions), folder_paths);
     let scores = filters_only(filters, Some(Facet::Scores), folder_paths);
     let tags = filters_only(filters, Some(Facet::Tags), folder_paths);
 
-    let mut branches = Vec::with_capacity(5);
+    let mut branches = Vec::with_capacity(4);
     push_count_branch(
         &mut branches,
         &mut params,
         "SELECT 'total', '0', count(*) FROM matched images",
         "",
         &total,
-    );
-    push_count_branch(
-        &mut branches,
-        &mut params,
-        "SELECT 'folders', CAST(images.folder_id AS TEXT), count(*) FROM matched images",
-        "GROUP BY images.folder_id",
-        &folders,
     );
     push_count_branch(
         &mut branches,
@@ -2371,17 +2329,14 @@ fn build_materialized_counts(
 
     let mut counts = FilterCounts {
         total: 0,
-        folders: Vec::new(),
         extensions: Vec::new(),
         scores: Vec::new(),
         tags: Vec::new(),
     };
-    let mut direct_folders: Vec<(i64, u64)> = Vec::new();
     for row in rows {
         let (kind, value, count) = row?;
         match kind.as_str() {
             "total" => counts.total = count,
-            "folders" => direct_folders.push((parse_count_key(&value)?, count)),
             "extensions" => counts.extensions.push(ValueCount { value, count }),
             "scores" => counts.scores.push(ValueCount { value, count }),
             "tags" => counts.tags.push(TagCount {
@@ -2391,17 +2346,6 @@ fn build_materialized_counts(
             _ => {}
         }
     }
-    let all = all_folders(connection)?;
-    counts.folders = expand_folder_counts(direct_folders, &all)
-        .into_iter()
-        .map(|(folder_id, count)| FolderCount { folder_id, count })
-        .collect();
-    counts.folders.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then(left.folder_id.cmp(&right.folder_id))
-    });
     counts.extensions.sort_by(|left, right| {
         right
             .count
@@ -3149,26 +3093,6 @@ mod tests {
         .unwrap();
         assert_eq!(ids(&by_lookalike), vec![7]);
 
-        let counts = filter_counts(
-            &fixture.session.db,
-            LibraryQuery {
-                filters: LibraryFilters {
-                    folder_ids: vec![nested_id],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            counts
-                .folders
-                .iter()
-                .find(|item| item.folder_id == fixture.folder_people)
-                .map(|item| item.count),
-            Some(3)
-        );
-
         let folders = list_folders(&fixture.session.db).unwrap();
         let people = folders
             .iter()
@@ -3305,14 +3229,6 @@ mod tests {
                 .map(|item| item.count),
             Some(1)
         );
-        // 文件夹分面不应用文件夹筛选，因此能看到其他文件夹。
-        assert!(
-            counts
-                .folders
-                .iter()
-                .any(|item| item.folder_id == fixture.folder_scenery)
-        );
-
         let folders = list_folders(&fixture.session.db).unwrap();
         assert_eq!(folders.len(), 3);
         assert_eq!(folders[1].path, "人物");
@@ -3617,23 +3533,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(searched.total, 2);
-        // 文件夹分面不受文件夹筛选影响：搜索命中 1/2/4，其中人物 2 张、风景 1 张。
-        assert_eq!(
-            searched
-                .folders
-                .iter()
-                .find(|item| item.folder_id == fixture.folder_people)
-                .map(|item| item.count),
-            Some(2)
-        );
-        assert_eq!(
-            searched
-                .folders
-                .iter()
-                .find(|item| item.folder_id == fixture.folder_scenery)
-                .map(|item| item.count),
-            Some(1)
-        );
         assert_eq!(
             searched
                 .tags
@@ -3712,22 +3611,6 @@ mod tests {
                 .tags
                 .iter()
                 .find(|item| item.tag_id == fixture.tag_sketch)
-                .map(|item| item.count),
-            Some(1)
-        );
-        assert_eq!(
-            collection
-                .folders
-                .iter()
-                .find(|item| item.folder_id == fixture.folder_people)
-                .map(|item| item.count),
-            Some(1)
-        );
-        assert_eq!(
-            collection
-                .folders
-                .iter()
-                .find(|item| item.folder_id == fixture.folder_scenery)
                 .map(|item| item.count),
             Some(1)
         );

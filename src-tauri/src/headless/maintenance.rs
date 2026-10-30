@@ -660,7 +660,7 @@ fn scenario_idle_yield(app: &tauri::AppHandle, options: &Options) -> Result<Valu
     }))
 }
 
-/// 造出缩略图包垃圾：先建缩略图，再删除全部行并清空记录，让段内只剩死数据。
+/// 造出缩略图包垃圾：先建缩略图，再删除全部行、清空记录并释放待删文件，让段内只剩死数据。
 fn prepare_pack_garbage(app: &tauri::AppHandle) -> Result<(Value, f64), String> {
     let state = app.state::<AppState>();
     activity::touch();
@@ -695,6 +695,13 @@ fn prepare_pack_garbage(app: &tauri::AppHandle) -> Result<(Value, f64), String> 
     let clear = wait_task(state.inner(), &clear.task_id)?;
     if clear.phase == TaskPhase::Failed {
         return Err(format!("清空操作记录失败：{}", clear.message));
+    }
+    // 清空只删记录；待删行要被真正删掉，缩略图才会变成包内死数据。
+    let release = state.release_pending().map_err(|error| error.to_string())?;
+    let release = started_task(release)?;
+    let release = wait_task(state.inner(), &release.task_id)?;
+    if release.phase == TaskPhase::Failed {
+        return Err(format!("释放待删文件失败：{}", release.message));
     }
     let before = state.pack_stats().map_err(|error| error.to_string())?;
     Ok((

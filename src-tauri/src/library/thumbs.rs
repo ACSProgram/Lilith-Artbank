@@ -40,10 +40,6 @@ pub struct ThumbLocation {
 pub struct ThumbPointer {
     pub location: ThumbLocation,
     pub format: String,
-    #[allow(dead_code)]
-    pub width: u32,
-    #[allow(dead_code)]
-    pub height: u32,
     pub version: u32,
 }
 
@@ -393,7 +389,7 @@ pub fn load_pointer(database: &LibraryDb, image_id: i64) -> AppResult<Option<Thu
         let pointer = connection
             .query_row(
                 "SELECT thumb_segment, thumb_offset, thumb_length, thumb_format,
-                        thumb_width, thumb_height, thumb_version
+                        thumb_version
                  FROM images WHERE id = ?1",
                 [image_id],
                 |row| {
@@ -404,9 +400,7 @@ pub fn load_pointer(database: &LibraryDb, image_id: i64) -> AppResult<Option<Thu
                             length: row.get(2)?,
                         },
                         format: row.get(3)?,
-                        width: row.get(4)?,
-                        height: row.get(5)?,
-                        version: row.get(6)?,
+                        version: row.get(4)?,
                     })
                 },
             )
@@ -828,7 +822,17 @@ mod tests {
         );
         let pointer = load_pointer(&session.db, image_id).unwrap().unwrap();
         assert_eq!(pointer.format, "webp");
-        assert_eq!((pointer.width, pointer.height), (120, 80));
+        let stored: (u32, u32) = session
+            .db
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT thumb_width, thumb_height FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored, (120, 80));
         assert_eq!(pointer.version, 2);
         let decoded =
             image::load_from_memory(&session.thumbs.read(pointer.location).unwrap()).unwrap();

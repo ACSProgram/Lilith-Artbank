@@ -142,7 +142,7 @@ export function confirmUndoTo(
   });
 }
 
-/** 清空操作记录：立即释放待删除文件，并且之后不能再撤销。 */
+/** 清空操作记录：只删除记录与撤销数据，待删除文件由单独动作释放。 */
 export function confirmClearHistory(
   confirm: ConfirmFn,
   pendingCount: number,
@@ -155,13 +155,37 @@ export function confirmClearHistory(
       : "";
   const pending =
     pendingCount > 0
-      ? `已从回收站移除的 ${count(pendingCount)} 张图片会立即释放磁盘（约 ${formatBytes(pendingBytes)}）。`
+      ? `已从回收站移除的 ${count(pendingCount)} 张图片仍留在磁盘上（约 ${formatBytes(pendingBytes)}），之后可用「释放待删文件」删除。`
       : "";
   return confirm({
     title: "清空操作记录？",
     message: "所有记录都会被删除，图库不能再撤销到这些操作之前。",
     detail: [storage, pending].filter(Boolean).join(" "),
     confirmLabel: "清空记录",
+    danger: true,
+  });
+}
+
+/** 跳过撤销失败的记录：放弃这次撤销，记录留在时间线里但不再参与撤销与重做。 */
+export function confirmSkipUndo(confirm: ConfirmFn, label: string): Promise<boolean> {
+  return confirm({
+    title: `跳过「${label}」的撤销？`,
+    message: "这条记录会留在操作记录里，但不再参与撤销与重做；这次操作的结果会保持现状。",
+    confirmLabel: "跳过",
+    danger: true,
+  });
+}
+
+/** 释放待删文件：删除已从回收站移除、没有记录引用的原图文件，无法恢复。 */
+export function confirmReleasePending(
+  confirm: ConfirmFn,
+  pendingCount: number,
+  pendingBytes: number,
+): Promise<boolean> {
+  return confirm({
+    title: `释放 ${count(pendingCount)} 张待删图片？`,
+    message: `会删除这些图片的原图文件（约 ${formatBytes(pendingBytes)}），无法恢复。`,
+    confirmLabel: "释放",
     danger: true,
   });
 }

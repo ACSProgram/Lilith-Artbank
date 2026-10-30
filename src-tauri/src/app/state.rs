@@ -215,7 +215,6 @@ impl AppState {
         mut request: ImportRequest,
     ) -> AppResult<(ImportSnapshot, Option<i64>)> {
         request.optimize = None;
-        request.worker_threads = None;
         self.start_import_inner(self.app.clone(), request, true)
     }
 
@@ -1388,12 +1387,15 @@ impl AppState {
             Some("undone") | Some("redoing") => {
                 return Err(AppError::message("这条记录已经撤销，可以重做"));
             }
+            Some("undoSkipped") => {
+                return Err(AppError::message("这条记录已跳过撤销"));
+            }
             Some(_) => return Err(AppError::message("只能撤销已经完成的操作")),
             None => return Err(AppError::message("操作记录不存在")),
         }
         if failed > 0 {
             return Err(AppError::message(
-                "之后有一条记录上次撤销失败，不能继续回退；请先处理失败原因或清空记录",
+                "之后有一条记录上次撤销失败，不能继续回退；请先重试或跳过这条记录",
             ));
         }
         if redo_failed > 0 {
@@ -1438,6 +1440,9 @@ impl AppState {
                     "这条记录上次撤销失败，需要先处理失败原因",
                 ));
             }
+            Some("undoSkipped") => {
+                return Err(AppError::message("这条记录已跳过撤销"));
+            }
             Some(_) => return Err(AppError::message("只能重做已经撤销的操作")),
             None => return Err(AppError::message("操作记录不存在")),
         }
@@ -1451,11 +1456,11 @@ impl AppState {
         let (database, root) = self.query_source()?;
         let handle = TaskHandle::new(
             uuid::Uuid::new_v4().to_string(),
-            TaskKind::ReleaseGarbage,
+            TaskKind::ClearHistory,
             "清空操作记录",
         );
-        // 清空本身是一条事务；随后的释放和自动释放一样按块检查取消，所以同样允许取消。
-        handle.set_cancellable(true);
+        // 只删除记录与撤销暂存，是一条短事务；待删文件由「释放待删文件」单独处理。
+        handle.set_cancellable(false);
         let app = self.app.clone();
         let worker = handle.clone();
         let tasks = self.tasks.clone();
@@ -1481,15 +1486,46 @@ impl AppState {
                     move || {
                         let _guard: LaneGuard = guard;
                         task.set_phase(TaskPhase::Running);
-                        let result = history::clear(&database, &root)
-                            .and_then(|_| history::run_release(&database, &root, task.clone()));
+                        let result = history::clear(&database, &root).map(|_| ());
                         query::clear_page_cache();
                         ai.invalidate_similarity();
-                        finish_release(&task, &result);
+                        task.finish_from(&result);
                     },
                 );
             },
         )
+    }
+
+    pub fn retry_undo(&self, operation_id: i64) -> AppResult<TaskStartResult> {
+        let (database, _) = self.query_source()?;
+        let status: Option<String> = database.with_reader(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT status FROM operations WHERE id = ?1",
+                    [operation_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })?;
+        match status.as_deref() {
+            Some("undoFailed") => self.start_retry_undo_task(operation_id),
+            Some(_) => Err(AppError::message("只有撤销失败的记录可以重试")),
+            None => Err(AppError::message("操作记录不存在")),
+        }
+    }
+
+    pub fn skip_undo(&self, operation_id: i64) -> AppResult<()> {
+        // 只改记录状态，不动图片与文件；与撤销/重做、清空记录互斥。
+        let _guard = self.begin_metadata_write("跳过撤销失败")?;
+        let (database, _) = self.query_source()?;
+        history::skip_undo(&database, operation_id)
+    }
+
+    /// 独立动作：删除已没有记录引用的待释放文件。
+    ///
+    /// 自动释放可能刚好在跑，排队等它结束即可；清理没有记录引用的批次可以重复执行。
+    pub fn release_pending(&self) -> AppResult<TaskStartResult> {
+        self.start_release_task("释放待删文件", ConflictPolicy::Queue)
     }
 
     /// 图库可用后的收尾：先续做中断的撤销（撤销不排队，要先拿到写资源），再按上限裁剪。
@@ -1606,15 +1642,50 @@ impl AppState {
     }
 
     fn start_undo_task(&self, target_id: i64, count: usize) -> AppResult<TaskStartResult> {
+        self.start_history_task(
+            TaskKind::Undo,
+            format!("撤销 {count} 条记录"),
+            count > 1,
+            "undo-history",
+            "正在撤销操作",
+            move |database, root, thumbs, task| {
+                history::run_undo(&database, &root, &thumbs, target_id, task)
+            },
+        )
+    }
+
+    fn start_retry_undo_task(&self, operation_id: i64) -> AppResult<TaskStartResult> {
+        self.start_history_task(
+            TaskKind::Undo,
+            "重试撤销失败记录".to_owned(),
+            false,
+            "retry-undo-history",
+            "正在重试撤销",
+            move |database, root, thumbs, task| {
+                history::retry_undo(&database, &root, &thumbs, operation_id, task)
+            },
+        )
+    }
+
+    fn start_history_task<F>(
+        &self,
+        kind: TaskKind,
+        label: String,
+        cancellable: bool,
+        worker_name: &'static str,
+        path_note: &'static str,
+        run: F,
+    ) -> AppResult<TaskStartResult>
+    where
+        F: FnOnce(Arc<LibraryDb>, PathBuf, Arc<ThumbPack>, Arc<TaskHandle>) -> AppResult<()>
+            + Send
+            + 'static,
+    {
         let (database, thumbs, root) = self
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
-        let handle = TaskHandle::new(
-            uuid::Uuid::new_v4().to_string(),
-            TaskKind::Undo,
-            format!("撤销 {count} 条记录"),
-        );
-        handle.set_cancellable(count > 1);
+        let handle = TaskHandle::new(uuid::Uuid::new_v4().to_string(), kind, label);
+        handle.set_cancellable(cancellable);
         let app = self.app.clone();
         let worker = handle.clone();
         let tasks = self.tasks.clone();
@@ -1624,7 +1695,7 @@ impl AppState {
             .with_content_writer()
             .with_metadata_writer()
             .with_paths(vec![PathScope::write("")])
-            .with_path_note("正在撤销操作");
+            .with_path_note(path_note);
         self.tasks
             .launch(app, handle, request, ConflictPolicy::Fail, move |guard| {
                 let database = database.clone();
@@ -1633,11 +1704,10 @@ impl AppState {
                 let task = worker.clone();
                 let tasks = tasks.clone();
                 let ai = ai.clone();
-                let _ = tasks.spawn_worker("undo-history".to_owned(), task.clone(), move || {
+                let _ = tasks.spawn_worker(worker_name.to_owned(), task.clone(), move || {
                     let _guard: LaneGuard = guard;
                     task.set_phase(TaskPhase::Running);
-                    let result =
-                        history::run_undo(&database, &root, &thumbs, target_id, task.clone());
+                    let result = run(database, root, thumbs, task.clone());
                     query::clear_page_cache();
                     ai.invalidate_similarity();
                     task.finish_from(&result);
@@ -1646,43 +1716,16 @@ impl AppState {
     }
 
     fn start_redo_task(&self, target_id: i64, count: usize) -> AppResult<TaskStartResult> {
-        let (database, thumbs, root) = self
-            .library_handles()
-            .ok_or_else(|| AppError::message("尚未打开图库"))?;
-        let handle = TaskHandle::new(
-            uuid::Uuid::new_v4().to_string(),
+        self.start_history_task(
             TaskKind::Redo,
             format!("重做 {count} 条记录"),
-        );
-        handle.set_cancellable(count > 1);
-        let app = self.app.clone();
-        let worker = handle.clone();
-        let tasks = self.tasks.clone();
-        let ai = self.ai.clone();
-        let request = ResourceRequest::session_read()
-            .with_timeline(Access::Write)
-            .with_content_writer()
-            .with_metadata_writer()
-            .with_paths(vec![PathScope::write("")])
-            .with_path_note("正在重做操作");
-        self.tasks
-            .launch(app, handle, request, ConflictPolicy::Fail, move |guard| {
-                let database = database.clone();
-                let thumbs = thumbs.clone();
-                let root = root.clone();
-                let task = worker.clone();
-                let tasks = tasks.clone();
-                let ai = ai.clone();
-                let _ = tasks.spawn_worker("redo-history".to_owned(), task.clone(), move || {
-                    let _guard: LaneGuard = guard;
-                    task.set_phase(TaskPhase::Running);
-                    let result =
-                        history::run_redo(&database, &root, &thumbs, target_id, task.clone());
-                    query::clear_page_cache();
-                    ai.invalidate_similarity();
-                    task.finish_from(&result);
-                });
-            })
+            count > 1,
+            "redo-history",
+            "正在重做操作",
+            move |database, root, thumbs, task| {
+                history::run_redo(&database, &root, &thumbs, target_id, task)
+            },
+        )
     }
 
     fn start_release_task(
@@ -1849,8 +1892,6 @@ impl AppState {
                 self.start_check_task(app, request)
             }
             BatchTaskKind::Export => self.start_export_task(app, request),
-            // 「立即回收」与空闲循环提交的是同一个任务，区别只在提交前是否等空闲条件。
-            BatchTaskKind::PackCompact => self.compact_pack_now(app),
         }
     }
 

@@ -93,11 +93,6 @@ export interface ImagePage {
   nextPageToken: string | null;
 }
 
-export interface FolderCount {
-  folderId: number;
-  count: number;
-}
-
 export interface ValueCount {
   value: string;
   count: number;
@@ -110,7 +105,6 @@ export interface TagCount {
 
 export interface FilterCounts {
   total: number;
-  folders: FolderCount[];
   extensions: ValueCount[];
   scores: ValueCount[];
   tags: TagCount[];
@@ -311,7 +305,13 @@ export type HistoryKind =
   | "aiDescription"
   | "optimize";
 
-export type HistoryStatus = "applied" | "undone" | "redoing" | "undoFailed";
+export type HistoryStatus =
+  | "applied"
+  | "undone"
+  | "redoing"
+  | "undoFailed"
+  /** 用户放弃撤销失败的记录：保留在时间线里，不再参与撤销与重做。 */
+  | "undoSkipped";
 
 export interface HistoryEntry {
   id: number;

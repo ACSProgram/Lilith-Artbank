@@ -344,10 +344,19 @@ fn trash_restore_and_permanent_delete_are_deferred_until_history_clear() {
     cleared.expect_ok();
     for file in &files[0..2] {
         assert!(
-            !file.exists(),
-            "清空记录后释放任务应删除原图：{}",
+            file.is_file(),
+            "清空记录本身不释放文件，待删原图应保留：{}",
             file.display()
         );
+    }
+    let released = headless(&workspace, "history")
+        .action("release")
+        .library(&library)
+        .finish();
+    report.record(&released);
+    released.expect_ok();
+    for file in &files[0..2] {
+        assert!(!file.exists(), "释放待删文件应删除原图：{}", file.display());
     }
     let now_counts = library_counts(&workspace, &library, &mut report);
     assert_eq!(now_counts["imageCount"], 10);

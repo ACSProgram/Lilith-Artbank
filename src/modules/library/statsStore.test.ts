@@ -27,7 +27,7 @@ function summary(total: number): StatsSnapshot {
 function facets(total: number): StatsSnapshot {
   return {
     profile: "facets",
-    data: { total, folders: [], extensions: [], scores: [], tags: [] },
+    data: { total, extensions: [], scores: [], tags: [] },
   };
 }
 

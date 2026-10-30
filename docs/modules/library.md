@@ -39,11 +39,11 @@ PRAGMA mmap_size = 268435456;
 - schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 10；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
-- v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；20 万行建这两个索引合计 459 ms，39 万行的真实库首次打开按同量级估算在 1 s 左右。v1 库按 v1→v2→v3→v4 链式升级。
+- v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；建索引耗时与首次打开停顿见[性能基准](../guides/performance.md)。v1 库按 v1→v2→v3→v4 链式升级。
 - v4 → v5 新增 `operations` / `operation_chunks` / `undo_runs` 三张表、`images.purge_operation_id` / `origin_operation_id` 两列与 `idx_images_purge` 索引，不改现有行；v1–v3 库按链式迁移到 v5。
 - v5 → v6 给 `images` 增加 `optimized_at INTEGER NOT NULL DEFAULT 0`（0 表示没做过空间优化），不改现有行。
 - v6 → v7 给 `folders` 增加 `kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal','temp'))` 与唯一部分索引 `idx_folders_single_temp`，并插入唯一的临时文件夹行；内部路径固定为 `.artbank-temp`，已有同名文件夹时追加 `-1`、`-2` 后缀。v1–v6 库按链式迁移到 v7。
-- v7 → v8 只新增覆盖索引 `idx_images_visible_facets(deleted_at, purge_operation_id, folder_id, file_ext, score)`，不改数据与语义。真实库（39 万行）建索引 533 ms、库体积 +7 MB；计数与文件夹聚合从 620/683 ms 降到 20/27 ms。
+- v7 → v8 只新增覆盖索引 `idx_images_visible_facets(deleted_at, purge_operation_id, folder_id, file_ext, score)`，不改数据与语义；收益与建索引成本见[性能基准](../guides/performance.md)。
 - v8 → v9 只新增覆盖索引 `idx_images_visible_bytes(deleted_at, folder_id, file_size)`，供文件夹概览的 `SUM(file_size)` 在索引内完成，不改数据与语义。分面索引保持窄，避免标签聚合因索引变宽而退化。
 - v9 → v10 给 `folders` 增加 `trashed_at` 与 `purge_operation_id` 两列，并建两个空集上的部分索引；只做 `ALTER TABLE ADD COLUMN`，不改现有行。旧 `folderDelete`（空文件夹物理删除）记录仍可解析与撤销。
 
@@ -86,7 +86,7 @@ origin_operation_id 导入批次；用于撤销导入时找回本次新增的行
 ```
 
 - `deleted_at IS NULL` 表示正常；非空表示回收站。软删除不移动原图。
-- 永久删除与清空回收站不再立即删行删文件，只写 `purge_operation_id`。这些图片与文件夹行不出现在回收站、回收站树、普通视图与全库搜索中；记录过期或清空操作记录后，`ReleaseGarbage` 任务才删行删原图与空目录。
+- 永久删除与清空回收站不再立即删行删文件，只写 `purge_operation_id`。这些图片与文件夹行不出现在回收站、回收站树、普通视图与全库搜索中；记录过期后自动安排 `ReleaseGarbage` 删除；清空操作记录本身不删文件，之后用「释放待删文件」删除。
 - `operations.id` 使用 `AUTOINCREMENT`，记录清理后不复用；`purge_operation_id`、`origin_operation_id` 不建外键，记录行删除后标记仍可用于释放扫描。
 - `thumb_segment = 0` 表示还没有缩略图；`thumb_version` 用于 URL 缓存失效。缩略图包追加写入，永久删除图片不会回收包内字节。
 - 缩略图段在追加 8 MiB、换段、指针事务提交前与切换/关闭图库时 `sync_all`，其余追加只 `flush`；打开图库时按 `thumb_segments.size` 与磁盘实际长度比对，缺段或截断时把越界指针清成 `thumb_segment = 0`，这些行重新算「缺缩略图」并由重建任务补上。
@@ -126,6 +126,7 @@ ai                 { baseUrl, port, autoStart, pythonPath, serverScript,
                      modelPath, clipModelPath, prewarmImports }
 performance        { readerConnections, workerThreads }
 history            { maxSteps }  每个图库保留的操作记录步数，默认 100
+maintenance        { autoCompactThumbs }  空闲时自动回收缩略图段；默认 true，缺键按默认值
 import             { optimize }  「导入时压缩」选项；null 表示关闭（默认）
 mcp                { enabled, port, mode }  MCP 服务；默认关闭、18767、ask
 ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
@@ -213,7 +214,10 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `get_operation_history` | — | `HistoryPage` |
 | `undo_to_operation` | `{ targetId }` | `TaskStartResult`（撤销目标及上方尚未撤销的记录） |
 | `redo_to_operation` | `{ targetId }` | `TaskStartResult`（从当前状态重做到目标记录） |
-| `clear_operation_history` | — | `TaskStartResult`（清空记录并释放全部待删除文件） |
+| `retry_undo_operation` | `{ targetId }` | `TaskStartResult`（只重试这条撤销失败的记录） |
+| `skip_undo_operation` | `{ targetId }` | `null`（标为 `undoSkipped`，不再参与撤销与重做） |
+| `release_pending_files` | — | `TaskStartResult`（删除没有记录引用的待释放文件） |
+| `clear_operation_history` | — | `TaskStartResult`（只清空记录与撤销数据，不删原图） |
 | `get_collections` | — | `CollectionInfo[]` |
 | `create_collection` | `{ name }` | `CollectionInfo` |
 | `rename_collection` | `{ collectionId, name }` | `null` |
@@ -311,14 +315,14 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 图片空间优化不写任何逆数据：每批事务内更新 `images` 并累加 `affected`，完成后用 `history::update_label` 把「N 张 · 省 X」写进标题。`run_undo` 在标记 `undoing` 之前预检链中含 `optimize` 就返回“压缩操作不可撤销，原图已删除”，不会留下假的 `undoFailed`；记录面板同样禁用撤销。
 - 撤销是线性回退：选中第 N 条 = 依次撤回当前仍为 `applied` 的记录，直到 N。成功的记录不再删除，而是标为 `undone`（列表里变灰）；`undone` 记录保持原 chunks，并通过 `redo` chunks 保存撤销前的状态。多条记录的撤销只在记录之间检查取消。
 - 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
-- 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重试成功或清空记录。所有逆操作与重做操作都可重复执行。
-- 裁剪只处理 `applied` / `undoFailed`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除/清空记录安排 `ReleaseGarbage`。
-- `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；图片处理完后自底向上删除已无图片、已无子文件夹且磁盘目录为空的回收站文件夹行与目录。可重复执行，也可取消：每 400 行检查一次取消，停下时未处理的行仍带待释放标记，消息写「已停止，剩余待释放保留到下次」。有释放失败的终态是「部分失败」而不是「完成」，失败条数进失败清单与日志。清空操作记录会删掉全部记录与暂存目录，并安排释放全部待删除文件（同样可取消）。
+- 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。可以对这条记录单独「重试撤销」，或「跳过」：跳过会把它标为 `undoSkipped`，仍留在时间线里，但不再参与撤销与重做，也不再阻挡更早记录。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重做重试成功（撤销失败则靠重试或跳过解除）。所有逆操作与重做操作都可重复执行。
+- 裁剪只处理 `applied` / `undoFailed` / `undoSkipped`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入记录删除 `.artbank/undo/<id>/`，永久删除安排 `ReleaseGarbage`；`undo_runs` 中目标已被裁掉的行同事务清理。
+- `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；图片处理完后自底向上删除已无图片、已无子文件夹且磁盘目录为空的回收站文件夹行与目录。可重复执行，也可取消：每 400 行检查一次取消，停下时未处理的行仍带待释放标记，消息写「已停止，剩余待释放保留到下次」。有释放失败的终态是「部分失败」而不是「完成」，失败条数进失败清单与日志。「清空操作记录」只删掉全部记录、`undo_runs` 与暂存目录，不删除任何原图文件；已从回收站移除的图片会留在磁盘上，之后由单独的「释放待删文件」动作删除（自动释放或重新打开图库时也会清理）。
 - 释放失败要落到用户看得见的地方：删文件失败与「回收站目录里还有未纳管文件」都写进任务的失败清单与日志，任务消息给出“N 项未能释放”。原图路径无法解析（哈希或扩展名不合法）的行不删行——删了就再也查不到——只清掉待释放标记并保留在回收站，失败清单里给出存库路径。
 - 「还有待释放文件」按磁盘事实判断：图片的无主标记只要有就算，文件夹的无主标记要看目录是不是不存在或已空。目录里还有未纳管文件的文件夹保留标记但不算待释放，因此不会每次写入或开库都白排一次释放任务；清空回收站会把这些无主标记改成新记录，下次释放再试。
 - 待释放行对查询不可见：图片与文件夹的 `purge_operation_id` 非空时分别从回收站视图、回收站树与全库搜索中排除。图片的待释放行一定有 `deleted_at`，普通视图与集合视图靠 `deleted_at IS NULL` 挡住；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
 - 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有运行中的任务且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有运行中的任务且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed` / `undoSkipped`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
 - `HistoryStorage`：`{ recordCount, chunkCount, chunkBytes, undoFiles, undoBytes, totalBytes }`。逆数据用 `sum(length(data))` 统计，不读 BLOB 内容；`undo*` 递归统计 `.artbank/undo/` 的普通文件并跳过符号链接。操作记录面板显示记录数与占用；清空只删除记录与暂存，不对 SQLite 执行 `VACUUM`，数据库文件不会立即缩小。
 - `recoveryNeeded` 为真表示存在 `undoing` / `redoing` 记录且没有对应撤销/重做任务在跑；此时 `blockedReason` 提示重新打开图库恢复。
 - 界面入口在浏览工具栏“记录”按钮：灰色 `undone` 记录可选中重做，“当前状态”分隔线标出撤销位置；新操作后灰色记录消失。见 [浏览与检索](browse-and-query.md#操作记录)。
@@ -363,25 +367,4 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 ## 测试
 
-`cargo test` 覆盖：
-
-- 设置往返、v1 `lastLibraryId`/首项迁移、v2→v3 迁移（`thumbnailCacheMb` 被删除、新字段补默认值、旧值不丢）、v4→v5 迁移（补 `history.maxSteps=100`）、v6→v7 迁移（补 `ai.prewarmImports=true`）、操作记录步数范围拒绝、非法主题与重复排序指标拒绝、设置页不覆盖后端 `libraryPath`、相对路径拒绝；
-- schema 初始化、v1→v2 迁移、v2→v3 迁移（`folders.sort_index` 按名称编号）、v3→v4 迁移（新增修改时间与像素索引）、v4→v5 迁移（新增操作表、待释放列与索引且保留现有行）、v5→v6 迁移（新增 `optimized_at` 且旧行为 0）、v6→v7 迁移（新增 `kind`、唯一临时文件夹与同名冲突后缀）、v7→v8 迁移（只建覆盖索引、幂等、现有行不变）、v8→v9 迁移（只建字节汇总覆盖索引、幂等、现有行不变）、v9→v10 迁移（新增回收站列与部分索引、幂等、现有行不变）、大小写冲突拒绝、FTS 插入/更新、重复初始化拒绝；
-- 目录规范校验（非法字符、保留设备名、结尾空格/句点、保留目录、根路径）；
-- 图库创建/重开/重复创建拒绝/普通目录拒绝打开；
-- 文件夹：多级创建补齐祖先、重命名/移动子树、仅大小写重命名、整树移入回收站（非空也可、保留行与目录）、删除单元恢复（含从子树恢复整单、跨删除单元拒绝）、永久删除只写待释放标记并清理空目录与行、跨子树移动拒绝、临时文件夹不进入排序；
-- 文件夹批量操作：多文件夹移动/插入与撤销重做、父子同时选中只移动最外层、批量排序的完整集合校验与一条记录、直属筛选（含根目录与后代排除）、移动/删除标题包含路径、窗口可见性回退；
-- 临时文件夹：每库恰好一个隐藏行、清空行/文件/集合引用、普通视图与全库搜索不可见、临时元数据不写操作记录、禁止移动/回收站/编辑/加入集合；
-- 导入仓储插入、内容哈希冲突与合并元数据；
-- 导入批次、取消、重复与 pack 缺失（见 [导入与缩略图](import.md)）；
-- 查询：键集分页无重复、重复排序键的 id 决胜、文件夹/扩展名/评分/标签 any/all、升序/降序、回收站视图、筛选分面计数、文件夹/标签列表、全部匹配 id；文件夹子树筛选（后代命中、相似前缀不误匹配、根目录等价全库）、直接/子树计数、文件夹分面按子树展开；
-- 多级排序查询：6 级排序跨页无重复无遗漏（重复值 + 混合方向 + 两个文件夹）、文件夹排序走 id 游标、锚点包含目标行、排序级数/重复指标/游标长度校验；文件夹同级重排、跨父级拒绝；
-- 搜索与筛选：描述/标签名/文件夹路径搜索、全库范围包含回收站、时间/大小/存在性筛选、集合手工顺序、非法参数拒绝；
-- 元数据：详情与主色、评分/描述更新、标签集合/增删/重命名/删除、文件夹移动与失败回滚、软删除/恢复、永久删除与清空回收站的延迟标记与释放；
-- 操作记录：空记录回滚、线性撤销回收站/恢复、永久删除标记撤销、待释放批次释放、裁剪保留最新、取消在块边界（撤销按记录、释放按 400 行）、`pending`/`undoing` 启动恢复、无主暂存目录清理、重开图库后历史仍可读；覆盖移动撤销（文件与行、部分恢复后续做）、编辑撤销（文件、行、缩略图、`feature_blobs`、暂存目录）、文件夹创建/重命名/移动/删除/排序撤销，以及导入新增/合并撤销（新建文件夹与标签清理、合并快照恢复）；重做覆盖回收站/恢复、永久删除标记、移动、编辑、文件夹创建/重命名/移动/排序/删除链条与导入新增/合并，另测“重做到较旧记录时保留更新记录为灰”、新操作清空重做分支、写入内容的导入清空重做分支而空 `pending` 导入保留、`redoing` 启动续做；覆盖评分/描述/AI 描述、标签设置/增删/改名/删除、集合 CRUD/排序/加入移出/运算/相似分组的线性撤销与重做，以及标签合并的迁移、去重、撤销与重做。
-- 图片空间优化：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、估算分层与只读、凭证指纹与候选 ±10%、执行后内容列与 `optimized_at` 更新而其余元数据不变、旧图删除、重复压缩跳过、`pending` 记录恢复为 `applied`。
-- 集合：CRUD/排序、加入去重、移出、并集/交集/差集；
-- 查看器源：小图直接服务、预览缓存与复用、长边 4096 限制、EXIF 方向预览、原图缺失与回收站只读；
-- 编辑保存：几何顺序与输出格式、旧文件清理、缩略图指针、元数据保留、feature_blobs 清除、冲突/无修改/回收站拒绝。
-
-性能基准（默认忽略）见 [性能基准](../guides/performance.md)。
+按改动的检查范围与命令见[验证策略](../guides/validation.md)；性能基准见[性能基准](../guides/performance.md)。

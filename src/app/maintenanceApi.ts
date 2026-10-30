@@ -7,8 +7,8 @@ const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in 
 /**
  * 维护页专用的少量命令。
  *
- * 检查、导出、包回收都走 `start_batch_task`（范围 + 选项的形状与批量任务一致），
- * 这里只留「读包统计」「取报告」「导出报告」「移孤儿」这四件事。
+ * 检查与导出走 `start_batch_task`（范围 + 选项的形状与批量任务一致），
+ * 包回收走专用的 `start_pack_compact`；这里只留「读包统计」「立即回收」「取报告」「导出报告」「移孤儿」五件事。
  */
 export const maintenanceApi = {
   async packStats(): Promise<PackStats> {

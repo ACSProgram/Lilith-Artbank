@@ -7,7 +7,6 @@ import type {
   CombineMode,
   DeleteReport,
   FilterCounts,
-  FolderCount,
   FolderChange,
   FolderInfo,
   FolderStats,
@@ -256,7 +255,7 @@ export function mockLibraryCounts(): {
   };
 }
 
-type Facet = "folders" | "extensions" | "scores" | "tags" | null;
+type Facet = "extensions" | "scores" | "tags" | null;
 
 function isLibraryScope(query: LibraryQuery): boolean {
   return query.search.trim().length > 0 && query.searchScope === "library";
@@ -297,7 +296,7 @@ function folderTrashedOf(folderId: number): boolean {
 
 function matchesFilters(image: ImageRow, filters: LibraryFilters, exclude: Facet): boolean {
   if (filters.trashLoose && folderTrashedOf(image.folderId)) return false;
-  if (exclude !== "folders" && filters.folderIds.length > 0) {
+  if (filters.folderIds.length > 0) {
     const matched = filters.folderIds.some((folderId) => {
       const path = folderPathOf(folderId);
       return path != null && isSameOrDescendant(image.folderPath, path);
@@ -472,7 +471,6 @@ function groupCounts(rows: ImageRow[], key: (image: ImageRow) => string): Map<st
 
 export function mockFilterCounts(query: LibraryQuery): FilterCounts {
   const total = mockImages.filter((image) => matches(image, query, null)).length;
-  const matchedForFolders = mockImages.filter((image) => matches(image, query, "folders"));
   const extensionCounts = groupCounts(
     mockImages.filter((image) => matches(image, query, "extensions")),
     (image) => image.fileExt,
@@ -488,15 +486,6 @@ export function mockFilterCounts(query: LibraryQuery): FilterCounts {
     }
   }
 
-  const folders: FolderCount[] = folderState
-    .map((folder) => ({
-      folderId: folder.id,
-      count: matchedForFolders.filter((image) =>
-        isSameOrDescendant(image.folderPath, folder.path),
-      ).length,
-    }))
-    .filter((item) => item.count > 0)
-    .sort((a, b) => b.count - a.count || a.folderId - b.folderId);
   const extensions: ValueCount[] = [...extensionCounts.entries()]
     .map(([value, count]) => ({ value, count }))
     .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
@@ -508,7 +497,7 @@ export function mockFilterCounts(query: LibraryQuery): FilterCounts {
     .filter((item) => item.tagId > 0)
     .sort((a, b) => b.count - a.count || a.tagId - b.tagId);
 
-  return { total, folders, extensions, scores, tags };
+  return { total, extensions, scores, tags };
 }
 
 function mockFolderStats(query: LibraryQuery): FolderStats {
@@ -1438,7 +1427,6 @@ function mockHistoryTask(kind: TaskKind, label: string, scope: string): TaskSnap
     kind,
     label,
     scope,
-    lane: "write",
     phase: "running",
     total: 0,
     completed: 0,
@@ -1527,10 +1515,33 @@ export function mockRedoToOperation(targetId: number): TaskStartResult {
   };
 }
 
+export function mockRetryUndo(targetId: number): TaskStartResult {
+  mockOperations = mockOperations.map((entry) =>
+    entry.id === targetId ? { ...entry, status: "undone" as const, error: "" } : entry,
+  );
+  return {
+    status: "started",
+    task: mockHistoryTask("undo", "撤销操作", "重试撤销失败记录"),
+  };
+}
+
+export function mockSkipUndo(targetId: number): void {
+  mockOperations = mockOperations.map((entry) =>
+    entry.id === targetId ? { ...entry, status: "undoSkipped" as const } : entry,
+  );
+}
+
+export function mockReleasePendingFiles(): TaskStartResult {
+  return {
+    status: "started",
+    task: mockHistoryTask("releaseGarbage", "释放删除文件", "释放待删文件"),
+  };
+}
+
 export function mockClearOperationHistory(): TaskStartResult {
   mockOperations = [];
   return {
     status: "started",
-    task: mockHistoryTask("releaseGarbage", "释放删除文件", "清空操作记录"),
+    task: mockHistoryTask("clearHistory", "清空操作记录", "清空操作记录"),
   };
 }

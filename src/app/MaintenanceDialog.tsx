@@ -365,7 +365,7 @@ export function MaintenanceDialog({ open, onClose, context, libraryId }: Mainten
     <Modal
       open={open}
       title="维护与检查"
-      subtitle="检查原图、处理孤儿、回收缩略图空间、导出图片。范围与批量任务共用同一套口径。"
+      subtitle="检查原图、处理孤儿、回收缩略图空间、导出图片。"
       width={860}
       onClose={onClose}
       footer={footer}

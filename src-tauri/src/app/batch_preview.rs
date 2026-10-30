@@ -100,8 +100,7 @@ fn filter_for(request: &BatchTaskPreviewRequest) -> AppResult<Option<PendingFilt
         }
         BatchTaskKind::SimilarityGroups
         | BatchTaskKind::OptimizeEstimate
-        | BatchTaskKind::Optimize
-        | BatchTaskKind::PackCompact => {
+        | BatchTaskKind::Optimize => {
             return Err(AppError::message("该任务类型不提供待处理数量"));
         }
     })

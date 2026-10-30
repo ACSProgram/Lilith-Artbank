@@ -74,7 +74,7 @@ pub struct ImportSettings {
     pub optimize: Option<ImportOptimize>,
 }
 
-/// MCP 服务默认关闭，开启后使用询问档；批次 1 尚未注册写工具，实际能力为只读。
+/// MCP 服务默认关闭、默认询问档；三档语义与工具清单见 `docs/modules/mcp.md`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum McpMode {

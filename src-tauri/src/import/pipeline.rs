@@ -1275,7 +1275,6 @@ mod tests {
             duplicate_policy: DuplicatePolicy::Skip,
             perceptual_threshold: 6,
             optimize: None,
-            worker_threads: Some(4),
             #[cfg(test)]
             cancel_after: None,
         }
@@ -1926,7 +1925,6 @@ mod tests {
         let session = open_library(&library_root);
 
         let mut cancel_request = request(&source_dir);
-        cancel_request.worker_threads = Some(4);
         cancel_request.cancel_after = Some(20);
         let job = Arc::new(ImportJob::new(
             "cancel-job",

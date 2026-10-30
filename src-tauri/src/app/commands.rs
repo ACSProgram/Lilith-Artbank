@@ -239,10 +239,8 @@ pub struct AppInfo {
     pub exe_path: String,
 }
 
-/// 日志文件名与 `lib.rs` 里 `TargetKind::Folder` 的 `file_name` 一致。
-const LOG_FILE_STEM: &str = "lilith-artbank";
-
 fn log_file_path() -> String {
+    use crate::app::logging::LOG_FILE_STEM;
     let dir = crate::app::paths::log_dir();
     // 插件按给定文件名落盘，不同版本对扩展名的处理不一致，两个候选都试一次。
     for candidate in [
@@ -833,6 +831,30 @@ pub fn redo_to_operation(
 }
 
 #[tauri::command]
+pub fn retry_undo_operation(
+    state: State<'_, AppState>,
+    target_id: i64,
+) -> Result<TaskStartResult, String> {
+    trace::write("retry_undo_operation", || {
+        AppError::command(state.retry_undo(target_id))
+    })
+}
+
+#[tauri::command]
+pub fn skip_undo_operation(state: State<'_, AppState>, target_id: i64) -> Result<(), String> {
+    trace::write("skip_undo_operation", || {
+        AppError::command(state.skip_undo(target_id))
+    })
+}
+
+#[tauri::command]
+pub fn release_pending_files(state: State<'_, AppState>) -> Result<TaskStartResult, String> {
+    trace::write("release_pending_files", || {
+        AppError::command(state.release_pending())
+    })
+}
+
+#[tauri::command]
 pub fn clear_operation_history(state: State<'_, AppState>) -> Result<TaskStartResult, String> {
     trace::write("clear_operation_history", || {
         AppError::command(state.clear_history())
@@ -1397,6 +1419,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_operation_history,
         undo_to_operation,
         redo_to_operation,
+        retry_undo_operation,
+        skip_undo_operation,
+        release_pending_files,
         clear_operation_history,
         get_collections,
         create_collection,

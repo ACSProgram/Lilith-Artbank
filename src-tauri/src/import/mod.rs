@@ -82,8 +82,6 @@ pub struct ImportRequest {
     /// 勾选后导入即压缩；`None` 表示不压缩，行为与以前完全一致。
     #[serde(default)]
     pub optimize: Option<ImportOptimize>,
-    #[serde(default)]
-    pub worker_threads: Option<usize>,
     #[cfg(test)]
     #[serde(skip)]
     pub cancel_after: Option<usize>,
@@ -303,7 +301,6 @@ mod tests {
             duplicate_policy: DuplicatePolicy::Skip,
             perceptual_threshold: 6,
             optimize: None,
-            worker_threads: None,
             cancel_after: None,
         }
     }

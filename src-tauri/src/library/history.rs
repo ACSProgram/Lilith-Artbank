@@ -178,6 +178,8 @@ pub enum OperationStatus {
     /// 重做进行中；崩溃后从这里续做。
     Redoing,
     UndoFailed,
+    /// 用户放弃撤销失败的记录：保留在时间线里，不再参与撤销与重做。
+    UndoSkipped,
 }
 
 impl OperationStatus {
@@ -189,6 +191,7 @@ impl OperationStatus {
             Self::Undone => "undone",
             Self::Redoing => "redoing",
             Self::UndoFailed => "undoFailed",
+            Self::UndoSkipped => "undoSkipped",
         }
     }
 
@@ -200,6 +203,7 @@ impl OperationStatus {
             "undone" => Ok(Self::Undone),
             "redoing" => Ok(Self::Redoing),
             "undoFailed" => Ok(Self::UndoFailed),
+            "undoSkipped" => Ok(Self::UndoSkipped),
             other => Err(AppError::message(format!("未知的操作状态：{other}"))),
         }
     }
@@ -1044,7 +1048,7 @@ pub fn list(database: &LibraryDb) -> AppResult<Vec<HistoryEntry>> {
         let mut statement = connection.prepare(
             "SELECT id, kind, label, created_at, affected, status, error
              FROM operations
-             WHERE status IN ('applied', 'undoFailed', 'undone', 'redoing')
+             WHERE status IN ('applied', 'undoFailed', 'undoSkipped', 'undone', 'redoing')
              ORDER BY id DESC",
         )?;
         let rows = statement
@@ -1147,6 +1151,9 @@ pub fn preview_undo(database: &LibraryDb, target_id: i64) -> AppResult<Operation
         OperationStatus::Undone | OperationStatus::Redoing => {
             return Err(AppError::message("这条记录已经撤销，可以重做"));
         }
+        OperationStatus::UndoSkipped => {
+            return Err(AppError::message("这条记录已跳过撤销"));
+        }
         OperationStatus::Pending | OperationStatus::Undoing => {
             return Err(AppError::message("只能撤销已经完成的操作"));
         }
@@ -1156,7 +1163,7 @@ pub fn preview_undo(database: &LibraryDb, target_id: i64) -> AppResult<Operation
         .any(|row| row.0 >= target_id && row.5 == OperationStatus::UndoFailed.as_str())
     {
         return Err(AppError::message(
-            "之后有一条记录上次撤销失败，不能继续回退；请先处理失败原因或清空记录",
+            "之后有一条记录上次撤销失败，不能继续回退；请先重试或跳过这条记录",
         ));
     }
     if rows.iter().any(|row| {
@@ -1199,6 +1206,9 @@ pub fn preview_redo(database: &LibraryDb, target_id: i64) -> AppResult<Operation
             return Err(AppError::message(
                 "这条记录上次撤销失败，需要先处理失败原因",
             ));
+        }
+        OperationStatus::UndoSkipped => {
+            return Err(AppError::message("这条记录已跳过撤销"));
         }
         OperationStatus::Pending | OperationStatus::Undoing => {
             return Err(AppError::message("只能重做已经撤销的操作"));
@@ -1318,14 +1328,14 @@ fn undo_usage(path: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
-/// 只裁剪 `applied` / `undo_failed`；`pending` / `undoing` 交给启动恢复。
+/// 只裁剪 `applied` / `undoFailed` / `undoSkipped`；`pending` / `undoing` 交给启动恢复。
 pub fn trim(database: &LibraryDb, max_steps: u32) -> AppResult<Vec<EvictedOperation>> {
     database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let evicted = {
             let mut statement = transaction.prepare(
                 "SELECT id, kind FROM operations
-                 WHERE status IN ('applied', 'undoFailed')
+                 WHERE status IN ('applied', 'undoFailed', 'undoSkipped')
                  ORDER BY id DESC
                  LIMIT -1 OFFSET ?1",
             )?;
@@ -1346,6 +1356,11 @@ pub fn trim(database: &LibraryDb, max_steps: u32) -> AppResult<Vec<EvictedOperat
         for operation in &evicted {
             transaction.execute("DELETE FROM operations WHERE id = ?1", [operation.id])?;
         }
+        // 运行审计只跟随仍存在的记录；被裁掉的目标不再有恢复意义。
+        transaction.execute(
+            "DELETE FROM undo_runs WHERE target_operation_id NOT IN (SELECT id FROM operations)",
+            [],
+        )?;
         transaction.commit()?;
         Ok(evicted)
     })
@@ -1504,12 +1519,13 @@ fn load_redo_records(connection: &Connection, operation_id: i64) -> AppResult<Ve
     Ok(records)
 }
 
-/// 清空全部操作记录，并删除撤销暂存目录；调用方随后安排待释放文件清理。
+/// 清空全部操作记录、运行审计与撤销暂存目录；不删除任何原图，待删文件由单独的释放动作处理。
 pub fn clear(database: &LibraryDb, root: &Path) -> AppResult<u64> {
     let deleted = database.with_writer(|connection| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM operations", [])?;
         let deleted = transaction.changes();
+        transaction.execute("DELETE FROM undo_runs", [])?;
         transaction.commit()?;
         Ok(deleted)
     })?;
@@ -1613,56 +1629,132 @@ pub fn run_undo(
             cancelled = true;
             break;
         }
-        task.set_message(format!("撤销：{label}"));
-        // 先记 undoing 再撤：崩溃后按最小的 undoing id 续做。
-        // 只有第一次从 applied 进入时才丢弃旧的重做数据；续做必须保留上次已写入的快照。
-        database.with_writer(|connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let status: String = transaction.query_row(
-                "SELECT status FROM operations WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )?;
-            if status == OperationStatus::Applied.as_str() {
-                clear_redo_chunks(&transaction, id)?;
-            }
-            transaction.execute(
-                "UPDATE operations SET status = 'undoing', error = '' WHERE id = ?1",
-                [id],
-            )?;
-            transaction.commit()?;
-            Ok(())
-        })?;
-        match undo_operation(database, root, thumbs, &task, id, kind) {
-            Ok(()) => {
-                database.with_writer(|connection| {
-                    connection.execute(
-                        "UPDATE operations
-                         SET status = 'undone', undone_at = ?1, error = ''
-                         WHERE id = ?2",
-                        params![now_ms(), id],
-                    )?;
-                    Ok(())
-                })?;
-                task.inc_completed();
-            }
-            Err(error) => {
-                database.with_writer(|connection| {
-                    connection.execute(
-                        "UPDATE operations SET status = 'undoFailed', error = ?1 WHERE id = ?2",
-                        params![error.to_string(), id],
-                    )?;
-                    Ok(())
-                })?;
-                run.finish("failed")?;
-                return Err(AppError::message(format!("撤销「{label}」失败：{error}")));
-            }
+        if let Err(error) = undo_record(database, root, thumbs, &task, id, kind, &label) {
+            run.finish("failed")?;
+            return Err(error);
         }
     }
     run.finish(if cancelled { "cancelled" } else { "completed" })?;
     task.set_message("");
     Ok(())
+}
+
+/// 重试单条撤销失败的记录：只撤这一条，不碰时间线上其他记录。
+pub fn retry_undo(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    operation_id: i64,
+    task: Arc<TaskHandle>,
+) -> AppResult<()> {
+    let run_id = start_run(database, operation_id)?;
+    let run = HistoryRunGuard::new(database, run_id);
+    let (kind, label, status): (String, String, String) = database.with_reader(|connection| {
+        Ok(connection.query_row(
+            "SELECT kind, label, status FROM operations WHERE id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
+    })?;
+    if status != OperationStatus::UndoFailed.as_str() {
+        run.finish("failed")?;
+        return Err(AppError::message("只有撤销失败的记录可以重试"));
+    }
+    task.set_total(1);
+    let kind = HistoryKind::parse(&kind)?;
+    match undo_record(database, root, thumbs, &task, operation_id, kind, &label) {
+        Ok(()) => {
+            run.finish("completed")?;
+            task.set_message("");
+            Ok(())
+        }
+        Err(error) => {
+            run.finish("failed")?;
+            Err(error)
+        }
+    }
+}
+
+/// 放弃撤销失败的记录：保留在时间线里，之后不再参与撤销与重做。
+pub fn skip_undo(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM operations WHERE id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(AppError::message("操作记录不存在"));
+        };
+        if status != OperationStatus::UndoFailed.as_str() {
+            return Err(AppError::message("只有撤销失败的记录可以跳过"));
+        }
+        transaction.execute(
+            "UPDATE operations SET status = 'undoSkipped' WHERE id = ?1",
+            [operation_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn undo_record(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    task: &TaskHandle,
+    id: i64,
+    kind: HistoryKind,
+    label: &str,
+) -> AppResult<()> {
+    task.set_message(format!("撤销：{label}"));
+    // 先记 undoing 再撤：崩溃后按最小的 undoing id 续做，撤销失败后的重试也从这里继续。
+    // 只有第一次从 applied 进入时才丢弃旧的重做数据；续做与重试都必须保留上次已写入的快照
+    // （导入撤销按批提交，重做要靠这些已提交的快照才知道哪些行已经撤过）。
+    database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status: String =
+            transaction.query_row("SELECT status FROM operations WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })?;
+        if status == OperationStatus::Applied.as_str() {
+            clear_redo_chunks(&transaction, id)?;
+        }
+        transaction.execute(
+            "UPDATE operations SET status = 'undoing', error = '' WHERE id = ?1",
+            [id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })?;
+    match undo_operation(database, root, thumbs, task, id, kind) {
+        Ok(()) => {
+            database.with_writer(|connection| {
+                connection.execute(
+                    "UPDATE operations
+                     SET status = 'undone', undone_at = ?1, error = ''
+                     WHERE id = ?2",
+                    params![now_ms(), id],
+                )?;
+                Ok(())
+            })?;
+            task.inc_completed();
+            Ok(())
+        }
+        Err(error) => {
+            database.with_writer(|connection| {
+                connection.execute(
+                    "UPDATE operations SET status = 'undoFailed', error = ?1 WHERE id = ?2",
+                    params![error.to_string(), id],
+                )?;
+                Ok(())
+            })?;
+            Err(AppError::message(format!("撤销「{label}」失败：{error}")))
+        }
+    }
 }
 
 /// 重做当前状态到目标记录之间的全部 `undone` 记录；越早的记录越先做。
@@ -5012,6 +5104,164 @@ mod tests {
     }
 
     #[test]
+    fn trim_and_clear_drop_undo_runs() {
+        let fixture = Fixture::new();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let (_, id) = write_with_id(
+                fixture.db(),
+                NewOperation::new(HistoryKind::Trash, format!("记录 {index}")),
+                |_, draft| {
+                    draft.affected(1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            ids.push(id.unwrap());
+        }
+        fixture
+            .db()
+            .with_writer(|connection| {
+                for id in &ids {
+                    connection.execute(
+                        "INSERT INTO undo_runs(target_operation_id, state, started_at)
+                         VALUES (?1, 'completed', 1)",
+                        [id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        trim(fixture.db(), 1).unwrap();
+        let runs: i64 = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row("SELECT count(*) FROM undo_runs", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(runs, 1, "被裁掉的记录不再保留运行审计");
+
+        clear(fixture.db(), &fixture.root).unwrap();
+        let runs: i64 = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row("SELECT count(*) FROM undo_runs", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    fn force_undo_failed(fixture: &Fixture, operation_id: i64) {
+        fixture
+            .db()
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE operations SET status = 'undoFailed', error = '文件被占用' WHERE id = ?1",
+                    [operation_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn deleted_at(fixture: &Fixture, image_id: i64) -> Option<i64> {
+        fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT deleted_at FROM images WHERE id = ?1",
+                    [image_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn retry_undo_failed_record_undoes_only_it() {
+        let fixture = Fixture::new();
+        let image = fixture.insert_image("retry");
+        metadata::set_trashed(fixture.db(), &[image], true).unwrap();
+        let entry = list(fixture.db()).unwrap().remove(0);
+        force_undo_failed(&fixture, entry.id);
+        // 模拟上次撤销已提交的重做快照：重试是续做，不能把它们清掉（导入撤销按批提交，
+        // 重做要靠这些快照找回已撤过的行）。
+        fixture
+            .db()
+            .with_writer(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                append_redo(
+                    &transaction,
+                    entry.id,
+                    &RedoRecord::PurgeIds { ids: Vec::new() },
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        retry_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            entry.id,
+            task(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            list(fixture.db()).unwrap()[0].status,
+            OperationStatus::Undone
+        );
+        assert!(deleted_at(&fixture, image).is_none());
+        let kept = fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(load_redo_records(connection, entry.id)?
+                    .iter()
+                    .any(|record| matches!(record, RedoRecord::PurgeIds { ids } if ids.is_empty())))
+            })
+            .unwrap();
+        assert!(kept, "重试撤销不应清掉上次已提交的重做快照");
+    }
+
+    #[test]
+    fn skipped_record_stays_in_timeline_but_does_not_block_undo() {
+        let fixture = Fixture::new();
+        let first = fixture.insert_image("first");
+        metadata::set_trashed(fixture.db(), &[first], true).unwrap();
+        let second = fixture.insert_image("second");
+        metadata::set_trashed(fixture.db(), &[second], true).unwrap();
+
+        let entries = list(fixture.db()).unwrap();
+        let failed = entries[0].id;
+        let older = entries[1].id;
+        force_undo_failed(&fixture, failed);
+
+        skip_undo(fixture.db(), failed).unwrap();
+        let entries = list(fixture.db()).unwrap();
+        assert_eq!(entries[0].status, OperationStatus::UndoSkipped);
+        assert_eq!(entries[0].error, "文件被占用");
+
+        run_undo(
+            fixture.db(),
+            &fixture.root,
+            &fixture.session.thumbs,
+            older,
+            task(),
+        )
+        .unwrap();
+        assert_eq!(
+            list(fixture.db()).unwrap()[1].status,
+            OperationStatus::Undone
+        );
+        assert!(deleted_at(&fixture, first).is_none());
+        assert!(deleted_at(&fixture, second).is_some());
+    }
+
+    #[test]
     fn undoes_trash_and_restore_in_linear_order() {
         let fixture = Fixture::new();
         let first = fixture.insert_image("a");
@@ -6011,7 +6261,6 @@ mod tests {
             },
             perceptual_threshold: 0,
             optimize: None,
-            worker_threads: Some(2),
             #[cfg(test)]
             cancel_after: None,
         };

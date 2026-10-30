@@ -803,7 +803,7 @@ fn usage() -> String {
          \x20          rename-tag|delete-tag|merge-tags|move|trash|restore|delete|empty-trash\n\
          \x20 folder create|rename|move|delete|restore|delete-permanently|reorder|place|apply-order|trash\n\
          \x20 collection list|create|rename|delete|reorder|add|remove|combine\n\
-         \x20 history list|undo|redo|clear\n\
+         \x20 history list|undo|redo|clear|release\n\
          \x20 viewer source\n\
          \x20 edit estimate|save\n\
          \x20 task list|wait|cancel\n\

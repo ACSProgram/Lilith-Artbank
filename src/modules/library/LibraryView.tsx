@@ -293,7 +293,6 @@ export function LibraryView({
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const appliedChangeRevision = useRef(0);
-  const contextRevision = useRef(0);
   const [findSimilarContextVersion, setFindSimilarContextVersion] = useState(0);
   // 标签筛选后保留原图选择；若不在第一页，用锚点游标跳到它所在位置。
   const preserveTagSelectionRef = useRef(false);

@@ -3,7 +3,6 @@
 //! 所有会长时间占用磁盘、写连接或 AI 服务的操作都注册到这里，准入由
 //! `concurrency::resources` 的资源表决定：只有真正读写同一资源的任务才互相等待；
 //! 长任务冲突时默认按资源 FIFO 排队，路径锁写者优先，短操作仍立即失败。
-//! `TaskLane` 只用于任务中心的展示与优先级提示，不再决定冲突。
 //! 任务体 panic、线程起不来或提前返回都在这里落到失败终态，并释放资源。
 //! 排队中的任务不占任何资源；真正开始时还要核对图库代次，换库后直接取消。
 //! 进度通过 `task-progress` / `task-finished` 事件推给前端任务中心。
@@ -59,6 +58,8 @@ pub enum TaskKind {
     EmptyTrash,
     Undo,
     Redo,
+    /// 只删除操作记录与撤销暂存，不释放待删除文件。
+    ClearHistory,
     ReleaseGarbage,
     OptimizeEstimate,
     Optimize,
@@ -75,28 +76,6 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    pub fn lane(self) -> TaskLane {
-        match self {
-            Self::Import
-            | Self::Thumbnail
-            | Self::FolderMove
-            | Self::PermanentDelete
-            | Self::EmptyTrash
-            | Self::Undo
-            | Self::Redo
-            | Self::ReleaseGarbage
-            | Self::Optimize
-            | Self::OrphanMove
-            | Self::PackCompact => TaskLane::Write,
-            Self::AiEmbedding | Self::AiPose | Self::AiDescription | Self::TempFeatures => {
-                TaskLane::Ai
-            }
-            Self::SimilarityGroups | Self::OptimizeEstimate | Self::CheckLibrary | Self::Export => {
-                TaskLane::Scan
-            }
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Import => "导入",
@@ -110,6 +89,7 @@ impl TaskKind {
             Self::EmptyTrash => "清空回收站",
             Self::Undo => "撤销操作",
             Self::Redo => "重做操作",
+            Self::ClearHistory => "清空操作记录",
             Self::ReleaseGarbage => "释放删除文件",
             Self::OptimizeEstimate => "估算压缩空间",
             Self::Optimize => "优化图片空间",
@@ -141,14 +121,6 @@ impl TaskKind {
                 | Self::ReleaseGarbage
         )
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum TaskLane {
-    Write,
-    Ai,
-    Scan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -200,7 +172,6 @@ pub struct TaskSnapshot {
     pub kind: TaskKind,
     pub label: String,
     pub scope: String,
-    pub lane: TaskLane,
     pub phase: TaskPhase,
     pub total: usize,
     pub completed: usize,
@@ -246,7 +217,6 @@ pub struct TaskSummary {
     pub kind: TaskKind,
     pub label: String,
     pub scope: String,
-    pub lane: TaskLane,
     pub phase: TaskPhase,
 }
 
@@ -335,10 +305,6 @@ impl TaskHandle {
 
     pub fn id(&self) -> &str {
         &self.id
-    }
-
-    pub fn lane(&self) -> TaskLane {
-        self.kind.lane()
     }
 
     pub fn phase(&self) -> TaskPhase {
@@ -552,7 +518,6 @@ impl TaskHandle {
             kind: self.kind,
             label: self.kind.label().to_owned(),
             scope: self.scope.clone(),
-            lane: self.lane(),
             phase,
             total,
             completed,
@@ -591,7 +556,6 @@ impl TaskHandle {
             kind: self.kind,
             label: self.kind.label().to_owned(),
             scope: self.scope.clone(),
-            lane: self.lane(),
             phase: self.phase(),
         }
     }
@@ -1353,8 +1317,6 @@ pub enum BatchTaskKind {
     CheckFast,
     /// 完整校验（重算 BLAKE3）。
     CheckFull,
-    /// 立即回收缩略图包，不等空闲条件。
-    PackCompact,
     /// 导出到目录。
     Export,
 }
@@ -1479,14 +1441,12 @@ mod tests {
                 kind: TaskKind::Import,
                 label: "导入".into(),
                 scope: "整个图库".into(),
-                lane: TaskLane::Write,
                 phase: TaskPhase::Running,
             }],
         })
         .unwrap();
         assert_eq!(value["status"], "conflict");
         assert_eq!(value["active"][0]["taskId"], "a");
-        assert_eq!(value["active"][0]["lane"], "write");
     }
 
     #[test]
@@ -1527,10 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_release_run_on_write_lane() {
-        assert_eq!(TaskKind::Undo.lane(), TaskLane::Write);
-        assert_eq!(TaskKind::Redo.lane(), TaskLane::Write);
-        assert_eq!(TaskKind::ReleaseGarbage.lane(), TaskLane::Write);
+    fn undo_and_release_have_labels() {
         assert_eq!(TaskKind::Undo.label(), "撤销操作");
         assert_eq!(TaskKind::ReleaseGarbage.label(), "释放删除文件");
     }
@@ -1669,7 +1626,6 @@ mod tests {
         assert!(snapshot.phase.is_terminal());
         assert_eq!(snapshot.phase, TaskPhase::Yielded);
         assert!(handle.is_finished());
-        assert_eq!(TaskKind::PackCompact.lane(), TaskLane::Write);
         assert_eq!(TaskKind::PackCompact.label(), "回收缩略图包");
 
         // 终态之后取消请求不再改写相位。
@@ -1682,10 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_task_kinds_have_lanes_and_labels() {
-        assert_eq!(TaskKind::CheckLibrary.lane(), TaskLane::Scan);
-        assert_eq!(TaskKind::Export.lane(), TaskLane::Scan);
-        assert_eq!(TaskKind::OrphanMove.lane(), TaskLane::Write);
+    fn maintenance_task_kinds_have_labels() {
         assert_eq!(TaskKind::CheckLibrary.label(), "检查图库");
         assert_eq!(TaskKind::Export.label(), "导出图片");
         assert_eq!(TaskKind::OrphanMove.label(), "清理孤儿文件");

@@ -146,7 +146,7 @@ export function McpPanel({
         />
         <span>
           <strong>启用 MCP 服务</strong>
-          <small>只从本机 127.0.0.1 接受连接，AI 客户端通过同一份图库状态读写。</small>
+          <small>只从本机 127.0.0.1 接受连接。</small>
         </span>
       </label>
 

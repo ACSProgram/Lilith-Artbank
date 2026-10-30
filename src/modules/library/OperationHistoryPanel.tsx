@@ -16,6 +16,8 @@ import { Spinner } from "../../shared/components/Spinner";
 import {
   confirmClearHistory,
   confirmRedoTo,
+  confirmReleasePending,
+  confirmSkipUndo,
   confirmUndoTo,
 } from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
@@ -140,6 +142,13 @@ export function OperationHistoryPanel({
     return null;
   }, [page, selectedIndex, boundary]);
 
+  const failedEntry =
+    selectedIndex >= 0 && page?.entries[selectedIndex]?.status === "undoFailed"
+      ? page.entries[selectedIndex]
+      : null;
+  const skippedSelected =
+    selectedIndex >= 0 && page?.entries[selectedIndex]?.status === "undoSkipped";
+
   const actionDisabled =
     !page?.canRun ||
     busy ||
@@ -154,7 +163,7 @@ export function OperationHistoryPanel({
     selection?.blocked ??
     (selection?.failed
       ? selection.failed.status === "undoFailed"
-        ? "有一条记录上次撤销失败，需要先处理它"
+        ? "有一条记录上次撤销失败，选中它后可重试或跳过"
         : "有一条记录上次重做失败，需要先重试它"
       : selection?.mode === "undo" && selection.target.status !== "applied"
         ? "这条记录不能作为撤销目标"
@@ -209,6 +218,57 @@ export function OperationHistoryPanel({
       }
     } catch (cause) {
       notify(redo ? "重做失败" : "撤销失败", "error", errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retryFailed = async () => {
+    if (!failedEntry || busy) return;
+    setBusy(true);
+    try {
+      const result = await libraryApi.retryUndoOperation(failedEntry.id);
+      if (handleResult(result, "已开始重试撤销", "现在不能重试撤销")) {
+        setSelectedId(null);
+      }
+    } catch (cause) {
+      notify("重试撤销失败", "error", errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const skipFailed = async () => {
+    if (!failedEntry || busy) return;
+    const accepted = await confirmSkipUndo(confirm, failedEntry.label);
+    if (!accepted) return;
+    setBusy(true);
+    try {
+      await libraryApi.skipUndoOperation(failedEntry.id);
+      notify("已跳过这条记录的撤销", "success");
+      setSelectedId(null);
+      await load();
+    } catch (cause) {
+      notify("跳过撤销失败", "error", errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const releasePending = async () => {
+    if (!page || busy) return;
+    const accepted = await confirmReleasePending(
+      confirm,
+      page.pendingPurgeCount,
+      page.pendingPurgeBytes,
+    );
+    if (!accepted) return;
+    setBusy(true);
+    try {
+      const result = await libraryApi.releasePendingFiles();
+      handleResult(result, "已开始释放待删文件", "现在不能释放待删文件");
+    } catch (cause) {
+      notify("释放待删文件失败", "error", errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -312,6 +372,10 @@ export function OperationHistoryPanel({
                       <span className="operation-history-status">
                         撤销失败{entry.error ? `：${entry.error}` : ""}
                       </span>
+                    ) : entry.status === "undoSkipped" ? (
+                      <span className="operation-history-status is-muted">
+                        已跳过撤销{entry.error ? `（${entry.error}）` : ""}
+                      </span>
                     ) : isRedoStatus(entry) && entry.error ? (
                       <span className="operation-history-status">
                         上次重做失败：{entry.error}
@@ -335,23 +399,52 @@ export function OperationHistoryPanel({
 
         {page && page.entries.length > 0 ? (
           <div className="operation-history-actions">
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={actionDisabled}
-              loading={busy && historyTask == null}
-              title={actionReason ?? undefined}
-              onClick={() => void runAction()}
-            >
-              {selection?.mode === "redo" ? "重做到这条" : "撤销到这条之前"}
-            </Button>
-            <span className="operation-history-hint">
-              {selection
-                ? selection.mode === "redo"
-                  ? `将重做 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
-                  : `共 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
-                : "选择一条记录后撤销或重做"}
-            </span>
+            {failedEntry ? (
+              <>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!page.canRun || busy || historyTask != null}
+                  loading={busy}
+                  onClick={() => void retryFailed()}
+                >
+                  重试撤销
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!page.canRun || busy || historyTask != null}
+                  onClick={() => void skipFailed()}
+                >
+                  跳过这条
+                </Button>
+                <span className="operation-history-hint">
+                  先重试；确认撤不回去时可跳过，之后这条记录不再参与撤销
+                </span>
+              </>
+            ) : (
+              <>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={actionDisabled}
+                  loading={busy && historyTask == null}
+                  title={actionReason ?? undefined}
+                  onClick={() => void runAction()}
+                >
+                  {selection?.mode === "redo" ? "重做到这条" : "撤销到这条之前"}
+                </Button>
+                <span className="operation-history-hint">
+                  {selection
+                    ? selection.mode === "redo"
+                      ? `将重做 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
+                      : `共 ${selection.count.toLocaleString()} 条记录，影响 ${selection.affected.toLocaleString()} ${selection.unit}`
+                    : skippedSelected
+                      ? "这条记录已跳过撤销"
+                      : "选择一条记录后撤销或重做"}
+                </span>
+              </>
+            )}
           </div>
         ) : null}
 
@@ -365,18 +458,30 @@ export function OperationHistoryPanel({
               : ""}
             {page ? ` · 保留最近 ${page.maxSteps} 步` : ""}
           </span>
-          <Button
-            size="sm"
-            variant="danger"
-            icon={<Trash2 size={13} />}
-            disabled={
-              busy || active.length > 0 || !page || page.entries.length === 0
-            }
-            title={active.length > 0 ? page?.blockedReason ?? undefined : undefined}
-            onClick={() => void clear()}
-          >
-            清空记录
-          </Button>
+          <div className="operation-history-footer-actions">
+            {page && page.pendingPurgeCount > 0 ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busy || active.length > 0}
+                onClick={() => void releasePending()}
+              >
+                释放待删文件
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              variant="danger"
+              icon={<Trash2 size={13} />}
+              disabled={
+                busy || active.length > 0 || !page || page.entries.length === 0
+              }
+              title={active.length > 0 ? page?.blockedReason ?? undefined : undefined}
+              onClick={() => void clear()}
+            >
+              清空记录
+            </Button>
+          </div>
         </footer>
       </div>
     </Popover>

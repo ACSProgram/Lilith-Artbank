@@ -159,6 +159,8 @@ fn decorate_entry(
         && !redo_chain_blocked;
     let blocked_reason = if entry.status == OperationStatus::UndoFailed {
         Some("这条记录上次撤销失败，需要先处理失败原因".to_owned())
+    } else if entry.status == OperationStatus::UndoSkipped {
+        Some("这条记录已跳过撤销".to_owned())
     } else if (entry.status == OperationStatus::Applied && undo_chain_blocked)
         || (matches!(
             entry.status,

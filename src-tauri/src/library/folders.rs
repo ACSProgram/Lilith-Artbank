@@ -1263,19 +1263,11 @@ fn info_in(connection: &Connection, folder_id_value: i64) -> AppResult<FolderInf
 }
 
 /// 移入回收站的前置条件：存在、普通文件夹、非根、当前在正常树中。
-pub fn deletion_blocker(
-    db: &LibraryDb,
-    root: &Path,
-    folder_id_value: i64,
-) -> AppResult<Option<String>> {
-    db.with_reader(|connection| deletion_blocker_in(connection, root, folder_id_value))
+pub fn deletion_blocker(db: &LibraryDb, folder_id_value: i64) -> AppResult<Option<String>> {
+    db.with_reader(|connection| deletion_blocker_in(connection, folder_id_value))
 }
 
-fn deletion_blocker_in(
-    connection: &Connection,
-    _root: &Path,
-    folder_id_value: i64,
-) -> AppResult<Option<String>> {
+fn deletion_blocker_in(connection: &Connection, folder_id_value: i64) -> AppResult<Option<String>> {
     let state: Option<(String, Option<i64>, Option<i64>, String)> = connection
         .query_row(
             "SELECT kind, trashed_at, purge_operation_id, path FROM folders WHERE id = ?1",

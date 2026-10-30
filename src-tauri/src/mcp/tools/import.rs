@@ -137,7 +137,6 @@ fn prepare_request(input: &ImportStartInput) -> AppResult<ImportRequest> {
         duplicate_policy: duplicate_policy(input.duplicate_policy.as_deref())?,
         perceptual_threshold: DEFAULT_PERCEPTUAL_THRESHOLD,
         optimize: None,
-        worker_threads: None,
         #[cfg(test)]
         cancel_after: None,
     };
@@ -250,7 +249,6 @@ mod tests {
     fn builds_a_request_without_optimization() {
         let request = prepare_request(&input(vec![absolute_temp_path()])).unwrap();
         assert!(request.optimize.is_none());
-        assert!(request.worker_threads.is_none());
         assert_eq!(request.folder_mode, FolderMode::Flat);
         assert_eq!(request.duplicate_policy, DuplicatePolicy::Skip);
     }
@@ -282,7 +280,6 @@ mod tests {
         let parsed: ImportStartInput = serde_json::from_value(value).unwrap();
         let request = prepare_request(&parsed).unwrap();
         assert!(request.optimize.is_none());
-        assert!(request.worker_threads.is_none());
     }
 
     #[test]

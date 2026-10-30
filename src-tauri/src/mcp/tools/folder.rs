@@ -250,7 +250,7 @@ fn run_folders_modify(
         FolderAction::Delete => {
             let target = resolve_target(&database, input)?;
             let current = folders::info(&database, target)?;
-            if let Some(reason) = folders::deletion_blocker(&database, &root, target)? {
+            if let Some(reason) = folders::deletion_blocker(&database, target)? {
                 return Ok(rejected(reason));
             }
             let subfolder_count = folders::subtree_folder_count(&database, target)?;
@@ -499,17 +499,14 @@ mod tests {
         let parent = folders::find_id(&database, "有子目录").unwrap().unwrap();
         let root_id = folders::find_id(&database, "").unwrap().unwrap();
 
+        assert_eq!(folders::deletion_blocker(&database, empty).unwrap(), None);
         assert_eq!(
-            folders::deletion_blocker(&database, &root, empty).unwrap(),
-            None
-        );
-        assert_eq!(
-            folders::deletion_blocker(&database, &root, parent).unwrap(),
+            folders::deletion_blocker(&database, parent).unwrap(),
             None,
             "非空文件夹也能移入回收站"
         );
         assert!(
-            folders::deletion_blocker(&database, &root, root_id)
+            folders::deletion_blocker(&database, root_id)
                 .unwrap()
                 .unwrap()
                 .contains("根目录")
@@ -517,7 +514,7 @@ mod tests {
 
         folders::trash(&database, parent).unwrap();
         assert!(
-            folders::deletion_blocker(&database, &root, parent)
+            folders::deletion_blocker(&database, parent)
                 .unwrap()
                 .unwrap()
                 .contains("回收站")

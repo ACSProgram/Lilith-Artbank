@@ -68,7 +68,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。拼图按“画布 32 MiB + 最大一格解码”一次申请全进程 1.5 GiB 字节预算（与导入、压缩、查看器共用），逐格解码不再各自排队。
 - 每个格子带 `status`：`image` 有图、`missing` 有图但缩略图/原图读不出来、`empty` 这一格本来没有图；`thumbMissing` 只对 `missing` 为 true。被 `excludeCells` 排除的格子不占 `cells`，单独列在顶层 `excludedCells`。
-- AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本，当前没有导出工具。
+- AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本；MCP 不提供导出工具。
 - `images_get` 的 `capabilities.embedding` / `pose` 读的是 `feature_blobs` 是否存在，意思是「算没算过向量」，不代表参与全库相似扫描：回收站与临时区的图片即使有向量也不会进入全库扫描结果。
 - `library_info` 的 `tempFolder` 给出临时文件夹是否可用、内部路径、图片数与生命周期说明；普通查询默认不含临时图片，必须显式 `view: "temp"` 或使用显式 id。
 - `library_info.features` 只统计普通图库（不含临时区）；临时区自己的特征数在 `tempEmbeddings` / `tempPoses`，AI 不应把它们当成整库覆盖度。`limits.maxTempFeatureImages` 是临时区单次生成的特征张数上限（100）。

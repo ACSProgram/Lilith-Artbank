@@ -15,6 +15,7 @@ export type TaskKind =
   | "emptyTrash"
   | "undo"
   | "redo"
+  | "clearHistory"
   | "releaseGarbage"
   | "optimizeEstimate"
   | "optimize"
@@ -24,7 +25,6 @@ export type TaskKind =
   | "orphanMove"
   | "packCompact";
 
-export type TaskLane = "write" | "ai" | "scan";
 export type TaskPhase =
   | "queued"
   | "preparing"
@@ -46,7 +46,6 @@ export type BatchTaskKind =
   | "aiDescription"
   | "checkFast"
   | "checkFull"
-  | "packCompact"
   | "export";
 export type TaskRequestKind =
   | BatchTaskKind
@@ -169,7 +168,6 @@ export interface TaskSnapshot {
   kind: TaskKind;
   label: string;
   scope: string;
-  lane: TaskLane;
   phase: TaskPhase;
   total: number;
   completed: number;
@@ -210,7 +208,6 @@ export interface TaskSummary {
   kind: TaskKind;
   label: string;
   scope: string;
-  lane: TaskLane;
   phase: TaskPhase;
 }
 

@@ -148,6 +148,7 @@
 | `start_import` | `{ request }` | `ImportSnapshot`（立即返回；`phase` 可能为 `queued`，任务在后台执行） |
 | `cancel_import` | `{ jobId }` | `null` |
 | `get_import_status` | `{ jobId }` | `ImportSnapshot \| null` |
+| `set_import_optimize` | `{ optimize }` | `null`（保存「导入时压缩」选项） |
 
 `ImportRequest`：
 
@@ -164,7 +165,7 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
                             勾选导入时压缩才传对象；null 表示不压缩
 ```
 
-`workerThreads` 不由前端传入：导入的工作线程数取全局图像预算（设置里的 `performance.workerThreads`，为空时取逻辑核数 - 1，上限 128）；请求里的 `workerThreads` 字段仅为反序列化兼容保留，不再生效。
+`workerThreads` 不由前端传入：导入的工作线程数取全局图像预算（设置里的 `performance.workerThreads`，为空时取逻辑核数 - 1，上限 128）。`ImportRequest` 里没有这个字段；旧调用方多传时被 serde 忽略。
 
 `ImportProgress`（camelCase）：`jobId`、`phase`（`queued` / `scanning` / `processing` / `finishing` / `completed` / `cancelled` / `failed`）、`target`、`total`、`processed`、`written`、`percent`、`imported`、`duplicates`、`merged`、`tempReplaced`、`failed`、`similar`、`optimized`、`optimizedBytes`、`writtenBytes`、`ratePerSecond`、`etaSeconds`、`optimizeFailed`、`current`、`elapsedMs`。`writtenBytes` 是已入库新增图片的最终字节总和；`ratePerSecond` 为 `null` 表示样本不足或尚未开始，`etaSeconds` 在终态或没有速度时为空。`written` 是写线程处理完（成功、重复或失败）的条数；`percent` 在 completed 之前最多 99。`ImportSnapshot` 另含 `startedAt`、`finishedAt`、`failures`、`hints`、`previewIds`，以及 `duplicatePairs` / `duplicatePairCount` / `duplicatePairsTruncated`、`batchDuplicatePairs` / `batchDuplicatePairCount` / `batchDuplicatePairsTruncated`、`mergedImageIds` / `mergedImageIdsTruncated`、`importedPairs` / `importedPairsTruncated`。四组数组各自上限 200，`hints` 上限 100；精确计数不受截断影响。
 
@@ -174,7 +175,4 @@ optimize: null | { tier: "extreme" | "high" | "medium", outputFormat: "jpeg" | "
 
 ## 尚未实现
 
-- 剪贴板图片/路径输入。
-- HEIC/AVIF 解码。
-- 移动模式；默认只复制，不改用户原文件。源目录若在图库内，原文件也不会被移动或删除；请优先从图库外导入。
-- 感知重复的分桶索引与阈值标定（需真实样本，见[待办](../planning/todo.md)）。
+未实现项与待决策统一记在[待办与待决策](../planning/todo.md)；本文件只记录已生效的契约。当前默认只复制，不改用户原文件。

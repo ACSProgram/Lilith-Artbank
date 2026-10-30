@@ -12,7 +12,8 @@ use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 pub(crate) const LOG_MAX_FILE_SIZE: u128 = 4_000_000;
 /// 保留的归档份数；活动文件不计入，因此 `logs/` 最多 6 个文件、约 24MB。
 pub(crate) const LOG_KEPT_FILES: usize = 5;
-const LOG_FILE_STEM: &str = "lilith-artbank";
+/// 日志文件主名；命令记录按同一主名拼路径。
+pub(crate) const LOG_FILE_STEM: &str = "lilith-artbank";
 
 /// 日志插件。无头入口不写 stdout，保证 stdout 只有单行结果 JSON。
 pub(crate) fn plugin<R: Runtime>(log_dir: PathBuf, stdout: bool) -> tauri::plugin::TauriPlugin<R> {

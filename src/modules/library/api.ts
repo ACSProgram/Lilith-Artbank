@@ -29,6 +29,7 @@ import {
   mockQueryIds,
   mockQueryPage,
   mockRedoToOperation,
+  mockReleasePendingFiles,
   mockRemoveFromCollection,
   mockRemoveTags,
   mockRenameCollection,
@@ -38,8 +39,10 @@ import {
   mockReorderFolders,
   mockRestoreFolder,
   mockRestoreImages,
+  mockRetryUndo,
   mockSearchTags,
   mockSelectionTags,
+  mockSkipUndo,
   mockSetImageTags,
   mockSetScores,
   mockTags,
@@ -298,6 +301,21 @@ export const libraryApi = {
   async redoToOperation(targetId: number): Promise<TaskStartResult> {
     if (!isTauri()) return mockRedoToOperation(targetId);
     return invoke<TaskStartResult>("redo_to_operation", { targetId });
+  },
+
+  async retryUndoOperation(targetId: number): Promise<TaskStartResult> {
+    if (!isTauri()) return mockRetryUndo(targetId);
+    return invoke<TaskStartResult>("retry_undo_operation", { targetId });
+  },
+
+  async skipUndoOperation(targetId: number): Promise<void> {
+    if (!isTauri()) return mockSkipUndo(targetId);
+    return invoke<void>("skip_undo_operation", { targetId });
+  },
+
+  async releasePendingFiles(): Promise<TaskStartResult> {
+    if (!isTauri()) return mockReleasePendingFiles();
+    return invoke<TaskStartResult>("release_pending_files");
   },
 
   async clearOperationHistory(): Promise<TaskStartResult> {
