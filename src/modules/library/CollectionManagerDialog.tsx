@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowDown, ArrowUp, Layers, Pencil, Trash2, X } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Modal } from "../../shared/components/Modal";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { libraryApi } from "./api";
 import type { CollectionInfo } from "./types";
 import { errorMessage } from "../../shared/errors";

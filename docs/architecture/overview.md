@@ -18,8 +18,8 @@ src/modules/library/         文件夹树、图库视图、虚拟网格/列表�
 src/modules/import/          导入弹窗、进度、结果与失败清单
 src/modules/viewer/          查看器、几何编辑工具、姿势叠加
 src/modules/ai/              AI 状态、任务对话框与设置入口
-src/shared/                  无领域语义的控件、确认文案、错误文案、缩略图/原图 URL、剪贴板与查看器会话契约
-src/styles/                  tokens.css（浅/深语义颜色变量）与 index.css（组件样式，只引用变量）
+src/shared/                  无领域语义的控件、确认文案、提示契约、UI 设置类型、查询/变化契约、缩略图/原图 URL、剪贴板与查看器会话契约
+src/styles/                  tokens.css（浅/深语义颜色变量）与 index.css（只按顺序 @import 分文件；app/library/dialogs/import/viewer/ai/folders/tasks/optimize/mcp/maintenance.css，只引用变量）
 
 src-tauri/src/app/           设置、AppState、Tauri 命令适配、窗口生命周期、thumb:// 与 img:// 协议、任务总线
 src-tauri/src/concurrency/   资源表（会话/时间线/内容写/元数据写/AI 服务/文件夹子树路径锁）、图像工作预算、进度计量
@@ -31,6 +31,8 @@ src-tauri/src/ai/            HTTP 客户端、任务队列、服务进程托管�
 ```
 
 Tauri 命令是薄适配器：解析 DTO、取当前图库、调用领域函数、把错误转成稳定字符串。业务逻辑不写在命令里。
+
+巨型领域模块按关注点拆成目录模块，公开路径仍是 `<module>::<item>`：`library/history/`（写入、回放、`undo/*`、chunks）、`library/query/`（分页、SQL、统计、文件夹、标签、待处理）、`library/metadata/`（读取、字段、标签、移动、释放）、`library/folders/`（变更、回收站、撤销、树）、`library/optimize/`（候选、执行、提交）、`library/optimize_estimate/`（抽样、分层、外推、报告）、`import/pipeline/`（扫描、写线程、发布）、`app/state/`（会话、导入、图库读写、历史服务、维护、MCP 网关）与 `app/tasks/`（任务句柄、任务总线）。前端对应的大组件也按状态与展示拆开（`LibraryView` 的工具栏/弹层/对话框、`ImageInspector`/`BatchInspector`、`FolderTree` 的展开与分行、`OptimizeDialog` 的执行面板、`SettingsDialog` 的分类分区、`MaintenanceDialog` 的分区、`LibraryWorkspace` 的数据/任务/拖放 hook）。
 
 ## 应用生命周期
 

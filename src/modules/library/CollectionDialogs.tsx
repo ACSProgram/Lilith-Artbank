@@ -3,7 +3,7 @@ import { Layers, Plus } from "lucide-react";
 import { Button } from "../../shared/components/Button";
 import { Field } from "../../shared/components/Field";
 import { Modal } from "../../shared/components/Modal";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { errorMessage } from "../../shared/errors";
 import { libraryApi } from "./api";
 import type { CollectionInfo, CombineMode } from "./types";

@@ -6,7 +6,7 @@ import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
 import { Spinner } from "../shared/components/Spinner";
 import { appApi, browserPreview } from "./api";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useAppRuntime } from "./runtimeContext";
 import type { LibraryInspection } from "./types";
 import { errorMessage } from "../shared/errors";

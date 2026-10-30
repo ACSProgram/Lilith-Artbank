@@ -1,4 +1,4 @@
-import type { ConfirmOptions } from "../../app/noticeContext";
+import type { ConfirmOptions } from "../notices";
 import { Button } from "./Button";
 import { Modal } from "./Modal";
 

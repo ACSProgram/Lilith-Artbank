@@ -12,7 +12,7 @@ import {
 import { TaskCapsule } from "./TaskCapsule";
 import { isTaskActive, type BatchTaskRequest, type TaskSnapshot } from "./taskTypes";
 import { errorMessage } from "../shared/errors";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useAppRuntime } from "./runtimeContext";
 import { McpApprovalHost } from "./McpApprovalCard";
 import {

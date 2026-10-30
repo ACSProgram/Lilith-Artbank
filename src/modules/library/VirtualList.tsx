@@ -20,7 +20,7 @@ import {
   formatScore,
   isGifImage,
 } from "./model";
-import { LIST_COLUMNS, type ListColumn } from "../../app/types";
+import { LIST_COLUMNS, type ListColumn } from "../../shared/settings";
 import type { ImageRow, SortKey, SortSpec } from "./types";
 import type { MoreStatus } from "./useImageQuery";
 import type { VirtualViewHandle } from "./virtual";

@@ -80,7 +80,7 @@
 
 前端结构：
 
-- `src/modules/viewer/`：types、api、model、ImageViewer、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）、model.test。
+- `src/modules/viewer/`：types、api、model、ImageViewer（编排）、ViewerStage（舞台渲染）、useViewerSource（源图加载/渐进层/重试）、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）、model.test。
 - `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。详情侧栏的写入经 `session.refresh(change)` 交给图库，生成姿势后同样发特征变化；外部变化后按活动图复核存在与回收站状态，并按数据源列表复核它是否还在结果里，离开时关闭。两个前端模块不互相导入。
 - `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步、保存后就地更新行（`ViewerSessionUpdate`）、`refresh(change)`、`expectTrashed`、标签筛选与元数据操作的桥接契约。
 - `src/shared/tagFilter.ts`：标签筛选的范围与动作类型，图库与查看器共用的最小契约。

@@ -253,13 +253,13 @@ Rust：
 - `src-tauri/src/mcp/tools/task.rs`：任务与确认单查询、等待、取消与导入回执（含 `includePairs` 归因数组）。
 - `src-tauri/src/mcp/tools/import.rs`：导入输入校验、固定不压缩、确认预览与任务启动。
 - `src-tauri/src/mcp/tools/feature.rs`：`temp_features_generate` 的临时区校验、100 张上限、确认预览与任务启动。
-- `src-tauri/src/library/history.rs`：`write_with_id`、`prefix_label`、`preview_undo` / `preview_redo`。
-- `src-tauri/src/library/metadata.rs`、`collections.rs`：带 `operationId` 的写入口、`merge_tags_with_id` / `merge_preview` 与 `create_with_images`。
-- `src-tauri/src/app/state.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀；`start_temp_features` 占 `ai.service`。
+- `src-tauri/src/library/history/`：`write_with_id`、`prefix_label`、`preview_undo` / `preview_redo`。
+- `src-tauri/src/library/metadata/`、`collections.rs`：带 `operationId` 的写入口、`merge_tags_with_id` / `merge_preview` 与 `create_with_images`。
+- `src-tauri/src/app/state/mcp_gateway.rs`：确认队列、MCP 写入串行、MCP 任务记录、导入回执缓存、`library-changed`、批准执行入口；`start_mcp_import` 固定清空压缩与线程参数并加 `AI ·` 前缀；`start_temp_features` 占 `ai.service`。
 - `src-tauri/src/app/commands.rs`：`list_mcp_approvals`、`approve_mcp_approval`、`reject_mcp_approval`。
-- `src-tauri/src/import/pipeline.rs`、`import/job.rs`：重复对、批内重复、合并目标与源文件映射的采集、上限与截断标记。
+- `src-tauri/src/import/pipeline/`、`import/job.rs`：重复对、批内重复、合并目标与源文件映射的采集、上限与截断标记。
 - `src-tauri/src/imageops/contact_sheet.rs`：拼图布局、编号与 JPEG 编码。
-- `src-tauri/src/library/folders.rs`：文件夹建/改名/移动/删除与撤销记录；`info` / `find_id` / `deletion_blocker` 供 MCP 预检复用。
+- `src-tauri/src/library/folders/`：文件夹建/改名/移动/删除与撤销记录；`info` / `find_id` / `deletion_blocker` 供 MCP 预检复用。
 - `src-tauri/src/library/import.rs`：`find_by_hash_state` 的临时区口径、`discard_temporary_duplicate`、pHash 索引排除临时区。
 - `src-tauri/src/library/similarity.rs`、`ai/embedding.rs`、`ai/pose.rs`：相似扫描返回截断前的命中总数（`*_with_total`），接受范围 id 集合、排除集合与阈值；全库扫描排除临时图片，显式范围仍可命中；主色平均在 `imageops/colors.rs::aggregate_palettes`，embedding 平均在 `ai/embedding.rs::target_average`。
 - `src-tauri/src/ai/runtime.rs`：相似结果槽改存 `(id, 分数)`，`similarity_scores` 供预览带 `score`；`AiError.transport` 让语义搜索连接失败只报可读文案；`start_temp_features` 复用批量 AI 任务并失效语义结果与均值缓存。

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { appApi, browserPreview } from "./api";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { AppRuntimeContext, type AppRuntime } from "./runtimeContext";
 import { setThemeMode } from "./theme";
 import { setThumbCacheLimit } from "../shared/thumbCache";

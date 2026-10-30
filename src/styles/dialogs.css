@@ -1,0 +1,325 @@
+/* 通用对话框、筛选面板与杂项样式。 */
+/* ---------- 对话框 ---------- */
+
+.dialog-section {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog-section:last-of-type {
+  border-bottom: none;
+}
+
+.dialog-section h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 9px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.3px;
+}
+
+.dialog-inline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.dialog-inline .input {
+  flex: 1;
+  min-width: 0;
+  height: 29px;
+  font-size: 11.5px;
+}
+
+.dialog-field {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.dialog-field .input {
+  width: 78px;
+  min-width: 78px;
+  height: 29px;
+  font-size: 11.5px;
+}
+
+.dialog-empty {
+  margin: 4px 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.dialog-error {
+  color: var(--danger);
+}
+
+.dialog-hint {
+  margin: 0 0 8px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.collection-manager-list,
+.tag-manager-list,
+.collection-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.collection-manager-row,
+.tag-manager-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+/* 合并目标选择要占满整行，所以只有标签行允许换行。 */
+.tag-manager-row {
+  flex-wrap: wrap;
+}
+
+/* 合并目标选择：占满整行，跟在被合并的标签下面。 */
+.tag-manager-merge {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-basis: 100%;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.collection-manager-name,
+.tag-manager-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collection-manager-row em,
+.tag-manager-row em {
+  color: var(--text-faint);
+  font-style: normal;
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.collection-manager-actions,
+.tag-manager-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 「清理 0 张标签」贴着标题右端；它是批量删除入口，用警示色而不是强调色。 */
+.tag-manager-purge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+.tag-manager-purge:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.tag-manager-purge:disabled {
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.collection-manager-edit,
+.tag-manager-edit {
+  flex: 1;
+}
+
+.tag-manager-edit {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  gap: 5px;
+}
+
+.collection-combine-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  margin-bottom: 8px;
+  padding: 3px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.collection-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.collection-picker-row:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.collection-picker-row span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collection-picker-row em {
+  color: var(--text-faint);
+  font-style: normal;
+  font-size: 9.5px;
+}
+
+.context-menu-danger {
+  color: var(--danger);
+}
+
+.context-menu-danger:hover {
+  background: var(--danger-soft);
+}
+
+/* ---------- 筛选面板 ---------- */
+
+.filter-section-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filter-section-tools .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9.5px;
+}
+
+.filter-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-range > span {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.filter-date,
+.filter-size {
+  flex: 1;
+  min-width: 0;
+  height: 27px;
+  padding: 0 5px;
+  font-size: 10.5px;
+}
+
+.filter-presence {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.filter-presence-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+@media (max-width: 1320px) {
+  .inspector {
+    width: 292px;
+  }
+}
+
+@media (max-width: 1120px) {
+  .library-toolbar-right {
+    gap: 6px;
+  }
+
+  .library-toolbar-right .search-field {
+    flex-basis: 440px;
+  }
+
+  .library-topbar-actions .selection-summary span {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .inspector {
+    width: min(300px, 45%);
+  }
+}
+
+/* ---------- Misc ---------- */
+
+.spinner {
+  display: inline-block;
+  flex-shrink: 0;
+  border: 2px solid var(--accent-border);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.splash {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.splash-mark {
+  width: 56px;
+  height: 56px;
+  display: block;
+  -webkit-user-drag: none;
+}
+
+.splash p {
+  margin: 0;
+}

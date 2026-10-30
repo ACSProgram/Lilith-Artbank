@@ -1,0 +1,431 @@
+/* 后台任务中心与批量任务对话框。 */
+/* ------------------------------------------------------------------ */
+/* 后台任务中心                                                       */
+/* ------------------------------------------------------------------ */
+
+.task-center {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 95;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.task-pill,
+.task-panel {
+  pointer-events: auto;
+}
+
+.task-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.task-pill.is-active {
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.task-panel {
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  max-height: min(420px, 60vh);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel);
+  box-shadow: var(--shadow-lg);
+}
+
+.task-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.task-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  overflow-y: auto;
+}
+
+.task-empty {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.task-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
+.task-row.is-active {
+  border-color: var(--accent-border);
+}
+
+.task-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-row-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.task-row-title strong {
+  color: var(--text);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.task-row-scope {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-phase {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.task-phase-running,
+.task-phase-preparing {
+  color: var(--accent);
+}
+
+.task-phase-failed {
+  color: var(--danger);
+}
+
+.task-phase-partialFailed {
+  color: var(--warning);
+}
+
+.task-phase-completed {
+  color: var(--success);
+}
+
+.task-phase-cancelling {
+  color: var(--warning);
+}
+
+.task-progress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--panel-hover);
+}
+
+.task-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-fill);
+  transition: width 160ms ease;
+}
+
+/* 取消中：进度不再推进，用静态斜纹表示“在等收尾”，不做无限动画。 */
+.task-progress.is-cancelling > span {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--warning) 0 4px,
+    transparent 4px 8px
+  );
+}
+
+.task-row-meta,
+.task-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.task-row-message {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-cancel-note {
+  color: var(--warning);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.task-row-actions {
+  justify-content: flex-start;
+  gap: 14px;
+}
+
+.task-failures {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+}
+
+.task-failures > div {
+  display: flex;
+  gap: 8px;
+  font-size: 10.5px;
+}
+
+.task-failures > div span {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+
+.task-failures > div em {
+  overflow: hidden;
+  color: var(--danger);
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-failures-more {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+/* ------------------------------------------------------------------ */
+/* 批量任务对话框                                                     */
+/* ------------------------------------------------------------------ */
+
+.batch-task {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.batch-task-types {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.batch-task-type {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text-muted);
+  text-align: left;
+}
+
+.batch-task-type span {
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.batch-task-type small {
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.batch-task-type.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.batch-task-type.is-active span {
+  color: var(--accent);
+}
+
+.batch-task-type:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.batch-task-scopes {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.batch-task-scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.batch-task-scope input {
+  accent-color: var(--accent);
+}
+
+.batch-task-scope span {
+  flex-shrink: 0;
+}
+
+.batch-task-scope em {
+  overflow: hidden;
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-task-scope:has(input:checked) {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.batch-task-scope.is-disabled {
+  opacity: 0.55;
+}
+
+.batch-task-service {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-service span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-task-service em {
+  margin-left: auto;
+  color: var(--success);
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.batch-task-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.batch-task-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+}
+
+.batch-task-progress-head,
+.batch-task-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-progress-head strong {
+  color: var(--text);
+  font-size: 11.5px;
+}
+
+.batch-task-progress-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-task-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-preview span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-task-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.batch-task-facts span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.batch-task-current {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

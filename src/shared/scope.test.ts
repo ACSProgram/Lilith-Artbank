@@ -10,7 +10,7 @@ import {
 } from "./scope.ts";
 import type { BatchTaskContextInfo } from "./batchTaskContext.ts";
 import { emptyFilters } from "../modules/library/model.ts";
-import type { LibraryQuery } from "../modules/library/types.ts";
+import type { LibraryQuery } from "./contracts/library.ts";
 
 const query: LibraryQuery = {
   view: "all",

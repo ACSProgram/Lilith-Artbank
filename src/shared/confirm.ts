@@ -1,4 +1,4 @@
-import type { ConfirmOptions } from "../app/noticeContext";
+import type { ConfirmOptions } from "./notices";
 import { formatBytes } from "./format";
 
 /** `useNotices().confirm` 的签名；语义化封装只依赖这个函数，方便在任意组件里调用。 */

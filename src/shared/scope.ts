@@ -1,4 +1,4 @@
-import type { LibraryQuery } from "../modules/library/types";
+import type { LibraryQuery } from "./contracts/library";
 import type { BatchTaskContextInfo } from "./batchTaskContext";
 import type { ActionAvailability } from "./capability";
 

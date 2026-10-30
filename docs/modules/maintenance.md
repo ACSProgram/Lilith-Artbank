@@ -2,7 +2,7 @@
 
 维护任务都是显式触发的长任务：有进度、可取消、失败有清单。它们不改变“原图不可变”的原则，只清理可重建缓存或用户明确要求删除的内容。
 
-本域覆盖的长任务：重建缩略图（走任务总线，可选重算 pHash / 主色）、图片空间优化（估算与执行两阶段）、永久删除与清空回收站的待释放标记与后台释放任务（`ReleaseGarbage`）、库检查（快速检查与完整 BLAKE3 校验）、孤儿移入回收站（可撤销）、导出到目录、缩略图包空闲回收。入口都在工具栏「任务 → 维护与检查…」的四个分区里（`src/app/MaintenanceDialog.tsx`）。
+本域覆盖的长任务：重建缩略图（走任务总线，可选重算 pHash / 主色）、图片空间优化（估算与执行两阶段）、永久删除与清空回收站的待释放标记与后台释放任务（`ReleaseGarbage`）、库检查（快速检查与完整 BLAKE3 校验）、孤儿移入回收站（可撤销）、导出到目录、缩略图包空闲回收。入口都在工具栏「任务 → 维护与检查…」的四个分区里（`src/app/MaintenanceDialog.tsx`，分区与报告在 `src/app/maintenance/`）。
 
 描述导出/回填整条**不做**：真实库只有 1.7% 的图片缺描述，导出要复制 10–20 GB，且 `output/` 里全是 64 位哈希文件名，对外部打标工具不友好。特征包只统计、不回收：模型切换会让整包作废重算，压了没有意义。
 
@@ -94,7 +94,7 @@
 - 输出：范围与候选两行短信息、样本张数与覆盖率（含 ≥32 MP 大图被抽到的张数）、候选池的「处理 / 候选内跳过」环图与细分图例、未纳入候选单独一组、预计节省与误差、预计耗时与误差及三项拆分、样本质量分布、收益曲线、分文件夹明细、样本失败清单（最多 20 条）。覆盖率低于 1% 时在耗时下固定一行提示「抽样只读取了 X% 的候选体积，实际误差可能大于上面的 ± 值」。
 - 收益曲线：横轴是**已处理的候选张数占比**（与执行时的进度条同源），纵轴是累计节省；按执行顺序（bpp 从高到低）累加。横轴刻度取 0/20/40/60/80/100%，与五个里程碑点一一对齐。每个点的耗时按三段各自加权：`work` 按像素、`write` 按该层的预测输出字节、`finish` 按该层张数。界面上标注 20% / 40% / 60% / 80% / 100% 五个里程碑（图上只给首尾标数值，其余看右侧表格）。前 20% 的图片的累计节省不到总节省的 10% 时，曲线下方补一句预告「前 20% 的图片预计…开始阶段进展可能较慢」，因为同批里混着会跳过的图时，开头可能很久看不到空间变少。
 - 命令：`start_batch_task` 的 `kind = "optimizeEstimate"` 携带 `optimize` 与 `estimateSampleSize`；结果用 `get_optimize_estimate(taskId)` 读取。
-- 实现：判据、阶梯编码、PSNR/坏点、EXIF/ICC 搬运与去 Orientation 在 `src-tauri/src/imageops/optimize.rs`；分层、抽样、外推、漏斗与耗时拆分在 `src-tauri/src/library/optimize_estimate.rs`；任务与结果缓存在 `src-tauri/src/app/state.rs`；界面在 `src/app/OptimizeDialog.tsx`，占比环图与收益曲线在 `src/app/OptimizeCharts.tsx`。
+- 实现：判据、阶梯编码、PSNR/坏点、EXIF/ICC 搬运与去 Orientation 在 `src-tauri/src/imageops/optimize.rs`；分层、抽样、外推、漏斗与耗时拆分在 `src-tauri/src/library/optimize_estimate/`（`sampling` / `strata` / `extrapolate` / `report` / `estimate`）；任务与结果缓存在 `src-tauri/src/app/state/maintenance.rs`；界面在 `src/app/OptimizeDialog.tsx`（执行面板在 `OptimizeExecutionPanel.tsx`），占比环图与收益曲线在 `src/app/OptimizeCharts.tsx`。
 - 未做：分文件夹明细每行的「只处理这个文件夹」按钮（范围切换不支持任意 folderId，见 `src/shared/scope.ts`）。
 
 ### 执行（写路径）
@@ -133,7 +133,7 @@
 - 操作记录：`kind = 'optimize'`，`affected` 是实际替换的张数，不写撤销数据；完成后标题改写为「优化图片空间 · N 张 · 省 X」。撤销/重做会返回“压缩操作不可撤销，原图已删除”，记录面板在撤销链中含压缩记录时禁用撤销。
 - 崩溃恢复：已提交批次的 `affected > 0`，打开图库时按通用规则标为 `applied`；未提交批次的临时文件由文件守卫删除；rename 后、提交前崩溃留下的目标文件在下一次执行或导入时按内容哈希接管或替换。
 - 断电边界：不承诺磁盘自身缓存撒谎、文件系统损坏、外部程序改文件时的恢复，也不承诺任意时刻的全库快照一致；不做启动时的全库孤儿扫描。没有做过拔电注入测试——只验证了发布顺序、提交失败回滚、孤儿接管与平台层调用（本机目录 flush 可用）。
-- 实现：写路径、发布与孤儿恢复在 `src-tauri/src/library/optimize.rs`；持久化 rename 与目录 flush 在 `src-tauri/src/platform/fs.rs`；校准记录在 `src-tauri/src/library/calibration.rs`；任务启动在 `src-tauri/src/app/state.rs`；两阶段界面在 `src/app/OptimizeDialog.tsx`。
+- 实现：写路径、发布与孤儿恢复在 `src-tauri/src/library/optimize/`（`candidates` / `execute` / `commit`）；持久化 rename 与目录 flush 在 `src-tauri/src/platform/fs.rs`；校准记录在 `src-tauri/src/library/calibration.rs`；任务启动在 `src-tauri/src/app/state/maintenance.rs`；两阶段界面在 `src/app/OptimizeDialog.tsx`。
 
 ## 临时文件
 

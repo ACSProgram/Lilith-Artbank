@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDownUp, ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
-import type { SortProfile } from "../../app/types";
+import type { SortProfile } from "../../shared/settings";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Popover } from "../../shared/components/Popover";
 import {

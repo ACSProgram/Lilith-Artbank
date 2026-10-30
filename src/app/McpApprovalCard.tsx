@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ShieldCheck, ShieldX } from "lucide-react";
 import { appApi, browserPreview } from "./api";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { errorMessage } from "../shared/errors";
 import { Button } from "../shared/components/Button";
 import type { McpApproval, McpApprovalStatus } from "./types";

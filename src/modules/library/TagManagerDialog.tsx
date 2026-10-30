@@ -5,7 +5,7 @@ import { Modal } from "../../shared/components/Modal";
 import { Spinner } from "../../shared/components/Spinner";
 import { TagSuggestions } from "../../shared/components/TagSuggestions";
 import { filterTagSuggestions, tagSuggestionRequest } from "../../shared/tagNames";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { libraryApi } from "./api";
 import type { TagInfo } from "./types";
 import { errorMessage } from "../../shared/errors";

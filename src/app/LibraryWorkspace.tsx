@@ -1,28 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FolderOpen, Images, Trash2, Upload } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
 import type { ImportTarget } from "../modules/import/types";
 import { LibraryView } from "../modules/library/LibraryView";
 import { libraryApi } from "../modules/library/api";
-import type {
-  CollectionInfo,
-  FolderChange,
-  FolderInfo,
-  SortSpec,
-  TrashFolders,
-} from "../modules/library/types";
 import {
   DEFAULT_KEEP_SORT,
   browseToFolder,
   sortForViewChange,
 } from "../modules/library/model";
-import type { DataChange, DataChangeSignal } from "../modules/library/dataChange";
 import { useLibraryBrowse } from "../modules/library/useLibraryBrowse";
-import {
-  createStatsStore,
-  type StatsStore,
-} from "../modules/library/statsStore";
+import { createStatsStore } from "../modules/library/statsStore";
 import { StatsStoreProvider } from "../modules/library/StatsProvider";
 import { aiApi } from "../modules/ai/api";
 import { useAiStatus } from "../modules/ai/useAiStatus";
@@ -33,82 +22,22 @@ import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { BatchTaskDialog } from "./BatchTaskDialog";
 import { MaintenanceDialog } from "./MaintenanceDialog";
 import { OptimizeDialog } from "./OptimizeDialog";
-import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
-import { useTaskData } from "./taskContext";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useAppRuntime } from "./runtimeContext";
 import { Sidebar } from "./Sidebar";
 import { ViewerHost } from "./ViewerHost";
 import { errorMessage } from "../shared/errors";
-import type { ViewerSession } from "../shared/viewerSession";
-import { useDragSort, type DragPayload, type DropTarget } from "../shared/useDragSort";
-import {
-  applyFolderChange,
-  foldersById,
-  isSameOrDescendant,
-  outermostFolders,
-  parentFolderPath,
-} from "../modules/library/folderTreeModel";
+import { useLibraryData } from "./useLibraryData";
+import { useTaskDialogs } from "./useTaskDialogs";
+import { useFolderDrag } from "./useFolderDrag";
 
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
   onChangeLibrary: () => void;
 }
 
-/** 重算对话框范围计数时用到的当前库数据。 */
-interface ContextSources {
-  folders: FolderInfo[];
-  /** 为空表示这次没有重新读取集合，集合相关字段沿用旧值。 */
-  collections: CollectionInfo[] | null;
-  selectedIds: number[];
-  libraryTotal: number | null;
-  tempTotal: number | null;
-}
-
-/**
- * 按打开时的范围重取数量。范围对象已经消失时把对应字段置空，界面据此禁用该范围，
- * 不静默使用旧数字。
- */
-async function refreshTaskContext(
-  previous: BatchTaskContextInfo,
-  sources: ContextSources,
-  stats: StatsStore,
-): Promise<BatchTaskContextInfo> {
-  const folder =
-    previous.folderId != null
-      ? sources.folders.find((item) => item.id === previous.folderId)
-      : undefined;
-  const collections = sources.collections;
-  const collection =
-    previous.collectionId != null && collections
-      ? collections.find((item) => item.id === previous.collectionId)
-      : undefined;
-  let viewTotal = previous.viewTotal;
-  if (previous.query) {
-    try {
-      viewTotal = (await stats.fetch("summary", previous.query)).total;
-    } catch {
-      viewTotal = null;
-    }
-  }
-  return {
-    ...previous,
-    selectedIds: sources.selectedIds,
-    viewTotal,
-    folderId: folder?.id ?? null,
-    folderName: folder?.path ?? null,
-    folderDirectTotal: folder?.directImageCount ?? null,
-    folderTotal: folder?.totalImageCount ?? null,
-    collectionId: collection?.id ?? (collections ? null : previous.collectionId),
-    collectionName: collection?.name ?? (collections ? null : previous.collectionName),
-    collectionTotal: collection?.imageCount ?? (collections ? null : previous.collectionTotal),
-    libraryTotal: sources.libraryTotal ?? previous.libraryTotal,
-    tempTotal: sources.tempTotal ?? previous.tempTotal,
-  };
-}
-
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
-  const { current, settings, saveSettings } = useAppRuntime();
+  const { current, settings } = useAppRuntime();
   const { notify } = useNotices();
   const statsStore = useMemo(
     () =>
@@ -121,190 +50,55 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     if (!statsStore) return;
     return () => statsStore.dispose();
   }, [statsStore]);
-  const [importOpen, setImportOpen] = useState(false);
-  const [pendingPaths, setPendingPaths] = useState<string[]>([]);
-  const [dragging, setDragging] = useState(false);
-  const [changeSignal, setChangeSignal] = useState<DataChangeSignal | null>(null);
-  const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null);
-  const [folders, setFolders] = useState<FolderInfo[]>([]);
-  const [foldersLoaded, setFoldersLoaded] = useState(false);
-  const [trashFolders, setTrashFolders] = useState<TrashFolders | null>(null);
-  const [selectedImageIds, setSelectedImageIds] = useState<number[]>([]);
-  const [similarityGroupsOpen, setSimilarityGroupsOpen] = useState(false);
-  const [similarityGroupsTaskId, setSimilarityGroupsTaskId] = useState<string | null>(null);
-  const [similarityGroupsContext, setSimilarityGroupsContext] =
-    useState<BatchTaskContextInfo | null>(null);
-  const [batchContext, setBatchContext] = useState<BatchTaskContextInfo | null>(null);
-  const [optimizeContext, setOptimizeContext] = useState<BatchTaskContextInfo | null>(null);
-  const [maintenanceContext, setMaintenanceContext] = useState<BatchTaskContextInfo | null>(null);
-  const [contextsRevision, setContextsRevision] = useState(0);
-  const [optimizeStale, setOptimizeStale] = useState(false);
-  const contextsRevisionRef = useRef(0);
   const browse = useLibraryBrowse(settings?.ui.sort);
-  const importTarget: ImportTarget =
-    browse.browse.view === "temp" ? "temp" : "library";
-  const importFolder = useMemo(() => {
-    if (importTarget === "temp") return "";
-    const selected = browse.browse.filters.folderIds;
-    if (selected.length !== 1) return "";
-    return folders.find((folder) => folder.id === selected[0])?.path ?? "";
-  }, [browse.browse.filters.folderIds, folders, importTarget]);
   const similarity = useSimilarityBrowse();
-  const { lastFinished, lastChange } = useTaskData();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
-  const optimizeQueryRef = useRef(0);
-  const importOpenRef = useRef(false);
-  importOpenRef.current = importOpen;
-  const changeQueue = useRef<DataChange[]>([]);
-  const changeScheduled = useRef(false);
-  const lastEmittedChange = useRef<{ key: string; at: number } | null>(null);
-
-  /**
-   * 把变化排队后一次交给图库。任务结束与导入完成会各发一次同一条变化，短窗口内按内容去重；
-   * 去重键只用 id 数量与首尾，不拼接可能上万条的 id 列表。
-   */
-  const emitChange = useCallback((change: DataChange) => {
-    const ids = change.ids ?? [];
-    const idKey = ids.length > 0 ? `${ids.length}:${ids[0]}:${ids[ids.length - 1]}` : "";
-    const key = [
-      change.kind,
-      change.source,
-      change.reason ?? "",
-      idKey,
-      change.fields?.join(",") ?? "",
-      change.tagAction ?? "",
-      change.tagId ?? "",
-      change.score ?? "",
-      change.targetFolderPath ?? "",
-      change.similarity,
-    ].join("|");
-    const now = performance.now();
-    if (
-      lastEmittedChange.current?.key === key &&
-      now - lastEmittedChange.current.at < 400
-    ) {
-      return;
-    }
-    lastEmittedChange.current = { key, at: now };
-    changeQueue.current.push(change);
-    if (changeScheduled.current) return;
-    changeScheduled.current = true;
-    queueMicrotask(() => {
-      changeScheduled.current = false;
-      const changes = changeQueue.current.splice(0);
-      if (changes.length === 0) return;
-      setChangeSignal((previous) => ({
-        revision: (previous?.revision ?? 0) + 1,
-        changes,
-      }));
-    });
-  }, []);
-
-  /** 相似组保留规则改了就存，不弹“设置已保存”。 */
-  const persistKeepSort = useCallback(
-    (next: SortSpec[]) => {
-      if (!settings) return;
-      void saveSettings(
-        { ...settings, ui: { ...settings.ui, similarityKeepSort: next } },
-        { silent: true },
-      ).catch((cause: unknown) => {
-        notify("保存保留规则失败", "error", errorMessage(cause));
-      });
-    },
-    [notify, saveSettings, settings],
-  );
+  const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
     similarity.clear();
     // 图库切换时丢弃旧库的相似结果；clear 是稳定回调。
   }, [current?.id, similarity.clear]);
 
-  const foldersGeneration = useRef(0);
-  const reloadFolders = useCallback(async () => {
-    const generation = foldersGeneration.current + 1;
-    foldersGeneration.current = generation;
-    try {
-      const next = await libraryApi.getFolders();
-      if (generation !== foldersGeneration.current) return;
-      setFolders(next);
-      setFoldersLoaded(true);
-    } catch (cause) {
-      if (generation !== foldersGeneration.current) return;
-      notify("读取文件夹失败", "error", errorMessage(cause));
-    }
-  }, [notify]);
+  const {
+    changeSignal,
+    emitChange,
+    folders,
+    setFolders,
+    reloadFolders,
+    trashFolders,
+    selectedImageIds,
+    setSelectedImageIds,
+    viewerSession,
+    setViewerSession,
+  } = useLibraryData(browse);
 
-  useEffect(() => {
-    setTrashFolders(null);
-    void reloadFolders();
-  }, [reloadFolders, current?.id]);
-
-  const trashGeneration = useRef(0);
-  const reloadTrashFolders = useCallback(async () => {
-    const generation = trashGeneration.current + 1;
-    trashGeneration.current = generation;
-    try {
-      const next = await libraryApi.getTrashFolders();
-      if (generation !== trashGeneration.current) return;
-      setTrashFolders(next);
-    } catch (cause) {
-      if (generation !== trashGeneration.current) return;
-      notify("读取回收站文件夹失败", "error", errorMessage(cause));
-    }
-  }, [notify]);
-
-  useEffect(() => {
-    if (browse.browse.view !== "trash") return;
-    void reloadTrashFolders();
-  }, [browse.browse.view, current?.id, reloadTrashFolders]);
-
-  useEffect(() => {
-    if (browse.browse.view !== "trash" || !changeSignal) return;
-    void reloadTrashFolders();
-  }, [changeSignal, browse.browse.view, reloadTrashFolders]);
-
-  useEffect(() => {
-    if (!foldersLoaded || browse.browse.view === "trash") return;
-    const selected = browse.browse.filters.folderIds;
-    if (selected.length === 0) return;
-    const existing = new Set(folders.map((folder) => folder.id));
-    const next = selected.filter((id) => existing.has(id));
-    if (next.length !== selected.length) {
-      browse.applyBrowse(
-        {
-          ...browse.browse,
-          filters: {
-            ...browse.browse.filters,
-            folderIds: next,
-            folderDirect: next.length > 0 && browse.browse.filters.folderDirect,
-          },
-        },
-        false,
-      );
-    }
-  }, [folders, foldersLoaded, browse]);
-
-  // 回收站树刷新后，已恢复/永久删除的文件夹要从选择里移除。
-  useEffect(() => {
-    if (browse.browse.view !== "trash" || !trashFolders) return;
-    const selected = browse.browse.filters.folderIds;
-    if (selected.length === 0) return;
-    const existing = new Set(trashFolders.folders.map((folder) => folder.id));
-    const next = selected.filter((id) => existing.has(id));
-    if (next.length !== selected.length) {
-      browse.applyBrowse(
-        {
-          ...browse.browse,
-          filters: {
-            ...browse.browse.filters,
-            folderIds: next,
-            folderDirect: next.length > 0 && browse.browse.filters.folderDirect,
-          },
-        },
-        false,
-      );
-    }
-  }, [trashFolders, browse]);
+  const {
+    importOpen,
+    pendingPaths,
+    importOpenRef,
+    setPendingPaths,
+    setImportOpen,
+    openImport,
+    closeImport,
+    handleImportFinished,
+    similarityGroupsOpen,
+    setSimilarityGroupsOpen,
+    similarityGroupsTaskId,
+    setSimilarityGroupsTaskId,
+    similarityGroupsContext,
+    setSimilarityGroupsContext,
+    batchContext,
+    setBatchContext,
+    optimizeContext,
+    setOptimizeContext,
+    optimizeStale,
+    setOptimizeStale,
+    maintenanceContext,
+    setMaintenanceContext,
+    persistKeepSort,
+    handleContextsChanged,
+  } = useTaskDialogs({ statsStore, emitChange, folders, selectedImageIds });
 
   useEffect(() => {
     if (browserPreview) return;
@@ -334,34 +128,16 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     };
   }, []);
 
-  /** 任务改变图库数据后把变化交给浏览界面；文件夹/计数/特征由变化计划决定。 */
-  const lastChangeRevision = useRef<number | null>(null);
-  useEffect(() => {
-    if (!lastChange) return;
-    const previous = lastChangeRevision.current;
-    lastChangeRevision.current = lastChange.revision;
-    if (previous === lastChange.revision) return;
-    if (lastChange.closeViewer) setViewerSession(null);
-    // 同一时刻多个任务结束：只拿到最后一条时退化为保守的完整刷新。
-    if (previous != null && lastChange.revision - previous > 1) {
-      emitChange({
-        kind: "unknown",
-        source: "task",
-        reason: "batched",
-        clearSelection: true,
-        similarity: "clear",
-      });
-      return;
-    }
-    emitChange(lastChange.change);
-  }, [lastChange, emitChange]);
+  const { beginDrag } = useFolderDrag({ folders, setFolders, emitChange });
 
-  // 撤销/重做可能删除或恢复当前查看的图片，完成后退出查看器，避免停在过期内容上。
-  useEffect(() => {
-    if (lastFinished?.kind === "undo" || lastFinished?.kind === "redo") {
-      setViewerSession(null);
-    }
-  }, [lastFinished]);
+  const importTarget: ImportTarget =
+    browse.browse.view === "temp" ? "temp" : "library";
+  const importFolder = useMemo(() => {
+    if (importTarget === "temp") return "";
+    const selected = browse.browse.filters.folderIds;
+    if (selected.length !== 1) return "";
+    return folders.find((folder) => folder.id === selected[0])?.path ?? "";
+  }, [browse.browse.filters.folderIds, folders, importTarget]);
 
   const generateDescription = useCallback(async (imageId: number) => {
     const result = await aiApi.describeImage(imageId);
@@ -380,202 +156,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     return aiApi.generatePose(imageId);
   }, []);
 
-  const handleDrop = useCallback(
-    async (item: DragPayload, target: DropTarget) => {
-      if (item.kind === "images") {
-        if (target.position !== "inside") return;
-        const path =
-          target.kind === "root"
-            ? ""
-            : (folders.find((folder) => folder.id === target.folderId)?.path ?? "");
-        try {
-          const report = await libraryApi.moveImagesToFolder(item.imageIds, path);
-          notify(
-            `已移动 ${report.moved.toLocaleString()} 张，跳过 ${report.skipped.toLocaleString()} 张`,
-            report.failures.length > 0 ? "error" : "success",
-            report.failures[0]?.reason,
-          );
-          emitChange({
-            kind: "folder",
-            source: "local",
-            reason: "moveImages",
-            ids: item.imageIds,
-            fields: ["folder"],
-            targetFolderPath: path,
-            similarity: "keep",
-          });
-        } catch (cause) {
-          notify("移动图片失败", "error", errorMessage(cause));
-        }
-        return;
-      }
-
-      const dragged = outermostFolders(foldersById(folders, item.folderIds));
-      if (dragged.length === 0) return;
-      const targetFolder =
-        target.kind === "root"
-          ? folders.find((folder) => folder.path === "")
-          : folders.find((folder) => folder.id === target.folderId);
-      if (!targetFolder) return;
-      if (dragged.some((folder) => isSameOrDescendant(targetFolder.path, folder.path))) {
-        notify("不能把文件夹移动到自身或子文件夹", "error");
-        return;
-      }
-      const draggedIds = [...dragged]
-        .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id)
-        .map((folder) => folder.id);
-      const movedIds = new Set(draggedIds);
-      /** 目标父级下排除被拖文件夹后的同级顺序。 */
-      const siblingsOf = (parentPath: string) =>
-        folders
-          .filter(
-            (folder) =>
-              folder.path !== "" &&
-              parentFolderPath(folder.path) === parentPath &&
-              !movedIds.has(folder.id),
-          )
-          .sort((left, right) => left.sortIndex - right.sortIndex || left.id - right.id);
-
-      try {
-        let change: FolderChange;
-        if (target.position === "inside") {
-          const alreadyInside = dragged.every(
-            (folder) => parentFolderPath(folder.path) === targetFolder.path,
-          );
-          if (alreadyInside) {
-            change = await libraryApi.reorderFolders(
-              draggedIds,
-              targetFolder.id,
-              siblingsOf(targetFolder.path).length,
-            );
-          } else {
-            change = await libraryApi.placeFolders(draggedIds, targetFolder.id, null);
-          }
-        } else {
-          const parentPath = parentFolderPath(targetFolder.path);
-          const parent = folders.find((folder) => folder.path === parentPath);
-          if (!parent) return;
-          const siblings = siblingsOf(parentPath);
-          const position = siblings.findIndex((folder) => folder.id === targetFolder.id);
-          if (position < 0) return;
-          const index = target.position === "before" ? position : position + 1;
-          const sameParent = dragged.every(
-            (folder) => parentFolderPath(folder.path) === parentPath,
-          );
-          if (sameParent) {
-            change = await libraryApi.reorderFolders(draggedIds, parent.id, index);
-          } else {
-            change = await libraryApi.placeFolders(draggedIds, parent.id, index);
-          }
-        }
-        setFolders((previous) => applyFolderChange(previous, change));
-        emitChange({
-          kind: "folder",
-          source: "local",
-          reason: "moveFolder",
-          fields: ["folder"],
-          foldersAlreadyLoaded: true,
-          similarity: "keep",
-        });
-      } catch (cause) {
-        notify("移动文件夹失败", "error", errorMessage(cause));
-      }
-    },
-    [folders, notify, emitChange],
-  );
-
-  const { beginDrag } = useDragSort({
-    onDrop: (item, target) => handleDrop(item, target),
-    onReject: (item, target) => {
-      if (item.kind === "folders" && target.kind === "folder") {
-        notify("不能把文件夹移动到自身或子文件夹", "error");
-      }
-    },
-    canDrop: (item, target) => {
-      if (item.kind === "images") return target.position === "inside";
-      if (target.kind === "root") return true;
-      const targetFolder = folders.find((folder) => folder.id === target.folderId);
-      if (!targetFolder) return false;
-      const dragged = foldersById(folders, item.folderIds);
-      if (dragged.length !== item.folderIds.length) return false;
-      return !dragged.some((folder) =>
-        isSameOrDescendant(targetFolder.path, folder.path),
-      );
-    },
-  });
-
-  // 优化对话框先打开、后补范围计数：只查总数，不跑分面统计。
-  // 放在 `if (!current)` 之前，避免关闭图库时少注册一个 effect。
-  useEffect(() => {
-    if (!optimizeContext?.query || optimizeContext.viewTotal != null || !statsStore) {
-      return;
-    }
-    const generation = optimizeQueryRef.current + 1;
-    optimizeQueryRef.current = generation;
-    let disposed = false;
-    void statsStore
-      .fetch("summary", optimizeContext.query)
-      .then(({ total }) => {
-        if (disposed || generation !== optimizeQueryRef.current) return;
-        setOptimizeContext((previous) =>
-          previous && previous.query ? { ...previous, viewTotal: total } : previous,
-        );
-      })
-      .catch(() => {
-        // 取不到就保持“—”，不阻塞对话框。
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [optimizeContext, statsStore]);
-
-  const handleContextsChanged = useCallback(() => {
-    setContextsRevision((value) => value + 1);
-  }, []);
-
-  // 对话框打开期间数据变化：重取范围数量与选择；估算保留，只标记“执行前会复核”。
-  useEffect(() => {
-    if (contextsRevision === 0 || !statsStore) return;
-    const previousBatch = batchContext;
-    const previousOptimize = optimizeContext;
-    if (!previousBatch && !previousOptimize) return;
-    const generation = contextsRevisionRef.current + 1;
-    contextsRevisionRef.current = generation;
-    const needsCollections = [previousBatch, previousOptimize].some(
-      (context) => context?.collectionId != null,
-    );
-    void (async () => {
-      let nextCollections: CollectionInfo[] | null = null;
-      if (needsCollections) {
-        try {
-          nextCollections = await libraryApi.getCollections();
-        } catch {
-          nextCollections = null;
-        }
-      }
-      const sources: ContextSources = {
-        folders,
-        collections: nextCollections,
-        selectedIds: selectedImageIds,
-        libraryTotal: current?.imageCount ?? null,
-        tempTotal: current?.tempCount ?? null,
-      };
-      const [nextBatch, nextOptimize] = await Promise.all([
-        previousBatch ? refreshTaskContext(previousBatch, sources, statsStore) : null,
-        previousOptimize
-          ? refreshTaskContext(previousOptimize, sources, statsStore)
-          : null,
-      ]);
-      if (generation !== contextsRevisionRef.current) return;
-      if (nextBatch) setBatchContext((current) => (current ? nextBatch : current));
-      if (nextOptimize) {
-        setOptimizeContext((current) => (current ? nextOptimize : current));
-        setOptimizeStale(true);
-      }
-    })();
-    // 只在计数版本推进时按打开时的上下文重取，不随上下文对象本身重跑。
-  }, [contextsRevision, statsStore]);
-
   if (!current) return null;
 
   const hasImages =
@@ -588,17 +168,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
       : mean?.phase === "missing" && mean.count === 0
         ? (mean.message ?? "还没有图片 embedding，可在批量任务里生成")
         : null;
-
-  const handleImportFinished = () => {
-    // 任务结束路径通常也会发同一条变化；emitChange 在短窗口内去重。
-    emitChange({
-      kind: "membership",
-      source: "import",
-      reason: "import",
-      clearSelection: true,
-      similarity: "clear",
-    });
-  };
 
   const handleDataChanged = (
     delta?: { images?: number; trash?: number },
@@ -672,20 +241,6 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     } catch (error) {
       notify("复制图片失败", "error", errorMessage(error));
     }
-  };
-
-  const openImport = (paths: string[] = []) => {
-    if (browserPreview) {
-      notify("导入需要 Tauri 桌面窗口", "info", "浏览器预览不会读写真实图库。");
-      return;
-    }
-    setPendingPaths(paths);
-    setImportOpen(true);
-  };
-
-  const closeImport = () => {
-    setImportOpen(false);
-    setPendingPaths([]);
   };
 
   return (

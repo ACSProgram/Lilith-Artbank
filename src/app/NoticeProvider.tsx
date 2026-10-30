@@ -7,7 +7,7 @@ import {
   type ConfirmOptions,
   type NoticeApi,
   type NoticeKind,
-} from "./noticeContext";
+} from "../shared/notices";
 
 interface Toast {
   id: number;

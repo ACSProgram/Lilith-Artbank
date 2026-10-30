@@ -1,5 +1,5 @@
 import type { TagFilterAction, TagFilterScope } from "./tagFilter";
-import type { DataChange } from "../modules/library/dataChange";
+import type { DataChange } from "./contracts/dataChange";
 
 /** 查看器与图库浏览之间的最小契约；由 `src/app` 编排，模块之间不直接导入。 */
 export interface ViewerSessionItem {

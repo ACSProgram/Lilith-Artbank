@@ -1,22 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import {
-  AlertTriangle,
-  ClipboardCheck,
-  Download,
-  FileWarning,
-  Package,
-  Play,
-  Square,
-  Trash2,
-} from "lucide-react";
+import { ClipboardCheck, Download, FileWarning, Package } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Modal } from "../shared/components/Modal";
-import { Spinner } from "../shared/components/Spinner";
-import { ScopePicker } from "../shared/components/ScopePicker";
 import type { BatchTaskContextInfo } from "../shared/batchTaskContext";
 import { errorMessage } from "../shared/errors";
-import { formatBytes } from "../shared/format";
 import {
   buildScope,
   defaultScopeChoice,
@@ -24,27 +12,21 @@ import {
   type ScopeChoice,
   type TaskScope,
 } from "../shared/scope";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { maintenanceApi } from "./maintenanceApi";
 import {
-  formatRelative,
-  reportIsClean,
-  REPORT_ITEM_LIMIT,
   segmentGarbageRatio,
   type InspectionReport,
   type PackStats,
   type ReportGroup,
 } from "./maintenanceTypes";
 import { useTaskCenter } from "./taskContext";
-import { taskApi } from "./taskApi";
-import {
-  isTaskActive,
-  taskPercent,
-  TASK_PHASE_LABELS,
-  type BatchTaskRequest,
-  type TaskSnapshot,
-} from "./taskTypes";
-import { CancelPendingNote, TaskProgressBar } from "./taskProgress";
+import { isTaskActive, type BatchTaskRequest } from "./taskTypes";
+import { MaintenanceCheckSection } from "./maintenance/MaintenanceCheckSection";
+import { MaintenanceExportSection } from "./maintenance/MaintenanceExportSection";
+import { MaintenanceOrphansSection } from "./maintenance/MaintenanceOrphansSection";
+import { MaintenancePacksSection } from "./maintenance/MaintenancePacksSection";
+import { GROUP_LABELS } from "./maintenance/MaintenanceReport";
 
 type Section = "check" | "orphans" | "packs" | "export";
 
@@ -54,17 +36,6 @@ const SECTIONS: { id: Section; label: string; icon: typeof Package }[] = [
   { id: "packs", label: "包", icon: Package },
   { id: "export", label: "导出", icon: Download },
 ];
-
-/** 报告里每张表最多渲染这么多行；再多的部分请导出 CSV。 */
-const REPORT_ROWS = 200;
-
-/** 分组名与 Rust `report_csv_group` 的分组键一致，同时用于导出文件名后缀。 */
-const GROUP_LABELS: Record<ReportGroup, string> = {
-  missing: "缺失原图",
-  orphan: "孤儿文件",
-  sizeMismatch: "大小不符",
-  hashMismatch: "哈希不符",
-};
 
 interface MaintenanceDialogProps {
   open: boolean;
@@ -356,6 +327,36 @@ export function MaintenanceDialog({ open, onClose, context, libraryId }: Mainten
     }
   };
 
+  const cancelCheck = () => {
+    if (checkTask) void cancel(checkTask.taskId);
+  };
+
+  const cancelPackCompact = () => {
+    if (packTask) void cancel(packTask.taskId);
+  };
+
+  const cancelExport = () => {
+    if (exportTask) void cancel(exportTask.taskId);
+  };
+
+  const toggleAllOrphans = () => {
+    if (!report) return;
+    setSelectedOrphans(
+      selectedOrphans.size === report.orphans.length
+        ? new Set()
+        : new Set(report.orphans.map((orphan) => orphan.path)),
+    );
+  };
+
+  const toggleOrphan = (path: string) => {
+    setSelectedOrphans((previous) => {
+      const next = new Set(previous);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
   const footer = (
     <Button variant="primary" onClick={onClose}>
       关闭
@@ -391,569 +392,70 @@ export function MaintenanceDialog({ open, onClose, context, libraryId }: Mainten
         {error ? <p className="dialog-empty dialog-error">{error}</p> : null}
 
         {section === "check" ? (
-          <>
-            <section className="dialog-section">
-              <h3>检查方式</h3>
-              <div className="maintenance-choices">
-                <button
-                  type="button"
-                  className={`maintenance-choice${mode === "fast" ? " is-active" : ""}`}
-                  onClick={() => setMode("fast")}
-                >
-                  <strong>快速检查</strong>
-                  <small>只看文件在不在、大小对不对。几十万张也就一两分钟。</small>
-                </button>
-                <button
-                  type="button"
-                  className={`maintenance-choice${mode === "full" ? " is-active" : ""}`}
-                  onClick={() => setMode("full")}
-                >
-                  <strong>完整校验</strong>
-                  <small>在快速检查之上重算 BLAKE3，能发现内容被改过。</small>
-                </button>
-              </div>
-            </section>
-
-            <section className="dialog-section">
-              <h3>范围</h3>
-              {mode === "full" && fullLibrary ? (
-                <p className="dialog-hint">已覆盖整个图库，下面按当前视图的范围不再生效。</p>
-              ) : null}
-              <fieldset
-                className="maintenance-fieldset"
-                disabled={mode === "full" && fullLibrary}
-              >
-                <ScopePicker
-                  name="maintenance-check-scope"
-                  value={checkScope}
-                  onChange={setCheckScope}
-                  context={context}
-                  availability={scopeOptions}
-                />
-              </fieldset>
-              {mode === "full" ? (
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={fullLibrary}
-                    onChange={(event) => setFullLibrary(event.target.checked)}
-                  />
-                  <span>
-                    <strong>整个图库</strong>
-                    <small>
-                      {fullLibrary
-                        ? "开始时会再确认一次：全库完整校验通常要二三十分钟。"
-                        : "勾上之后按整个图库算，不受上面的范围限制。"}
-                    </small>
-                  </span>
-                </label>
-              ) : null}
-            </section>
-
-            <section className="dialog-section">
-              <div className="maintenance-actions">
-                <Button
-                  variant="primary"
-                  icon={<Play size={13} />}
-                  loading={starting}
-                  disabled={checkActive || !checkScopeReady}
-                  onClick={() => void startCheck()}
-                >
-                  开始检查
-                </Button>
-                {checkActive ? (
-                  <Button
-                    variant="danger"
-                    icon={<Square size={13} />}
-                    onClick={() => void cancel(checkTask!.taskId)}
-                  >
-                    取消检查
-                  </Button>
-                ) : null}
-              </div>
-              {checkTask ? <TaskProgress task={checkTask} /> : null}
-            </section>
-
-            {report ? (
-              <ReportView report={report} onSave={(group) => void saveReport(group)} />
-            ) : (
-              <p className="dialog-empty">还没有检查结果。运行一次检查后会在这里列出问题。</p>
-            )}
-          </>
+          <MaintenanceCheckSection
+            mode={mode}
+            onModeChange={setMode}
+            checkScope={checkScope}
+            onCheckScopeChange={setCheckScope}
+            fullLibrary={fullLibrary}
+            onFullLibraryChange={setFullLibrary}
+            context={context}
+            scopeOptions={scopeOptions}
+            checkScopeReady={checkScopeReady}
+            starting={starting}
+            checkActive={checkActive}
+            checkTask={checkTask}
+            onStartCheck={() => void startCheck()}
+            onCancelCheck={cancelCheck}
+            report={report}
+            onSaveReport={(group) => void saveReport(group)}
+          />
         ) : null}
 
         {section === "orphans" ? (
-          <>
-            {report ? (
-              <>
-                <section className="dialog-section">
-                  <h3>
-                    <AlertTriangle size={14} /> 孤儿文件
-                  </h3>
-                  <p className="dialog-hint">
-                    磁盘上有、但数据库里没有登记的文件，只占空间。移走后图库看起来没有任何变化；在「记录」里可以撤销，但清空回收站之后就真的没有了。
-                  </p>
-                  <div className="maintenance-actions">
-                    <Button
-                      variant="secondary"
-                      onClick={() =>
-                        setSelectedOrphans(
-                          selectedOrphans.size === report.orphans.length
-                            ? new Set()
-                            : new Set(report.orphans.map((orphan) => orphan.path)),
-                        )
-                      }
-                      disabled={report.orphans.length === 0}
-                    >
-                      {selectedOrphans.size === report.orphans.length ? "取消全选" : "全选"}
-                    </Button>
-                    <Button
-                      variant="danger"
-                      icon={<Trash2 size={13} />}
-                      loading={orphanBusy}
-                      disabled={selectedOrphans.size === 0 || orphanActive}
-                      onClick={() => void startOrphanMove()}
-                    >
-                      移入回收站 ({selectedOrphans.size.toLocaleString()})
-                    </Button>
-                  </div>
-                  {orphanTask ? <TaskProgress task={orphanTask} /> : null}
-                </section>
-                {report.orphans.length === 0 ? (
-                  <p className="dialog-empty">这份报告里没有孤儿文件。</p>
-                ) : (
-                  <div className="maintenance-table-wrap">
-                    <table className="maintenance-table">
-                      <thead>
-                        <tr>
-                          <th aria-label="选择" />
-                          <th>路径</th>
-                          <th>大小</th>
-                          <th>备注</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {report.orphans.slice(0, REPORT_ROWS).map((orphan) => (
-                          <tr key={orphan.path}>
-                            <td>
-                              <input
-                                type="checkbox"
-                                checked={selectedOrphans.has(orphan.path)}
-                                onChange={() =>
-                                  setSelectedOrphans((previous) => {
-                                    const next = new Set(previous);
-                                    if (next.has(orphan.path)) next.delete(orphan.path);
-                                    else next.add(orphan.path);
-                                    return next;
-                                  })
-                                }
-                              />
-                            </td>
-                            <td className="maintenance-path" title={orphan.path}>
-                              {orphan.path}
-                            </td>
-                            <td className="list-numeric">{formatBytes(orphan.size)}</td>
-                            <td>
-                              {orphan.otherFolder
-                                ? `哈希属于「${orphan.otherFolder}」`
-                                : "库里没有这个哈希"}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    {report.orphans.length > REPORT_ROWS ? (
-                      <p className="dialog-hint">
-                        只显示前 {REPORT_ROWS} 条，共 {report.orphans.length.toLocaleString()}{" "}
-                        条；其余请导出 CSV。
-                      </p>
-                    ) : null}
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="dialog-empty">先运行一次检查，这里会列出扫描到的孤儿文件。</p>
-            )}
-          </>
+          <MaintenanceOrphansSection
+            report={report}
+            selectedOrphans={selectedOrphans}
+            onToggleAll={toggleAllOrphans}
+            onToggleOrphan={toggleOrphan}
+            orphanBusy={orphanBusy}
+            orphanActive={orphanActive}
+            orphanTask={orphanTask}
+            onStartOrphanMove={() => void startOrphanMove()}
+          />
         ) : null}
 
         {section === "packs" ? (
-          <>
-            <section className="dialog-section">
-              <h3>
-                <Package size={14} /> 缩略图段
-              </h3>
-              {packStatus === "loading" ? <Spinner size={14} /> : null}
-              {packError ? <p className="dialog-empty dialog-error">{packError}</p> : null}
-              {packStats ? (
-                <>
-                  <div className="maintenance-actions">
-                    <Button
-                      variant="secondary"
-                      icon={<Play size={13} />}
-                      disabled={packActive || !reclaimable}
-                      title={
-                        reclaimable
-                          ? "现在就回收，不等空闲条件"
-                          : "没有超过阈值的段，回收不会释放空间"
-                      }
-                      onClick={() => void startPackCompact()}
-                    >
-                      立即回收
-                    </Button>
-                    {packActive ? (
-                      <Button
-                        variant="danger"
-                        icon={<Square size={13} />}
-                        onClick={() => packTask && void cancel(packTask.taskId)}
-                      >
-                        取消
-                      </Button>
-                    ) : null}
-                    <span className="maintenance-summary">
-                      共 {formatBytes(packStats.totalSize)} · 已用{" "}
-                      {formatBytes(packStats.totalUsed)} · 可回收{" "}
-                      {formatBytes(packStats.garbageBytes)}
-                    </span>
-                  </div>
-                  {packTask ? <TaskProgress task={packTask} /> : null}
-                  <p className="dialog-hint">
-                    {packStats.lastCompact
-                      ? `上次回收：${formatRelative(packStats.lastCompact.at)} · 释放 ${formatBytes(
-                          packStats.lastCompact.freedBytes,
-                        )}`
-                      : "还没有回收过。"}
-                    {reclaimable
-                      ? ` 垃圾率超过 ${(packStats.triggerRatio * 100).toFixed(0)}% 且空闲三分钟时自动回收。`
-                      : " 现在没有需要回收的段。"}
-                  </p>
-                  <div className="maintenance-table-wrap">
-                    <table className="maintenance-table">
-                      <thead>
-                        <tr>
-                          <th>段</th>
-                          <th>文件</th>
-                          <th>大小</th>
-                          <th>已用</th>
-                          <th>垃圾</th>
-                          <th>垃圾率</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {packStats.segments.map((segment) => (
-                          <tr key={segment.id}>
-                            <td className="list-numeric">#{segment.id}</td>
-                            <td className="maintenance-path" title={segment.fileName}>
-                              {segment.fileName}
-                            </td>
-                            <td className="list-numeric">{formatBytes(segment.size)}</td>
-                            <td className="list-numeric">{formatBytes(segment.used)}</td>
-                            <td className="list-numeric">{formatBytes(segment.garbage)}</td>
-                            <td className="list-numeric">
-                              {(segmentGarbageRatio(segment) * 100).toFixed(1)}%
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              ) : null}
-            </section>
-
-            <section className="dialog-section">
-              <h3>特征包</h3>
-              <p className="dialog-hint">特征包只有统计，没有回收按钮：它们只在整库重建时才会重写。</p>
-              {packStats && packStats.features.length > 0 ? (
-                <div className="maintenance-table-wrap">
-                  <table className="maintenance-table">
-                    <thead>
-                      <tr>
-                        <th>类型</th>
-                        <th>模型</th>
-                        <th>维度</th>
-                        <th>包</th>
-                        <th>条数</th>
-                        <th>已用</th>
-                        <th>垃圾</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {packStats.features.map((pack) => (
-                        <tr key={`${pack.kind}-${pack.model}-${pack.packName}`}>
-                          <td>{pack.kind}</td>
-                          <td className="maintenance-path" title={pack.model}>
-                            {pack.model}
-                          </td>
-                          <td className="list-numeric">{pack.dim}</td>
-                          <td className="maintenance-path" title={pack.packName}>
-                            {pack.packName}
-                          </td>
-                          <td className="list-numeric">{pack.blobs.toLocaleString()}</td>
-                          <td className="list-numeric">{formatBytes(pack.used)}</td>
-                          <td className="list-numeric">{formatBytes(pack.garbage)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <p className="dialog-empty">还没有生成过特征。</p>
-              )}
-            </section>
-          </>
+          <MaintenancePacksSection
+            packStats={packStats}
+            packStatus={packStatus}
+            packError={packError}
+            reclaimable={reclaimable}
+            packActive={packActive}
+            packTask={packTask}
+            onStartPackCompact={() => void startPackCompact()}
+            onCancelPackCompact={cancelPackCompact}
+          />
         ) : null}
 
         {section === "export" ? (
-          <>
-            <section className="dialog-section">
-              <h3>范围</h3>
-              <ScopePicker
-                name="maintenance-export-scope"
-                value={exportScope}
-                onChange={setExportScope}
-                context={context}
-                availability={exportScopeOptions}
-              />
-            </section>
-            <section className="dialog-section">
-              <h3>目标目录</h3>
-              <div className="maintenance-actions">
-                <Button variant="secondary" onClick={() => void pickExportDir()}>
-                  选择目录…
-                </Button>
-                <span className="maintenance-path" title={exportDir ?? undefined}>
-                  {exportDir ?? "还没有选择"}
-                </span>
-              </div>
-              <p className="dialog-hint">
-                文件按 `内容哈希.扩展名` 复制过去；同名文件直接跳过，不覆盖、不改名。
-              </p>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={includeManifest}
-                  onChange={(event) => setIncludeManifest(event.target.checked)}
-                />
-                <span>
-                  <strong>附带 manifest.csv</strong>
-                  <small>每行一张图：内容哈希、扩展名、宽高、文件夹、评分、描述。</small>
-                </span>
-              </label>
-            </section>
-            <section className="dialog-section">
-              <div className="maintenance-actions">
-                <Button
-                  variant="primary"
-                  icon={<Download size={13} />}
-                  loading={starting}
-                  disabled={exportActive || !exportDir || !exportScopeOptions[exportScope].enabled}
-                  onClick={() => void startExport()}
-                >
-                  开始导出
-                </Button>
-                {exportActive ? (
-                  <Button
-                    variant="danger"
-                    icon={<Square size={13} />}
-                    onClick={() => exportTask && void cancel(exportTask.taskId)}
-                  >
-                    取消导出
-                  </Button>
-                ) : null}
-              </div>
-              <p className="dialog-hint">
-                导出期间导入、编辑、移动与删除都会被拒绝；全库导出会挡很久。
-              </p>
-              {exportTask ? (
-                <TaskProgress task={exportTask} copiedBytes={exportTask.originalBytes} />
-              ) : null}
-            </section>
-          </>
+          <MaintenanceExportSection
+            context={context}
+            exportScope={exportScope}
+            onExportScopeChange={setExportScope}
+            exportScopeOptions={exportScopeOptions}
+            exportDir={exportDir}
+            onPickExportDir={() => void pickExportDir()}
+            includeManifest={includeManifest}
+            onIncludeManifestChange={setIncludeManifest}
+            starting={starting}
+            exportActive={exportActive}
+            exportTask={exportTask}
+            onStartExport={() => void startExport()}
+            onCancelExport={cancelExport}
+          />
         ) : null}
       </div>
     </Modal>
-  );
-}
-
-/** 任务进度条：与批量任务对话框同一套百分比口径。 */
-function TaskProgress({ task, copiedBytes }: { task: TaskSnapshot; copiedBytes?: number }) {
-  const active = isTaskActive(task);
-  const cancelling = task.phase === "cancelling";
-  const percent = taskPercent(task);
-  const note =
-    task.message ||
-    (task.total > 0
-      ? `${task.completed.toLocaleString()} / ${task.total.toLocaleString()}`
-      : "准备中…");
-  return (
-    <div className="maintenance-progress">
-      <div className="maintenance-progress-head">
-        <span>
-          {TASK_PHASE_LABELS[task.phase]} · {task.label}
-        </span>
-        <span className="list-numeric">
-          {active ? `${percent}%` : task.phase === "yielded" ? "已让位" : ""}
-        </span>
-      </div>
-      <TaskProgressBar
-        percent={percent}
-        cancelling={cancelling}
-        className="maintenance-progress-bar"
-      />
-      <CancelPendingNote visible={cancelling} />
-      <p className="maintenance-progress-note">
-        {note}
-        {copiedBytes ? ` · 已复制 ${formatBytes(copiedBytes)}` : ""}
-        {task.failed > 0 ? ` · 失败 ${task.failed.toLocaleString()}` : ""}
-      </p>
-    </div>
-  );
-}
-
-/** 报告的四个清单：各自一张表，行数上限一致。 */
-function ReportView({
-  report,
-  onSave,
-}: {
-  report: InspectionReport;
-  onSave: (group?: ReportGroup) => void;
-}) {
-  return (
-    <section className="dialog-section">
-      <div className="maintenance-actions">
-        <h3 style={{ margin: 0 }}>{report.mode === "full" ? "完整校验" : "快速检查"}结果</h3>
-        <span className="maintenance-summary">
-          扫描 {report.scannedRows.toLocaleString()} 行 ·{" "}
-          {report.scannedFiles.toLocaleString()} 个文件 · {(report.elapsedMs / 1000).toFixed(1)} 秒
-        </span>
-        <Button
-          variant="secondary"
-          icon={<Download size={13} />}
-          onClick={() => onSave()}
-        >
-          导出全部
-        </Button>
-      </div>
-      {report.changedDuringScan > 0 ? (
-        <p className="dialog-hint">
-          扫描期间有 {report.changedDuringScan.toLocaleString()} 张被改动，已跳过哈希校验；它们不算问题。
-        </p>
-      ) : null}
-      {report.truncated ? (
-        <p className="dialog-hint">
-          问题太多：每份清单最多保留 {REPORT_ITEM_LIMIT.toLocaleString()} 条，导出 CSV
-          拿到的也是这些，超出部分没有记录。
-        </p>
-      ) : null}
-      {reportIsClean(report) ? (
-        <p className="dialog-empty">没有发现问题。</p>
-      ) : (
-        <div className="maintenance-report">
-          <ReportTable
-            group="missing"
-            total={report.missingTotal}
-            columns={["路径", "应有大小"]}
-            rows={report.missing.map((row) => [row.path, formatBytes(row.expectedSize)])}
-            onSave={onSave}
-          />
-          <ReportTable
-            group="orphan"
-            total={report.orphanTotal}
-            columns={["路径", "大小", "备注"]}
-            rows={report.orphans.map((row) => [
-              row.path,
-              formatBytes(row.size),
-              row.otherFolder ? `属于「${row.otherFolder}」` : "库里没有这个哈希",
-            ])}
-            onSave={onSave}
-          />
-          <ReportTable
-            group="sizeMismatch"
-            total={report.sizeMismatchTotal}
-            columns={["路径", "记录大小", "实际大小"]}
-            rows={report.sizeMismatch.map((row) => [
-              row.path,
-              formatBytes(row.expectedSize),
-              formatBytes(row.actualSize),
-            ])}
-            onSave={onSave}
-          />
-          <ReportTable
-            group="hashMismatch"
-            total={report.hashMismatchTotal}
-            columns={["路径"]}
-            rows={report.hashMismatch.map((row) => [row.path])}
-            onSave={onSave}
-          />
-        </div>
-      )}
-    </section>
-  );
-}
-
-function ReportTable({
-  group,
-  total,
-  columns,
-  rows,
-  onSave,
-}: {
-  group: ReportGroup;
-  total: number;
-  columns: string[];
-  rows: string[][];
-  onSave: (group?: ReportGroup) => void;
-}) {
-  if (total === 0) return null;
-  const title = GROUP_LABELS[group];
-  const shown = rows.slice(0, REPORT_ROWS);
-  return (
-    <div className="maintenance-report-group">
-      <h4>
-        {title} <em>{total.toLocaleString()}</em>
-        <Button
-          variant="ghost"
-          size="sm"
-          icon={<Download size={12} />}
-          style={{ marginLeft: "auto" }}
-          onClick={() => onSave(group)}
-        >
-          导出这一组
-        </Button>
-      </h4>
-      {total > shown.length ? (
-        <p className="dialog-hint">
-          只显示前 {shown.length.toLocaleString()} 条，共 {total.toLocaleString()} 条；导出 CSV
-          可以看全部。
-        </p>
-      ) : null}
-      <div className="maintenance-table-wrap">
-        <table className="maintenance-table">
-          <thead>
-            <tr>
-              {columns.map((column, index) => (
-                <th key={`${title}-head-${index}`}>{column}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((row, rowIndex) => (
-              <tr key={`${title}-${rowIndex}`}>
-                {row.map((cell, cellIndex) => (
-                  <td
-                    key={`${title}-${rowIndex}-${cellIndex}`}
-                    className={cellIndex === 0 ? "maintenance-path" : "list-numeric"}
-                    title={cellIndex === 0 ? cell : undefined}
-                  >
-                    {cell}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
   );
 }

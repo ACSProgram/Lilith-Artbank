@@ -18,7 +18,7 @@ import {
   isGifImage,
 } from "./model";
 import type { ImageRow } from "./types";
-import type { ThumbFit } from "../../app/types";
+import type { ThumbFit } from "../../shared/settings";
 import type { MoreStatus } from "./useImageQuery";
 import type { VirtualViewHandle } from "./virtual";
 

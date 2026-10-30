@@ -1,7 +1,7 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Database, FolderOpen, Settings } from "lucide-react";
 import { Button } from "../shared/components/Button";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useAppRuntime } from "./runtimeContext";
 import { errorMessage } from "../shared/errors";
 import { FolderTree } from "../modules/library/FolderTree";

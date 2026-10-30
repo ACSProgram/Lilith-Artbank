@@ -7,7 +7,7 @@ import {
   type RefObject,
 } from "react";
 import { AlertTriangle, History, Trash2, X } from "lucide-react";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { useTaskCenter } from "../../app/taskContext";
 import type { TaskStartResult } from "../../app/taskTypes";
 import { Button, IconButton } from "../../shared/components/Button";

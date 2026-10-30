@@ -1,4 +1,4 @@
-import type { FeatureSummary } from "../modules/library/types";
+import type { FeatureSummary } from "./contracts/library";
 
 export interface ActionAvailability {
   enabled: boolean;

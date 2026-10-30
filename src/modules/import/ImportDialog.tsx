@@ -10,7 +10,7 @@ import type { TagSuggestion } from "../../shared/tagNames";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import { formatBytes } from "../../shared/format";
 import { confirmImportOptimize } from "../../shared/confirm";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { importApi } from "./api";
 import type {
   DuplicatePolicy,

@@ -9,7 +9,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Copy,
@@ -18,22 +17,19 @@ import {
   Minimize,
   PanelRight,
   PersonStanding,
-  RefreshCw,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useNotices } from "../../app/noticeContext";
+import { useNotices } from "../../shared/notices";
 import { Button, IconButton } from "../../shared/components/Button";
 import { Spinner } from "../../shared/components/Spinner";
 import { errorMessage } from "../../shared/errors";
-import { thumbnailUrl } from "../../shared/thumbUrl";
-import type { ViewerSession, ViewerSessionItem } from "../../shared/viewerSession";
-import { viewerApi, withRetry } from "./api";
+import type { ViewerSession } from "../../shared/viewerSession";
+import { viewerApi } from "./api";
 import {
   buildEditRequest,
   clampCrop,
-  cropToOriginal,
   fitZoomForSize,
   flipGeometry,
   formatBytes,
@@ -43,16 +39,17 @@ import {
   initialGeometry,
   outputSize,
   rectBetween,
-  rescaleZoom,
   rotateGeometry,
   transformedSize,
   type GeometryState,
 } from "./model";
 import { Filmstrip } from "./Filmstrip";
-import { hasVisiblePose, PoseOverlay, visiblePoseCount } from "./PoseOverlay";
-import type { CropRect, PoseData, ViewerFallback, ViewerSource } from "./types";
+import { hasVisiblePose, visiblePoseCount } from "./PoseOverlay";
+import type { CropRect, PoseData, ViewerSource } from "./types";
 import { useEditEstimate } from "./useEditEstimate";
 import { useEditHistory } from "./useEditHistory";
+import { useViewerSource } from "./useViewerSource";
+import { ViewerStage } from "./ViewerStage";
 import { ViewerTools } from "./ViewerTools";
 
 interface ImageViewerProps {
@@ -81,52 +78,6 @@ function initialPoseOpacity(): number {
   }
 }
 
-type LoadState =
-  | { imageId: number; status: "loading" }
-  | { imageId: number; status: "error"; error: string }
-  | { imageId: number; status: "ready"; source: ViewerSource };
-
-interface MediaState {
-  imageId: number;
-  loaded: boolean;
-  failed: boolean;
-  thumbFailed: boolean;
-}
-
-function initialMedia(imageId: number): MediaState {
-  return { imageId, loaded: false, failed: false, thumbFailed: false };
-}
-
-function fallbackFor(
-  imageId: number,
-  item: ViewerSessionItem | undefined,
-): ViewerFallback {
-  if (item) {
-    return {
-      width: item.width,
-      height: item.height,
-      contentHash: item.contentHash,
-      fileExt: item.fileExt,
-      format: item.format,
-      fileSize: item.fileSize,
-      hasAlpha: item.hasAlpha,
-      deletedAt: item.deletedAt,
-      thumbVersion: item.thumbVersion,
-    };
-  }
-  return {
-    width: 1600,
-    height: 1200,
-    contentHash: `mock-${imageId}`,
-    fileExt: "png",
-    format: "png",
-    fileSize: 0,
-    hasAlpha: false,
-    deletedAt: null,
-    thumbVersion: 1,
-  };
-}
-
 export function ImageViewer({
   session,
   onClose,
@@ -143,42 +94,17 @@ export function ImageViewer({
 }: ImageViewerProps) {
   const { notify } = useNotices();
   const items = useSyncExternalStore(session.subscribe, session.getItems, session.getItems);
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
   const history = useEditHistory();
   const resetHistory = history.reset;
 
   const [activeId, setActiveId] = useState(session.initialId);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
-  const [load, setLoad] = useState<LoadState>({
-    imageId: session.initialId,
-    status: "loading",
-  });
-  const activeLoad =
-    load.imageId === activeId
-      ? load
-      : ({ imageId: activeId, status: "loading" } as const);
-  const source = activeLoad.status === "ready" ? activeLoad.source : null;
-  const sourceError = activeLoad.status === "error" ? activeLoad.error : null;
-  const geometry = source ? history.geometry : null;
 
-  const [media, setMedia] = useState<MediaState>(() => initialMedia(session.initialId));
-  const activeMedia =
-    media.imageId === activeId ? media : initialMedia(activeId);
-  // 回调里只按 imageId 归属，不展开渲染时的 activeMedia，避免丢掉同帧之后的复位。
-  const patchMedia = (imageId: number, patch: Partial<MediaState>) => {
-    setMedia((current) => ({
-      ...(current.imageId === imageId ? current : initialMedia(imageId)),
-      ...patch,
-    }));
-  };
   const [pose, setPose] = useState<PoseData | null>(null);
   const [poseOpen, setPoseOpen] = useState(false);
   const [poseBusy, setPoseBusy] = useState(false);
   const [poseOpacity, setPoseOpacity] = useState(initialPoseOpacity);
-  const [reloadToken, setReloadToken] = useState(0);
-  const [retry, setRetry] = useState(0);
   const [saving, setSaving] = useState(false);
 
   const [zoom, setZoom] = useState(1);
@@ -198,8 +124,6 @@ export function ImageViewer({
   const overlayRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const sourceRef = useRef(source);
-  sourceRef.current = source;
   const fitActiveRef = useRef(fitActive);
   fitActiveRef.current = fitActive;
   const showStageRef = useRef(false);
@@ -215,6 +139,50 @@ export function ImageViewer({
    * 显示旧内容；旧文件被释放后还会变成坏图，编辑也基于过期源。
    */
   const contentKey = item ? `${item.contentHash}:${item.fileSize}` : "";
+
+  const resetForImage = useCallback(() => {
+    setPose(null);
+    setPoseOpen(false);
+    setCropMode(false);
+    setCropDraft(null);
+    setPendingStep(0);
+    setDragging(false);
+    setCropDragging(false);
+    cropStart.current = null;
+    dragRef.current = null;
+    resetHistory(null);
+  }, [resetHistory]);
+
+  const handleSourceReady = useCallback(
+    (next: ViewerSource) => {
+      resetHistory(initialGeometry(next));
+    },
+    [resetHistory],
+  );
+
+  const {
+    source,
+    sourceError,
+    activeLoad,
+    activeMedia,
+    patchMedia,
+    retry,
+    retryLoad,
+    resetMedia,
+    reload,
+  } = useViewerSource({
+    initialId: session.initialId,
+    activeId,
+    contentKey,
+    items,
+    fitActiveRef,
+    setZoom,
+    setPose,
+    onSwitch: resetForImage,
+    onReady: handleSourceReady,
+  });
+
+  const geometry = source ? history.geometry : null;
 
   const hasChanges = source && geometry ? hasPixelChanges(source, geometry) : false;
   const hasPose = hasVisiblePose(pose);
@@ -246,66 +214,6 @@ export function ImageViewer({
     geometry,
     Boolean(source?.editable && !source.deleted && hasChanges && !cropMode),
   );
-
-  // 源图加载：过期请求直接丢弃；大图预览由 Rust 生成并缓存。
-  // `contentKey` 在体内不用到，只作为重取条件：内容被替换后图片 id 不变，只按 id 判断会停在旧图。
-  useEffect(() => {
-    let disposed = false;
-    const fromPlaceholder = sourceRef.current == null;
-    const placeholderWidth = fromPlaceholder
-      ? (itemsRef.current.find((item) => item.id === activeId)?.width ?? 0)
-      : 0;
-
-    setLoad({ imageId: activeId, status: "loading" });
-    // 只在切到另一张图时复位；同一张图的复位由重试与保存入口先行完成。
-    setMedia((current) =>
-      current.imageId === activeId ? current : initialMedia(activeId),
-    );
-    setPose(null);
-    setPoseOpen(false);
-    setCropMode(false);
-    setCropDraft(null);
-    setPendingStep(0);
-    setDragging(false);
-    setCropDragging(false);
-    cropStart.current = null;
-    dragRef.current = null;
-    resetHistory(null);
-
-    viewerApi
-      .getViewerSource(
-        activeId,
-        fallbackFor(
-          activeId,
-          itemsRef.current.find((item) => item.id === activeId),
-        ),
-      )
-      .then((next) => {
-        if (disposed) return;
-        if (!fitActiveRef.current && placeholderWidth > 0) {
-          setZoom((value) => rescaleZoom(value, placeholderWidth, next.displayWidth));
-        }
-        setLoad({ imageId: activeId, status: "ready", source: next });
-        resetHistory(initialGeometry(next));
-      })
-      .catch((cause: unknown) => {
-        if (disposed) return;
-        setLoad({ imageId: activeId, status: "error", error: errorMessage(cause) });
-      });
-
-    viewerApi
-      .getImagePose(activeId)
-      .then((next) => {
-        if (!disposed) setPose(next);
-      })
-      .catch(() => {
-        if (!disposed) setPose(null);
-      });
-
-    return () => {
-      disposed = true;
-    };
-  }, [activeId, contentKey, reloadToken, resetHistory, retry]);
 
   useEffect(() => {
     session.onActiveChange(activeId);
@@ -635,9 +543,9 @@ export function ImageViewer({
         });
       }
       // 重新载入查看器源图、回到适应窗口并清空撤销栈；列表本身已就地更新，不重置查询与滚动位置。
-      setMedia(initialMedia(activeId));
+      resetMedia(activeId);
       setFitActive(true);
-      setReloadToken((value) => value + 1);
+      reload();
       onSaved?.(activeId);
     } catch (cause) {
       notify("保存失败", "error", errorMessage(cause));
@@ -679,12 +587,6 @@ export function ImageViewer({
       notify("复制图片失败", "error", errorMessage(cause));
     }
   };
-
-  const retryLoad = useCallback(() => {
-    setLoad({ imageId: activeId, status: "loading" });
-    setMedia(initialMedia(activeId));
-    setRetry((value) => value + 1);
-  }, [activeId]);
 
   const stagePoint = (event: ReactPointerEvent) => {
     const rect = stageRef.current?.getBoundingClientRect();
@@ -749,19 +651,23 @@ export function ImageViewer({
     setDragging(false);
   };
 
+  const handleThumbError = () => {
+    if (activeIdRef.current !== activeId) return;
+    patchMedia(activeId, { thumbFailed: true });
+  };
+
+  const handleImageLoad = () => {
+    if (activeIdRef.current !== activeId) return;
+    patchMedia(activeId, { loaded: true, failed: false });
+  };
+
+  const handleImageError = () => {
+    if (activeIdRef.current !== activeId) return;
+    patchMedia(activeId, { loaded: false, failed: true });
+  };
+
   const flipH = geometry?.flipHorizontal ?? false;
   const flipV = geometry?.flipVertical ?? false;
-  const fullSize = transformedSize(displayWidth, displayHeight, rotate);
-  const appliedCrop = !cropping ? geometry?.crop ?? null : null;
-  const clipWidth = (appliedCrop ? appliedCrop.width : fullSize.width) * zoom;
-  const clipHeight = (appliedCrop ? appliedCrop.height : fullSize.height) * zoom;
-  const overlayRect = cropping ? cropDraft ?? geometry?.crop ?? null : null;
-  const overlayOriginal =
-    overlayRect && source ? cropToOriginal(overlayRect, rotate, source) : null;
-  const imageTransform = `translate(-50%, -50%) rotate(${rotate * 90}deg) scaleX(${
-    flipH ? -1 : 1
-  }) scaleY(${flipV ? -1 : 1})`;
-
   const dimensions = source && geometry ? outputSize(source, geometry) : null;
 
   return (
@@ -906,161 +812,43 @@ export function ImageViewer({
         ) : null}
 
         <div className="viewer-canvas-wrap">
-          <div
-            ref={canvasRef}
-            className={`viewer-canvas${cropping ? " is-cropping" : ""}${
-              dragging ? " is-dragging" : ""
-            }${cropDragging ? " is-crop-dragging" : ""}`}
+          <ViewerStage
+            canvasRef={canvasRef}
+            stageRef={stageRef}
+            showLoading={activeLoad.status === "loading" && !hasThumb}
+            sourceError={sourceError}
+            showStage={showStage}
+            showSmallSpinner={showSmallSpinner}
+            cropping={cropping}
+            dragging={dragging}
+            cropDragging={cropDragging}
+            zoom={zoom}
+            pan={pan}
+            source={source}
+            displayWidth={displayWidth}
+            displayHeight={displayHeight}
+            rotate={rotate}
+            flipH={flipH}
+            flipV={flipV}
+            geometryCrop={geometry?.crop ?? null}
+            cropDraft={cropDraft}
+            thumbItem={thumbItem}
+            mediaLoaded={activeMedia.loaded}
+            mediaFailed={activeMedia.failed}
+            pose={pose}
+            poseVisible={poseVisible}
+            poseOpacity={poseOpacity}
+            retry={retry}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={endPointer}
             onPointerCancel={endPointer}
             onDoubleClick={() => (fitActive ? actualSize() : fitView())}
-            onContextMenu={(event) => event.preventDefault()}
-          >
-            {activeLoad.status === "loading" && !hasThumb ? (
-              <div className="viewer-state">
-                <Spinner size={22} />
-                <strong>正在读取原图</strong>
-                <span>大图可能需要生成预览…</span>
-              </div>
-            ) : null}
-
-            {activeLoad.status === "error" ? (
-              <div className="viewer-state viewer-state-error">
-                <AlertTriangle size={24} />
-                <strong>无法打开图片</strong>
-                <span>{sourceError}</span>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  icon={<RefreshCw size={13} />}
-                  onClick={retryLoad}
-                >
-                  重试
-                </Button>
-              </div>
-            ) : null}
-
-            {showStage ? (
-              <div
-                className="viewer-pan"
-                style={{
-                  transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px)`,
-                }}
-              >
-                <div
-                  className="viewer-clip"
-                  style={{ width: clipWidth, height: clipHeight }}
-                >
-                  <div
-                    ref={stageRef}
-                    className="viewer-stage"
-                    style={{
-                      width: fullSize.width * zoom,
-                      height: fullSize.height * zoom,
-                      left: appliedCrop ? -appliedCrop.x * zoom : 0,
-                      top: appliedCrop ? -appliedCrop.y * zoom : 0,
-                    }}
-                  >
-                    <div
-                      className={`viewer-image-wrap${source?.hasAlpha ? " is-alpha" : ""}`}
-                      style={{
-                        width: displayWidth * zoom,
-                        height: displayHeight * zoom,
-                        transform: imageTransform,
-                      }}
-                    >
-                      {thumbItem ? (
-                        <img
-                          className={`viewer-thumb-layer${
-                            activeMedia.loaded ? " is-retired" : ""
-                          }`}
-                          src={thumbnailUrl(thumbItem.id, thumbItem.thumbVersion)}
-                          alt=""
-                          draggable={false}
-                          onError={() => {
-                            if (activeIdRef.current !== activeId) return;
-                            patchMedia(activeId, { thumbFailed: true });
-                          }}
-                        />
-                      ) : null}
-
-                      {source ? (
-                        <img
-                          className={`viewer-image${
-                            activeMedia.loaded ? " is-loaded" : ""
-                          }`}
-                          src={withRetry(source.url, retry)}
-                          alt=""
-                          draggable={false}
-                          style={{ imageOrientation: "from-image" }}
-                          onLoad={() => {
-                            if (activeIdRef.current !== activeId) return;
-                            patchMedia(activeId, { loaded: true, failed: false });
-                          }}
-                          onError={() => {
-                            if (activeIdRef.current !== activeId) return;
-                            patchMedia(activeId, { loaded: false, failed: true });
-                          }}
-                        />
-                      ) : null}
-
-                      {poseVisible && pose ? (
-                        <PoseOverlay
-                          pose={pose}
-                          width={source?.displayWidth ?? displayWidth}
-                          height={source?.displayHeight ?? displayHeight}
-                          zoom={zoom}
-                          opacity={poseOpacity}
-                        />
-                      ) : null}
-                    </div>
-
-                    {overlayRect ? (
-                      <div
-                        className={`viewer-crop-rect${cropDraft ? " is-draft" : ""}`}
-                        style={{
-                          left: overlayRect.x * zoom,
-                          top: overlayRect.y * zoom,
-                          width: overlayRect.width * zoom,
-                          height: overlayRect.height * zoom,
-                        }}
-                      >
-                        <span className="viewer-crop-size">
-                          {overlayOriginal
-                            ? `${overlayOriginal.width.toLocaleString()} × ${overlayOriginal.height.toLocaleString()}`
-                            : ""}
-                        </span>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </div>
-            ) : null}
-
-            {showSmallSpinner ? (
-              <div className="viewer-image-loading">
-                <Spinner size={18} />
-              </div>
-            ) : null}
-
-            {source && activeMedia.failed ? (
-              <div className="viewer-state viewer-state-error">
-                <AlertTriangle size={24} />
-                <strong>这张图片打不开</strong>
-                <span>原图可能已被移动或删除，也可能是当前不支持的格式。</span>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  icon={<RefreshCw size={13} />}
-                  onClick={retryLoad}
-                >
-                  重新加载
-                </Button>
-              </div>
-            ) : null}
-          </div>
+            onThumbError={handleThumbError}
+            onImageLoad={handleImageLoad}
+            onImageError={handleImageError}
+            onRetryLoad={retryLoad}
+          />
 
           {!fullscreen && poseVisible && pose ? (
             <div className="viewer-pose-panel">

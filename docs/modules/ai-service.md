@@ -195,7 +195,7 @@ Content-Type: application/octet-stream
 
 ### 队列与进度
 
-- 批量任务挂在 `app/tasks.rs` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
+- 批量任务挂在 `app/tasks/` 的任务总线上，进度、取消与失败清单都由 `TaskHandle` 承载；进度事件 `task-progress` / `task-finished` 约 150ms 一次，失败清单最多保留 200 条（imageId + 原因）。`ai-job-progress` / `ai-job-finished` 已删除，前端只订任务总线。
 - 范围由 `TaskScope` 在 Rust 侧解析成 id 集合（选中 / 文件夹 / 集合 / 当前视图 / 临时文件夹 / 全库）；`AiJobRequest` 只接收已解析的 id，不再有“id 与 query 都为空就退回全库”的隐式分支。
 - 开始前预览：`preview_batch_task` 只读返回“范围 N 张 / 将处理 M 张”。待处理条件与任务启动共用 `query::PendingFilter`：embedding 按当前模型与维度、pose 按任意模型、描述按空描述或非手写来源；已删除与待释放行不计入 M。AI 离线或 embedding 缺模型维度时 M 显示“—”，任务不可开始；服务恢复后由状态轮询触发重算。
 - 快照字段：除张数与百分比外，`TaskSnapshot` 还带 `runStartedAt`（第一次进入 `running` 的时间，排队与准备不算）、`currentFile`（图库内相对路径）、`ratePerSecond` 与 `etaSeconds`；压缩任务另有 `originalBytes` / `savedBytes`（只统计已提交并替换的图片）与 `skipBreakdown`（候选内跳过按 6 个原因细分）。速度是运行以来平均每秒结算的张数，含失败与跳过；压缩的 ETA 优先用滚动吞吐，百分比由「已结算 / 候选张数」派生（`progressPercent` 对压缩恒为 `null`）；终态不返回 ETA。
@@ -297,7 +297,7 @@ Content-Type: application/octet-stream
 - `server/clip_cache.py`：SigLIP2 图片塔/文本塔独立加载、单塔驻留、空闲卸载。
 - `server/pose_engine.py`：MediaPipe Pose 33 点。
 - `server/image_io.py`：图片字节解码与 EXIF 方向。
-- `src-tauri/src/app/tasks.rs`：任务总线、资源准入（`concurrency/resources.rs`）、默认排队（FIFO + 路径写优先）、panic 兜底与统一事件。
+- `src-tauri/src/app/tasks/`：任务总线、资源准入（`concurrency/resources.rs`）、默认排队（FIFO + 路径写优先）、panic 兜底与统一事件；`handle.rs` 放任务句柄，`bus.rs` 放总线与进度泵。
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。

@@ -4,7 +4,7 @@
 
 ## 查询 DTO
 
-统一查询 DTO 位于 `src-tauri/src/library/query.rs` 与 `src/modules/library/types.ts`：
+统一查询 DTO 位于 `src-tauri/src/library/query/`（`mod.rs` 放 DTO 与公开入口，`page.rs` / `sql.rs` / `stats.rs` / `folders.rs` / `tags.rs` / `pending.rs` 分实现）与 `src/modules/library/types.ts`（查询契约定义在 `src/shared/contracts/library.ts`，`types.ts` 重导出）：
 
 ```text
 LibraryQuery {
@@ -305,22 +305,33 @@ src/modules/library/
   api.ts                    Tauri 命令入口 + 浏览器预览 mock
   mock.ts                   浏览器预览用的可变数据集与查询/编辑/文件夹实现
   model.ts                  BrowseState、查询构造、全局排序与集合顺序暂存、结果集身份键、标签筛选换算
-  dataChange.ts             数据变化类型、失效计划（planDataChange）、选择裁剪、任务/MCP 变化映射
+  dataChange.ts             失效计划（planDataChange）、选择裁剪、任务/MCP 变化映射（数据类型在 shared/contracts/dataChange.ts）
   useLibraryBrowse.ts       受控 BrowseState、初始排序、浏览历史与返回
   useImageQuery.ts          首屏/下一页、代次、锚点跳转、pageToken、保留旧行刷新与就地替换行
-  LibraryView.tsx           视图：搜索/排序/选择/键盘/右键菜单/面包屑
+  LibraryView.tsx           视图编排：搜索/排序/选择/键盘/右键菜单/面包屑
+  LibraryToolbar.tsx        顶栏、第二行工具栏、相似/筛选摘要条
+  LibraryStateOverlay.tsx   加载/错误/空结果覆盖层
+  LibraryDialogs.tsx        集合与标签对话框的组装
   SortMenu.tsx              排序弹层：多级编辑、方向、排序方案
   LibraryContextMenu.tsx    右键菜单（夹在视口内，点击外部或滚动即关闭）
   FindSimilarPanel.tsx      找相似面板：参考图、指标、最低相似度、结果数量、范围
   ViewBar.tsx               全部/回收站标签、集合胶囊、集合管理入口、清空回收站
-  FolderTree.tsx            侧栏文件夹树：正常树与回收站树、多选、展开、右键菜单、排序菜单、指针拖放、上下双视图
+  FolderTree.tsx            侧栏文件夹树编排：选择、拖放、右键菜单、上下双视图
+  FolderTreeRows.tsx        文件夹行与“直属图片”行渲染
+  FolderContextMenu.tsx     文件夹与根行的右键菜单
+  useFolderExpansion.ts     展开集合的持久化、水合与祖先展开
+  useFolderSplit.ts         上下双视图比例、拖动与持久化
   folderTreeModel.ts        树构建与排序、可见行展开、祖先路径、面包屑、包含判断
   FolderDialogs.tsx         文件夹命名/重命名对话框
   VirtualGrid.tsx           自适应列数虚拟网格（支持开始拖动图片）
   VirtualList.tsx           固定行高虚拟列表（列头排序、开始拖动图片）
   virtual.ts                两个虚拟视图共用的滚动句柄类型
   FilterPanel.tsx           范围与存在性筛选（不含文件夹分面）
-  Inspector.tsx             单张详情与批量编辑侧栏（文件夹选择器、标签点击筛选菜单）
+  Inspector.tsx             详情侧栏外壳与单张/批量切换
+  ImageInspector.tsx        单张详情（评分/标签/描述/文件夹/回收站）
+  BatchInspector.tsx        批量编辑侧栏
+  InspectorParts.tsx        颜色行、标签 chip、回收站操作等共用部件
+  useImageDetail.ts         按 imageId/version 取详情与身份守卫
   CollectionDialogs.tsx     新建集合（预填名称 + 内容来源）、重命名、集合运算
   CollectionManagerDialog.tsx 集合重命名/删除/排序（不再管新建与运算）
   CollectionPickerDialog.tsx  把选中图片加入现有或新集合
@@ -329,6 +340,10 @@ src/modules/library/
 
 src/shared/
   scope.ts                  范围语义（ScopeChoice / TaskScope）与可用性、数量文案
+  contracts/library.ts      查询 DTO（LibraryQuery / LibraryFilters / SortSpec / FeatureSummary 等）
+  contracts/dataChange.ts   数据变化 DTO（DataChange / RowPatch / 失效计划输入）
+  notices.ts                提示与确认契约（NoticeApi / ConfirmOptions / useNotices）
+  settings.ts               UI 设置类型（UiSettings / SortProfile / ThumbFit / 列表列）
   components/ScopePicker.tsx 范围单选框（批量任务、空间优化、找相似共用）
   dragModel.ts              拖放载荷/目标类型与落点判定（纯函数）
   useDragSort.ts            指针事件拖放控制器（图片与文件夹共用）

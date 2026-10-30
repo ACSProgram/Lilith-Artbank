@@ -15,7 +15,7 @@ import { errorMessage } from "../shared/errors";
 import { buildScope, scopeAvailability, type ScopeChoice } from "../shared/scope";
 import { thumbnailUrl } from "../shared/thumbUrl";
 import { KeepSortPicker } from "./KeepSortPicker";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useTaskCenter } from "./taskContext";
 import { taskApi } from "./taskApi";
 import { TASK_PHASE_LABELS, isTaskActive, taskPercent } from "./taskTypes";

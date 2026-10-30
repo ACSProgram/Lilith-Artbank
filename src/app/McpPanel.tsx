@@ -8,7 +8,7 @@ import { libraryApi } from "../modules/library/api";
 import type { HistoryEntry } from "../modules/library/types";
 import { browserPreview } from "./api";
 import { ApprovalCard, useApprovalActions, useMcpApprovals } from "./McpApprovalCard";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { useAppRuntime } from "./runtimeContext";
 import type { McpMode, McpStatus, Settings } from "./types";
 

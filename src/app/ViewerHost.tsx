@@ -7,7 +7,7 @@ import { ImageViewer } from "../modules/viewer/ImageViewer";
 import type { PoseData } from "../modules/viewer/types";
 import type { ViewerSession } from "../shared/viewerSession";
 import { useAppRuntime } from "./runtimeContext";
-import { useNotices } from "./noticeContext";
+import { useNotices } from "../shared/notices";
 import { errorMessage } from "../shared/errors";
 
 interface ViewerHostProps {
