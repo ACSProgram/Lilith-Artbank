@@ -1,6 +1,6 @@
 # MCP 图库控制
 
-支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库：24 个工具覆盖浏览、搜索、拼图、写入、撤销/重做、任务、导入、临时区特征与文件夹/标签管理，写入走操作记录并受三档权限约束。本文件只写当前契约；真实客户端验收步骤见[验证策略](../guides/validation.md)，未完成项见[待办](../planning/todo.md)。
+支持 MCP 的 AI 客户端通过应用内服务读取并修改当前图库：25 个工具覆盖浏览、搜索、拼图、只读 SQL 分析与导出、写入、撤销/重做、任务、导入、临时区特征与文件夹/标签管理，写入走操作记录并受三档权限约束。本文件只写当前契约；真实客户端验收步骤见[验证策略](../guides/validation.md)，未完成项见[待办](../planning/todo.md)。
 
 传输与进程：
 
@@ -44,13 +44,13 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 只读档不隐藏写工具，客户端缓存的 `tools/list` 不会因为切换档位失效。
 
-## 工具（24 个）
+## 工具（25 个）
 
-### 只读（8）
+### 只读（9）
 
 | 工具 | 输入 | 返回 |
 | --- | --- | --- |
-| `library_info` | — | 图库、普通/回收站/临时计数、schema、特征数量、AI 配置、当前 MCP 档位（`mode` / `writeAllowed` / `approval`）与限制 |
+| `library_info` | — | 图库、普通/回收站/临时计数、schema、特征数量、AI 配置、当前 MCP 档位（`mode` / `writeAllowed` / `approval`）与限制；`sql` 给 `library_sql` 的视图字段、单位与上限 |
 | `folders_list` | `parentPath?`、`limit?`、`cursor?` | 直接子文件夹、路径、直接/子树计数、`total`、`nextCursor`；只含正常树，不含回收站与待释放文件夹 |
 | `tags_list` | `query?`、`limit?`、`cursor?` | 有图片的标签 id、名称、图片数、`total`、`nextCursor`；0 张标签不返回 |
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
@@ -58,6 +58,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览 |
 | `images_get` | `ids≤50` | 详情、`[{id,name}]` 形状的标签、描述、能力标记；临时图片 `folderPath` 为「临时」并带 `temporary: true` |
 | `image_sheet` | selector、`grid 1–5`、`resolution: thumb/detail` | 拼图图片、格子映射、`sheetId`、下一页 |
+| `library_sql` | `sql`、`export?`、`format: jsonl/csv?` | 列名、行、行数、`truncated`；导出时附 20 行预览、真实文件路径与格式 |
 
 - `tags_list` 与 `folders_list` 都有 `total` 与 `nextCursor`：同级或标签超过 `limit` 时给出游标，原样传给 `cursor` 取下一页；单页上限仍是 500（`tags_list` 默认 100、`folders_list` 默认 200）。游标是 offset 语义的不透明字符串，解析失败报“游标无效”，不静默回到第一页。翻页不回快照：两次调用之间有写入时可能重复或漏掉条目，返回里的 `pagingNote` 已写明。
 - `search_images` 始终返回 `total`；`pageSize` 超出 1–50 直接报错，不静默截断。分面计数按需开启，2 字搜索与超大集合较慢。开 `includeFacets` 时额外返回 `facetsNote`：标签分面不应用 `tagIds` / `tagPresence` / `excludeTagIds`，选中一个标签后仍能看到其它标签的计数；其余分面各自排除自身维度。搜索与集合视图的分面按命中集统计，那里的标签分面只含命中集内的标签。分面只给 `tagId` 与计数，名称用 `tags_list` 取。
@@ -68,10 +69,39 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。拼图按“画布 32 MiB + 最大一格解码”一次申请全进程 1.5 GiB 字节预算（与导入、压缩、查看器共用），逐格解码不再各自排队。
 - 每个格子带 `status`：`image` 有图、`missing` 有图但缩略图/原图读不出来、`empty` 这一格本来没有图；`thumbMissing` 只对 `missing` 为 true。被 `excludeCells` 排除的格子不占 `cells`，单独列在顶层 `excludedCells`。
-- AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本；MCP 不提供导出工具。
+- AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本。需要把结果交给外部脚本时，用 `library_sql` 的导出参数写 JSONL/CSV 文件，不复制原图。
 - `images_get` 的 `capabilities.embedding` / `pose` 读的是 `feature_blobs` 是否存在，意思是「算没算过向量」，不代表参与全库相似扫描：回收站与临时区的图片即使有向量也不会进入全库扫描结果。
-- `library_info` 的 `tempFolder` 给出临时文件夹是否可用、内部路径、图片数与生命周期说明；普通查询默认不含临时图片，必须显式 `view: "temp"` 或使用显式 id。
+- `library_info` 的 `tempFolder` 给出临时文件夹是否可用、图片数与生命周期说明；内部路径不返回。普通查询默认不含临时图片，必须显式 `view: "temp"` 或使用显式 id。
 - `library_info.features` 只统计普通图库（不含临时区）；临时区自己的特征数在 `tempEmbeddings` / `tempPoses`，AI 不应把它们当成整库覆盖度。`limits.maxTempFeatureImages` 是临时区单次生成的特征张数上限（100）。
+
+### 只读 SQL 与导出
+
+`library_sql` 是唯一的分析出口：单条 `SELECT` 或以 `WITH` 开头的查询，导出是它的参数；不另设 `export_csv` / `run_script`，也不开放数据库文件。
+
+- 执行在应用进程内的专用只读连接上（`SQLITE_OPEN_READ_ONLY`，不在连接池里，不设 `query_only`），同一时刻只跑一条 SQL。关库/换库会中断正在跑的查询。
+- 连接首次使用时创建 `mcp_*` TEMP 视图；不写 schema、不占版本号。非聚合视图加了 `LIMIT -1`（聚合视图本身不会被展开），避免 SQLite 把视图展开后丢失 authorizer 的视图归属。
+- 输入边界：先去掉前导空白与 SQL 注释，只接受单条 `SELECT` / `WITH`；`prepare` 后不允许残留第二条语句。`EXPLAIN`、`PRAGMA`、`ATTACH`/`DETACH`、DDL/DML、事务/Savepoint 全部拒绝。
+- authorizer 白名单：只允许读取 `mcp_*` 视图及其底层表；直读 `images`、`feature_blobs` 等内部表与 `sqlite_master` / `sqlite_temp_master` 拒绝。函数按“内置放行 + 危险名拒绝”处理：`load_extension`、`readfile`、`writefile`、`fsdir`、`zipfile`、`sqlite_dbpage` 等与 `pragma_*` 表值函数拒绝；CTE、子查询、join、聚合、窗口函数、`ORDER BY` / `LIMIT` 与普通内置函数可用。
+- `SELECT 1` 这类不读表的常量查询允许；CTE 可用。CTE 名如果与内部表同名（例如 `WITH images AS ...`），会被当作直读内部表拒绝，换个名字即可。
+- 结果列名必须唯一且非空，重复或空列名直接报错，避免 JSON 行对象静默丢列。
+
+视图（字段与单位以 `library_info.sql` 为准，只增不减）：
+
+| 视图 | 内容 |
+| --- | --- |
+| `mcp_images` | 正常图片：id、文件夹、格式、宽高、字节、评分、描述、pHash/主色、导入/修改时间、内容哈希 |
+| `mcp_trash_images` / `mcp_temp_images` | 回收站图片与临时区图片；临时区文件夹固定显示「临时」 |
+| `mcp_folders` / `mcp_trash_folders` | 正常/回收站文件夹；根目录用空字符串表示 |
+| `mcp_tags` / `mcp_image_tags` | 标签、正常图片的标签关系与图片数 |
+| `mcp_collections` / `mcp_collection_items` | 集合、成员数与成员位置 |
+| `mcp_features` | 正常图片是否有 embedding/pose、模型与维度；不含 pack 名、偏移与向量本体 |
+
+- 字段口径：`rating` 代替 `score`；时间用 `_ms`；大小用 `_bytes`；pHash 与主色用 `hex()` 输出十六进制。不暴露绝对路径、仓库路径、内部表、pack 名或待释放细节。
+- 内联上限：200 行 / 256 KiB / 5 秒；超限返回 `truncated=true` 并明确说明不是全量，且在截断前多读一行确认还有数据。
+- 导出：`export=true` 时流式写入系统临时目录下的应用专属子目录（`<temp>/lilith-artbank/mcp-export/`），格式只有 JSONL（默认）与 CSV。上限 1,000,000 行 / 512 MiB / 60 秒；返回 20 行预览、总行数、`truncated`、真实文件路径与格式。文件随机命名、TTL 24 小时，启动、每次导出与空闲轮询时清理过期文件；不接受模型指定写入目录。
+- 值映射：`NULL` → JSON `null` / CSV 空字段；`INTEGER` 原样；`REAL` 用最短可往返表示，非有限值写 `NaN` / `Infinity` / `-Infinity`；`TEXT` 原样；`BLOB` 用 base64（不加 `base64:` 前缀）。CSV 为 UTF-8、无 BOM、首行列名、RFC 4180 引号；文本单元格以 `= + - @`、Tab 或 CR 开头时前加 `'` 防止表格公式注入。
+- 导出内容只含查询结果，不含原图像素或图库绝对路径；文件夹仍是相对路径。返回的导出路径是刻意的例外，它是模型的工作文件。
+- 每次 SQL 调用写 `logs/mcp.log`：SQL 摘要（单行、截断）、行数、字节数与导出路径。
 
 ### 写入（9）
 
@@ -221,8 +251,17 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 
 - 每次工具调用的工具名、档位、结果状态、`selected` / `affected` / `operationId` / `taskId` 与耗时（`tags_modify` 的记录沿用同一格式）；阻塞线程异常终止也记一条 `status=error`。错误只写可读错误文本，不写返回值或整份参数。
 - 导入来源单独一行：档位、目标文件夹、任务号、操作记录号、路径总数与前 20 个来源路径。总数写在路径之前，单行截断只会切掉路径尾部。
+- `library_sql` 单独一行：SQL 摘要（单行、最多 200 字）、行数、字节数与导出路径；摘要截断不影响计数。
 - 询问档的批准与执行结果；stdio 小桥的启动、连接错误与退出。
 - 单行最长 600 字符，换行会被压成空格。设置页的“最近 AI 操作”仍从操作记录里筛选 `AI ·` 标题，不解析日志文件。
+
+## 路径隐藏
+
+- `library_info` 不返回 `library.path` 与 `tempFolder.path`；`images_get` 不返回 `filePath`。查询结果里的文件夹始终是图库内相对路径。
+- 所有工具响应与错误都经过 `mcp/sanitize.rs` 的统一脱敏器，不只依赖各工具自觉：替换图库根、程序根、系统临时目录与 `.artbank` 绝对路径（含 `file://` 形式），大小写不敏感，替换成 `<library>` / `<app>` / `<temp>`。
+- 本次调用返回的导出文件路径及其父目录在脱敏时保留原样，否则会被“临时目录一律替换”一并抹掉；其它字段照常脱敏。
+- 审计日志可以保留完整路径便于本机排查；工具响应、错误与导出内容都不含图库根或程序根。
+- 路径隐藏只对“只通过 MCP 访问”的客户端有效；客户端若同时有 shell/文件读取能力，仍可能从设置或磁盘找到图库。真正的隔离要靠沙箱或独立账户。
 
 ## 安全与限制
 
@@ -245,6 +284,8 @@ Rust：
 - `src-tauri/src/mcp/audit.rs`：`logs/mcp.log` 工具调用与导入来源审计。
 - `src-tauri/src/mcp/selection.rs`：selector 解析（分页与全量 id）、排除与去重。
 - `src-tauri/src/mcp/sheet.rs`：拼图映射缓存与缩略图/原图读取。
+- `src-tauri/src/mcp/sanitize.rs`：MCP 响应与错误的路径脱敏器，导出路径白名单。
+- `src-tauri/src/mcp/tools/sql.rs`：`library_sql` 参数解析、只读连接调用与 SQL 审计。
 - `src-tauri/src/mcp/tools/read.rs`：只读工具、`find_similar` 的 `FindSimilarScope` 与多参考图参数。
 - `src-tauri/src/mcp/tools/write.rs`：写工具、数量核对、询问判定与写后事件；`willChange` 预检（评分/标签/集合成员/目标文件夹）也在这里。
 - `src-tauri/src/mcp/tools/folder.rs`：`folders_modify` 的四种动作、路径解析与删除前置检查（删除为移入回收站）。
@@ -259,6 +300,7 @@ Rust：
 - `src-tauri/src/app/commands.rs`：`list_mcp_approvals`、`approve_mcp_approval`、`reject_mcp_approval`。
 - `src-tauri/src/import/pipeline/`、`import/job.rs`：重复对、批内重复、合并目标与源文件映射的采集、上限与截断标记。
 - `src-tauri/src/imageops/contact_sheet.rs`：拼图布局、编号与 JPEG 编码。
+- `src-tauri/src/library/sql_query.rs`：只读连接、`mcp_*` TEMP 视图、authorizer、函数策略、执行上限、JSONL/CSV 导出与 TTL 清理；`schema_docs()` 供 `library_info.sql`。
 - `src-tauri/src/library/folders/`：文件夹建/改名/移动/删除与撤销记录；`info` / `find_id` / `deletion_blocker` 供 MCP 预检复用。
 - `src-tauri/src/library/import.rs`：`find_by_hash_state` 的临时区口径、`discard_temporary_duplicate`、pHash 索引排除临时区。
 - `src-tauri/src/library/similarity.rs`、`ai/embedding.rs`、`ai/pose.rs`：相似扫描返回截断前的命中总数（`*_with_total`），接受范围 id 集合、排除集合与阈值；全库扫描排除临时图片，显式范围仍可命中；主色平均在 `imageops/colors.rs::aggregate_palettes`，embedding 平均在 `ai/embedding.rs::target_average`。
@@ -275,4 +317,4 @@ Rust：
 
 ## 验证
 
-自动检查：`cargo test --lib mcp`，覆盖范围见[验证策略](../guides/validation.md)。真实客户端、确认卡片、`--mcp-stdio` 小桥与便携目录的验收步骤同文件“MCP 真实客户端”；代理不启动应用。
+自动检查：`cargo test --lib mcp`，覆盖范围见[验证策略](../guides/validation.md)；SQL 视图白名单、语句/函数拒绝、导出与脱敏在 `library::sql_query` 与 `mcp::sanitize` 的单测里，`acceptance_mcp` 通过真实 stdio 桥调用 `library_sql` 并检查导出路径。真实客户端、确认卡片、`--mcp-stdio` 小桥与便携目录的验收步骤同文件“MCP 真实客户端”；代理不启动应用。

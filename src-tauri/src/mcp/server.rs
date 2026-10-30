@@ -7,6 +7,7 @@ use rmcp::{
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
+use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
 use super::{
     audit,
     context::ReadContext,
+    sanitize::Sanitizer,
     tools::{
         self, ToolOutcome,
         feature::{self as feature_tool, TempFeaturesInput},
@@ -30,6 +32,7 @@ use super::{
             self, FindSimilarInput, FoldersListInput, ImageSheetInput, ImagesGetInput,
             SearchImagesInput, TagsListInput,
         },
+        sql::{self as sql_tool, LibrarySqlInput},
         tag::{self as tag_tool, TagsModifyInput},
         task::{self, TasksCancelInput, TasksGetInput},
         write::{
@@ -40,7 +43,7 @@ use super::{
 };
 
 /// 已注册的工具数，由 `library_info` 报给客户端；测试保证它与路由一致。
-const TOOL_COUNT: usize = 24;
+const TOOL_COUNT: usize = 25;
 
 /// 工具适配器只负责取当前 AppState、调用领域函数并把结果编码成 MCP 内容。
 #[derive(Clone)]
@@ -94,7 +97,7 @@ impl McpServer {
                 // 线程没能跑完（panic 或运行时关闭）也要留一条审计。
                 let message = format!("MCP 工具执行失败：{error}");
                 audit::tool(tool, mode, elapsed, Err(&message));
-                return Err(ErrorData::internal_error(message, None));
+                return Err(self.error_data(message));
             }
         };
         match &result {
@@ -128,14 +131,47 @@ impl McpServer {
             Err(error) => {
                 let message = format!("MCP 工具执行失败：{error}");
                 audit::tool(tool, mode, elapsed, Err(&message));
-                return Err(ErrorData::internal_error(message, None));
+                return Err(self.error_data(message));
             }
         };
         match &result {
             Ok(outcome) => audit::tool(tool, mode, elapsed, Ok(Some(&outcome.value))),
             Err(error) => audit::tool(tool, mode, elapsed, Err(&error.to_string())),
         }
-        Ok(outcome_result(result))
+        Ok(self.outcome_result(result))
+    }
+
+    fn sanitizer(&self) -> Sanitizer {
+        let root = self.app.state::<AppState>().mcp_library_root();
+        Sanitizer::new(root.as_deref())
+    }
+
+    fn to_tool_value(&self, result: AppResult<Value>) -> CallToolResult {
+        result.map_or_else(|error| self.tool_error(error), |value| self.finish(value))
+    }
+
+    fn outcome_result(&self, result: AppResult<ToolOutcome>) -> CallToolResult {
+        result.map_or_else(
+            |error| self.tool_error(error),
+            |outcome| self.finish(outcome.value),
+        )
+    }
+
+    /// 所有工具结果都在这里统一脱敏；导出路径是唯一保留的目录事实。
+    fn finish(&self, mut value: Value) -> CallToolResult {
+        self.sanitizer()
+            .with_export_from(&value)
+            .apply_value(&mut value);
+        CallToolResult::success(vec![ContentBlock::text(value.to_string())])
+    }
+
+    fn tool_error(&self, error: impl ToString) -> CallToolResult {
+        let text = self.sanitizer().apply(&error.to_string());
+        CallToolResult::error(vec![ContentBlock::text(text)])
+    }
+
+    fn error_data(&self, message: String) -> ErrorData {
+        ErrorData::internal_error(self.sanitizer().apply(&message), None)
     }
 }
 
@@ -149,17 +185,23 @@ fn ensure_enabled(state: &AppState) -> AppResult<()> {
     ))
 }
 
-fn outcome_result(result: AppResult<ToolOutcome>) -> CallToolResult {
-    match result {
-        Ok(outcome) => CallToolResult::success(vec![ContentBlock::text(outcome.value.to_string())]),
-        Err(error) => tool_error(error),
-    }
-}
-
 #[tool_router]
 impl McpServer {
     #[tool(
-        description = "图库概况：名称、路径、图片/回收站/临时文件夹计数、schema 版本、特征数量、AI 配置与 MCP 限制。只读。"
+        description = "在专用只读连接上执行单条 SELECT（或以 WITH 开头的查询），用于聚合、抽样与自定义分析。只能访问 mcp_* 视图：mcp_images、mcp_trash_images、mcp_temp_images、mcp_folders、mcp_trash_folders、mcp_tags、mcp_image_tags、mcp_collections、mcp_collection_items、mcp_features；直接读内部表、sqlite_master、PRAGMA、ATTACH、写操作与文件函数都会被拒绝。字段、类型与单位见 library_info.sql。默认内联返回（最多 200 行 / 256 KiB / 5 秒，truncated=true 表示不是全量）；需要完整结果时加 export=true，把结果流式写成 JSONL（默认）或 CSV 文件并返回真实路径与 20 行预览，可用自己的 Python 读取；导出上限 1,000,000 行 / 512 MiB / 60 秒。原图像素不经过这个工具。"
+    )]
+    async fn library_sql(
+        &self,
+        Parameters(input): Parameters<LibrarySqlInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_state("library_sql", move |state| {
+            sql_tool::library_sql(state, &input)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "图库概况：名称、图片/回收站/临时文件夹计数、schema 版本、特征数量、AI 配置、MCP 限制与 SQL 视图字段。只读。"
     )]
     async fn library_info(&self) -> Result<CallToolResult, ErrorData> {
         let result = self
@@ -167,7 +209,7 @@ impl McpServer {
                 read::library_info(context, TOOL_COUNT)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -182,7 +224,7 @@ impl McpServer {
                 read::folders_list(context, &input)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -210,7 +252,7 @@ impl McpServer {
                 read::tags_list(context, &input)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -233,7 +275,7 @@ impl McpServer {
                 read::collections_list(context)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -248,7 +290,7 @@ impl McpServer {
                 read::search_images(context, &input)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -263,7 +305,7 @@ impl McpServer {
                 read::find_similar(context, ai, &input)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -278,7 +320,7 @@ impl McpServer {
                 read::images_get(context, &input.ids)
             })
             .await?;
-        Ok(tool_value(result))
+        Ok(self.to_tool_value(result))
     }
 
     #[tool(
@@ -294,7 +336,9 @@ impl McpServer {
             })
             .await?;
         match result {
-            Ok(sheet) => {
+            Ok(mut sheet) => {
+                let sanitizer = self.sanitizer();
+                sanitizer.apply_value(&mut sheet.mapping);
                 let mapping = serde_json::to_string(&sheet.mapping).unwrap_or_else(|error| {
                     format!(r#"{{"error":"拼图映射序列化失败：{error}"}}"#)
                 });
@@ -305,7 +349,7 @@ impl McpServer {
                 ));
                 Ok(CallToolResult::success(content))
             }
-            Err(error) => Ok(tool_error(error)),
+            Err(error) => Ok(self.tool_error(error)),
         }
     }
 
@@ -499,7 +543,7 @@ impl ServerHandler for McpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合与标签、从本机导入图片，以及查看与撤销/重做操作记录。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。\
+                "Lilith Artbank 本地图库。可浏览、搜索、查看详情与拼图，也可批量改评分/标签/描述、移动、移入回收站、维护集合与标签、从本机导入图片，以及查看与撤销/重做操作记录。需要聚合、抽样或自定义分析时用只读 library_sql：只能查询 mcp_* 视图，字段口径见 library_info.sql；小结果内联返回，完整结果加 export=true 导出 JSONL/CSV 文件。需要向用户展示一组查找结果时，优先创建集合；不要复制文件。导入固定不压缩。\
 \n\n当前权限档以 library_info 的 mcp.writeAllowed 与 mcp.approval 为准，三档区别只有一处：\
 \n- readOnly：writeAllowed=false，全部写入、导入与撤销/重做都返回“当前是只读模式”。写工具仍然出现在 tools/list 里，这是正常的。\
 \n- ask：写入会执行，但 import_start（target=library）、images_trash、history_undo、history_redo、folders_modify 的 move/delete、tags_modify 的 delete/merge，以及任何超过 100 张的批量写入会先进入应用内待确认队列，返回 status=pendingApproval 与 approvalId；用 tasks_get(approvalId) 等用户决定。\
@@ -509,17 +553,6 @@ impl ServerHandler for McpServer {
 \n列表工具的 nextCursor 请原样回传，不要自己拼。",
             )
     }
-}
-
-fn tool_value(result: crate::app::error::AppResult<serde_json::Value>) -> CallToolResult {
-    match result {
-        Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
-        Err(error) => tool_error(error),
-    }
-}
-
-fn tool_error(error: impl ToString) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(error.to_string())])
 }
 
 #[cfg(test)]
@@ -555,6 +588,7 @@ mod tests {
             "temp_features_generate",
             "folders_modify",
             "tags_modify",
+            "library_sql",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

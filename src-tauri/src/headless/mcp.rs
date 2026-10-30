@@ -56,6 +56,18 @@ pub(super) fn scenario_bridge(app: &tauri::AppHandle, options: &Options) -> Resu
     let info = bridge.call_tool("library_info", json!({}))?;
     let search = bridge.call_tool("search_images", json!({ "pageSize": 5, "view": "all" }))?;
     let tags = bridge.call_tool("tags_list", json!({ "limit": 10 }))?;
+    let sql = bridge.call_tool(
+        "library_sql",
+        json!({ "sql": "SELECT count(*) AS n FROM mcp_images" }),
+    )?;
+    let sql_export = bridge.call_tool(
+        "library_sql",
+        json!({
+            "sql": "SELECT id, folder FROM mcp_images ORDER BY id",
+            "export": true,
+            "format": "jsonl",
+        }),
+    )?;
 
     // 关闭服务：小桥还开着，之后再调工具必须被拒绝，不能靠“客户端自觉断开”。
     let state = app.state::<AppState>();
@@ -73,6 +85,8 @@ pub(super) fn scenario_bridge(app: &tauri::AppHandle, options: &Options) -> Resu
         "libraryInfo": info.to_value(),
         "search": search.to_value(),
         "tags": tags.to_value(),
+        "sql": sql.to_value(),
+        "sqlExport": sql_export.to_value(),
         "afterDisableRejected": after_disable_rejected,
         "afterDisableError": after_disable_error,
         "runtimeRemovedAfterStop": runtime_removed,

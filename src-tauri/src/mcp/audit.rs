@@ -69,6 +69,23 @@ pub fn tool(tool: &str, mode: &str, duration_ms: u128, outcome: Result<Option<&V
     }
 }
 
+/// SQL 查询单独记录：摘要、行数、字节数与导出路径；摘要压缩成单行并截断。
+pub fn sql_query(sql: &str, rows: u64, bytes: u64, export: Option<&str>) {
+    let summary = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let summary: String = if summary.chars().count() > 200 {
+        format!("{}…", summary.chars().take(200).collect::<String>())
+    } else {
+        summary
+    };
+    log_line(
+        "sql",
+        &format!(
+            "sql={summary} rows={rows} bytes={bytes} export={}",
+            export.unwrap_or("-")
+        ),
+    );
+}
+
 /// 导入来源单独记录；总数写在路径之前，单行截断只会切掉路径尾部。
 pub fn import_sources(
     paths: &[String],

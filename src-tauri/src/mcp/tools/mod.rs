@@ -3,6 +3,7 @@ pub mod folder;
 pub mod history;
 pub mod import;
 pub mod read;
+pub mod sql;
 pub mod tag;
 pub mod task;
 pub mod write;

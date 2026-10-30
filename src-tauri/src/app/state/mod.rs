@@ -43,7 +43,7 @@ use crate::{
     library::{
         db::LibraryDb, history::RecoveryPlan, inspect::InspectionReport,
         optimize_estimate::OptimizeEstimate, paths::normalize_folder, query,
-        service::LibrarySession, thumbs::ThumbPack,
+        service::LibrarySession, sql_query::SqlSandbox, thumbs::ThumbPack,
     },
     mcp::{approval::ApprovalQueue, runtime::McpRuntime, sheet::SheetCache},
 };
@@ -72,6 +72,8 @@ pub struct AppState {
     /// 空闲回收线程；开库时启动，关库时停。
     idle_loop: Mutex<Option<IdleLoop>>,
     mcp_sheets: Arc<Mutex<SheetCache>>,
+    /// MCP 只读 SQL：一条专用只读连接，同一时刻只跑一条查询。
+    sql: Arc<SqlSandbox>,
     mcp_write: Arc<Mutex<()>>,
     mcp_approvals: Arc<ApprovalQueue>,
     mcp_tasks: Arc<Mutex<VecDeque<String>>>,
@@ -112,6 +114,7 @@ impl AppState {
             inspection_reports: Arc::new(Mutex::new(VecDeque::new())),
             idle_loop: Mutex::new(None),
             mcp_sheets: Arc::new(Mutex::new(SheetCache::default())),
+            sql: Arc::new(SqlSandbox::new()),
             mcp_write: Arc::new(Mutex::new(())),
             mcp_approvals,
             mcp_tasks: Arc::new(Mutex::new(VecDeque::new())),
@@ -126,6 +129,15 @@ impl AppState {
     pub fn current_library(&self) -> Option<(Arc<LibraryDb>, PathBuf)> {
         self.library_handles()
             .map(|(database, _, root)| (database, root))
+    }
+
+    /// 当前图库根目录；MCP 边界用它组装路径脱敏器。
+    pub(crate) fn mcp_library_root(&self) -> Option<PathBuf> {
+        self.library_handles().map(|(_, _, root)| root)
+    }
+
+    pub(crate) fn sql_sandbox(&self) -> Arc<SqlSandbox> {
+        self.sql.clone()
     }
 
     /// 一次取锁拿全当前图库的三件句柄，避免同一操作里重复加锁。

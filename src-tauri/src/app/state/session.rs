@@ -82,6 +82,7 @@ impl AppState {
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.sql.invalidate();
         self.mcp_approvals.clear();
         query::clear_page_cache();
         // 换库算换了一代：换库期间提交、还在排队的任务拿到资源后会直接取消。
@@ -120,6 +121,7 @@ impl AppState {
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.sql.invalidate();
         self.mcp_approvals.clear();
         query::clear_page_cache();
         // 换库算换了一代：换库期间提交、还在排队的任务拿到资源后会直接取消。
@@ -212,6 +214,7 @@ impl AppState {
         self.import_receipts.lock().clear();
         self.import_jobs.lock().clear();
         self.mcp_sheets.lock().clear();
+        self.sql.invalidate();
         self.mcp_approvals.clear();
         query::clear_page_cache();
         // 关库期间提交的任务已经拿着旧句柄，再递增一次让它们一起作废。

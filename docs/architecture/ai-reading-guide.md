@@ -12,7 +12,7 @@
 | 查看器、裁剪/旋转/调尺寸 | `docs/modules/viewer-and-editor.md` | `src/modules/viewer/`、`src-tauri/src/imageops/` |
 | description / embedding / pose、服务进程、语义搜索 | `docs/modules/ai-service.md` | `src-tauri/src/ai/`、`src/modules/ai/`、`server/` |
 | 找相似、相似分组、pHash/主色/embedding/pose 相似度 | `docs/modules/ai-service.md`（本地检索）、`docs/modules/browse-and-query.md`（找相似与相似分组） | `src-tauri/src/library/similarity.rs`、`src-tauri/src/ai/pose_similarity.rs`、`src-tauri/src/ai/embedding.rs`、`src/app/useSimilarityBrowse.ts`、`src/modules/library/FindSimilarPanel.tsx`、`src/shared/scope.ts` |
-| MCP 服务、stdio 小桥、读写工具、三档权限、确认队列、selector、拼图 | `docs/modules/mcp.md` | `src-tauri/src/mcp/`、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx` |
+| MCP 服务、stdio 小桥、读写工具、只读 SQL 与导出、路径脱敏、三档权限、确认队列、selector、拼图 | `docs/modules/mcp.md` | `src-tauri/src/mcp/`（只读 SQL 的连接、`mcp_*` 视图与导出在 `library/sql_query.rs`）、`src-tauri/src/imageops/contact_sheet.rs`、`src/app/McpPanel.tsx`、`src/app/McpApprovalCard.tsx` |
 | 清理、缩略图重建、图片空间优化（估算与执行） | `docs/modules/maintenance.md`（图片空间优化） | `src-tauri/src/` 对应领域模块；空间优化在 `imageops/optimize.rs`、`library/optimize_estimate/`、`library/optimize/`、`src/app/OptimizeDialog.tsx`（执行面板在 `OptimizeExecutionPanel.tsx`，图表在 `OptimizeCharts.tsx`） |
 | 构建、检查、基准、无窗口验收 | `docs/guides/validation.md`、`docs/guides/performance.md` | 工具脚本与测试；无头入口在 `src-tauri/src/headless/`，验收套件在 `src-tauri/tests/acceptance_*`，后台入口在 `tools/acceptance/run.ps1` |
 | 日志等级、行格式、命令记录、轮换 | `docs/guides/logging.md` | `src-tauri/src/app/trace.rs`、`src-tauri/src/app/logging.rs` |
@@ -35,7 +35,7 @@
 - 破坏性操作的确认文案走 `src/shared/confirm.ts`，不要在调用点各写一套标题。
 - 程序根目录、`settings.json` 与 `logs/` 的解析在 `app/paths.rs`；不要在其他模块各自拼 AppData 路径。
 - AI 服务端只改 `server/`；`/v1` 契约变化时同步 `docs/modules/ai-service.md`。
-- MCP 只做适配：工具在 `src-tauri/src/mcp/`，拼图像素在 `imageops/contact_sheet.rs`；不复制 `library/`、`ai/` 的逻辑，也不另起图库写进程。
+- MCP 只做适配：工具在 `src-tauri/src/mcp/`，拼图像素在 `imageops/contact_sheet.rs`，只读 SQL 的连接与视图在 `library/sql_query.rs`；不复制 `library/`、`ai/` 的逻辑，也不另起图库写进程。
 - 任何全量载入/全量扫描方案先对照 `docs/guides/performance.md`。
 - 真实仓库 `G:\Lilith Image Library` 只读；测试用临时目录。
 - 不建版本号/CHANGELOG/法务文件。

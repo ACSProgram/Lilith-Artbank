@@ -108,7 +108,7 @@ git diff --check
 - **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件夹整树移入回收站、删除单元恢复、删除单元之间不串恢复、永久删除后释放空目录与行、`trashLoose` 直属图片与文件夹计数；文件操作测试只用临时图库。
 - **查看器/编辑**：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同跑 `test:web` 与 typecheck/build。
 - **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。`acceptance_ai` 用进程内假 `/v1` 跑完整协议、重试、维度校验、语义搜索分页、相似分组与临时区；真实模型质量与显存仍手工。
-- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。`acceptance_mcp` 通过真实 `--mcp-stdio` 子进程验证生命周期、三档、审批拒绝/批准/过期/换库清空、工具列表与调用、口令轮换、端口占用与审计日志；真实第三方客户端与便携包仍手工。
+- **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。`cargo test --lib library::sql_query` 覆盖 `mcp_*` 视图、authorizer 与函数白名单、列名规则、内联/导出上限、JSONL/CSV 映射、TTL 清理；`mcp::sanitize` 覆盖路径脱敏与导出路径豁免。`acceptance_mcp` 通过真实 `--mcp-stdio` 子进程验证生命周期、三档、审批拒绝/批准/过期/换库清空、工具列表与调用、口令轮换、端口占用与审计日志；真实第三方客户端与便携包仍手工。
 - **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录；`acceptance_optimize` 在小纹理图上跑估算→改选/漂移→执行，并验证参数/集合指纹、缺失/变化拒绝或裁剪、全部跳过与临时区拒绝。
 - `server/` 只做一次性检查，不加入常驻测试：它依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 - 提交前只核对一次 `git status` 与 diff，不反复刷状态。
@@ -183,6 +183,10 @@ MCP 真实客户端：
 23. `search_images` 传 `filters.tagPresence: "missing"` 只能拿到没有标签的图片；再加 `excludeTagIds`，结果里不再出现带该标签的图片。
 24. 切到完全档调 `library_info`：`approval.threshold` 为 `null`、`appliesToCurrentMode` 为 false；问 AI「完全档批量写入需不需要确认」，应答不需要。
 25. `tags_modify` 合并两个近义标签：先 `dryRun` 看 `moved` / `duplicate`，正式执行后源标签消失、目标标签图片数为两者之和；`history_list(kind: "tagMerge")` 有 `AI ·` 记录，撤销后两个标签与关系都回来。
+
+26. 调用 `library_sql` 执行一条聚合 SQL（例如按评分或文件夹计数），确认内联结果与 `images_get` / 搜索数量一致；再传 `export=true, format="jsonl"` 与 `format="csv"`，把返回路径交给外部 Python 读取并处理，确认响应里有导出路径、没有图库根或程序根。
+27. 依次尝试直查 `images`、`SELECT * FROM sqlite_master`、`PRAGMA`、`ATTACH`、`DELETE`、`readfile(...)` 与第二条语句，确认都被拒绝且错误可读；`WITH`、join、聚合、`hex()` 与 `SELECT 1` 正常。
+28. 检查 `library_info` 没有 `library.path` / `tempFolder.path`、`images_get` 没有 `filePath`，各工具错误里不出现图库根、程序根或 `mcp-runtime.json`；`library_info.mcp.toolCount` 为 25，`library_info.sql` 能读出视图字段与上限。
 
 便携包：
 

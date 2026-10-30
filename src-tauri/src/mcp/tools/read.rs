@@ -194,7 +194,6 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
         "library": {
             "id": context.info.id,
             "name": context.info.name,
-            "path": context.info.path,
             "schemaVersion": context.info.schema_version,
         },
         "counts": {
@@ -204,8 +203,6 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
         },
         "tempFolder": {
             "available": temp_path.is_some(),
-            // 内部路径只用于诊断；查询临时图片用 view=temp，不要把它当普通文件夹。
-            "path": temp_path,
             "count": temp_count,
             "note": "只能通过 import_start(target=temp) 进入；关闭、切换图库或退出应用时清空，不写操作记录。",
         },
@@ -224,6 +221,7 @@ pub fn library_info(context: &ReadContext, tool_count: usize) -> AppResult<Value
             "launchConfigured": context.settings.ai.launch_configured(),
         },
         "mcp": mcp_limits(context, tool_count),
+        "sql": crate::library::sql_query::schema_docs(),
     }))
 }
 
@@ -573,7 +571,6 @@ pub fn images_get(context: &ReadContext, ids: &[i64]) -> AppResult<Value> {
         images.push(json!({
             "id": details.id,
             "contentHash": details.content_hash,
-            "filePath": details.file_path,
             "folderId": details.folder_id,
             "folderPath": display_folder(&details.folder_path, temporary),
             "temporary": temporary,
@@ -1379,7 +1376,7 @@ mod tests {
     #[test]
     fn library_info_reports_mode_and_limits() {
         let fixture = fixture();
-        let value = library_info(&fixture.context, 24).unwrap();
+        let value = library_info(&fixture.context, 25).unwrap();
         assert_eq!(value["counts"]["images"], 3);
         assert_eq!(value["mcp"]["mode"], "ask");
         assert_eq!(value["mcp"]["writeTools"], true);
@@ -1392,6 +1389,11 @@ mod tests {
         assert_eq!(value["mcp"]["limits"]["maxReferenceImages"], 100);
         assert_eq!(value["mcp"]["limits"]["maxImportPaths"], 10_000);
         assert_eq!(value["mcp"]["limits"]["importCompresses"], false);
+        // 图库路径不再返回给模型；SQL 视图口径放在 library_info.sql。
+        assert!(value["library"].get("path").is_none());
+        assert!(value["tempFolder"].get("path").is_none());
+        assert_eq!(value["sql"]["tool"], "library_sql");
+        assert_eq!(value["sql"]["limits"]["inlineRows"], 200);
     }
 
     #[test]
@@ -1402,7 +1404,7 @@ mod tests {
             (McpMode::ReadOnly, false, false, Value::Null),
         ] {
             fixture.context.settings.mcp.mode = mode;
-            let value = library_info(&fixture.context, 24).unwrap();
+            let value = library_info(&fixture.context, 25).unwrap();
             assert_eq!(value["mcp"]["writeAllowed"], write_allowed);
             assert_eq!(value["mcp"]["approval"]["appliesToCurrentMode"], applies);
             assert_eq!(value["mcp"]["approval"]["threshold"], threshold);

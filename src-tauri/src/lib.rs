@@ -77,6 +77,8 @@ pub fn run() {
                 })?;
             }
             let settings = app::settings::SettingsStore::load_or_create(settings_path)?;
+            // MCP SQL 导出文件只保留 24 小时；应用启动时顺手清一次。
+            crate::library::sql_query::cleanup_exports();
             let state = app::state::AppState::new(settings, application.handle().clone());
             state.open_configured_library();
             application.manage(state);

@@ -114,6 +114,9 @@ fn gate(auto: bool, idle: Option<Duration>, busy: bool) -> bool {
 }
 
 fn tick(app: &AppHandle) {
+    // 每轮空闲轮询顺手清理过期导出文件（与缩略图回收的开关无关）；目录通常不存在，
+    // 一次 read_dir 失败就返回。
+    crate::library::sql_query::cleanup_exports();
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };

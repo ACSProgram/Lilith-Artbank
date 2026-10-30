@@ -23,7 +23,7 @@
 - [查看器与几何编辑](modules/viewer-and-editor.md)：查看与导航、几何组合、保存语义、体积预估、`img://`。
 - [AI 服务](modules/ai-service.md)：进程托管、`/v1` 接口、feature pack、批量任务、本地检索与相似度算法。
 - [维护与批量工作流](modules/maintenance.md)：库检查与孤儿清理、缩略图重建与包空闲回收、待释放与清理、图片空间优化（估算与执行）、导出。
-- [MCP 图库控制](modules/mcp.md)：传输与进程、24 个工具、selector、数量核对、三档权限与确认队列、审计。
+- [MCP 图库控制](modules/mcp.md)：传输与进程、25 个工具、只读 SQL 与导出、selector、数量核对、三档权限与确认队列、路径隐藏、审计。
 
 ## 规范
 

@@ -29,6 +29,7 @@ pub mod query;
 pub mod schema;
 pub mod service;
 pub mod similarity;
+pub mod sql_query;
 pub mod stats;
 pub mod temp;
 pub mod thumbs;

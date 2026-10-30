@@ -37,7 +37,7 @@ fn stdio_bridge_lists_and_calls_tools() {
         data["initialize"]["result"]["serverInfo"]["name"], "lilith-artbank",
         "{data}"
     );
-    assert_eq!(data["toolCount"], 24, "{data}");
+    assert_eq!(data["toolCount"], 25, "{data}");
     assert_eq!(data["libraryInfo"]["mcp"]["mode"], "full", "{data}");
     assert_eq!(data["libraryInfo"]["mcp"]["writeAllowed"], true, "{data}");
     assert!(
@@ -46,6 +46,32 @@ fn stdio_bridge_lists_and_calls_tools() {
     );
     assert_eq!(data["search"]["total"], 2, "{data}");
     assert_eq!(data["tags"]["total"], 0, "{data}");
+    assert_eq!(data["sql"]["rows"][0]["n"], 2, "{data}");
+    assert!(
+        data["libraryInfo"]["library"].get("path").is_none(),
+        "library_info 不能返回图库路径：{data}"
+    );
+    assert!(
+        data["libraryInfo"]["tempFolder"].get("path").is_none(),
+        "library_info 不能返回临时目录路径：{data}"
+    );
+    assert!(
+        data["libraryInfo"]["sql"]["views"]["mcp_images"].is_object(),
+        "library_info 要带 SQL 视图口径：{data}"
+    );
+    let export_path = data["sqlExport"]["export"]["path"]
+        .as_str()
+        .expect("导出要返回文件路径");
+    assert_eq!(data["sqlExport"]["rowCount"], 2, "{data}");
+    assert!(
+        std::path::Path::new(export_path).is_file(),
+        "导出文件应存在：{export_path}"
+    );
+    assert!(
+        !export_path.contains(library.to_string_lossy().as_ref()),
+        "导出路径不能包含图库根：{export_path}"
+    );
+    std::fs::remove_file(export_path).ok();
     assert_eq!(
         data["afterDisableRejected"], true,
         "关闭服务后工具调用必须被拒绝：{data}"
