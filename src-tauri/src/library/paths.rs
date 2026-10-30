@@ -239,6 +239,25 @@ pub fn folder_within(path: &str, ancestor: &str) -> bool {
     path_bytes.len() == ancestor_bytes.len() || path_bytes[ancestor_bytes.len()] == b'/'
 }
 
+/// 目标路径 canonicalize 后必须仍在图库根目录内（含根）。
+pub fn ensure_within(root: &Path, directory: &Path, message: &str) -> AppResult<()> {
+    let canonical_root = root.canonicalize()?;
+    ensure_canonical_within(&canonical_root, directory, message)
+}
+
+/// 已知根目录的规范化路径时用它，避免批量校验时重复 canonicalize 根目录。
+pub fn ensure_canonical_within(
+    canonical_root: &Path,
+    directory: &Path,
+    message: &str,
+) -> AppResult<()> {
+    let canonical_directory = directory.canonicalize()?;
+    if !canonical_directory.starts_with(canonical_root) {
+        return Err(AppError::message(message));
+    }
+    Ok(())
+}
+
 pub fn normalize_content_extension(value: &str) -> AppResult<String> {
     let ext = value.trim().trim_start_matches('.').to_ascii_lowercase();
     if ext.is_empty() || ext.len() > 16 || !ext.chars().all(|ch| ch.is_ascii_alphanumeric()) {

@@ -1,13 +1,11 @@
 //! 图片能力查询：只在前端打开右键菜单/详情时按需调用，
 //! 不进入列表查询，避免给每页 150 行加多个 EXISTS。
 
-use std::collections::HashSet;
-
 use rusqlite::params_from_iter;
 
 use crate::{
-    app::error::{AppError, AppResult},
-    library::{db::LibraryDb, placeholders},
+    app::error::AppResult,
+    library::{db::LibraryDb, ids, placeholders},
 };
 
 const MAX_IDS: usize = 500;
@@ -37,25 +35,16 @@ pub fn image_capabilities(
     database: &LibraryDb,
     image_ids: &[i64],
 ) -> AppResult<Vec<ImageCapabilities>> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for id in image_ids {
-        if *id <= 0 {
-            return Err(AppError::message("图片 id 无效"));
-        }
-        if seen.insert(*id) {
-            ids.push(*id);
-        }
-    }
-    if ids.len() > MAX_IDS {
-        return Err(AppError::message(format!(
-            "一次最多查询 {MAX_IDS} 张图片的能力"
-        )));
-    }
+    let unique = ids::unique_positive(image_ids, "图片")?;
+    ids::ensure_max(
+        unique.len(),
+        MAX_IDS,
+        format!("一次最多查询 {MAX_IDS} 张图片的能力"),
+    )?;
 
     database.with_reader(|connection| {
-        let mut result = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(CHUNK) {
+        let mut result = Vec::with_capacity(unique.len());
+        for chunk in unique.chunks(CHUNK) {
             let marks = placeholders(chunk.len());
             let sql = format!(
                 "SELECT images.id,

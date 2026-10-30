@@ -11,7 +11,8 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
-        paths::{escape_like, normalize_content_extension, parent_path, subtree_like_pattern},
+        folder_tree::FolderTree,
+        paths::{escape_like, normalize_content_extension, subtree_like_pattern},
         placeholders, temp,
     },
 };
@@ -954,19 +955,12 @@ pub fn selected_pending_ids(
 
 /// 选择集 id 的公共校验：正整数、去重、数量上限；任务范围解析与待处理统计共用。
 pub(crate) fn normalize_scope_ids(ids: &[i64]) -> AppResult<Vec<i64>> {
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    for id in ids {
-        if *id <= 0 {
-            return Err(AppError::message("图片 id 无效"));
-        }
-        if seen.insert(*id) {
-            result.push(*id);
-        }
-    }
-    if result.len() > MAX_IDS {
-        return Err(AppError::message("单次任务最多处理 100 万张图片"));
-    }
+    let result = crate::library::ids::unique_positive(ids, "图片")?;
+    crate::library::ids::ensure_max(
+        result.len(),
+        MAX_IDS,
+        "单次任务最多处理 100 万张图片".to_owned(),
+    )?;
     Ok(result)
 }
 
@@ -1056,44 +1050,7 @@ fn pin_stats_indexes(query: &LibraryQuery) -> bool {
 }
 
 fn subfolder_count(connection: &Connection, folder_ids: &[i64]) -> AppResult<u64> {
-    let folders = all_folders(connection)?;
-    if folder_ids.is_empty() {
-        // 全库概览：根目录自身不算“子文件夹”。
-        let count = folders.iter().filter(|(_, path)| !path.is_empty()).count();
-        return Ok(count as u64);
-    }
-    let selected_ids: HashSet<i64> = folder_ids.iter().copied().collect();
-    // 库里可能存在同一子树两种大小写前缀的旧行，祖先比较必须与 SQL 的 NOCASE 同口径。
-    let selected_paths: HashSet<String> = folders
-        .iter()
-        .filter(|(id, _)| selected_ids.contains(id))
-        .map(|(_, path)| path.to_ascii_lowercase())
-        .collect();
-    if selected_paths.is_empty() {
-        return Ok(0);
-    }
-    let count = folders
-        .iter()
-        .filter(|(id, path)| {
-            if selected_ids.contains(id) {
-                return false;
-            }
-            // 统一小写后逐级回溯，每一级都复用同一份字符串。
-            let path = path.to_ascii_lowercase();
-            let mut current = Some(path.as_str());
-            while let Some(prefix) = current {
-                if selected_paths.contains(prefix) {
-                    return true;
-                }
-                if prefix.is_empty() {
-                    break;
-                }
-                current = Some(parent_path(prefix));
-            }
-            false
-        })
-        .count();
-    Ok(count as u64)
+    Ok(FolderTree::normal(connection)?.descendant_count(folder_ids))
 }
 
 fn stats_tags(connection: &Connection, counts: Vec<(i64, u64)>) -> AppResult<Vec<StatsTag>> {
@@ -1124,7 +1081,7 @@ const FOLDER_COUNTS_SQL: &str = "SELECT folder_id, count(*) FROM images
 
 pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
     database.with_reader(|connection| {
-        let folders = all_folders(connection)?;
+        let tree = FolderTree::normal(connection)?;
         let mut statement = connection.prepare(FOLDER_COUNTS_SQL)?;
         let direct = statement
             .query_map([], |row| {
@@ -1134,17 +1091,16 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
         drop(statement);
 
         let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
-        let totals: HashMap<i64, u64> =
-            expand_folder_counts(direct, &folders).into_iter().collect();
+        let totals: HashMap<i64, u64> = tree.totals(direct);
         let sort_indexes: HashMap<i64, i64> = connection
             .prepare("SELECT id, sort_index FROM folders")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(folders
-            .into_iter()
+        Ok(tree
+            .entries()
             .map(|(id, path)| FolderInfo {
                 id,
-                path,
+                path: path.to_owned(),
                 sort_index: sort_indexes.get(&id).copied().unwrap_or(0),
                 direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
                 total_image_count: totals.get(&id).copied().unwrap_or(0),
@@ -1187,11 +1143,12 @@ pub fn list_trash_folders(database: &LibraryDb) -> AppResult<TrashFolders> {
         drop(statement);
 
         let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
-        let paths: Vec<(i64, String)> = rows
-            .iter()
-            .map(|(id, path, _)| (*id, path.clone()))
-            .collect();
-        let totals: HashMap<i64, u64> = expand_folder_counts(direct, &paths).into_iter().collect();
+        let tree = FolderTree::new(
+            rows.iter()
+                .map(|(id, path, _)| (*id, path.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let totals: HashMap<i64, u64> = tree.totals(direct);
         let folders: Vec<FolderInfo> = rows
             .into_iter()
             .map(|(id, path, sort_index)| FolderInfo {
@@ -2394,55 +2351,6 @@ fn folder_scope_paths(connection: &Connection, ids: &[i64]) -> AppResult<Vec<Str
         .query_map(params_from_iter(ids.iter().copied()), |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(paths)
-}
-
-fn all_folders(connection: &Connection) -> AppResult<Vec<(i64, String)>> {
-    // 只返回正常树里的文件夹：回收站与待释放行对文件夹树、统计与 MCP 都不可见。
-    let mut statement = connection.prepare(
-        "SELECT id, path FROM folders
-         WHERE kind = 'normal' AND trashed_at IS NULL AND purge_operation_id IS NULL
-         ORDER BY path",
-    )?;
-    let folders = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(folders)
-}
-
-/// 把“直接位于该文件夹”的计数累加到自身与全部祖先，得到子树计数。
-///
-/// 只返回计数非零的文件夹；空文件夹由调用方按 0 补齐。
-/// 前缀比较忽略 ASCII 大小写：旧数据里子路径可能与祖先大小写不同，
-/// 按精确字符串查祖先会让这部分计数整段丢失。
-fn expand_folder_counts(direct: Vec<(i64, u64)>, folders: &[(i64, String)]) -> Vec<(i64, u64)> {
-    let by_path: HashMap<String, i64> = folders
-        .iter()
-        .map(|(id, path)| (path.to_ascii_lowercase(), *id))
-        .collect();
-    let path_by_id: HashMap<i64, &str> = folders
-        .iter()
-        .map(|(id, path)| (*id, path.as_str()))
-        .collect();
-    let mut totals: HashMap<i64, u64> = HashMap::new();
-    for (folder_id, count) in direct {
-        let Some(path) = path_by_id.get(&folder_id).copied() else {
-            continue;
-        };
-        let path = path.to_ascii_lowercase();
-        let mut current = Some(path.as_str());
-        while let Some(prefix) = current {
-            if let Some(id) = by_path.get(prefix) {
-                *totals.entry(*id).or_default() += count;
-            }
-            if prefix.is_empty() {
-                break;
-            }
-            current = Some(parent_path(prefix));
-        }
-    }
-    totals.into_iter().collect()
 }
 
 fn push_count_branch(

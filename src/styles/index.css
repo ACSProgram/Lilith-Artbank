@@ -5797,7 +5797,7 @@ body.is-drag-sorting * {
   white-space: nowrap;
 }
 
-.task-row-note {
+.task-cancel-note {
   color: var(--warning);
   font-size: 10.5px;
   line-height: 1.4;
@@ -6577,13 +6577,6 @@ body.is-drag-sorting * {
 
 .optimize-execution {
   gap: 8px;
-}
-
-/* 取消中：说明在等什么，不当成错误。 */
-.optimize-cancel-note {
-  color: var(--warning);
-  font-size: 10.5px;
-  line-height: 1.4;
 }
 
 /* 完成后的实际 / 预计对照，一行写完。 */
@@ -7483,6 +7476,7 @@ body.is-drag-sorting * {
 .maintenance-progress-bar > span {
   display: block;
   height: 100%;
+  border-radius: 0;
   background: var(--accent);
   transition: width 0.2s ease;
 }

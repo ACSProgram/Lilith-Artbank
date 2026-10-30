@@ -1023,6 +1023,39 @@ impl TaskBus {
         }
     }
 
+    /// 在当前阻塞线程里跑有返回值的写任务：排队、资源、panic 与终态都走任务总线。
+    ///
+    /// 调用方必须在阻塞线程里调用。任何退出路径都会落到终态，不会把任务留在排队中。
+    pub fn begin_blocking_task<T, F>(
+        &self,
+        app: &AppHandle,
+        handle: Arc<TaskHandle>,
+        request: ResourceRequest,
+        run: F,
+    ) -> AppResult<T>
+    where
+        F: FnOnce(&TaskHandle) -> AppResult<T>,
+    {
+        let _run_guard = TaskRunGuard {
+            handle: handle.clone(),
+        };
+        let lane = self.begin_queued(app, handle.clone(), request)?;
+        handle.set_phase(TaskPhase::Running);
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&handle))) {
+            Ok(result) => {
+                handle.finish_from(&result);
+                result
+            }
+            Err(payload) => Err(AppError::message(fail_from_panic(
+                &handle,
+                "write-task",
+                payload.as_ref(),
+            ))),
+        };
+        drop(lane);
+        result
+    }
+
     /// 启动任务：资源空闲且没有冲突等待者时立即运行；冲突时按 policy 失败或排队。
     pub fn launch<F>(
         &self,

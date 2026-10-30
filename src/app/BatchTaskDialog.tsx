@@ -13,6 +13,7 @@ import {
   type ActionAvailability,
 } from "../shared/capability";
 import { useTaskCenter, useTaskData } from "./taskContext";
+import { CancelPendingNote, TaskProgressBar } from "./taskProgress";
 import { taskApi } from "./taskApi";
 import {
   TASK_PHASE_LABELS,
@@ -222,6 +223,7 @@ export function BatchTaskDialog({
   const task = taskId ? find(taskId) : null;
   const activeTask = task && isTaskActive(task) ? task : null;
   const percent = task ? taskPercent(task) : 0;
+  const cancelling = task?.phase === "cancelling";
 
   const previewOffline = kind !== "thumbnail" && !online;
   const previewDimMissing = kind === "aiEmbedding" && online && !previewCapability;
@@ -491,9 +493,8 @@ export function BatchTaskDialog({
                 {task.failed > 0 ? ` · 失败 ${task.failed}` : ""}
               </span>
             </div>
-            <div className="task-progress">
-              <span style={{ width: `${percent}%` }} />
-            </div>
+            <TaskProgressBar percent={percent} cancelling={cancelling} />
+            <CancelPendingNote visible={cancelling} />
             <div className="batch-task-progress-meta">
               <span>
                 {task.message ||

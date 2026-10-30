@@ -5,12 +5,12 @@ import { Spinner } from "../shared/components/Spinner";
 import { formatDuration } from "../shared/format";
 import { useTaskCenter } from "./taskContext";
 import {
-  CANCEL_PENDING_NOTE,
   TASK_PHASE_LABELS,
   isTaskActive,
   taskPercent,
   type TaskSnapshot,
 } from "./taskTypes";
+import { CancelPendingNote, TaskProgressBar, taskProgressState } from "./taskProgress";
 
 /** 已运行时长；与 ETA 的“还剩多久”分开，一个带秒、一个取整到分钟。 */
 function formatElapsed(startedAt: number, finishedAt: number | null): string {
@@ -29,10 +29,7 @@ function TaskRow({
   onCancel: (taskId: string) => void;
 }) {
   const [showFailures, setShowFailures] = useState(false);
-  const active = isTaskActive(task);
-  const cancelling = task.phase === "cancelling";
-  const percent = taskPercent(task);
-  const done = task.completed + task.failed + task.skipped;
+  const { active, cancelling, done, percent } = taskProgressState(task);
 
   return (
     <div className={`task-row${active ? " is-active" : ""}`}>
@@ -48,9 +45,7 @@ function TaskRow({
       </div>
 
       {task.total > 0 || task.progressPercent !== null ? (
-        <div className={`task-progress${cancelling ? " is-cancelling" : ""}`}>
-          <span style={{ width: `${percent}%` }} />
-        </div>
+        <TaskProgressBar percent={percent} cancelling={cancelling} />
       ) : null}
 
       <div className="task-row-meta">
@@ -68,7 +63,7 @@ function TaskRow({
       </div>
 
       {cancelling ? (
-        <div className="task-row-note">{CANCEL_PENDING_NOTE}</div>
+        <CancelPendingNote visible />
       ) : active && task.message && task.total > 0 ? (
         <div className="task-row-message">{task.message}</div>
       ) : null}

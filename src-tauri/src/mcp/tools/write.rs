@@ -172,6 +172,51 @@ fn needs_approval(mode: McpMode, count: usize, dangerous: bool) -> bool {
     mode == McpMode::Ask && (dangerous || count > APPROVAL_THRESHOLD)
 }
 
+/// MCP 同步写工具的统一入口闸：模式、写锁与图库上下文一次取齐。
+///
+/// 持闸期间其他 MCP 写调用会排队；离开作用域自动放锁。
+pub(super) struct WriteGate<'a> {
+    pub(super) mode: McpMode,
+    pub(super) database: Arc<LibraryDb>,
+    pub(super) root: PathBuf,
+    _exclusive: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl<'a> WriteGate<'a> {
+    pub(super) fn enter(state: &'a AppState) -> AppResult<Self> {
+        let mode = ensure_writable(state)?;
+        let _exclusive = state.lock_mcp_writes();
+        let (database, root) = state
+            .current_library()
+            .ok_or_else(|| AppError::message("尚未打开图库"))?;
+        Ok(Self {
+            mode,
+            database,
+            root,
+            _exclusive,
+        })
+    }
+
+    pub(super) fn needs_approval(&self, count: usize, dangerous: bool) -> bool {
+        needs_approval(self.mode, count, dangerous)
+    }
+}
+
+/// 正式写入前的公共判定：confirmedCount、可用性、空选择。
+///
+/// 返回 `Some` 时调用方直接把它当结果；`None` 表示继续走“目标状态是否已经一致”
+/// 与审批/写入。五个按 selector 写入的工具共用这一顺序。
+fn pre_write_checks(
+    confirmed_count: Option<u64>,
+    inspection: &Inspection,
+    want_active: bool,
+    preview: &Value,
+) -> Option<ToolOutcome> {
+    confirmed_outcome(confirmed_count, inspection.selected, preview)
+        .or_else(|| ineligible_outcome(inspection, want_active))
+        .or_else(|| (inspection.selected == 0).then(noop_outcome))
+}
+
 fn inspect(state: &AppState, selector: &Selector, sample_active: bool) -> AppResult<Inspection> {
     let context = state.mcp_context()?;
     let resolved = selection::resolve_ids(selector, &context, &state.ai)?;
@@ -269,7 +314,7 @@ fn ineligible_outcome(inspection: &Inspection, want_active: bool) -> Option<Tool
     })))
 }
 
-fn confirmed_outcome(explicit: Option<u64>, actual: usize, preview: Value) -> Option<ToolOutcome> {
+fn confirmed_outcome(explicit: Option<u64>, actual: usize, preview: &Value) -> Option<ToolOutcome> {
     match explicit {
         Some(value) if value == actual as u64 => None,
         Some(_) => Some(ToolOutcome::value(json!({
@@ -694,9 +739,8 @@ fn run_update(
     input: &ImagesUpdateInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
+    let gate = WriteGate::enter(state)?;
     let kind = classify(input)?;
-    let _exclusive = state.lock_mcp_writes();
 
     if input.dry_run {
         let inspection = inspect(state, &input.selector, true)?;
@@ -727,22 +771,14 @@ fn run_update(
     }
     let before_will_change = update_will_change(&kind, &before)?;
     let preview = sample_preview(&before, before_will_change);
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
-    {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &before, true, &preview) {
         return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&before, true) {
-        return Ok(outcome);
-    }
-    if before.selected == 0 {
-        return Ok(noop_outcome());
     }
     // 目标状态与现状一致：不写库，也不留一条 affected=0 的空记录。
     if before_will_change == 0 {
         return Ok(no_change_outcome(before.selected));
     }
-    if needs_approval(mode, before.selected, false) && !approved {
+    if gate.needs_approval(before.selected, false) && !approved {
         let operation = match &kind {
             UpdateKind::Score(score) => format!("给 {} 张图片评分 {score} 星", before.selected),
             UpdateKind::AddTags(tags) => {
@@ -779,12 +815,7 @@ fn run_update(
     // 正式写入：先占元数据写，再重新解析，避免解析与写入之间被别的写操作插队。
     let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
-    {
-        return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&inspection, true) {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &inspection, true, &preview) {
         return Ok(outcome);
     }
     let will_change = update_will_change(&kind, &inspection)?;
@@ -838,14 +869,13 @@ pub fn execute_move(state: &AppState, input: &ImagesMoveInput) -> AppResult<Tool
 }
 
 fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
+    let gate = WriteGate::enter(state)?;
     let folder_path = normalize_folder(&input.folder_path)?;
     let target = if folder_path.is_empty() {
         "根目录".to_owned()
     } else {
         format!("「{folder_path}」")
     };
-    let _exclusive = state.lock_mcp_writes();
 
     let before = inspect(state, &input.selector, true)?;
     // 临时图片本来就不能移动：同步拒绝，不要先问用户一次再失败。
@@ -864,21 +894,13 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
         merge_object(&mut value, preview.clone());
         return Ok(ToolOutcome::value(value));
     }
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
-    {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &before, true, &preview) {
         return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&before, true) {
-        return Ok(outcome);
-    }
-    if before.selected == 0 {
-        return Ok(noop_outcome());
     }
     if will_change == 0 {
         return Ok(no_change_outcome(before.selected));
     }
-    if needs_approval(mode, before.selected, false) && !approved {
+    if gate.needs_approval(before.selected, false) && !approved {
         return enqueue_approval(
             state,
             "images_move",
@@ -895,12 +917,7 @@ fn run_move(state: &AppState, input: &ImagesMoveInput, approved: bool) -> AppRes
     }
 
     let inspection = inspect(state, &input.selector, true)?;
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
-    {
-        return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&inspection, true) {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &inspection, true, &preview) {
         return Ok(outcome);
     }
     let selected = inspection.selected;
@@ -917,8 +934,7 @@ pub fn execute_trash(state: &AppState, input: &ImagesTrashInput) -> AppResult<To
 }
 
 fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
+    let gate = WriteGate::enter(state)?;
     let before = inspect(state, &input.selector, true)?;
     // 临时图片不能移入回收站：同步拒绝，别弹一张注定失败的确认卡。
     if let Some(outcome) = temporary_outcome(&before)? {
@@ -930,19 +946,11 @@ fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppR
         merge_object(&mut value, preview.clone());
         return Ok(ToolOutcome::value(value));
     }
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
-    {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &before, true, &preview) {
         return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&before, true) {
-        return Ok(outcome);
-    }
-    if before.selected == 0 {
-        return Ok(noop_outcome());
     }
     // 移入回收站不论张数，询问档都要确认。
-    if mode == McpMode::Ask && !approved {
+    if gate.mode == McpMode::Ask && !approved {
         return enqueue_approval(
             state,
             "images_trash",
@@ -964,12 +972,7 @@ fn run_trash(state: &AppState, input: &ImagesTrashInput, approved: bool) -> AppR
 
     let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
-    {
-        return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&inspection, true) {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &inspection, true, &preview) {
         return Ok(outcome);
     }
     let (affected, operation_id) =
@@ -1003,8 +1006,7 @@ fn run_restore(
     input: &ImagesTrashInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
+    let gate = WriteGate::enter(state)?;
     let before = inspect(state, &input.selector, false)?;
     let preview = sample_preview(&before, before.trashed.len() as u64);
     if input.dry_run {
@@ -1012,18 +1014,10 @@ fn run_restore(
         merge_object(&mut value, preview.clone());
         return Ok(ToolOutcome::value(value));
     }
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
-    {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &before, false, &preview) {
         return Ok(outcome);
     }
-    if let Some(outcome) = ineligible_outcome(&before, false) {
-        return Ok(outcome);
-    }
-    if before.selected == 0 {
-        return Ok(noop_outcome());
-    }
-    if needs_approval(mode, before.selected, false) && !approved {
+    if gate.needs_approval(before.selected, false) && !approved {
         return enqueue_approval(
             state,
             "images_restore",
@@ -1041,12 +1035,7 @@ fn run_restore(
 
     let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, false)?;
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
-    {
-        return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&inspection, false) {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &inspection, false, &preview) {
         return Ok(outcome);
     }
     let (affected, operation_id) =
@@ -1086,8 +1075,7 @@ fn run_collection_create(
     input: &CollectionsCreateInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
+    let gate = WriteGate::enter(state)?;
     let inspection = match &input.selector {
         Some(selector) => Some(inspect(state, selector, true)?),
         None => None,
@@ -1125,7 +1113,7 @@ fn run_collection_create(
         return Ok(ToolOutcome::value(value));
     }
     if input.selector.is_some()
-        && let Some(outcome) = confirmed_outcome(input.confirmed_count, selected, preview.clone())
+        && let Some(outcome) = confirmed_outcome(input.confirmed_count, selected, &preview)
     {
         return Ok(outcome);
     }
@@ -1138,7 +1126,7 @@ fn run_collection_create(
     if input.selector.is_some() && selected == 0 {
         return Ok(noop_outcome());
     }
-    if needs_approval(mode, selected, false) && !approved {
+    if gate.needs_approval(selected, false) && !approved {
         let preview = match &inspection {
             Some(inspection) => guide_preview(
                 "创建集合",
@@ -1168,7 +1156,7 @@ fn run_collection_create(
     };
     let selected = inspection.as_ref().map(|item| item.selected).unwrap_or(0);
     if input.selector.is_some()
-        && let Some(outcome) = confirmed_outcome(input.confirmed_count, selected, preview.clone())
+        && let Some(outcome) = confirmed_outcome(input.confirmed_count, selected, &preview)
     {
         return Ok(outcome);
     }
@@ -1180,11 +1168,8 @@ fn run_collection_create(
     if input.selector.is_some() && selected == 0 {
         return Ok(noop_outcome());
     }
-    let (database, _) = state
-        .current_library()
-        .ok_or_else(|| AppError::message("尚未打开图库"))?;
     let (collection, added, operation_id) = collections::create_with_images(
-        &database,
+        &gate.database,
         &input.name,
         inspection
             .as_ref()
@@ -1213,12 +1198,9 @@ pub fn collections_modify(
     state: &AppState,
     input: &CollectionsModifyInput,
 ) -> AppResult<ToolOutcome> {
-    ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
-    let (database, _) = state
-        .current_library()
-        .ok_or_else(|| AppError::message("尚未打开图库"))?;
-    let current = collections::list(&database)?
+    let gate = WriteGate::enter(state)?;
+    let database = &gate.database;
+    let current = collections::list(database)?
         .into_iter()
         .find(|collection| collection.id == input.collection_id)
         .ok_or_else(|| AppError::message("集合不存在"))?;
@@ -1251,7 +1233,7 @@ pub fn collections_modify(
                 .as_deref()
                 .ok_or_else(|| AppError::message("action=rename 时必须提供 name"))?;
             let (_, operation_id) =
-                collections::rename_with_id(&database, input.collection_id, name)?;
+                collections::rename_with_id(database, input.collection_id, name)?;
             (
                 u64::from(operation_id.is_some()),
                 operation_id,
@@ -1260,7 +1242,7 @@ pub fn collections_modify(
         }
         CollectionModifyAction::Delete => {
             let (affected, operation_id) =
-                collections::delete_with_id(&database, input.collection_id)?;
+                collections::delete_with_id(database, input.collection_id)?;
             (affected, operation_id, json!({ "deleted": true }))
         }
     };
@@ -1300,15 +1282,8 @@ fn run_collection_membership(
     input: &CollectionsMembershipInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
-    ensure_collection_exists(
-        &state
-            .current_library()
-            .ok_or_else(|| AppError::message("尚未打开图库"))?
-            .0,
-        input.collection_id,
-    )?;
+    let gate = WriteGate::enter(state)?;
+    ensure_collection_exists(&gate.database, input.collection_id)?;
     let before = inspect(state, &input.selector, true)?;
     if let Some(outcome) = temporary_outcome(&before)? {
         return Ok(outcome);
@@ -1330,21 +1305,13 @@ fn run_collection_membership(
         merge_object(&mut value, preview.clone());
         return Ok(ToolOutcome::value(value));
     }
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, before.selected, preview.clone())
-    {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &before, true, &preview) {
         return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&before, true) {
-        return Ok(outcome);
-    }
-    if before.selected == 0 {
-        return Ok(noop_outcome());
     }
     if will_change == 0 {
         return Ok(no_change_outcome(before.selected));
     }
-    if needs_approval(mode, before.selected, false) && !approved {
+    if gate.needs_approval(before.selected, false) && !approved {
         return enqueue_approval(
             state,
             "collections_membership",
@@ -1362,12 +1329,7 @@ fn run_collection_membership(
 
     let lane = state.begin_metadata_write("修改图片信息")?;
     let inspection = inspect(state, &input.selector, true)?;
-    if let Some(outcome) =
-        confirmed_outcome(input.confirmed_count, inspection.selected, preview.clone())
-    {
-        return Ok(outcome);
-    }
-    if let Some(outcome) = ineligible_outcome(&inspection, true) {
+    if let Some(outcome) = pre_write_checks(input.confirmed_count, &inspection, true, &preview) {
         return Ok(outcome);
     }
     let (affected, operation_id) = match input.action {
@@ -1550,15 +1512,15 @@ mod tests {
 
     #[test]
     fn confirmed_count_must_be_exact_and_present() {
-        assert!(confirmed_outcome(Some(37), 37, json!({})).is_none());
+        assert!(confirmed_outcome(Some(37), 37, &json!({})).is_none());
 
-        let missing = confirmed_outcome(None, 37, json!({ "selected": 37 }))
+        let missing = confirmed_outcome(None, 37, &json!({ "selected": 37 }))
             .unwrap()
             .value;
         assert_eq!(missing["status"], "rejected");
         assert_eq!(missing["latestCount"], 37);
 
-        let mismatch = confirmed_outcome(Some(36), 37, json!({ "selected": 37 }))
+        let mismatch = confirmed_outcome(Some(36), 37, &json!({ "selected": 37 }))
             .unwrap()
             .value;
         assert_eq!(mismatch["status"], "rejected");

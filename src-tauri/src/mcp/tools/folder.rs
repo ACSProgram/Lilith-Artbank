@@ -80,11 +80,10 @@ fn run_folders_modify(
     input: &FoldersModifyInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = write::ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
-    let (database, root) = state
-        .current_library()
-        .ok_or_else(|| AppError::message("尚未打开图库"))?;
+    let gate = write::WriteGate::enter(state)?;
+    let mode = gate.mode;
+    let database = &gate.database;
+    let root = &gate.root;
 
     match input.action {
         FolderAction::Create => {
@@ -93,7 +92,7 @@ fn run_folders_modify(
             if path.is_empty() {
                 return Err(AppError::message("path 不能为空；新建根目录没有意义"));
             }
-            if folders::find_id(&database, &path)?.is_some() {
+            if folders::find_id(database, &path)?.is_some() {
                 return Ok(already_exists(&path));
             }
             let plan = json!({
@@ -118,7 +117,7 @@ fn run_folders_modify(
                     PathScope::write(&path),
                 ],
             )?;
-            let (list, operation_id) = folders::create_with_id(&database, &root, &path)?;
+            let (list, operation_id) = folders::create_with_id(database, root, &path)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",
@@ -128,18 +127,18 @@ fn run_folders_modify(
             )))
         }
         FolderAction::Rename => {
-            let target = resolve_target(&database, input)?;
-            let current = folders::info(&database, target)?;
+            let target = resolve_target(database, input)?;
+            let current = folders::info(database, target)?;
             if current.path.is_empty() {
                 return Err(AppError::message("不能重命名图库根目录"));
             }
-            reject_temp_folder(&database, &current.path)?;
+            reject_temp_folder(database, &current.path)?;
             let name = normalize_folder_name(input.name.as_deref().unwrap_or(""))?;
             let new_path = join_folder(parent_path(&current.path), &name);
             if new_path == current.path {
                 return Ok(no_change("文件夹名称没有变化"));
             }
-            if let Some(existing) = folders::find_id(&database, &new_path)?
+            if let Some(existing) = folders::find_id(database, &new_path)?
                 && existing != target
             {
                 return Ok(rejected(format!("「{new_path}」已经存在")));
@@ -167,7 +166,7 @@ fn run_folders_modify(
                 "重命名文件夹",
                 vec![PathScope::write(&current.path), PathScope::write(&new_path)],
             )?;
-            let (list, operation_id) = folders::rename_with_id(&database, &root, target, &name)?;
+            let (list, operation_id) = folders::rename_with_id(database, root, target, &name)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",
@@ -177,14 +176,14 @@ fn run_folders_modify(
             )))
         }
         FolderAction::Move => {
-            let target = resolve_target(&database, input)?;
-            let current = folders::info(&database, target)?;
+            let target = resolve_target(database, input)?;
+            let current = folders::info(database, target)?;
             if current.path.is_empty() {
                 return Err(AppError::message("不能移动图库根目录"));
             }
-            reject_temp_folder(&database, &current.path)?;
-            let parent = resolve_parent(&database, input)?;
-            reject_temp_folder(&database, &parent.path)?;
+            reject_temp_folder(database, &current.path)?;
+            let parent = resolve_parent(database, input)?;
+            reject_temp_folder(database, &parent.path)?;
             if folder_within(&parent.path, &current.path) {
                 return Ok(rejected("不能把文件夹移动到自身或子文件夹里"));
             }
@@ -196,7 +195,7 @@ fn run_folders_modify(
             if new_path == current.path {
                 return Ok(no_change("文件夹已经在这个位置"));
             }
-            if let Some(existing) = folders::find_id(&database, &new_path)?
+            if let Some(existing) = folders::find_id(database, &new_path)?
                 && existing != target
             {
                 return Ok(rejected(format!("目标位置已经有「{new_path}」")));
@@ -237,8 +236,7 @@ fn run_folders_modify(
                     PathScope::write(&parent.path),
                 ],
             )?;
-            let (list, operation_id) =
-                folders::move_to_with_id(&database, &root, target, parent.id)?;
+            let (list, operation_id) = folders::move_to_with_id(database, root, target, parent.id)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",
@@ -248,12 +246,12 @@ fn run_folders_modify(
             )))
         }
         FolderAction::Delete => {
-            let target = resolve_target(&database, input)?;
-            let current = folders::info(&database, target)?;
-            if let Some(reason) = folders::deletion_blocker(&database, target)? {
+            let target = resolve_target(database, input)?;
+            let current = folders::info(database, target)?;
+            if let Some(reason) = folders::deletion_blocker(database, target)? {
                 return Ok(rejected(reason));
             }
-            let subfolder_count = folders::subtree_folder_count(&database, target)?;
+            let subfolder_count = folders::subtree_folder_count(database, target)?;
             let plan = json!({
                 "operation": format!("把文件夹「{}」移入回收站", current.path),
                 "target": current.path,
@@ -288,7 +286,7 @@ fn run_folders_modify(
             }
             let _guard =
                 state.begin_folder_change("移入回收站", vec![PathScope::write(&current.path)])?;
-            let (_, operation_id) = folders::trash_with_id(&database, target)?;
+            let (_, operation_id) = folders::trash_with_id(database, target)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",

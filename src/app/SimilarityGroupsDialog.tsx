@@ -19,6 +19,7 @@ import { useNotices } from "./noticeContext";
 import { useTaskCenter } from "./taskContext";
 import { taskApi } from "./taskApi";
 import { TASK_PHASE_LABELS, isTaskActive, taskPercent } from "./taskTypes";
+import { CancelPendingNote, TaskProgressBar } from "./taskProgress";
 
 interface SimilarityGroupsDialogProps {
   open: boolean;
@@ -115,6 +116,7 @@ export function SimilarityGroupsDialog({
   const task = taskId ? find(taskId) : null;
   const running = task ? isTaskActive(task) : false;
   const percent = task ? taskPercent(task) : 0;
+  const cancelling = task?.phase === "cancelling";
   const embeddingAvailable = (embeddingCount ?? 0) > 0;
   const ready = phashOn || (embeddingOn && embeddingAvailable);
 
@@ -478,9 +480,8 @@ export function SimilarityGroupsDialog({
               </span>
               <em>{percent}%</em>
             </div>
-            <div className="task-progress">
-              <span style={{ width: `${percent}%` }} />
-            </div>
+            <TaskProgressBar percent={percent} cancelling={cancelling} />
+            <CancelPendingNote visible={cancelling} />
           </div>
         ) : null}
 

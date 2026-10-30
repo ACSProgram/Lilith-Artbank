@@ -68,21 +68,19 @@ fn run_tags_modify(
     input: &TagsModifyInput,
     approved: bool,
 ) -> AppResult<ToolOutcome> {
-    let mode = write::ensure_writable(state)?;
-    let _exclusive = state.lock_mcp_writes();
-    let (database, _) = state
-        .current_library()
-        .ok_or_else(|| AppError::message("尚未打开图库"))?;
+    let gate = write::WriteGate::enter(state)?;
+    let mode = gate.mode;
+    let database = &gate.database;
     let tag_id = input
         .tag_id
         .ok_or_else(|| AppError::message("tagId 不能为空"))?;
 
     match input.action {
-        TagAction::Rename => rename_tag(state, &database, input, tag_id),
+        TagAction::Rename => rename_tag(state, database, input, tag_id),
         TagAction::Delete => {
-            let name = metadata::tag_name(&database, tag_id)?
+            let name = metadata::tag_name(database, tag_id)?
                 .ok_or_else(|| AppError::message("标签不存在"))?;
-            let images = metadata::tag_image_count(&database, tag_id)?;
+            let images = metadata::tag_image_count(database, tag_id)?;
             if let Some(outcome) = expected_mismatch(input.expected_images, images) {
                 return Ok(outcome);
             }
@@ -100,7 +98,7 @@ fn run_tags_modify(
                 );
             }
             let lane = state.begin_metadata_write("修改图片信息")?;
-            let (affected, operation_id) = metadata::delete_tag_with_id(&database, tag_id)?;
+            let (affected, operation_id) = metadata::delete_tag_with_id(database, tag_id)?;
             drop(lane);
             Ok(ToolOutcome::value(write::finish_write(
                 state,
@@ -121,7 +119,7 @@ fn run_tags_modify(
             let target_id = input
                 .target_id
                 .ok_or_else(|| AppError::message("action=merge 时必须给 targetId"))?;
-            let preview = metadata::merge_preview(&database, tag_id, target_id)?;
+            let preview = metadata::merge_preview(database, tag_id, target_id)?;
             if let Some(outcome) = expected_mismatch(input.expected_images, preview.source_images) {
                 return Ok(outcome);
             }
@@ -142,8 +140,7 @@ fn run_tags_modify(
                 );
             }
             let lane = state.begin_metadata_write("修改图片信息")?;
-            let (report, operation_id) =
-                metadata::merge_tags_with_id(&database, tag_id, target_id)?;
+            let (report, operation_id) = metadata::merge_tags_with_id(database, tag_id, target_id)?;
             drop(lane);
             Ok(ToolOutcome::value(write::finish_write(
                 state,

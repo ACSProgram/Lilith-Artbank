@@ -27,7 +27,6 @@ import {
   type RuntimeOptimizePoint,
 } from "./optimizeProgress";
 import {
-  CANCEL_PENDING_NOTE,
   TASK_PHASE_LABELS,
   isTaskActive,
   settledRatio,
@@ -39,6 +38,7 @@ import {
   type TaskScope,
   type TaskSnapshot,
 } from "./taskTypes";
+import { CancelPendingNote, TaskProgressBar } from "./taskProgress";
 import { ScopePicker } from "../shared/components/ScopePicker";
 import {
   buildScope,
@@ -157,9 +157,7 @@ function ProgressPanel({ task, percent }: { task: TaskSnapshot; percent: number 
           <span>{percent}%</span>
         )}
       </div>
-      <div className="task-progress">
-        <span style={{ width: `${percent}%` }} />
-      </div>
+      <TaskProgressBar percent={percent} />
       <div className="batch-task-progress-meta">
         <span>{task.message || (isTaskActive(task) ? <Spinner size={12} /> : "已结束")}</span>
       </div>
@@ -213,9 +211,7 @@ function OptimizeExecutionStatus({ task }: { task: TaskSnapshot }) {
         </strong>
         <span>{percentLabel(percent, finished)}</span>
       </div>
-      <div className={`task-progress${cancelling ? " is-cancelling" : ""}`}>
-        <span style={{ width: `${percent}%` }} />
-      </div>
+      <TaskProgressBar percent={percent} cancelling={cancelling} />
 
       {finished ? (
         <div className="batch-task-facts">
@@ -246,7 +242,7 @@ function OptimizeExecutionStatus({ task }: { task: TaskSnapshot }) {
       )}
 
       {cancelling ? (
-        <div className="optimize-cancel-note">{CANCEL_PENDING_NOTE}</div>
+        <CancelPendingNote visible />
       ) : task.message && !(finished && task.phase === "completed") ? (
         // 成功结束时顶部已经是结论行，同一句话不再重复；取消与失败仍要说明原因。
         <div className="batch-task-progress-meta">

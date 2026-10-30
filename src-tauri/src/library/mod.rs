@@ -6,6 +6,7 @@ pub mod collections;
 pub mod content;
 pub mod db;
 pub mod edit;
+pub mod folder_tree;
 pub mod folders;
 pub mod fs_journal;
 
@@ -13,6 +14,7 @@ pub mod fs_journal;
 #[cfg(any(test, feature = "headless"))]
 pub mod fixture;
 pub mod history;
+pub mod ids;
 pub mod import;
 pub mod inspect;
 pub mod maintenance_actions;

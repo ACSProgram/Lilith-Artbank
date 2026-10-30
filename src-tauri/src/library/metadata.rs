@@ -17,8 +17,12 @@ use crate::{
             self, ChunkFormat, DescriptionRecord, HistoryKind, NewOperation, TagRecord,
             TagRefRecord,
         },
+        ids,
         import::{ensure_folder_path, ensure_tags_tracked},
-        paths::{LibraryPaths, normalize_content_extension, normalize_folder},
+        paths::{
+            LibraryPaths, ensure_canonical_within, ensure_within, normalize_content_extension,
+            normalize_folder, normalize_stored_folder, subtree_like_pattern,
+        },
         placeholders,
         service::now_ms,
         temp,
@@ -1808,7 +1812,7 @@ fn purge_folders_for_operation(
             )?;
             let children: i64 = connection.query_row(
                 "SELECT count(*) FROM folders WHERE path LIKE ?1 ESCAPE '\\'",
-                [crate::library::paths::subtree_like_pattern(&path)],
+                [subtree_like_pattern(&path)],
                 |row| row.get(0),
             )?;
             Ok((images, children))
@@ -1911,7 +1915,7 @@ pub(crate) fn content_path(
     if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppError::message("内容哈希无效，拒绝操作文件"));
     }
-    let normalized_folder = crate::library::paths::normalize_stored_folder(folder_path)?;
+    let normalized_folder = normalize_stored_folder(folder_path)?;
     if normalized_folder != folder_path {
         return Err(AppError::message("文件夹路径未规范化，拒绝操作文件"));
     }
@@ -1924,12 +1928,7 @@ pub(crate) fn content_path(
 
 /// 目标目录必须已经存在，且 canonicalize 后仍是图库根目录或其子目录。
 fn ensure_dir_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
-    let canonical_root = root.canonicalize()?;
-    let canonical_directory = directory.canonicalize()?;
-    if !canonical_directory.starts_with(&canonical_root) {
-        return Err(AppError::message("目标路径位于图库目录之外"));
-    }
-    Ok(())
+    ensure_within(root, directory, "目标路径位于图库目录之外")
 }
 
 pub(crate) fn remove_content_file(root: &Path, path: &Path) -> AppResult<()> {
@@ -1964,10 +1963,7 @@ impl ContentRemover {
         if self.parents.contains(parent) {
             return Ok(());
         }
-        let canonical = parent.canonicalize()?;
-        if !canonical.starts_with(&self.root) {
-            return Err(AppError::message("目标路径位于图库目录之外"));
-        }
+        ensure_canonical_within(&self.root, parent, "目标路径位于图库目录之外")?;
         self.parents.insert(parent.to_path_buf());
         Ok(())
     }
@@ -2051,23 +2047,12 @@ fn validate_score(score: i64) -> AppResult<()> {
 }
 
 fn validate_ids(values: &[i64], max: usize) -> AppResult<Vec<i64>> {
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    for value in values {
-        if *value <= 0 {
-            return Err(AppError::message("图片 id 无效"));
-        }
-        if seen.insert(*value) {
-            result.push(*value);
-        }
-    }
-    if result.is_empty() {
+    let unique = ids::unique_positive(values, "图片")?;
+    if unique.is_empty() {
         return Err(AppError::message("没有选择图片"));
     }
-    if result.len() > max {
-        return Err(AppError::message(format!("一次最多操作 {max} 张图片")));
-    }
-    Ok(result)
+    ids::ensure_max(unique.len(), max, format!("一次最多操作 {max} 张图片"))?;
+    Ok(unique)
 }
 
 #[cfg(test)]

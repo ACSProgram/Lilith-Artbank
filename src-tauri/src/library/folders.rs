@@ -12,6 +12,7 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
+        folder_tree::FolderTree,
         fs_journal::{self, FileJournal},
         history::{
             self, FolderDeleted, FolderPathChange, FolderRef, FolderReorder, FolderRow,
@@ -19,8 +20,8 @@ use crate::{
         },
         import::{ensure_folder_path, next_sort_index},
         paths::{
-            LibraryPaths, folder_within, join_folder, normalize_folder, normalize_folder_name,
-            parent_path, same_folder, subtree_like_pattern,
+            LibraryPaths, ensure_within, folder_within, join_folder, normalize_folder,
+            normalize_folder_name, parent_path, same_folder, subtree_like_pattern,
         },
         placeholders,
         query::{self, FolderChange, FolderInfo},
@@ -133,12 +134,7 @@ fn ensure_target_free(
 }
 
 fn ensure_inside_root(root: &Path, directory: &Path) -> AppResult<()> {
-    let canonical_root = root.canonicalize()?;
-    let canonical_directory = directory.canonicalize()?;
-    if !canonical_directory.starts_with(&canonical_root) {
-        return Err(AppError::message("文件夹位于图库目录之外"));
-    }
-    Ok(())
+    ensure_within(root, directory, "文件夹位于图库目录之外")
 }
 
 pub fn create(db: &LibraryDb, root: &Path, path: &str) -> AppResult<Vec<FolderInfo>> {
@@ -508,32 +504,12 @@ fn folder_rows_in(connection: &Connection) -> AppResult<Vec<(i64, String, i64)>>
 
 /// 子树内全部文件夹 id（含自身）；空路径表示根，不用于重命名/移动。
 fn subtree_folder_ids(connection: &Connection, path: &str) -> AppResult<Vec<i64>> {
-    let mut statement = connection.prepare(
-        "SELECT id FROM folders
-         WHERE path = ?1 COLLATE NOCASE OR path LIKE ?2 ESCAPE '\\'",
-    )?;
-    let ids = statement
-        .query_map(params![path, subtree_like_pattern(path)], |row| {
-            row.get::<_, i64>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(ids)
+    Ok(FolderTree::normal(connection)?.ids_under_path(path))
 }
 
 /// 从根到指定路径（含）的祖先文件夹 id；用于移动后更新两侧祖先的子树计数。
 fn ancestor_folder_ids(connection: &Connection, path: &str) -> AppResult<Vec<i64>> {
-    let mut ids = Vec::new();
-    let mut current = Some(path);
-    while let Some(prefix) = current {
-        if let Some(id) = folder_id(connection, prefix)? {
-            ids.push(id);
-        }
-        if prefix.is_empty() {
-            break;
-        }
-        current = Some(parent_path(prefix));
-    }
-    Ok(ids)
+    Ok(FolderTree::normal(connection)?.ancestors_of_path(path))
 }
 
 /// 一次把多个文件夹移动/插入到目标父级；只写一条操作记录。

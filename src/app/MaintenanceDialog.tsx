@@ -44,6 +44,7 @@ import {
   type BatchTaskRequest,
   type TaskSnapshot,
 } from "./taskTypes";
+import { CancelPendingNote, TaskProgressBar } from "./taskProgress";
 
 type Section = "check" | "orphans" | "packs" | "export";
 
@@ -778,6 +779,7 @@ export function MaintenanceDialog({ open, onClose, context, libraryId }: Mainten
 /** 任务进度条：与批量任务对话框同一套百分比口径。 */
 function TaskProgress({ task, copiedBytes }: { task: TaskSnapshot; copiedBytes?: number }) {
   const active = isTaskActive(task);
+  const cancelling = task.phase === "cancelling";
   const percent = taskPercent(task);
   const note =
     task.message ||
@@ -794,9 +796,12 @@ function TaskProgress({ task, copiedBytes }: { task: TaskSnapshot; copiedBytes?:
           {active ? `${percent}%` : task.phase === "yielded" ? "已让位" : ""}
         </span>
       </div>
-      <div className="maintenance-progress-bar" aria-hidden="true">
-        <span style={{ width: `${percent}%` }} />
-      </div>
+      <TaskProgressBar
+        percent={percent}
+        cancelling={cancelling}
+        className="maintenance-progress-bar"
+      />
+      <CancelPendingNote visible={cancelling} />
       <p className="maintenance-progress-note">
         {note}
         {copiedBytes ? ` · 已复制 ${formatBytes(copiedBytes)}` : ""}

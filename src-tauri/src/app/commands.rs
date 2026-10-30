@@ -14,10 +14,7 @@ use crate::{
         error::{AppError, AppResult},
         settings::Settings,
         state::AppState,
-        tasks::{
-            self, BatchTaskRequest, LaneGuard, TaskHandle, TaskKind, TaskPhase, TaskScope,
-            TaskSnapshot, TaskStartResult,
-        },
+        tasks::{BatchTaskRequest, TaskHandle, TaskKind, TaskScope, TaskSnapshot, TaskStartResult},
         trace,
     },
     concurrency::resources::{Access, ResourceRequest},
@@ -702,26 +699,10 @@ where
     let handle = TaskHandle::new(uuid::Uuid::new_v4().to_string(), kind, scope);
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let guard = state
+        state
             .tasks
-            .begin_queued(&app, handle.clone(), request)
-            .map_err(|error| error.to_string())?;
-        let _guard: LaneGuard = guard;
-        handle.set_phase(TaskPhase::Running);
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&state, &*handle)));
-        match outcome {
-            Ok(result) => {
-                handle.finish_from(&result);
-                result.map_err(|error| error.to_string())
-            }
-            // 与任务总线的线程兜底同一套文案与终态，避免两处不一致。
-            Err(payload) => Err(tasks::fail_from_panic(
-                &handle,
-                "write-task",
-                payload.as_ref(),
-            )),
-        }
+            .begin_blocking_task(&app, handle, request, |handle| work(&state, handle))
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?

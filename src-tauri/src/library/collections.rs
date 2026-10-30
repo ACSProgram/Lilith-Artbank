@@ -11,7 +11,7 @@ use crate::{
             self, CollectionItemsRecord, CollectionOrderState, CollectionRenameRecord,
             CollectionReorderRecord, CollectionSnapshot, HistoryKind, NewOperation,
         },
-        placeholders,
+        ids, placeholders,
         service::now_ms,
         temp,
     },
@@ -82,7 +82,7 @@ pub fn create_with_images(
     let ids = if image_ids.is_empty() {
         Vec::new()
     } else {
-        validate_ids(image_ids, MAX_IMAGES)?
+        validate_ids(image_ids, MAX_IMAGES, "图片")?
     };
     temp::reject_images(
         database,
@@ -218,7 +218,7 @@ pub fn delete_with_id(database: &LibraryDb, collection_id: i64) -> AppResult<(u6
 }
 
 pub fn reorder(database: &LibraryDb, collection_ids: &[i64]) -> AppResult<()> {
-    let ids = validate_ids(collection_ids, 10_000)?;
+    let ids = validate_ids(collection_ids, 10_000, "集合")?;
     history::write(
         database,
         NewOperation::new(HistoryKind::CollectionReorder, "调整集合顺序"),
@@ -265,7 +265,7 @@ pub fn add_images_with_id(
     image_ids: &[i64],
 ) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
-    let ids = validate_ids(image_ids, MAX_IMAGES)?;
+    let ids = validate_ids(image_ids, MAX_IMAGES, "图片")?;
     temp::reject_images(
         database,
         &ids,
@@ -335,7 +335,7 @@ pub fn remove_images_with_id(
     image_ids: &[i64],
 ) -> AppResult<(u64, Option<i64>)> {
     validate_id(collection_id)?;
-    let ids = validate_ids(image_ids, MAX_IMAGES)?;
+    let ids = validate_ids(image_ids, MAX_IMAGES, "图片")?;
     let name = collection_name(database, collection_id)?;
     history::write_with_id(
         database,
@@ -404,7 +404,7 @@ pub fn combine(
     collection_ids: &[i64],
     name: &str,
 ) -> AppResult<CollectionInfo> {
-    let ids = validate_ids(collection_ids, MAX_COMBINE_COLLECTIONS)?;
+    let ids = validate_ids(collection_ids, MAX_COMBINE_COLLECTIONS, "集合")?;
     if ids.len() < 2 {
         return Err(AppError::message("集合运算至少需要两个集合"));
     }
@@ -509,7 +509,7 @@ pub fn create_groups(
     let groups: Vec<Vec<i64>> = groups
         .iter()
         .filter(|group| !group.is_empty())
-        .map(|group| validate_ids(group, MAX_IMAGES))
+        .map(|group| validate_ids(group, MAX_IMAGES, "图片"))
         .collect::<AppResult<Vec<_>>>()?;
     if groups.is_empty() {
         return Err(AppError::message("没有可保存的分组"));
@@ -721,23 +721,12 @@ fn validate_id(id: i64) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_ids(values: &[i64], max: usize) -> AppResult<Vec<i64>> {
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    for value in values {
-        if *value <= 0 {
-            return Err(AppError::message("id 无效"));
-        }
-        if seen.insert(*value) {
-            result.push(*value);
-        }
-    }
+fn validate_ids(values: &[i64], max: usize, noun: &str) -> AppResult<Vec<i64>> {
+    let result = ids::unique_positive(values, noun)?;
     if result.is_empty() {
         return Err(AppError::message("没有提供 id"));
     }
-    if result.len() > max {
-        return Err(AppError::message(format!("一次最多处理 {max} 项")));
-    }
+    ids::ensure_max(result.len(), max, format!("一次最多处理 {max} 项"))?;
     Ok(result)
 }
 

@@ -179,6 +179,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 正式写入必须带 `confirmedCount`，等于 selector 解析出的 id 数；缺失或不一致返回 `status: "rejected"` 与最新数量。
 - selector 解析为空返回 `status: "noop"`，不产生历史记录。`collections_create` 只在带 selector 时套用这条；不带 selector 时按用户意图创建空集合。`collections_membership` 会先核对集合是否存在，不存在直接报错，不进确认队列。
 - 部分 id 不存在、已在回收站或状态不符时返回 `status: "rejected"` 与失败清单，不执行任何一行。
+- 九个同步写工具（`images_update` / `images_move` / `images_trash` / `images_restore`、`collections_create` / `collections_modify` / `collections_membership`、`folders_modify`、`tags_modify`）共用 `WriteGate`：进入时一次完成模式校验、MCP 写串行与图库上下文，随后用 `pre_write_checks` 统一核对 `confirmedCount`、可用性与空选择；各工具的预览、资源申请与写入实现保持独立。
 - MCP 写入在本进程内串行；短写入立即申请元数据写或对应文件夹路径，与导入、移动、编辑、压缩、撤销/重做或 AI 任务冲突时直接拒绝，不排队（文件夹工具最多等当前一次读图 10 秒，超时再报冲突）。文件夹工具在真正执行前申请该子树路径写资源；`dryRun` 与审批入队时不申请，审批执行时若资源冲突则确认单直接失败。
 - 长任务（`library_import`、`library_move`、`temp_features_generate`）默认排队：调用立即返回 `taskId`，任务可能处于 `queued` 阶段；`tasks_cancel` 可取消排队中的任务。撤销/重做与清空记录不排队，被占用时直接失败。
 - 一次工具调用对应一条历史记录；标签操作的历史 `affected` 是关系条数，工具结果同时给出 `selected`。
