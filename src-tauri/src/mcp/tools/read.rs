@@ -872,6 +872,7 @@ mod tests {
             sheets: Arc::new(parking_lot::Mutex::new(SheetCache::default())),
             resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
             images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
+            memory: Arc::new(crate::concurrency::budget::ImageMemoryBudget::default()),
         };
         Fixture {
             _temp: temp,

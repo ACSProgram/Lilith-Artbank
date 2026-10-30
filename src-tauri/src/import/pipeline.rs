@@ -314,7 +314,7 @@ fn run_inner(
         });
         let mib = 1024 * 1024;
         log::debug!(
-            "导入内存预算：{threads} 线程，上限 {} MiB，峰值占用 {} MiB，单张最大估算 {} MiB",
+            "导入内存预算：{threads} 线程，全进程上限 {} MiB，全进程峰值占用 {} MiB，单张最大估算 {} MiB",
             context.memory.limit() / mib,
             context.memory.peak() / mib,
             context.max_estimate.load(Ordering::Relaxed) / mib,

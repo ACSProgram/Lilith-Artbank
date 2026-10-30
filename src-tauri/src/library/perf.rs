@@ -1297,6 +1297,7 @@ fn perf_optimize_batch_size() {
             &crate::concurrency::budget::ImageBudget::new(
                 crate::concurrency::budget::default_limit(),
             ),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
         )
         .expect("optimize");
         let elapsed = started.elapsed().as_secs_f64();
@@ -1387,6 +1388,7 @@ fn perf_estimate_vs_actual() {
         &NoopReporter,
         &crate::concurrency::resources::ResourceTable::new(),
         &crate::concurrency::budget::ImageBudget::new(crate::concurrency::budget::default_limit()),
+        &crate::concurrency::budget::ImageMemoryBudget::default(),
         &crate::concurrency::resources::HolderInfo::new("perf-estimate", "估算"),
     )
     .expect("estimate")
@@ -1409,6 +1411,7 @@ fn perf_estimate_vs_actual() {
         operation,
         &NoopReporter,
         &crate::concurrency::budget::ImageBudget::new(crate::concurrency::budget::default_limit()),
+        &crate::concurrency::budget::ImageMemoryBudget::default(),
     )
     .expect("optimize");
     let actual = started.elapsed().as_secs_f64();
@@ -1527,6 +1530,7 @@ fn perf_estimate_sampling_spread() {
             &crate::concurrency::budget::ImageBudget::new(
                 crate::concurrency::budget::default_limit(),
             ),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
             &crate::concurrency::resources::HolderInfo::new("perf-spread", "估算"),
         )
         .expect("estimate")

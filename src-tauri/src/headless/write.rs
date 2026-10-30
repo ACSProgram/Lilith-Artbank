@@ -307,6 +307,7 @@ pub(super) fn dispatch(
                     request.image_id,
                     &state.resources(),
                     &state.images(),
+                    &state.memory(),
                 )
                 .map_err(|error| error.to_string())
             }))

@@ -83,8 +83,8 @@ pub struct AppState {
     pub tasks: TaskBus,
     pub mcp: McpRuntime,
     app: AppHandle,
-    /// 导入解码内存额度；按估算字节排队，避免大图并发撑高峰值。
-    import_memory: Arc<ImageMemoryBudget>,
+    /// 图像解码内存额度；全进程共用，按估算字节排队，避免多个解码路径叠加撑高峰值。
+    image_memory: Arc<ImageMemoryBudget>,
     library: Mutex<Option<LibrarySession>>,
     /// 最近发起的导入；允许排队后可能同时存在多个未结束的导入。
     import_jobs: Mutex<VecDeque<Arc<ImportJob>>>,
@@ -119,15 +119,16 @@ impl AppState {
         let images = Arc::new(ImageBudget::from_setting(
             settings.snapshot().performance.worker_threads,
         ));
+        let image_memory = Arc::new(ImageMemoryBudget::default());
         let tasks = TaskBus::with_images(images.clone());
-        let ai = AiRuntime::with_runtime(tasks.resources(), images);
+        let ai = AiRuntime::with_runtime(tasks.resources(), images, image_memory.clone());
         Self {
             settings,
             ai,
             tasks,
             mcp: McpRuntime::new(),
             app,
-            import_memory: Arc::new(ImageMemoryBudget::default()),
+            image_memory,
             library: Mutex::new(None),
             import_jobs: Mutex::new(VecDeque::new()),
             import_receipts: Mutex::new(VecDeque::new()),
@@ -298,7 +299,7 @@ impl AppState {
             operation_id,
             resources: self.resources(),
             images: self.images(),
-            memory: self.import_memory(),
+            memory: self.memory(),
             holder: HolderInfo::new(job.id(), "导入")
                 .with_reason("正在导入")
                 .with_path_note("正在导入到"),
@@ -383,8 +384,8 @@ impl AppState {
         self.tasks.images()
     }
 
-    pub(crate) fn import_memory(&self) -> Arc<ImageMemoryBudget> {
-        self.import_memory.clone()
+    pub(crate) fn memory(&self) -> Arc<ImageMemoryBudget> {
+        self.image_memory.clone()
     }
 
     pub(crate) fn move_task_request(
@@ -517,6 +518,7 @@ impl AppState {
             sheets: self.mcp_sheets.clone(),
             resources: self.resources(),
             images: self.images(),
+            memory: self.memory(),
         })
     }
 
@@ -2008,6 +2010,7 @@ impl AppState {
         let estimates = self.optimize_estimates.clone();
         let resources = self.resources();
         let images = self.images();
+        let memory = self.memory();
         self.tasks.launch(
             app,
             handle,
@@ -2031,6 +2034,7 @@ impl AppState {
                             &*worker,
                             &resources,
                             &images,
+                            &memory,
                             &holder,
                         );
                         match result {
@@ -2088,6 +2092,7 @@ impl AppState {
         let tasks = self.tasks.clone();
         let ai = self.ai.clone();
         let images = self.images();
+        let memory = self.memory();
         // 压缩只替换图片内容、不改变文件夹结构与文件名，所以用“原地替换”而不是写锁：
         // 查看器在压缩期间仍能读原图，移动/删除/导入/另一个压缩照旧互斥。
         let resource_request = ResourceRequest::path_replace("")
@@ -2151,6 +2156,7 @@ impl AppState {
                         operation_id,
                         &*worker,
                         &images,
+                        &memory,
                     );
                     // 已提交的批次会改变文件、大小与可选特征；成功或中途出错都要刷新缓存。
                     query::clear_page_cache();

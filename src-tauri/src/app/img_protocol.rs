@@ -67,6 +67,7 @@ fn route(app: &AppHandle<Wry>, path: &str) -> Result<Response<Vec<u8>>, ImageErr
             &row,
             &state.resources(),
             &state.images(),
+            &state.memory(),
         )
         .map_err(|error| ImageError::NotFound(format!("预览文件不可用：{error}")))?;
         let bytes = std::fs::read(&target)

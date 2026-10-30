@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::{
     app::error::{AppError, AppResult},
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget, estimate_working_bytes},
         resources::{HolderInfo, ResourceTable},
     },
     imageops::{
@@ -27,6 +27,7 @@ pub fn small_bytes(
     image_id: i64,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
     holder: &HolderInfo,
     cancel: &dyn Fn() -> bool,
 ) -> AppResult<Vec<u8>> {
@@ -43,6 +44,7 @@ pub fn small_bytes(
         SMALL_MAX_EDGE,
         resources,
         images,
+        memory,
         holder,
         cancel,
     )
@@ -56,6 +58,7 @@ pub fn description_bytes(
     image_id: i64,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
     holder: &HolderInfo,
     cancel: &dyn Fn() -> bool,
 ) -> AppResult<Vec<u8>> {
@@ -66,6 +69,7 @@ pub fn description_bytes(
         DESCRIPTION_MAX_EDGE,
         resources,
         images,
+        memory,
         holder,
         cancel,
     )
@@ -79,15 +83,20 @@ fn encoded_from_original(
     max_edge: u32,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
     holder: &HolderInfo,
     cancel: &dyn Fn() -> bool,
 ) -> AppResult<Vec<u8>> {
     // 先拿路径读锁并读字节，再拿图像预算：预算许可只在解码/编码期间持有，
-    // 不会出现“拿着许可等文件夹写者”的环。
+    // 不会出现“拿着许可等文件夹写者”的环。线程许可在前、字节额度在后，顺序与其它路径一致。
     let (row, bytes) = content::read_original(database, resources, root, image_id, holder, cancel)?;
     let _permit = images
         .acquire(cancel)
         .map_err(|_| AppError::message("图像预算等待已取消"))?;
+    let estimate = estimate_working_bytes(row.width, row.height, bytes.len() as u64, false);
+    let _memory = memory
+        .acquire(estimate, cancel)
+        .map_err(|_| AppError::message("图像内存预算等待已取消"))?;
     let decoded = decode::decode_bytes(&bytes, Some(&row.file_ext))?;
     let (width, height) = thumbnail::fit_within(decoded.width, decoded.height, max_edge);
     let image = if (width, height) == (decoded.width, decoded.height) {

@@ -23,7 +23,7 @@ use crate::{
         },
     },
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget},
         resources::{Access, Conflict, HolderInfo, ResourceGuard, ResourceRequest, ResourceTable},
     },
     imageops,
@@ -313,6 +313,7 @@ struct Inner {
     library: RwLock<Option<LibraryHandles>>,
     resources: Arc<ResourceTable>,
     images: Arc<ImageBudget>,
+    memory: Arc<ImageMemoryBudget>,
     generation: AtomicU64,
     /// 监督线程的所有权；代次与持有者在同一把锁里交接。
     supervisor: SupervisorSlot,
@@ -335,10 +336,15 @@ impl AiRuntime {
         Self::with_runtime(
             Arc::new(ResourceTable::new()),
             Arc::new(ImageBudget::default()),
+            Arc::new(ImageMemoryBudget::default()),
         )
     }
 
-    pub fn with_runtime(resources: Arc<ResourceTable>, images: Arc<ImageBudget>) -> Self {
+    pub fn with_runtime(
+        resources: Arc<ResourceTable>,
+        images: Arc<ImageBudget>,
+        memory: Arc<ImageMemoryBudget>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 process: Mutex::new(AiProcess::default()),
@@ -350,6 +356,7 @@ impl AiRuntime {
                 library: RwLock::new(None),
                 resources,
                 images,
+                memory,
                 generation: AtomicU64::new(0),
                 supervisor: SupervisorSlot::new(),
                 manual_stop: AtomicBool::new(false),
@@ -548,6 +555,7 @@ impl AiRuntime {
             image_id,
             &self.inner.resources,
             &self.inner.images,
+            &self.inner.memory,
             &holder,
             &|| false,
         )?;
@@ -593,6 +601,7 @@ impl AiRuntime {
             image_id,
             &self.inner.resources,
             &self.inner.images,
+            &self.inner.memory,
             &holder,
             &|| false,
         )?;
@@ -683,6 +692,7 @@ impl AiRuntime {
             settings: settings.clone(),
             resources: self.inner.resources.clone(),
             images: self.inner.images.clone(),
+            memory: self.inner.memory.clone(),
         };
         let writes_history = request.kind == AiJobKind::Description;
         let temp_features = task_kind == Some(TaskKind::TempFeatures);

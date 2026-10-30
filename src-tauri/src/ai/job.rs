@@ -9,7 +9,7 @@ use crate::{
         tasks::{TaskHandle, TaskKind, TaskPhase},
     },
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget},
         resources::{HolderInfo, ResourceTable},
     },
     library::{
@@ -105,6 +105,7 @@ pub struct JobContext {
     pub settings: AiSettings,
     pub resources: Arc<ResourceTable>,
     pub images: Arc<ImageBudget>,
+    pub memory: Arc<ImageMemoryBudget>,
 }
 
 /// 任务主流程：探活并确保能力 → 过滤缺失项 → 逐张处理。
@@ -283,6 +284,7 @@ fn process_one(
                 image_id,
                 &context.resources,
                 &context.images,
+                &context.memory,
                 holder,
                 cancel,
             )?;
@@ -313,6 +315,7 @@ fn process_one(
                 image_id,
                 &context.resources,
                 &context.images,
+                &context.memory,
                 holder,
                 cancel,
             )?;
@@ -332,6 +335,7 @@ fn process_one(
                 image_id,
                 &context.resources,
                 &context.images,
+                &context.memory,
                 holder,
                 cancel,
             )?;

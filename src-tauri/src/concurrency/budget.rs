@@ -1,7 +1,8 @@
 //! 全局图像工作预算：所有解码、编码、缩略图、pHash/主色与临时文件写入共用一个上限。
 //!
-//! 线程许可只限制并发张数；大图导入还要用字节预算限制同一时刻的解码内存，
-//! 否则“15 个线程各拿一张 20 MP 大图”会把峰值撑到数 GB。
+//! 线程许可只限制并发张数；字节预算限制同一时刻的解码内存。导入、压缩、估算、
+//! 查看器预览、AI 输入解码与 MCP 拼图共用同一份字节额度，否则“15 个线程各拿一张
+//! 20 MP 大图”会把峰值撑到数 GB，多个任务并行时还会叠加。
 
 use std::{
     sync::{
@@ -120,7 +121,8 @@ pub fn default_limit() -> usize {
         .max(1)
 }
 
-/// 导入解码内存的默认上限：大图少并发、小图多并发，峰值压在 1.5 GiB 附近。
+/// 图像解码内存的默认上限：大图少并发、小图多并发，峰值压在 1.5 GiB 附近。
+/// 全进程一份，导入、压缩、估算、查看器、AI 输入与 MCP 拼图都从这份额度里申请。
 pub const DEFAULT_MEMORY_LIMIT: u64 = 1536 * 1024 * 1024;
 
 struct MemoryState {
@@ -135,6 +137,8 @@ struct MemoryInner {
 }
 
 /// 字节预算：按“预计同时占用的解码内存”排队，而不是只数线程。
+///
+/// 一份额度服务全进程的图像解码：导入、压缩、估算、查看器预览、AI 输入与 MCP 拼图。
 pub struct ImageMemoryBudget {
     inner: Arc<MemoryInner>,
 }
@@ -222,8 +226,11 @@ impl Drop for MemoryPermit {
     }
 }
 
-/// 单张图片的工作内存估算：整张解码图、缩略图与 pHash/主色；压缩路径还要算源文件
-/// 字节、编码结果与 PSNR 回读缓冲。系数取保守值，实测后再校准。
+/// 单张图片的工作内存估算：整张解码图与随之产生的缩放缓冲。
+///
+/// `optimize` 为 true 时按压缩路径算：像素 × 16、源文件字节与 PSNR 回读缓冲；
+/// 其余解码（导入、查看器预览、AI 输入、MCP 拼图）按像素 × 5 + 8 MiB 开销。
+/// 系数取保守值，实测后再校准。
 pub fn estimate_working_bytes(width: u32, height: u32, source_size: u64, optimize: bool) -> u64 {
     const OVERHEAD: u64 = 8 * 1024 * 1024;
     let pixels = u64::from(width) * u64::from(height);

@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::{
     app::error::{AppError, AppResult},
-    concurrency::budget::{BudgetError, ImageBudget},
+    concurrency::budget::{BudgetError, ImageBudget, ImageMemoryBudget, estimate_working_bytes},
     imageops::{
         colors,
         optimize::{self, LadderOutcome, OptimizeFormat, OptimizeOptions, SkipReason, SourceInfo},
@@ -491,6 +491,7 @@ pub fn optimize(
     operation_id: i64,
     reporter: &dyn BatchReporter,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
 ) -> AppResult<OptimizeReport> {
     optimize_with_batch_size(
         database,
@@ -502,6 +503,7 @@ pub fn optimize(
         reporter,
         BATCH_SIZE,
         images,
+        memory,
     )
 }
 
@@ -549,6 +551,7 @@ pub(crate) fn optimize_with_batch_size(
     reporter: &dyn BatchReporter,
     batch_size: usize,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
 ) -> AppResult<OptimizeReport> {
     options.validate()?;
     let started = Instant::now();
@@ -676,6 +679,18 @@ pub(crate) fn optimize_with_batch_size(
                             Ok(permit) => permit,
                             Err(BudgetError::Cancelled) => return Ok(None),
                         };
+                        // 线程许可在前、字节额度在后，与导入、估算和 AI 解码的顺序一致。
+                        let estimate = estimate_working_bytes(
+                            row.width,
+                            row.height,
+                            row.file_size.max(0) as u64,
+                            true,
+                        );
+                        let memory_permit = match memory.acquire(estimate, &|| reporter.cancelled())
+                        {
+                            Ok(permit) => permit,
+                            Err(BudgetError::Cancelled) => return Ok(None),
+                        };
                         let relative = content::relative_display_path(
                             &row.folder_path,
                             &row.content_hash,
@@ -683,6 +698,7 @@ pub(crate) fn optimize_with_batch_size(
                         );
                         reporter.current(Some(row.id), Some(&relative));
                         let result = encode_one(&paths, row, options);
+                        drop(memory_permit);
                         drop(permit);
                         if let Some(meter) = reporter.meter() {
                             meter.advance_units(1);
@@ -1358,6 +1374,7 @@ mod tests {
             operation,
             &NoopReporter,
             &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
         )
         .unwrap();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
@@ -1472,6 +1489,37 @@ mod tests {
         assert_eq!(report.stop_reason, None, "{report:?}");
         // 其余 6 张照常处理（fixture 的首张 + 后面 5 张）。
         assert_eq!(report.processed, 6, "{report:?}");
+    }
+
+    /// 字节额度小到每张都超限时走独占路径：任务照常完成，额度用完归零。
+    #[test]
+    fn optimize_returns_memory_permit_for_oversized_images() {
+        let (fixture, image_id, _hash, _old_path) = fixture();
+        let operation = crate::library::history::begin_live(
+            &fixture.session.db,
+            NewOperation::new(
+                crate::library::history::HistoryKind::Optimize,
+                "优化图片空间",
+            ),
+        )
+        .unwrap();
+        let candidates = collect_candidates(&fixture.session.db, &[image_id]).unwrap();
+        let memory = crate::concurrency::budget::ImageMemoryBudget::new(1);
+        let report = optimize(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            candidates,
+            &OptimizeOptions::default(),
+            operation,
+            &NoopReporter,
+            &crate::concurrency::budget::ImageBudget::new(2),
+            &memory,
+        )
+        .unwrap();
+        crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
+        assert_eq!(report.processed, 1, "{report:?}");
+        assert_eq!(memory.in_use(), 0);
     }
 
     #[test]
@@ -1617,6 +1665,7 @@ mod tests {
             operation,
             &reporter,
             &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
         )
         .unwrap();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();
@@ -1781,6 +1830,7 @@ mod tests {
             operation,
             &NoopReporter,
             &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
         )
         .unwrap_err();
         crate::library::history::finish_live(&fixture.session.db, operation, "").unwrap();

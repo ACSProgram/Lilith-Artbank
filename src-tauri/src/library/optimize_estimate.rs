@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::{
     app::{error::AppResult, tasks::TaskScope},
     concurrency::{
-        budget::{BudgetError, ImageBudget},
+        budget::{BudgetError, ImageBudget, ImageMemoryBudget, estimate_working_bytes},
         resources::{HolderInfo, ResourceTable},
     },
     imageops::{
@@ -458,6 +458,7 @@ pub fn estimate(
     reporter: &dyn BatchReporter,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
     holder: &HolderInfo,
 ) -> AppResult<Option<OptimizeEstimate>> {
     options.validate()?;
@@ -620,6 +621,7 @@ pub fn estimate(
                             options,
                             resources,
                             images,
+                            memory,
                             holder,
                             &|| reporter.cancelled(),
                         );
@@ -899,6 +901,7 @@ fn sample_one(
     options: &OptimizeOptions,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
     holder: &HolderInfo,
     cancel: &dyn Fn() -> bool,
 ) -> SampleOutcome {
@@ -928,6 +931,19 @@ fn sample_one(
         }
     };
     let read_secs = read_started.elapsed().as_secs_f64();
+    // 线程许可已在上面拿到；字节额度按这张图的像素与源体积估算，压缩路径口径与执行阶段一致。
+    let estimate = estimate_working_bytes(row.width, row.height, row.file_size.max(0) as u64, true);
+    let _memory = match memory.acquire(estimate, cancel) {
+        Ok(permit) => permit,
+        Err(BudgetError::Cancelled) => {
+            return failed_outcome(
+                row.pixels(),
+                row.file_size.max(0) as u64,
+                read_secs,
+                "估算已取消".to_owned(),
+            );
+        }
+    };
     let old_bytes = source_bytes.len() as u64;
     let skip_now = |skip: SkipReason| SampleOutcome {
         old_bytes,
@@ -2057,6 +2073,7 @@ mod tests {
         ids.push(insert("png", "png", &[7_u8; 256], 64, 64));
 
         let reporter = Recorder::default();
+        let memory = crate::concurrency::budget::ImageMemoryBudget::new(1);
         let estimate = estimate(
             &session.db,
             &root,
@@ -2068,10 +2085,13 @@ mod tests {
             &reporter,
             &crate::concurrency::resources::ResourceTable::new(),
             &crate::concurrency::budget::ImageBudget::new(2),
+            &memory,
             &crate::concurrency::resources::HolderInfo::new("estimate-test", "估算"),
         )
         .unwrap()
         .unwrap();
+        // 额度小到每张都超限，样本编码走独占路径；结束后额度必须全部归还。
+        assert_eq!(memory.in_use(), 0);
 
         let prefilter_count = estimate.skip_compact.count
             + estimate.skip_optimized.count
@@ -2201,6 +2221,7 @@ mod tests {
             &reporter,
             &crate::concurrency::resources::ResourceTable::new(),
             &crate::concurrency::budget::ImageBudget::new(2),
+            &crate::concurrency::budget::ImageMemoryBudget::default(),
             &crate::concurrency::resources::HolderInfo::new("estimate-test", "估算"),
         )
         .unwrap()

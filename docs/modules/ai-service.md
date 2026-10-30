@@ -203,7 +203,7 @@ Content-Type: application/octet-stream
 - 先到先得：同一资源上的等待者按申请顺序启动；路径锁写者优先，避免文件夹改名被持续的读图请求饿死。短写只申请短期资源，不排在长任务后面。
 - 取消：停止调度新请求；正在飞的那次请求约 100 毫秒内被打断，不算失败、不进失败清单；已经保存的结果不回滚。
 - 熔断：连续 5 张失败视为服务不可用，任务以失败结束，避免把整库都记成失败。
-- 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。
+- 发送的图片：embedding 与 pose 使用缩略图包里的 512px WebP（缺失或读取失败时回退解码原图）；description 解码原图（应用 EXIF 方向）后缩到最长边 1536，避免把 100MP 原图直接上传。回退解码原图时按像素申请全进程 1.5 GiB 字节预算，与导入、压缩、查看器共用。
 - 已完成的 embedding/pose 写入 feature pack 与 `feature_blobs`；描述写入 `images.description`，并设置 `description_source='ai'`、`description_model`。用户手工编辑后 `description_source='user'`。
 - 描述任务会产生用户可见的内容修改，因此使用 live 操作记录：任务开始建 `pending` 记录，每张写入时在同一事务里追加旧描述并计入 `affected`，结束（含取消/失败）调用 `finish_live`；已经写入的描述在任务取消后仍可撤销。该记录由 `history::LiveOperation` 守卫，任务 panic、线程启动失败或提前返回时在 Drop 里收尾，不会留下永远 pending 的记录。单张 `ai_describe_image` 走普通 `history::write`。embedding/pose 是派生数据，不进入操作记录。
 - 任务 panic 按失败处理：任务边界用 `catch_unwind` 捕获，标记失败、写失败清单并释放资源；不会再出现“界面显示运行中、资源永不释放”的状态。release 构建使用 unwind，panic 信息写入日志。

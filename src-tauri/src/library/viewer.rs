@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::{
     app::error::{AppError, AppResult},
     concurrency::{
-        budget::ImageBudget,
+        budget::{ImageBudget, ImageMemoryBudget, estimate_working_bytes},
         resources::{HolderInfo, ResourceTable},
     },
     imageops::{
@@ -81,8 +81,17 @@ pub fn source(
     image_id: i64,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
 ) -> AppResult<ViewerSource> {
-    source_with_threshold(database, root, image_id, PREVIEW_PIXELS, resources, images)
+    source_with_threshold(
+        database,
+        root,
+        image_id,
+        PREVIEW_PIXELS,
+        resources,
+        images,
+        memory,
+    )
 }
 
 fn source_with_threshold(
@@ -92,6 +101,7 @@ fn source_with_threshold(
     preview_threshold: u64,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
 ) -> AppResult<ViewerSource> {
     let paths = LibraryPaths::new(root);
     let holder = HolderInfo::new(format!("viewer-{image_id}"), "查看器").with_path_note("正在读取");
@@ -116,6 +126,10 @@ fn source_with_threshold(
         let _permit = images
             .acquire(&|| false)
             .map_err(|_| AppError::message("图像预算等待已取消"))?;
+        let estimate = estimate_working_bytes(row.width, row.height, bytes.len() as u64, false);
+        let _memory = memory
+            .acquire(estimate, &|| false)
+            .map_err(|_| AppError::message("图像内存预算等待已取消"))?;
         ensure_preview_bytes(&paths, &row, &bytes)?
     } else {
         drop(guard);
@@ -172,6 +186,7 @@ pub(crate) fn ensure_preview_file(
     row: &ContentRow,
     resources: &ResourceTable,
     images: &ImageBudget,
+    memory: &ImageMemoryBudget,
 ) -> AppResult<(PathBuf, String)> {
     let target = preview_path(paths, row.id, &row.content_hash);
     if target.is_file() {
@@ -183,6 +198,10 @@ pub(crate) fn ensure_preview_file(
     let _permit = images
         .acquire(&|| false)
         .map_err(|_| AppError::message("图像预算等待已取消"))?;
+    let estimate = estimate_working_bytes(latest.width, latest.height, bytes.len() as u64, false);
+    let _memory = memory
+        .acquire(estimate, &|| false)
+        .map_err(|_| AppError::message("图像内存预算等待已取消"))?;
     ensure_preview_bytes(paths, &latest, &bytes)?;
     Ok((
         preview_path(paths, latest.id, &latest.content_hash),
@@ -360,6 +379,7 @@ mod tests {
             fixture.image_id,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(!source.preview);
@@ -388,6 +408,7 @@ mod tests {
             fixture.image_id,
             &resources,
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("文件夹正忙"));
@@ -403,6 +424,7 @@ mod tests {
             100,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(source.preview);
@@ -426,6 +448,7 @@ mod tests {
             100,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(again.preview);
@@ -433,6 +456,25 @@ mod tests {
             fs::metadata(&preview).unwrap().modified().unwrap(),
             modified
         );
+    }
+
+    /// 字节额度小到预览必然超限时，解码走独占路径；配额用完必须归还。
+    #[test]
+    fn preview_generation_releases_memory_quota() {
+        let fixture = fixture(false);
+        let memory = ImageMemoryBudget::new(1);
+        let source = source_with_threshold(
+            &fixture.session.db,
+            &fixture.root,
+            fixture.image_id,
+            100,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
+            &memory,
+        )
+        .unwrap();
+        assert!(source.preview);
+        assert_eq!(memory.in_use(), 0);
     }
 
     #[test]
@@ -476,6 +518,7 @@ mod tests {
             1,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(source.preview);
@@ -495,6 +538,7 @@ mod tests {
             fixture.image_id,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(source.deleted);
@@ -512,7 +556,8 @@ mod tests {
                 &fixture.root,
                 fixture.image_id,
                 &ResourceTable::new(),
-                &ImageBudget::new(2)
+                &ImageBudget::new(2),
+                &ImageMemoryBudget::default(),
             )
             .is_err()
         );
@@ -528,6 +573,7 @@ mod tests {
             100,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         let paths = LibraryPaths::new(&fixture.root);
@@ -542,6 +588,7 @@ mod tests {
             &row,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert_eq!(regenerated.0, preview);
@@ -563,6 +610,7 @@ mod tests {
             100,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         let paths = LibraryPaths::new(&fixture.root);
@@ -576,7 +624,8 @@ mod tests {
                 &paths,
                 &row,
                 &ResourceTable::new(),
-                &ImageBudget::new(2)
+                &ImageBudget::new(2),
+                &ImageMemoryBudget::default(),
             )
             .unwrap()
             .0,
@@ -591,7 +640,8 @@ mod tests {
                 &paths,
                 &row,
                 &ResourceTable::new(),
-                &ImageBudget::new(2)
+                &ImageBudget::new(2),
+                &ImageMemoryBudget::default(),
             )
             .is_err()
         );
@@ -662,6 +712,7 @@ mod tests {
             image_id,
             &ResourceTable::new(),
             &ImageBudget::new(2),
+            &ImageMemoryBudget::default(),
         )
         .unwrap();
         assert!(source.preview);

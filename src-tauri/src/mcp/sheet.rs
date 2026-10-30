@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::{
     app::error::{AppError, AppResult},
+    concurrency::budget::estimate_working_bytes,
     imageops::contact_sheet,
     library::{
         content,
@@ -17,6 +18,10 @@ use super::context::ReadContext;
 const MAX_SHEETS: usize = 128;
 pub const SHEET_TTL_MINUTES: u64 = 2 * 60;
 const SHEET_TTL: Duration = Duration::from_secs(SHEET_TTL_MINUTES * 60);
+/// 拼图画布与逐格缩放缓冲的估算；画布约 10 MB，加上 RGB 副本与单格 RGBA 仍留余量。
+const SHEET_CANVAS_BYTES: u64 = 32 * 1024 * 1024;
+/// 缩略图最长边；解码缓冲按缩略图上限估算，不按原图。
+const SHEET_THUMB_EDGE: u32 = crate::imageops::thumbnail::THUMB_MAX_EDGE;
 
 /// 拼图映射只保存格子与图片 id；展示字段在本次返回里直接给出，不重复缓存。
 #[derive(Debug, Clone)]
@@ -225,6 +230,34 @@ pub fn build(
     }
 
     // 逐格解码：画完一格就释放，detail 拼图不会同时持有整盘原图。
+    // 峰值是“画布 + 最大的一格”，所以整盘只申请一份额度；单格不再各自申请，
+    // 避免拿着画布额度去等一张超限图的独占额度。
+    // 逐格解码串行进行，整盘只占一个线程许可；先线程后字节，与其它解码路径同序。
+    let cell_estimate = slots
+        .iter()
+        .filter_map(|slot| slot.row.as_ref())
+        .map(|row| match resolution {
+            SheetResolution::Thumb => {
+                estimate_working_bytes(SHEET_THUMB_EDGE, SHEET_THUMB_EDGE, 0, false)
+            }
+            SheetResolution::Detail => estimate_working_bytes(
+                row.width.max(0) as u32,
+                row.height.max(0) as u32,
+                row.file_size.max(0) as u64,
+                false,
+            ),
+        })
+        .max()
+        .unwrap_or(0);
+    let Ok(_permit) = context.images.acquire(&|| false) else {
+        return Err(AppError::message("图像预算等待已取消"));
+    };
+    let Ok(_memory) = context
+        .memory
+        .acquire(SHEET_CANVAS_BYTES.saturating_add(cell_estimate), &|| false)
+    else {
+        return Err(AppError::message("图像内存预算等待已取消"));
+    };
     let mut drawn = vec![false; expected];
     let image = contact_sheet::render(grid, &labels, |index| {
         let row = slots[index].row.as_ref()?;
@@ -266,7 +299,6 @@ fn load_thumbnail(
     pointer: Option<ThumbPointer>,
 ) -> Option<image::DynamicImage> {
     let pointer = pointer?;
-    let _permit = context.images.acquire(&|| false).ok()?;
     let bytes = context.thumbs.read(pointer.location).ok()?;
     contact_sheet::decode_thumbnail(&bytes).ok()
 }
@@ -283,7 +315,6 @@ fn load_original(context: &ReadContext, image_id: i64) -> Option<image::DynamicI
         &holder,
     )
     .ok()?;
-    let _permit = context.images.acquire(&|| false).ok()?;
     crate::import::decode::decode_bytes(&bytes, Some(&row.file_ext))
         .ok()
         .map(|decoded| decoded.image)
@@ -329,6 +360,19 @@ mod tests {
         assert!(error.to_string().contains("3×3"));
     }
 
+    /// 拼图画布与格子解码都从共享字节额度里申请，结束后额度必须全部归还。
+    #[test]
+    fn builds_sheet_and_returns_memory_quota() {
+        let context = test_context();
+        let slots = vec![SheetSlot {
+            label: "A1".to_owned(),
+            row: None,
+        }];
+        let built = build(&context, 1, SheetResolution::Detail, slots).unwrap();
+        assert!(!built.image.is_empty());
+        assert_eq!(context.memory.in_use(), 0);
+    }
+
     fn test_context() -> ReadContext {
         let temp = tempfile::tempdir().unwrap();
         let (session, _) = crate::library::service::create(temp.path(), "拼图测试", 1).unwrap();
@@ -342,6 +386,7 @@ mod tests {
             sheets,
             resources: std::sync::Arc::new(crate::concurrency::resources::ResourceTable::new()),
             images: std::sync::Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
+            memory: std::sync::Arc::new(crate::concurrency::budget::ImageMemoryBudget::default()),
         }
     }
 }

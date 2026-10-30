@@ -938,8 +938,9 @@ pub async fn get_viewer_source(
             .ok_or_else(|| "尚未打开图库".to_owned())?;
         let resources = state.resources();
         let images = state.images();
+        let memory = state.memory();
         tauri::async_runtime::spawn_blocking(move || {
-            viewer::source(&database, &root, image_id, &resources, &images)
+            viewer::source(&database, &root, image_id, &resources, &images, &memory)
         })
         .await
         .map_err(|error| error.to_string())?

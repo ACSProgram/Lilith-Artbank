@@ -72,6 +72,8 @@ fn context(
         },
         resources: Arc::new(crate::concurrency::resources::ResourceTable::new()),
         images: Arc::new(crate::concurrency::budget::ImageBudget::new(2)),
+        // 额度小到每张输入都超限：批量任务里的解码走独占路径，覆盖共享字节预算的接入。
+        memory: Arc::new(crate::concurrency::budget::ImageMemoryBudget::new(1)),
     }
 }
 
