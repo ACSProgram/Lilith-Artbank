@@ -35,6 +35,10 @@ export interface TagInputProps {
   searchSuggestions?: (query: string) => Promise<TagSuggestion[]>;
   /** 草稿模式开启：点外部按钮前先提交未回车的文本，避免丢字。 */
   commitOnBlur?: boolean;
+  /** `pending` 时 chip 用虚线描边，表示尚未保存。 */
+  tone?: "default" | "pending";
+  /** 输入框里可新增的标签数（0 或 1），用于让外部按钮同步数量；禁用期间不通知。 */
+  onPendingChange?: (count: number) => void;
 }
 
 /**
@@ -52,6 +56,8 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
     exclude,
     searchSuggestions,
     commitOnBlur = false,
+    tone = "default",
+    onPendingChange,
   },
   ref,
 ) {
@@ -63,16 +69,27 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
   const inputDisabled = disabled || remaining <= 0;
   const needle = text.trim();
 
-  const commitName = useCallback(
+  /** 提交一段文本后的 chip 列表；空文本、禁用、已满、重复或已排除时原样返回。 */
+  const resolveNames = useCallback(
     (raw: string): string[] => {
       const name = normalizeTagName(raw);
       if (!name || disabled || remaining <= 0) return value;
-      const next = mergeTagNames(value, [name], { max, exclude });
+      return mergeTagNames(value, [name], { max, exclude });
+    },
+    [value, disabled, remaining, max, exclude],
+  );
+
+  const commitName = useCallback(
+    (raw: string): string[] => {
+      const next = resolveNames(raw);
       if (next.length !== value.length) onChange(next);
       return next;
     },
-    [value, disabled, remaining, max, exclude, onChange],
+    [resolveNames, value.length, onChange],
   );
+
+  // 待添加数只算“按下保存后确实会新增”的那一条，所以复用同一套判定。
+  const pendingCount = resolveNames(text).length > value.length ? 1 : 0;
 
   const commitText = useCallback((): string[] => {
     const next = commitName(text);
@@ -83,6 +100,12 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
   }, [commitName, text]);
 
   useImperativeHandle(ref, () => ({ commitPending: commitText }), [commitText]);
+
+  useEffect(() => {
+    // 提交中会禁用输入，此时不动待添加数，外部按钮的文案不会闪成 0。
+    if (disabled) return;
+    onPendingChange?.(pendingCount);
+  }, [pendingCount, disabled, onPendingChange]);
 
   // 调用方每次渲染都可能新建数组；用拼接后的键做依赖，内容不变就不重查建议。
   const valueKey = value.join("\u0000");
@@ -129,6 +152,7 @@ export const TagInput = forwardRef<TagInputHandle, TagInputProps>(function TagIn
               key={`${name}-${index}`}
               name={name}
               disabled={disabled}
+              pending={tone === "pending"}
               removeLabel={`移除标签 ${name}`}
               onRemove={() => onChange(value.filter((_, item) => item !== index))}
             />

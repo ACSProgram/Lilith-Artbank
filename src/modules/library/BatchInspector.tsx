@@ -47,8 +47,13 @@ export function BatchInspector({
   const [busy, setBusy] = useState(false);
   const [score, setScore] = useState("unset");
   const [tagAdd, setTagAdd] = useState<string[]>([]);
+  /** 输入框里尚未回车的标签数（0 或 1），由 `TagInput` 回报。 */
+  const [pendingTextCount, setPendingTextCount] = useState(0);
+  /** 自增后重挂 `TagInput`，用来清空它的输入框文本。 */
+  const [draftEpoch, setDraftEpoch] = useState(0);
   const [partialQuery, setPartialQuery] = useState("");
   const tagAddRef = useRef<TagInputHandle>(null);
+  const draftImageIds = useRef(imageIds);
   const [folderDraft, setFolderDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
 
@@ -61,9 +66,14 @@ export function BatchInspector({
     forget: forgetSelectionTag,
   } = useSelectionTags(imageIds, tagVersion);
 
-  // 换一批选择时，上一批的暂存标签与搜索词不再适用。
+  // 换一批选择时，上一批的暂存标签、输入框文本与搜索词不再适用。
   useEffect(() => {
+    if (draftImageIds.current === imageIds) return;
+    draftImageIds.current = imageIds;
     setTagAdd([]);
+    // 重挂输入框会在它自己挂载时回报 0；这里先清一次，避免按钮短暂显示上一批的数量。
+    setPendingTextCount(0);
+    setDraftEpoch((value) => value + 1);
     setPartialQuery("");
   }, [imageIds]);
 
@@ -77,6 +87,7 @@ export function BatchInspector({
     : partialTags;
   const visiblePartial = partialMatches.slice(0, 200);
   const commonTagNames = commonTags.map((tag) => tag.name);
+  const pendingTagCount = tagAdd.length + pendingTextCount;
 
   const run = async (
     operation: () => Promise<string>,
@@ -126,6 +137,7 @@ export function BatchInspector({
       async () => {
         const added = await libraryApi.addTagsToImages(imageIds, names);
         setTagAdd([]);
+        setPendingTextCount(0);
         return `新增 ${added.toLocaleString()} 个标签关联`;
       },
       "标签已添加",
@@ -265,7 +277,11 @@ export function BatchInspector({
         <h4>
           <Tags size={12} /> 添加标签
         </h4>
+        {pendingTagCount > 0 ? (
+          <div className="tag-group-label">待添加，尚未保存</div>
+        ) : null}
         <TagInput
+          key={draftEpoch}
           ref={tagAddRef}
           value={tagAdd}
           onChange={setTagAdd}
@@ -275,19 +291,18 @@ export function BatchInspector({
           placeholder="输入标签，回车添加"
           searchSuggestions={searchTagSuggestions}
           commitOnBlur
+          tone="pending"
+          onPendingChange={setPendingTextCount}
         />
         <div className="inspector-inline-actions">
           <Button
             size="sm"
             loading={busy}
-            disabled={tagAdd.length === 0}
+            disabled={pendingTagCount === 0}
             onClick={applyAddTags}
           >
-            添加
+            保存 {pendingTagCount} 个标签
           </Button>
-          {tagAdd.length > 0 ? (
-            <span className="field-hint">将添加 {tagAdd.length} 个标签</span>
-          ) : null}
         </div>
       </section>
 

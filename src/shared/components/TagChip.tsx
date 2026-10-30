@@ -7,6 +7,8 @@ export interface TagChipProps {
   active?: boolean;
   /** 部分图片持有：降低强调，用于批量移除候选。 */
   muted?: boolean;
+  /** 尚未保存：虚线描边，用于批量侧栏的待添加区。 */
+  pending?: boolean;
   /** 名称右侧的附加信息，例如 `全部` 或 `12/30`。 */
   count?: ReactNode;
   /** 名称按钮的 title；不传时使用名称。 */
@@ -29,6 +31,7 @@ export function TagChip({
   name,
   active = false,
   muted = false,
+  pending = false,
   count,
   nameTitle,
   onNameClick,
@@ -40,7 +43,14 @@ export function TagChip({
   disabled = false,
   trailing,
 }: TagChipProps) {
-  const className = `tag-chip${active ? " is-filtering" : ""}${muted ? " is-partial" : ""}`;
+  const className = [
+    "tag-chip",
+    active && "is-filtering",
+    muted && "is-partial",
+    pending && "is-pending",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   if (onActivate) {
     return (

@@ -1957,6 +1957,12 @@
   text-decoration: underline;
 }
 
+/* 待添加：虚线描边 + 弱化文字色，与已保存的实线标签区分（底色沿用 `.tag-chip`）。 */
+.tag-chip.is-pending {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
 .tag-chip.is-filtering {
   border-color: var(--accent-fill);
   background: var(--accent-fill);
