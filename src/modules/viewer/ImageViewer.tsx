@@ -41,11 +41,11 @@ import {
   rectBetween,
   rotateGeometry,
   transformedSize,
-  type GeometryState,
-} from "./model";
+} from "../../shared/editGeometry";
+import type { CropRect, GeometryState } from "../../shared/contracts/edit";
 import { Filmstrip } from "./Filmstrip";
 import { hasVisiblePose, visiblePoseCount } from "./PoseOverlay";
-import type { CropRect, PoseData, ViewerSource } from "./types";
+import type { PoseData, ViewerSource } from "./types";
 import { useEditEstimate } from "./useEditEstimate";
 import { useEditHistory } from "./useEditHistory";
 import { useViewerSource } from "./useViewerSource";

@@ -15,6 +15,7 @@ use crate::{
 
 use super::chunks::load_chunks;
 use super::undo::{
+    batch_edit::{redo_batch_edit, undo_batch_edit},
     collections::{redo_collection, undo_collection},
     edit::{redo_edit, undo_edit},
     folders::{redo_folder, undo_folder},
@@ -596,16 +597,28 @@ pub fn run_undo(
         return Err(AppError::message("压缩操作不可撤销，原图已删除"));
     }
 
-    task.set_total(operations.len());
+    let units = operations
+        .iter()
+        .try_fold(0_usize, |total, (id, kind, _)| {
+            Ok::<_, AppError>(total + operation_units(database, *id, *kind)?)
+        })?;
+    task.set_total(units.max(operations.len()));
     let mut cancelled = false;
     for (id, kind, label) in operations {
         if task.should_cancel() {
             cancelled = true;
             break;
         }
-        if let Err(error) = undo_record(database, root, thumbs, &task, id, kind, &label) {
-            run.finish("failed")?;
-            return Err(error);
+        match undo_record(database, root, thumbs, &task, id, kind, &label) {
+            Ok(true) => {}
+            Ok(false) => {
+                cancelled = true;
+                break;
+            }
+            Err(error) => {
+                run.finish("failed")?;
+                return Err(error);
+            }
         }
     }
     run.finish(if cancelled { "cancelled" } else { "completed" })?;
@@ -634,10 +647,10 @@ pub fn retry_undo(
         run.finish("failed")?;
         return Err(AppError::message("只有撤销失败的记录可以重试"));
     }
-    task.set_total(1);
     let kind = HistoryKind::parse(&kind)?;
+    task.set_total(operation_units(database, operation_id, kind)?);
     match undo_record(database, root, thumbs, &task, operation_id, kind, &label) {
-        Ok(()) => {
+        Ok(_) => {
             run.finish("completed")?;
             task.set_message("");
             Ok(())
@@ -675,6 +688,28 @@ pub fn skip_undo(database: &LibraryDb, operation_id: i64) -> AppResult<()> {
     })
 }
 
+/// 一条记录在进度条上占几个单位：批量编辑按快照张数，其余按 1 条。
+fn operation_units(database: &LibraryDb, id: i64, kind: HistoryKind) -> AppResult<usize> {
+    if kind != HistoryKind::BatchEdit {
+        return Ok(1);
+    }
+    let count = database.with_reader(|connection| {
+        let mut count = 0_usize;
+        for chunk in load_chunks(connection, id)? {
+            if chunk.format == ChunkFormat::Json
+                && matches!(
+                    serde_json::from_slice::<BatchEditRecord>(&chunk.data),
+                    Ok(BatchEditRecord::Snapshot { .. })
+                )
+            {
+                count += 1;
+            }
+        }
+        Ok(count.max(1))
+    })?;
+    Ok(count)
+}
+
 fn undo_record(
     database: &LibraryDb,
     root: &Path,
@@ -683,7 +718,7 @@ fn undo_record(
     id: i64,
     kind: HistoryKind,
     label: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     task.set_message(format!("撤销：{label}"));
     // 先记 undoing 再撤：崩溃后按最小的 undoing id 续做，撤销失败后的重试也从这里继续。
     // 只有第一次从 applied 进入时才丢弃旧的重做数据；续做与重试都必须保留上次已写入的快照
@@ -705,7 +740,7 @@ fn undo_record(
         Ok(())
     })?;
     match undo_operation(database, root, thumbs, task, id, kind) {
-        Ok(()) => {
+        Ok(true) => {
             database.with_writer(|connection| {
                 connection.execute(
                     "UPDATE operations
@@ -715,9 +750,12 @@ fn undo_record(
                 )?;
                 Ok(())
             })?;
-            task.inc_completed();
-            Ok(())
+            if kind != HistoryKind::BatchEdit {
+                task.inc_completed();
+            }
+            Ok(true)
         }
+        Ok(false) => Ok(false),
         Err(error) => {
             database.with_writer(|connection| {
                 connection.execute(
@@ -792,7 +830,12 @@ pub fn run_redo(
         Ok(())
     })?;
 
-    task.set_total(operations.len());
+    let units = operations
+        .iter()
+        .try_fold(0_usize, |total, (id, kind, _)| {
+            Ok::<_, AppError>(total + operation_units(database, *id, *kind)?)
+        })?;
+    task.set_total(units.max(operations.len()));
     let mut cancelled = false;
     for (index, (id, kind, label)) in operations.iter().enumerate() {
         if task.should_cancel() {
@@ -802,7 +845,7 @@ pub fn run_redo(
         }
         task.set_message(format!("重做：{label}"));
         match redo_operation(database, root, thumbs, &task, *id, *kind) {
-            Ok(()) => {
+            Ok(true) => {
                 database.with_writer(|connection| {
                     connection.execute(
                         "UPDATE operations
@@ -813,6 +856,12 @@ pub fn run_redo(
                     Ok(())
                 })?;
                 task.inc_completed();
+            }
+            Ok(false) => {
+                // 批量记录中途取消：本条与之后的记录回到 `undone`，避免留下半重做的 `redoing`。
+                reset_redoing(database, &ids[index..])?;
+                cancelled = true;
+                break;
             }
             Err(error) => {
                 // 重做失败不会丢掉撤销状态；修正原因后可以再次重做。
@@ -912,9 +961,12 @@ fn undo_operation(
     task: &TaskHandle,
     operation_id: i64,
     kind: HistoryKind,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     match kind {
         HistoryKind::Edit => undo_edit(database, root, thumbs, operation_id)?,
+        HistoryKind::BatchEdit => {
+            return undo_batch_edit(database, root, thumbs, task, operation_id);
+        }
         HistoryKind::Import => undo_import(database, root, task, operation_id)?,
         HistoryKind::Move => undo_move(database, root, operation_id)?,
         HistoryKind::FolderCreate
@@ -952,7 +1004,7 @@ fn undo_operation(
             return Err(AppError::message("压缩操作不可撤销，原图已删除"));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn redo_operation(
@@ -962,9 +1014,12 @@ fn redo_operation(
     task: &TaskHandle,
     operation_id: i64,
     kind: HistoryKind,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     match kind {
         HistoryKind::Edit => redo_edit(database, root, thumbs, operation_id)?,
+        HistoryKind::BatchEdit => {
+            return redo_batch_edit(database, root, thumbs, task, operation_id);
+        }
         HistoryKind::Import => redo_import(database, root, task, operation_id)?,
         HistoryKind::Move => redo_move(database, root, operation_id)?,
         HistoryKind::FolderCreate
@@ -1002,7 +1057,7 @@ fn redo_operation(
             return Err(AppError::message("压缩操作不可撤销，原图已删除"));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 struct OffsetReporter<'a> {

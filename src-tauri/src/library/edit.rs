@@ -4,20 +4,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     app::error::{AppError, AppResult},
     imageops::{
         colors, edit,
-        edit::{CropRect, Geometry, MAX_EDIT_PIXELS, OutputFormat, ResizeSpec},
+        edit::{CanvasFit, CropRect, Geometry, MAX_EDIT_PIXELS, OutputFormat, ResizeSpec},
         phash, thumbnail,
     },
     import::decode,
     library::{
         content::{self, ContentRow},
         db::LibraryDb,
+        fs_journal::FileJournal,
         history::{self, EditSnapshot, HistoryKind, NewOperation},
         metadata,
         paths::LibraryPaths,
@@ -115,6 +116,203 @@ impl TempFile {
     }
 }
 
+/// 准备阶段的结果：临时文件已编码、派生数据已算好，等提交事务。
+pub(crate) struct PreparedEdit {
+    pub row: ContentRow,
+    pub new_hash: String,
+    pub file_ext: String,
+    pub file_size: i64,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub has_alpha: bool,
+    pub thumb: thumbnail::EncodedThumbnail,
+    pub phash: Vec<u8>,
+    pub colors4: Vec<u8>,
+    pub colors8: Vec<u8>,
+    temp: TempFile,
+}
+
+/// 撤销副本的落点；批量任务在循环外建好目录，避免每张事务回滚时误删整棵目录。
+#[derive(Clone, Copy)]
+pub(crate) struct StageOptions {
+    pub operation_id: i64,
+    pub create_dir: bool,
+}
+
+/// 准备阶段只读原图与计算，不碰数据库；返回 `None` 表示编码结果与原内容相同。
+pub(crate) fn prepare(
+    root: &Path,
+    row: &ContentRow,
+    geometry: &Geometry,
+    fit: Option<CanvasFit>,
+    pad: [u8; 4],
+    output_format: OutputFormat,
+    quality: u8,
+) -> AppResult<Option<PreparedEdit>> {
+    let paths = LibraryPaths::new(root);
+    let source = row.path(&paths)?;
+    let decoded = decode::decode(&source)?;
+    if u64::from(decoded.width) * u64::from(decoded.height) > MAX_EDIT_PIXELS {
+        return Err(AppError::message(format!(
+            "原图解码后为 {}×{}，超过编辑上限",
+            decoded.width, decoded.height
+        )));
+    }
+
+    let processed = edit::apply_fitted(decoded.image, geometry, fit, pad)?;
+    let (width, height) = (processed.width(), processed.height());
+    let has_alpha = output_format != OutputFormat::Jpeg && processed.color().has_alpha();
+
+    let temp = TempFile::new(paths.temp.join(format!(
+        "edit-{}-{}.{}",
+        row.id,
+        uuid::Uuid::new_v4(),
+        output_format.extension()
+    )));
+    let (new_hash, new_size) = write_encoded(temp.path(), &processed, output_format, quality)?;
+    if new_hash == row.content_hash {
+        return Ok(None);
+    }
+
+    let thumb = thumbnail::encode(&processed)?;
+    let hash = phash::compute(&processed);
+    let (colors4, colors8) = colors::dominant(&processed);
+    let file_size =
+        i64::try_from(new_size).map_err(|_| AppError::message("编辑结果大小超出数据库范围"))?;
+
+    Ok(Some(PreparedEdit {
+        row: row.clone(),
+        new_hash,
+        file_ext: output_format.extension().to_owned(),
+        file_size,
+        width,
+        height,
+        format: output_format.name().to_owned(),
+        has_alpha,
+        thumb,
+        phash: hash.to_vec(),
+        colors4: colors4.to_vec(),
+        colors8: colors8.to_vec(),
+        temp,
+    }))
+}
+
+/// 提交阶段：冲突检查、发布新内容、更新行、清特征并返回撤销快照。
+///
+/// 调用方负责在自己持有的事务里把快照写进操作记录；批量任务每张一个事务。
+pub(crate) fn commit_prepared(
+    transaction: &Transaction<'_>,
+    root: &Path,
+    thumbs: &ThumbPack,
+    prepared: &mut PreparedEdit,
+    journal: &mut FileJournal,
+    stage: Option<StageOptions>,
+) -> AppResult<EditSnapshot> {
+    let conflict: Option<i64> = transaction
+        .query_row(
+            "SELECT id FROM images WHERE content_hash = ?1 AND id <> ?2",
+            params![prepared.new_hash, prepared.row.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(other) = conflict {
+        return Err(AppError::message(format!(
+            "编辑结果与图片 #{other} 的内容相同，已拒绝保存；请调整裁剪或输出设置"
+        )));
+    }
+
+    let paths = LibraryPaths::new(root);
+    let destination = metadata::content_path(
+        &paths,
+        &prepared.row.folder_path,
+        &prepared.new_hash,
+        &prepared.file_ext,
+    )?;
+
+    if let Some(stage) = stage {
+        let staged_dir = history::undo_dir(root, stage.operation_id);
+        if stage.create_dir {
+            std::fs::create_dir_all(&staged_dir)?;
+            journal.created_tree(&staged_dir);
+        }
+        let staged = staged_dir.join(format!(
+            "{}.{}",
+            prepared.row.content_hash, prepared.row.file_ext
+        ));
+        stage_original(&prepared.row.path(&paths)?, &staged)?;
+    }
+
+    if publish(prepared.temp.path(), &destination)? {
+        journal.published(&destination);
+    }
+    let location = thumbs.append(&prepared.thumb.bytes)?;
+    let now = now_ms();
+
+    let changed = transaction.execute(
+        "UPDATE images SET
+            content_hash = ?1, file_ext = ?2, file_size = ?3, width = ?4, height = ?5,
+            format = ?6, has_alpha = ?7, phash = ?8, colors4 = ?9, colors8 = ?10,
+            modified_at = ?11, thumb_segment = ?12, thumb_offset = ?13,
+            thumb_length = ?14, thumb_format = 'webp', thumb_width = ?15,
+            thumb_height = ?16, thumb_version = thumb_version + 1
+         WHERE id = ?17",
+        params![
+            prepared.new_hash,
+            prepared.file_ext,
+            prepared.file_size,
+            prepared.width,
+            prepared.height,
+            prepared.format,
+            prepared.has_alpha,
+            prepared.phash.as_slice(),
+            prepared.colors4.as_slice(),
+            prepared.colors8.as_slice(),
+            now,
+            location.segment,
+            i64::try_from(location.offset)
+                .map_err(|_| AppError::message("缩略图偏移超出数据库范围"))?,
+            location.length,
+            prepared.thumb.width,
+            prepared.thumb.height,
+            prepared.row.id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(AppError::message("图片不存在或已被删除"));
+    }
+    transaction.execute(
+        "DELETE FROM feature_blobs WHERE image_id = ?1",
+        [prepared.row.id],
+    )?;
+    crate::library::import::ensure_thumb_segment(transaction, location.segment, now)?;
+    if let Ok(size) = thumbs.segment_size_bytes(location.segment) {
+        crate::library::import::update_thumb_segment_size(transaction, location.segment, size)?;
+    }
+    prepared.temp.disarm();
+    if let Err(error) = thumbs.sync() {
+        log::warn!("缩略图段落盘失败：{error}");
+    }
+
+    Ok(EditSnapshot {
+        image_id: prepared.row.id,
+        folder_path: prepared.row.folder_path.clone(),
+        content_hash: prepared.row.content_hash.clone(),
+        file_ext: prepared.row.file_ext.clone(),
+        file_size: prepared.row.file_size,
+        width: prepared.row.width,
+        height: prepared.row.height,
+        format: prepared.row.format.clone(),
+        has_alpha: prepared.row.has_alpha,
+        phash: prepared.row.phash.clone(),
+        colors4: prepared.row.colors4.clone(),
+        colors8: prepared.row.colors8.clone(),
+        modified_at: prepared.row.modified_at,
+        new_hash: prepared.new_hash.clone(),
+        new_file_ext: prepared.file_ext.clone(),
+    })
+}
+
 /// 保存与体积预估共用的前置校验：几何参数、回收站、像素上限、输出格式与质量。
 fn resolve(
     database: &LibraryDb,
@@ -162,155 +360,82 @@ pub fn save(
 
     let paths = LibraryPaths::new(root);
     let source = row.path(&paths)?;
-    let decoded = decode::decode(&source)?;
-    if u64::from(decoded.width) * u64::from(decoded.height) > MAX_EDIT_PIXELS {
-        return Err(AppError::message(format!(
-            "原图解码后为 {}×{}，超过编辑上限",
-            decoded.width, decoded.height
-        )));
-    }
-
-    let processed = edit::apply(decoded.image, &geometry)?;
-    let (width, height) = (processed.width(), processed.height());
-    let has_alpha = output_format != OutputFormat::Jpeg && processed.color().has_alpha();
-
-    let mut temp = TempFile::new(paths.temp.join(format!(
-        "edit-{}-{}.{}",
-        row.id,
-        uuid::Uuid::new_v4(),
-        output_format.extension()
-    )));
-    let (new_hash, new_size) = write_encoded(temp.path(), &processed, output_format, quality)?;
-    if new_hash == row.content_hash {
+    let Some(mut prepared) = prepare(
+        root,
+        &row,
+        &geometry,
+        None,
+        [0, 0, 0, 0],
+        output_format,
+        quality,
+    )?
+    else {
         return Ok(unchanged(&row, false));
-    }
+    };
 
-    let destination = metadata::content_path(
-        &paths,
-        &row.folder_path,
-        &new_hash,
-        output_format.extension(),
-    )?;
-    let thumb = thumbnail::encode(&processed)?;
-    let hash = phash::compute(&processed);
-    let (colors4, colors8) = colors::dominant(&processed);
-    let file_ext = output_format.extension().to_owned();
-    let file_size =
-        i64::try_from(new_size).map_err(|_| AppError::message("编辑结果大小超出数据库范围"))?;
-
-    let commit = history::write(
+    let mut result = history::write(
         database,
         NewOperation::new(HistoryKind::Edit, "编辑图片"),
         |transaction, draft| {
-            let conflict: Option<i64> = transaction
-                .query_row(
-                    "SELECT id FROM images WHERE content_hash = ?1 AND id <> ?2",
-                    params![new_hash, row.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(other) = conflict {
-                return Err(AppError::message(format!(
-                    "编辑结果与图片 #{other} 的内容相同，已拒绝保存；请调整裁剪或输出设置"
-                )));
-            }
-
-            let id = draft.id();
-            let staged_dir = history::undo_dir(root, id);
-            std::fs::create_dir_all(&staged_dir)?;
-            draft.journal().created_tree(&staged_dir);
-            let staged = staged_dir.join(format!("{}.{}", row.content_hash, row.file_ext));
-            stage_original(&source, &staged)?;
-
-            // 目标已存在说明相同内容已在库里，不是本次发布的新文件，不能记进日志，
-            // 否则回滚会删掉别的行正在引用的文件。
-            if publish(temp.path(), &destination)? {
-                draft.journal().published(&destination);
-            }
-            let location = thumbs.append(&thumb.bytes)?;
-            let now = now_ms();
-
-            let changed = transaction.execute(
-                "UPDATE images SET
-                    content_hash = ?1, file_ext = ?2, file_size = ?3, width = ?4, height = ?5,
-                    format = ?6, has_alpha = ?7, phash = ?8, colors4 = ?9, colors8 = ?10,
-                    modified_at = ?11, thumb_segment = ?12, thumb_offset = ?13,
-                    thumb_length = ?14, thumb_format = 'webp', thumb_width = ?15,
-                    thumb_height = ?16, thumb_version = thumb_version + 1
-                 WHERE id = ?17",
-                params![
-                    new_hash,
-                    file_ext,
-                    file_size,
-                    width,
-                    height,
-                    output_format.name(),
-                    has_alpha,
-                    hash.as_slice(),
-                    colors4.as_slice(),
-                    colors8.as_slice(),
-                    now,
-                    location.segment,
-                    i64::try_from(location.offset)
-                        .map_err(|_| AppError::message("缩略图偏移超出数据库范围"))?,
-                    location.length,
-                    thumb.width,
-                    thumb.height,
-                    row.id,
-                ],
+            let operation_id = draft.id();
+            let snapshot = commit_prepared(
+                transaction,
+                root,
+                thumbs,
+                &mut prepared,
+                draft.journal(),
+                Some(StageOptions {
+                    operation_id,
+                    create_dir: true,
+                }),
             )?;
-            if changed == 0 {
-                return Err(AppError::message("图片不存在或已被删除"));
-            }
-            // 内容已变，旧的 embedding/pose 不再有效。
-            transaction.execute("DELETE FROM feature_blobs WHERE image_id = ?1", [row.id])?;
-            crate::library::import::ensure_thumb_segment(transaction, location.segment, now)?;
-            if let Ok(size) = thumbs.segment_size_bytes(location.segment) {
-                crate::library::import::update_thumb_segment_size(
-                    transaction,
-                    location.segment,
-                    size,
-                )?;
-            }
-            draft.json(&EditSnapshot {
-                image_id: row.id,
-                folder_path: row.folder_path.clone(),
-                content_hash: row.content_hash.clone(),
-                file_ext: row.file_ext.clone(),
-                file_size: row.file_size,
-                width: row.width,
-                height: row.height,
-                format: row.format.clone(),
-                has_alpha: row.has_alpha,
-                phash: row.phash.clone(),
-                colors4: row.colors4.clone(),
-                colors8: row.colors8.clone(),
-                modified_at: row.modified_at,
-                new_hash: new_hash.clone(),
-                new_file_ext: file_ext.to_owned(),
-            })?;
+            draft.json(&snapshot)?;
             draft.affected(1);
-            // 指针提交前落盘，避免掉电后这张图的缩略图指向段尾之外。
-            if let Err(error) = thumbs.sync() {
-                log::warn!("缩略图段落盘失败：{error}");
-            }
-            Ok(())
+            Ok(EditResult {
+                image_id: prepared.row.id,
+                content_hash: prepared.new_hash.clone(),
+                file_ext: prepared.file_ext.clone(),
+                file_size: prepared.file_size,
+                width: prepared.width,
+                height: prepared.height,
+                format: prepared.format.clone(),
+                has_alpha: prepared.has_alpha,
+                thumb_version: prepared.row.thumb_version + 1,
+                changed: true,
+                old_file_removed: false,
+            })
         },
-    );
-
-    commit?;
-    temp.disarm();
+    )?;
 
     // 旧哈希已不再被任何行引用；删除失败不影响保存结果，留给后续维护清理。
-    let still_referenced: bool = database.with_reader(|connection| {
-        Ok(connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM images WHERE content_hash = ?1)",
-            [&row.content_hash],
-            |row| row.get(0),
-        )?)
-    })?;
-    let old_file_removed = if !still_referenced {
-        match metadata::remove_content_file(root, &source) {
+    result.old_file_removed = remove_old_original(database, root, &row, &source);
+
+    Ok(result)
+}
+
+/// 提交后清理旧原图与旧预览；单图保存与批量编辑共用。
+///
+/// 旧哈希仍被别的行引用时保留文件；引用查询失败按“仍被引用”处理，宁可留下文件也不误删。
+/// 返回是否真的删掉了旧原图。
+pub(crate) fn remove_old_original(
+    database: &LibraryDb,
+    root: &Path,
+    row: &ContentRow,
+    source: &Path,
+) -> bool {
+    let still_referenced = database
+        .with_reader(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM images WHERE content_hash = ?1)",
+                [&row.content_hash],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .unwrap_or(true);
+    let removed = if still_referenced {
+        false
+    } else {
+        match metadata::remove_content_file(root, source) {
             Ok(()) => true,
             Err(error) => {
                 log::warn!(
@@ -321,24 +446,13 @@ pub fn save(
                 false
             }
         }
-    } else {
-        false
     };
-    let _ = std::fs::remove_file(viewer::preview_path(&paths, row.id, &row.content_hash));
-
-    Ok(EditResult {
-        image_id: row.id,
-        content_hash: new_hash,
-        file_ext,
-        file_size,
-        width,
-        height,
-        format: output_format.name().to_owned(),
-        has_alpha,
-        thumb_version: row.thumb_version + 1,
-        changed: true,
-        old_file_removed,
-    })
+    let _ = std::fs::remove_file(viewer::preview_path(
+        &LibraryPaths::new(root),
+        row.id,
+        &row.content_hash,
+    ));
+    removed
 }
 
 /// 保存结果体积预估：在内存里编码一次并丢弃，只返回字节数。

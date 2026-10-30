@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { EditableSource, GeometryState } from "./contracts/edit.ts";
 import {
   fitZoom,
   fitZoomForSize,
@@ -10,29 +11,16 @@ import {
   rescaleZoom,
   resizeForNewBase,
   rotateGeometry,
-  type GeometryState,
-} from "./model.ts";
-import type { ViewerSource } from "./types.ts";
+} from "./editGeometry.ts";
 
-function source(overrides: Partial<ViewerSource> = {}): ViewerSource {
+function source(overrides: Partial<EditableSource> = {}): EditableSource {
   return {
-    imageId: 1,
-    contentHash: "hash",
-    fileExt: "png",
     format: "png",
-    fileSize: 1000,
-    thumbVersion: 1,
     hasAlpha: false,
     width: 600,
     height: 400,
     displayWidth: 600,
     displayHeight: 400,
-    preview: false,
-    downsampled: false,
-    editable: true,
-    deleted: false,
-    maxEditPixels: 50_000_000,
-    url: "",
     ...overrides,
   };
 }
@@ -107,7 +95,7 @@ test("quality change counts as a pixel change only for lossy formats", () => {
   const quality = withCrop(null, { quality: 60 });
   assert.equal(hasPixelChanges(image, quality), false);
 
-  const jpeg = source({ format: "jpeg", fileExt: "jpg" });
+  const jpeg = source({ format: "jpeg" });
   const jpegBase = initialGeometry(jpeg);
   assert.equal(hasPixelChanges(jpeg, { ...jpegBase, quality: 60 }), true);
   assert.equal(hasPixelChanges(jpeg, jpegBase), false);

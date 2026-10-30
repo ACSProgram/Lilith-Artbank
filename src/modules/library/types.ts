@@ -203,6 +203,7 @@ export interface DeleteReport {
 export type HistoryKind =
   | "import"
   | "edit"
+  | "batchEdit"
   | "move"
   | "trash"
   | "restore"

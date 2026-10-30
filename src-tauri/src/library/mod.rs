@@ -6,6 +6,7 @@ pub mod collections;
 pub mod content;
 pub mod db;
 pub mod edit;
+pub mod edit_batch;
 pub mod folder_tree;
 pub mod folders;
 pub mod fs_journal;

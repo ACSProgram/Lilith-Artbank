@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FolderInput, Layers, Star, Tags } from "lucide-react";
+import { Crop, FolderInput, Layers, Star, Tags } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Spinner } from "../../shared/components/Spinner";
@@ -22,6 +22,7 @@ export interface BatchInspectorProps {
   onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
+  onOpenBatchEdit: () => void;
   onTrash: () => void;
   onRestore: () => void;
   onDelete: () => void;
@@ -37,6 +38,7 @@ export function BatchInspector({
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
+  onOpenBatchEdit,
   onTrash,
   onRestore,
   onDelete,
@@ -222,6 +224,18 @@ export function BatchInspector({
       <div className="batch-summary">
         批量操作会作用于全部 {count.toLocaleString()} 张已选图片。
       </div>
+
+      {!inTemp && !inTrash ? (
+        <section className="inspector-section">
+          <h4>
+            <Crop size={12} /> 像素编辑
+          </h4>
+          <Button size="sm" variant="secondary" disabled={busy} onClick={onOpenBatchEdit}>
+            旋转、翻转或裁剪
+          </Button>
+          <span className="field-hint">整批使用同一套处理；输出会重新编码。</span>
+        </section>
+      ) : null}
 
       <section className="inspector-section">
         <h4>

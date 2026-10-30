@@ -16,12 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::error::{AppError, AppResult},
-    library::{db::LibraryDb, fs_journal::FileJournal, paths::LibraryPaths, service::now_ms},
+    library::{
+        content, db::LibraryDb, fs_journal::FileJournal, paths::LibraryPaths, service::now_ms,
+    },
 };
 
 mod chunks;
 mod replay;
 mod undo {
+    pub(super) mod batch_edit;
     pub(super) mod collections;
     pub(super) mod edit;
     pub(super) mod folders;
@@ -49,6 +52,8 @@ mod tests;
 pub enum HistoryKind {
     Import,
     Edit,
+    /// 一次批量编辑整批一条记录；每张一个快照，撤销/重做逐张恢复。
+    BatchEdit,
     Move,
     Trash,
     Restore,
@@ -94,6 +99,7 @@ impl HistoryKind {
         match self {
             Self::Import => "import",
             Self::Edit => "edit",
+            Self::BatchEdit => "batchEdit",
             Self::Move => "move",
             Self::Trash => "trash",
             Self::Restore => "restore",
@@ -133,6 +139,7 @@ impl HistoryKind {
         let kind = match value {
             "import" => Self::Import,
             "edit" => Self::Edit,
+            "batchEdit" => Self::BatchEdit,
             "move" => Self::Move,
             "trash" => Self::Trash,
             "restore" => Self::Restore,
@@ -424,6 +431,14 @@ pub struct EditSnapshot {
     pub new_file_ext: String,
 }
 
+/// 批量编辑的逆数据：元数据 + 每张一个内容快照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum BatchEditRecord {
+    Meta { reversible: bool },
+    Snapshot { snapshot: Box<EditSnapshot> },
+}
+
 /// 导入合并项的快照：撤销时恢复评分、修改时间与标签关系。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,6 +489,10 @@ pub enum RedoRecord {
     },
     EditState {
         state: EditRedoState,
+    },
+    /// 批量编辑撤销时逐张记下当前状态；重做按 image_id 匹配。
+    EditStates {
+        items: Vec<EditRedoState>,
     },
     ImportImages {
         items: Vec<ImportRedoImage>,
@@ -576,6 +595,27 @@ pub struct EditRedoState {
     pub colors4: Vec<u8>,
     pub colors8: Vec<u8>,
     pub modified_at: i64,
+}
+
+impl EditRedoState {
+    /// 从当前行捕获重做状态；单图与批量撤销共用。
+    pub(crate) fn from_row(row: &content::ContentRow) -> Self {
+        Self {
+            image_id: row.id,
+            folder_path: row.folder_path.clone(),
+            content_hash: row.content_hash.clone(),
+            file_ext: row.file_ext.clone(),
+            file_size: row.file_size,
+            width: row.width,
+            height: row.height,
+            format: row.format.clone(),
+            has_alpha: row.has_alpha,
+            phash: row.phash.clone(),
+            colors4: row.colors4.clone(),
+            colors8: row.colors8.clone(),
+            modified_at: row.modified_at,
+        }
+    }
 }
 
 /// 导入撤销时删除的完整行；重做按原 id 插回。
@@ -839,6 +879,30 @@ pub fn write_with_id_mode<T>(
         let operation_id = draft.id;
         transaction.commit()?;
         Ok((value, Some(operation_id)))
+    });
+    if outcome.is_ok() {
+        journal.disarm();
+    }
+    outcome
+}
+
+/// 长任务的一次内容写事务：`first_write` 时清掉重做分支，成功提交后保留文件动作。
+///
+/// 批量编辑每张图一个事务，共用同一个 `operation_id`；不要整批持有一个写事务。
+pub fn write_live<T>(
+    database: &LibraryDb,
+    first_write: bool,
+    work: impl FnOnce(&Transaction<'_>, &mut FileJournal) -> AppResult<T>,
+) -> AppResult<T> {
+    let mut journal = FileJournal::armed();
+    let outcome = database.with_writer(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if first_write {
+            discard_redo_branch(&transaction)?;
+        }
+        let value = work(&transaction, &mut journal)?;
+        transaction.commit()?;
+        Ok(value)
     });
     if outcome.is_ok() {
         journal.disarm();

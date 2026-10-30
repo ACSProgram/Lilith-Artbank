@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use rusqlite::{TransactionBehavior, params};
 
@@ -19,15 +19,34 @@ use super::super::{
     undo_dir,
 };
 
-/// 编辑撤销：用暂存旧原图恢复内容列与缩略图；当前内容已经不是本次编辑结果时拒绝猜测。
-/// 新原图不删除，移进暂存目录留给重做。
+/// 单图编辑撤销：整条记录只有一个快照。
 pub(crate) fn undo_edit(
     database: &LibraryDb,
     root: &Path,
     thumbs: &ThumbPack,
     operation_id: i64,
 ) -> AppResult<()> {
-    let snapshot: EditSnapshot = database.with_reader(|connection| {
+    let snapshot = load_snapshot(database, operation_id)?;
+    restore_old(database, root, thumbs, operation_id, &snapshot)
+}
+
+/// 单图编辑重做：撤销时记下的重做状态就是目标状态（旧记录 `EditState`、新记录 `EditStates`）。
+pub(crate) fn redo_edit(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    operation_id: i64,
+) -> AppResult<()> {
+    let snapshot = load_snapshot(database, operation_id)?;
+    let state = load_redo_states(database, operation_id)?
+        .remove(&snapshot.image_id)
+        .ok_or_else(|| AppError::message("这条记录缺少重做数据"))?;
+    restore_new(database, root, thumbs, operation_id, &snapshot, &state)
+}
+
+/// 单图记录只有一个快照 chunk；批量记录用 `BatchEditRecord`，由调用方自己解析。
+pub(super) fn load_snapshot(database: &LibraryDb, operation_id: i64) -> AppResult<EditSnapshot> {
+    database.with_reader(|connection| {
         let mut snapshot = None;
         for chunk in load_chunks(connection, operation_id)? {
             if chunk.format == ChunkFormat::Json {
@@ -35,8 +54,42 @@ pub(crate) fn undo_edit(
             }
         }
         snapshot.ok_or_else(|| AppError::message("编辑记录缺少内容快照"))
-    })?;
+    })
+}
 
+/// 重做数据按 `image_id` 归并：单图写 `EditState`，批量写 `EditStates`。
+pub(super) fn load_redo_states(
+    database: &LibraryDb,
+    operation_id: i64,
+) -> AppResult<HashMap<i64, EditRedoState>> {
+    database.with_reader(|connection| {
+        let mut states = HashMap::new();
+        for record in load_redo_records(connection, operation_id)? {
+            match record {
+                RedoRecord::EditState { state } => {
+                    states.insert(state.image_id, state);
+                }
+                RedoRecord::EditStates { items } => {
+                    for item in items {
+                        states.insert(item.image_id, item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(states)
+    })
+}
+
+/// 撤销一张：用暂存旧原图恢复内容列与缩略图；当前内容已经不是本次编辑结果时拒绝猜测。
+/// 新原图不删除，移进暂存目录留给重做。单图撤销与批量撤销共用。
+pub(super) fn restore_old(
+    database: &LibraryDb,
+    root: &Path,
+    thumbs: &ThumbPack,
+    operation_id: i64,
+    snapshot: &EditSnapshot,
+) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
     let staged_dir = undo_dir(root, operation_id);
     let old_staged = staged_dir.join(format!("{}.{}", snapshot.content_hash, snapshot.file_ext));
@@ -79,11 +132,17 @@ pub(crate) fn undo_edit(
         return Ok(());
     }
     if current.content_hash != snapshot.new_hash {
-        return Err(AppError::message("图片内容已经变化，无法撤销这次编辑"));
+        return Err(AppError::message(format!(
+            "图片 #{} 的内容已经变化，无法撤销这次编辑",
+            snapshot.image_id
+        )));
     }
 
     if !stage_file(&old_content, &old_staged)? {
-        return Err(AppError::message("编辑前的原图暂存已丢失，无法撤销"));
+        return Err(AppError::message(format!(
+            "图片 #{} 编辑前的原图暂存已丢失，无法撤销",
+            snapshot.image_id
+        )));
     }
     let decoded = decode::decode(&old_staged)?;
     let thumb = thumbnail::encode(&decoded.image)?;
@@ -121,22 +180,8 @@ pub(crate) fn undo_edit(
         append_redo(
             &transaction,
             operation_id,
-            &RedoRecord::EditState {
-                state: EditRedoState {
-                    image_id: current.id,
-                    folder_path: current.folder_path.clone(),
-                    content_hash: current.content_hash.clone(),
-                    file_ext: current.file_ext.clone(),
-                    file_size: current.file_size,
-                    width: current.width,
-                    height: current.height,
-                    format: current.format.clone(),
-                    has_alpha: current.has_alpha,
-                    phash: current.phash.clone(),
-                    colors4: current.colors4.clone(),
-                    colors8: current.colors8.clone(),
-                    modified_at: current.modified_at,
-                },
+            &RedoRecord::EditStates {
+                items: vec![EditRedoState::from_row(&current)],
             },
         )?;
         let thumb_offset = i64::try_from(location.offset)
@@ -212,31 +257,15 @@ pub(crate) fn undo_edit(
     Ok(())
 }
 
-pub(crate) fn redo_edit(
+/// 重做一张：把撤销时移走的新原图放回、恢复行与缩略图。单图重做与批量重做共用。
+pub(super) fn restore_new(
     database: &LibraryDb,
     root: &Path,
     thumbs: &ThumbPack,
     operation_id: i64,
+    snapshot: &EditSnapshot,
+    state: &EditRedoState,
 ) -> AppResult<()> {
-    let snapshot: EditSnapshot = database.with_reader(|connection| {
-        let mut snapshot = None;
-        for chunk in load_chunks(connection, operation_id)? {
-            if chunk.format == ChunkFormat::Json {
-                snapshot = Some(decode_json(&chunk.data)?);
-            }
-        }
-        snapshot.ok_or_else(|| AppError::message("编辑记录缺少内容快照"))
-    })?;
-    let state = database.with_reader(|connection| {
-        load_redo_records(connection, operation_id)?
-            .into_iter()
-            .find_map(|record| match record {
-                RedoRecord::EditState { state } => Some(state),
-                _ => None,
-            })
-            .ok_or_else(|| AppError::message("这条记录缺少重做数据"))
-    })?;
-
     let paths = LibraryPaths::new(root);
     let staged_dir = undo_dir(root, operation_id);
     let old_staged = staged_dir.join(format!("{}.{}", snapshot.content_hash, snapshot.file_ext));
@@ -282,7 +311,10 @@ pub(crate) fn redo_edit(
         return Ok(());
     }
     if current.content_hash != snapshot.content_hash {
-        return Err(AppError::message("图片内容已经变化，无法重做这次编辑"));
+        return Err(AppError::message(format!(
+            "图片 #{} 的内容已经变化，无法重做这次编辑",
+            snapshot.image_id
+        )));
     }
 
     if !stage_file(&old_content, &old_staged)? {
@@ -295,7 +327,10 @@ pub(crate) fn redo_edit(
     let mut moved = false;
     if !new_content.is_file() {
         if !new_staged.is_file() {
-            return Err(AppError::message("编辑后的原图暂存已丢失，无法重做"));
+            return Err(AppError::message(format!(
+                "图片 #{} 编辑后的原图暂存已丢失，无法重做",
+                snapshot.image_id
+            )));
         }
         if let Some(parent) = new_content.parent() {
             fs::create_dir_all(parent)?;

@@ -1,5 +1,3 @@
-export type OutputFormat = "jpeg" | "png" | "webp";
-
 export interface ViewerSource {
   imageId: number;
   contentHash: string;
@@ -19,29 +17,6 @@ export interface ViewerSource {
   maxEditPixels: number;
   /** 由前端 api 层拼好；浏览器预览为 data URL。 */
   url: string;
-}
-
-export interface CropRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface ResizeSpec {
-  width: number;
-  height: number;
-}
-
-export interface SaveEditRequest {
-  imageId: number;
-  rotate: number;
-  flipHorizontal: boolean;
-  flipVertical: boolean;
-  crop: CropRect | null;
-  resize: ResizeSpec | null;
-  outputFormat: OutputFormat;
-  quality: number;
 }
 
 export interface SaveEditResult {

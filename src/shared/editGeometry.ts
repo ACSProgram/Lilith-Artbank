@@ -1,26 +1,21 @@
 import type {
   CropRect,
+  EditableSource,
+  GeometryState,
   OutputFormat,
   ResizeSpec,
   SaveEditRequest,
-  ViewerSource,
-} from "./types";
+  SourceGeometry,
+} from "./contracts/edit";
 
 export const DEFAULT_QUALITY = 90;
+export const WEBP_DEFAULT_QUALITY = 85;
 export const MAX_EDIT_PIXELS = 50_000_000;
 export const MAX_EDIT_DIMENSION = 65_535;
 
-export interface GeometryState {
-  /** 顺时针 90° 的次数，0-3。 */
-  rotate: number;
-  flipHorizontal: boolean;
-  flipVertical: boolean;
-  /** 显示坐标（旋转/翻转后、缩放前）。 */
-  crop: CropRect | null;
-  /** 原图像素尺寸；与裁剪后的原始尺寸相同时按未设置处理。 */
-  resize: ResizeSpec | null;
-  outputFormat: OutputFormat;
-  quality: number;
+/** 批量编辑里 `quality: null` 的落点；PNG 的质量参数不参与编码。 */
+export function defaultQualityFor(format: OutputFormat): number {
+  return format === "webp" ? WEBP_DEFAULT_QUALITY : DEFAULT_QUALITY;
 }
 
 export function transformedSize(width: number, height: number, rotate: number) {
@@ -34,7 +29,7 @@ export function defaultOutputFormat(format: string, hasAlpha: boolean): OutputFo
   return hasAlpha ? "png" : "jpeg";
 }
 
-export function initialGeometry(source: ViewerSource): GeometryState {
+export function initialGeometry(source: EditableSource): GeometryState {
   return {
     rotate: 0,
     flipHorizontal: false,
@@ -82,7 +77,7 @@ function rotateCropOnce(crop: CropRect, bounds: { width: number; height: number 
 /** 旋转整图时把裁剪矩形一起转过去，而不是清空。 */
 export function rotateGeometry(
   state: GeometryState,
-  source: ViewerSource,
+  source: SourceGeometry,
   delta: number,
 ): GeometryState {
   const steps = ((delta % 4) + 4) % 4;
@@ -113,7 +108,7 @@ export function rotateGeometry(
  */
 export function flipGeometry(
   state: GeometryState,
-  source: ViewerSource,
+  source: SourceGeometry,
   axis: "horizontal" | "vertical",
 ): GeometryState {
   const bounds = transformedSize(source.displayWidth, source.displayHeight, state.rotate);
@@ -173,7 +168,7 @@ export function clampResize(resize: ResizeSpec): ResizeSpec {
 /** 发送给 Rust 的编辑参数；保存与体积预估共用同一套换算。 */
 export function buildEditRequest(
   imageId: number,
-  source: ViewerSource,
+  source: SourceGeometry,
   geometry: GeometryState,
 ): SaveEditRequest {
   const base = baseOutputSize(source, geometry);
@@ -193,7 +188,7 @@ export function buildEditRequest(
 export function cropToOriginal(
   crop: CropRect,
   rotate: number,
-  source: ViewerSource,
+  source: SourceGeometry,
 ): CropRect {
   const even = rotate % 2 === 0;
   const scaleX = even
@@ -211,7 +206,7 @@ export function cropToOriginal(
   return { x, y, width, height };
 }
 
-export function baseOutputSize(source: ViewerSource, geometry: GeometryState) {
+export function baseOutputSize(source: SourceGeometry, geometry: GeometryState) {
   if (geometry.crop) {
     const crop = cropToOriginal(geometry.crop, geometry.rotate, source);
     return { width: crop.width, height: crop.height };
@@ -223,7 +218,7 @@ function resizeIsEffective(resize: ResizeSpec | null, base: { width: number; hei
   return resize != null && (resize.width !== base.width || resize.height !== base.height);
 }
 
-export function outputSize(source: ViewerSource, geometry: GeometryState) {
+export function outputSize(source: SourceGeometry, geometry: GeometryState) {
   const base = baseOutputSize(source, geometry);
   return resizeIsEffective(geometry.resize, base) ? geometry.resize! : base;
 }
@@ -236,7 +231,7 @@ function sourceOutputFormat(format: string): OutputFormat | null {
 }
 
 /** 仅几何/尺寸修改，不含输出格式；用于“未保存”提示。 */
-export function hasGeometryEdits(source: ViewerSource, geometry: GeometryState): boolean {
+export function hasGeometryEdits(source: SourceGeometry, geometry: GeometryState): boolean {
   const base = baseOutputSize(source, geometry);
   return (
     geometry.rotate !== 0 ||
@@ -252,7 +247,7 @@ export function hasLossyQualityChange(geometry: GeometryState): boolean {
   return geometry.outputFormat !== "png" && geometry.quality !== DEFAULT_QUALITY;
 }
 
-export function hasPixelChanges(source: ViewerSource, geometry: GeometryState): boolean {
+export function hasPixelChanges(source: EditableSource, geometry: GeometryState): boolean {
   return (
     hasGeometryEdits(source, geometry) ||
     geometry.outputFormat !== sourceOutputFormat(source.format) ||
@@ -292,7 +287,7 @@ export function fitZoomForSize(
 
 /** 占位阶段直接传会话项的宽高，不依赖 `ViewerSource`。 */
 export function fitZoom(
-  source: ViewerSource,
+  source: SourceGeometry,
   rotate: number,
   viewportWidth: number,
   viewportHeight: number,
@@ -308,7 +303,7 @@ export function fitZoom(
 
 /** GIF 走 Rust 静态预览时，动画不可用。 */
 export function gifStaticPreview(
-  source: Pick<ViewerSource, "format" | "preview"> | null | undefined,
+  source: { format: string; preview?: boolean } | null | undefined,
 ): boolean {
   return source?.format === "gif" && source.preview === true;
 }
@@ -385,7 +380,7 @@ export function clamp(value: number, min: number, max: number): number {
 }
 
 // 体积格式化与图库共用一份实现；`node --test` 直接跑 .ts 时需要显式扩展名。
-export { formatBytes } from "../../shared/format.ts";
+export { formatBytes } from "./format.ts";
 
 export function formatDimensions(width: number, height: number): string {
   return `${width.toLocaleString()} × ${height.toLocaleString()}`;

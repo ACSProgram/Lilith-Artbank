@@ -1,4 +1,5 @@
 import type { ImportTarget } from "../modules/import/types";
+import type { BatchEditOptions } from "../shared/contracts/edit";
 import type { TaskScope } from "../shared/scope";
 
 export type { TaskScope };
@@ -23,7 +24,8 @@ export type TaskKind =
   | "checkLibrary"
   | "export"
   | "orphanMove"
-  | "packCompact";
+  | "packCompact"
+  | "edit";
 
 export type TaskPhase =
   | "queued"
@@ -46,7 +48,8 @@ export type BatchTaskKind =
   | "aiDescription"
   | "checkFast"
   | "checkFull"
-  | "export";
+  | "export"
+  | "edit";
 export type TaskRequestKind =
   | BatchTaskKind
   | "similarityGroups"
@@ -231,6 +234,8 @@ export interface BatchTaskRequest {
   /** 导出：目标目录与是否附带 `manifest.csv`。 */
   targetDir?: string | null;
   includeManifest?: boolean;
+  /** 批量编辑：整批共用一套 recipe。 */
+  edit?: BatchEditOptions | null;
   conflict: ConflictPolicy;
 }
 
@@ -244,12 +249,22 @@ export interface BatchTaskPreviewRequest {
   scope: TaskScope;
   overwrite: boolean;
   capability: BatchTaskPreviewCapability | null;
+  /** 只有批量编辑需要；预检按它计算跳过原因、体积与统一画布可用性。 */
+  edit?: BatchEditOptions | null;
 }
 
 export interface BatchTaskPreview {
   total: number;
   /** 缺少模型维度或离线时为空。 */
   willProcess: number | null;
+  /** 批量编辑：按原因细分的跳过数。 */
+  skipBreakdown?: TaskSkipBucket[];
+  /** 批量编辑：预计新增文件的字节数。 */
+  estimatedOutputBytes?: number;
+  /** 批量编辑：库所在磁盘的可用字节数；不可用时为空。 */
+  availableBytes?: number | null;
+  /** 批量编辑：翻转/旋转后宽度与高度是否全部一致，决定能否用“同一像素矩形”。 */
+  uniformDimensions?: boolean;
 }
 
 export type TaskStartResult =

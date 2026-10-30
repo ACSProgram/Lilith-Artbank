@@ -42,6 +42,11 @@ pub fn flush_directory(path: &Path) -> AppResult<()> {
     }
 }
 
+/// 磁盘可用字节；只用于批量编辑前的空间预检，取不到时返回 `None` 而不是猜。
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    imp::available(path)
+}
+
 #[derive(Debug)]
 enum FlushError {
     /// 当前系统/文件系统不提供目录 flush；rename 的 write-through 仍然有效。
@@ -57,8 +62,8 @@ mod imp {
         Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
             CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-            MoveFileExW, OPEN_EXISTING,
+            FILE_SHARE_WRITE, FlushFileBuffers, GetDiskFreeSpaceExW, MOVEFILE_REPLACE_EXISTING,
+            MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
         },
     };
 
@@ -117,6 +122,21 @@ mod imp {
         }
     }
 
+    pub(super) fn available(path: &Path) -> Option<u64> {
+        let path = wide(path);
+        let mut free = 0_u64;
+        // SAFETY: 路径以 NUL 结尾；三个输出指针都指向本栈上的有效 u64。
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                path.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+
     fn classify(error: io::Error) -> FlushError {
         match error.raw_os_error() {
             Some(code) if UNSUPPORTED_CODES.contains(&code) => {
@@ -142,6 +162,10 @@ mod imp {
         directory
             .sync_all()
             .map_err(|error| FlushError::Failed(error.to_string()))
+    }
+
+    pub(super) fn available(_path: &Path) -> Option<u64> {
+        None
     }
 }
 

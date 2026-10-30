@@ -1,6 +1,6 @@
 # 查看器与几何编辑
 
-查看器负责“看”和“轻度几何编辑”。编辑保存复用图库统一的“新内容发布”路径（新内容哈希 → 新文件 → 事务更新行 → 旧文件清理），不覆盖原文件。
+查看器负责“看”和“轻度几何编辑”。编辑保存复用图库统一的“新内容发布”路径（新内容哈希 → 新文件 → 事务更新行 → 旧文件清理），不覆盖原文件。批量编辑复用同一套几何规则与内容发布路径，但入口在批量侧栏，不经过查看器会话。
 
 ## 当前实现
 
@@ -31,7 +31,7 @@
 
 - 旋转 90°（0-3 次顺时针）、水平/垂直翻转、裁剪、调尺寸；全部只在保存时落到像素。
 - 顺序固定为：**翻转 → 顺时针旋转 → 裁剪 → 缩放**。前端 CSS 变换使用相同顺序，裁剪选区在旋转/翻转后的显示坐标上绘制。
-- 几何操作可组合：旋转会把裁剪矩形一起转过去（`(x, y, w, h) → (H - y - h, x, h, w)`），翻转按显示空间镜像裁剪矩形，尺寸按新基底等比重算，不再清空前面的结果。翻转按显示空间语义：旋转奇数次时，界面上的“水平翻转”对应原图的垂直翻转；后端的翻转先于旋转，因此换算在 `model.ts` 里完成（`rotateGeometry` / `flipGeometry` / `resizeForNewBase`，均有单测）。
+- 几何操作可组合：旋转会把裁剪矩形一起转过去（`(x, y, w, h) → (H - y - h, x, h, w)`），翻转按显示空间镜像裁剪矩形，尺寸按新基底等比重算，不再清空前面的结果。翻转按显示空间语义：旋转奇数次时，界面上的“水平翻转”对应原图的垂直翻转；后端的翻转先于旋转，因此换算在 `src/shared/editGeometry.ts` 里完成（`rotateGeometry` / `flipGeometry` / `resizeForNewBase`，均有单测）。
 - 裁剪保存时按显示坐标 → 原图坐标换算；旋转为奇数时宽高比例互换，降采样预览同样按显示/原图比例换算。
 - 调尺寸：锁定纵横比、百分比预设、直接输入宽高；输出上限 5000 万像素、单边 65535。
 - 输出：JPEG / PNG / WebP；JPEG、WebP 质量 1-100，PNG 无损；JPEG 透明区域合成白底。默认沿用 JPEG/PNG/WebP；GIF/TIFF/TGA/BMP 按是否有 alpha 默认转 PNG/JPEG，转换本身算一次修改。GIF 编辑只保留首帧。
@@ -39,6 +39,20 @@
 - 工具面板实时显示原图、裁剪后、输出尺寸；“未保存”标记与保存按钮都看同一份 `hasChanges`：几何变化、格式变化、以及**有损格式把质量调到非默认值**都算修改（后端 `has_changes` 规则一致）。
 - 撤销栈：会话内最多 50 步，记录 `GeometryState` 快照与操作名（“旋转 90°”“裁剪”“调整尺寸”“输出 JPEG q60”），工具栏底部两个按钮显示“撤销：裁剪”这类可读标签。同一滑块的连续调整在 600ms 内合并成一步；切换图片与保存成功后清空。保存本身不进入这个会话内撤销栈，但会写入图库操作记录，可从工具栏“记录”撤销或重做（见 [图库与元数据](library.md#操作记录与撤销)）。
 - 体积预估：输出区在几何/格式/质量变化后防抖 500ms 调 `estimate_edit_size`，返回字节数与是否精确；大图（>2000 万像素）按 1/4 边长编码后按面积比外推并标“约”。同一时间只跑一次编码，新请求只保留最新一份，过期结果直接丢弃。有损格式同时提示“重新编码会损失画质、原始 EXIF 不保留”。
+
+### 批量编辑
+
+多选图片后，从详情侧栏的“像素编辑”打开 `src/app/BatchEditDialog.tsx`。整批使用一套 recipe，只接受当前选择，不进入查看器，也不接受当前视图、文件夹或全库范围；临时区与回收站不显示这个入口。面板按选中顺序均匀取最多 9 张作预览，用缩略图加 CSS 变换模拟效果，不调用后端解码。
+
+- 画布：参考图决定初始 W×H（随旋转换算），可改成任意目标尺寸；`cover` 等比填满后居中裁掉超出部分，`contain` 完整放入后补底。未画裁剪框时输出 = 画布 W×H，画框后输出 = 裁剪框尺寸。
+- 同一像素矩形：只有所选图片在翻转/旋转后宽高完全一致时可用（前端先本地判断，预检再用 `uniformDimensions` 复核）；裁剪框按原图像素坐标应用到每张图，不缩放、不重采样，输出 = 裁剪框尺寸，画布只用于预览。尺寸不一致时预检返回“可处理 0 张”，面板退回统一画布。
+- 操作顺序固定为**翻转 → 顺时针旋转 → 画布适配 → 矩形裁剪 → 编码**；画布适配是批量新增的一步。目标尺寸、裁剪框与输出尺寸共用单图的 5000 万像素 / 单边 65535 校验。
+- 补底：输出 PNG/WebP 且原图有 alpha 用透明；输出 JPEG 或原图无 alpha 用白色。JPEG 输出统一去透明。
+- 输出：保持原格式（默认）/ JPEG / PNG / WebP。保持原格式时，JPEG/PNG/WebP 各自保持，TIFF/TGA/BMP 按单图规则落到 PNG 或 JPEG（GIF 在跳过清单里）。`quality: null` 表示按每张图的输出格式取默认（JPEG 90、WebP 85、PNG 无损），只有手动拖动后才写具体值；保持原格式的混合批次不会把 WebP 按 JPEG 的 90 重编码。
+- 跳过并报告：回收站、临时区、GIF、缺原图、解码后超过 5000 万像素、输出与当前内容相同。单张失败继续并列入任务失败清单：编码失败、输出哈希与库内另一张图片相同、文件夹在任务期间被移动且复核失败、路径无法解析。
+- 确认页显示总张数、可处理数、输出尺寸/格式/质量、预计新增字节与磁盘可用量、跳过原因；预计输出超过可用空间时直接拒绝开始。会清空 embedding/pose、重新生成缩略图/pHash/主色；标签、评分、描述、集合与图片 id 不变。文案明确重新编码有一次性画质损失，当前路径不保留原 EXIF/ICC。
+- 可撤销上限 2000 张。不超过时整批写一条 `batchEdit` 记录，每张一个内容快照；撤销按编辑顺序逆序恢复，重做按顺序恢复，任务进度按选中张数推进（跳过与失败各自计数，不重复算完成）。超过 2000 张时确认页只给“返回并缩小选择（推荐）”与“继续，本次不可撤销”；后者仍写一条 `batchEdit` 记录但 `reversible=false`，提交后删除旧原图，撤销明确返回“本次批量编辑没有保留撤销副本”。
+- 执行复用批量任务总线（`start_batch_task` 的 `kind: "edit"` 与 `preview_batch_task`）。整批占一个内容写资源、一个时间线读锁与一个 `LiveOperation`；逐张申请所在文件夹写锁并在提交后释放，逐张申请图像预算，不整批解码。取消保留已完成部分，全部跳过或全部无变化时不留下空记录；有单张失败时任务落「部分失败」。
 
 ### 空间优化与编辑的边界
 
@@ -76,11 +90,13 @@
 
 `ViewerSource`：原图/显示尺寸、格式、大小、内容哈希、`preview`、`downsampled`、`editable`、`deleted`、`maxEditPixels`。`EditRequest`：`imageId`、`rotate`（0-3）、`flipHorizontal`、`flipVertical`、`crop`（原图坐标）、`resize`、`outputFormat`、`quality`。`EditResult`：新哈希/尺寸/格式/大小/`thumbVersion`、`changed`、`oldFileRemoved`。`EditSizeEstimate`：`{ fileSize, exact }`——只回答“大概多大”，尺寸由前端自己按几何状态算。
 
-保存与体积预估共用同一份前置校验（`library/edit.rs` 的 `resolve`：几何参数、回收站、像素上限、输出格式、质量范围），所以两者对“能不能保存”的判断不会分叉。
+保存与体积预估共用同一份前置校验（`library/edit.rs` 的 `resolve`：几何参数、回收站、像素上限、输出格式、质量范围），所以两者对“能不能保存”的判断不会分叉。批量编辑没有新增命令：前端通过 `start_batch_task`（`kind: "edit"`、`edit: BatchEditOptions`）与 `preview_batch_task` 复用批量任务入口，任务类型为 `edit`，显示“批量编辑”。
 
 前端结构：
 
-- `src/modules/viewer/`：types、api、model、ImageViewer（编排）、ViewerStage（舞台渲染）、useViewerSource（源图加载/渐进层/重试）、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）、model.test。
+- `src/modules/viewer/`：types、api、ImageViewer（编排）、ViewerStage（舞台渲染）、useViewerSource（源图加载/渐进层/重试）、ViewerTools、Filmstrip、PoseOverlay、useEditHistory（撤销栈）、useEditEstimate（体积预估）。
+- `src/shared/contracts/edit.ts`：输出格式、裁剪/尺寸、几何状态与批量 recipe 的纯数据类型；`src/shared/editGeometry.ts` 放查看器与批量面板共用的几何换算与单测，不再经 `viewer/types` 转出。
+- `src/app/BatchEditDialog.tsx`：批量编辑面板与预览；入口按钮在 `src/modules/library/BatchInspector.tsx`，由 `LibraryWorkspace` 挂载对话框。
 - `src/app/ViewerHost.tsx`：查看器与详情侧栏的编排层；全屏状态与胶片带开关也从这里接进来。详情侧栏的写入经 `session.refresh(change)` 交给图库，生成姿势后同样发特征变化；外部变化后按活动图复核存在与回收站状态，并按数据源列表复核它是否还在结果里，离开时关闭。两个前端模块不互相导入。
 - `src/shared/viewerSession.ts`：图库向查看器提供已加载条目、翻页、选择同步、保存后就地更新行（`ViewerSessionUpdate`）、`refresh(change)`、`expectTrashed`、标签筛选与元数据操作的桥接契约。
 - `src/shared/tagFilter.ts`：标签筛选的范围与动作类型，图库与查看器共用的最小契约。

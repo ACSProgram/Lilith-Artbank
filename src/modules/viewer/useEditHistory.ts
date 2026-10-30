@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { sameGeometry, type GeometryState } from "./model";
+import { sameGeometry } from "../../shared/editGeometry";
+import type { GeometryState } from "../../shared/contracts/edit";
 
 export const MAX_HISTORY_STEPS = 50;
 /** 同一滑块连续调整在此窗口内合并成一步。 */

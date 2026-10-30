@@ -105,6 +105,8 @@ interface LibraryViewProps {
   similarity?: SimilarityBrowseState;
   onOpenSimilarityGroups?: (context: BatchTaskContextInfo) => void;
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
+  /** 批量像素编辑；只接受选中集。 */
+  onOpenBatchEdit?: (imageIds: number[]) => void;
   onOpenOptimize?: (context: BatchTaskContextInfo) => void;
   /** 打开维护与检查；与批量任务共用同一份范围上下文。 */
   onOpenMaintenance?: (context: BatchTaskContextInfo) => void;
@@ -179,6 +181,7 @@ export function LibraryView({
   similarity,
   onOpenSimilarityGroups,
   onOpenBatchTasks,
+  onOpenBatchEdit,
   onOpenOptimize,
   onOpenMaintenance,
   onGenerateDescription,
@@ -2203,6 +2206,7 @@ export function LibraryView({
             onChanged={(change) => applyChange(change)}
             onAddToCollection={() => setCollectionPickerOpen(true)}
             onRemoveFromCollection={(ids) => void removeFromCurrentCollection(ids)}
+            onOpenBatchEdit={onOpenBatchEdit}
             onTrash={(ids) => void trashSelected(ids)}
             onRestore={(ids) => void restoreSelected(ids)}
             onDelete={(ids) => void deleteSelected(ids)}

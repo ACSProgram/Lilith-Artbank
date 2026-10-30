@@ -1,5 +1,6 @@
 //! 图库状态：结构体与共享访问器，领域方法按职责分在子模块。
 
+mod edit_batch;
 mod history_service;
 mod import;
 mod library_ops;

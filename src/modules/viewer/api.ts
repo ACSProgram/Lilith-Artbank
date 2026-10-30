@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { imageUrl } from "../../shared/imgUrl";
+import type { SaveEditRequest } from "../../shared/contracts/edit";
 import type {
   EditSizeEstimate,
   PoseData,
-  SaveEditRequest,
   SaveEditResult,
   ViewerFallback,
   ViewerSource,

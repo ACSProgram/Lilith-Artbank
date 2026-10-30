@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { buildEditRequest, type GeometryState } from "./model";
+import { buildEditRequest } from "../../shared/editGeometry";
+import type { GeometryState } from "../../shared/contracts/edit";
 import { viewerApi } from "./api";
 import type { EditSizeEstimate, ViewerSource } from "./types";
 

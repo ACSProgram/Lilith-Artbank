@@ -62,7 +62,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CropRect {
     pub x: u32,
@@ -76,6 +76,43 @@ pub struct CropRect {
 pub struct ResizeSpec {
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitMode {
+    Cover,
+    Contain,
+}
+
+/// 批量编辑的统一画布：先等比适配，再套裁剪框。
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasFit {
+    pub width: u32,
+    pub height: u32,
+    pub mode: FitMode,
+}
+
+impl CanvasFit {
+    pub fn validate(&self) -> AppResult<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(AppError::message("画布尺寸必须大于 0"));
+        }
+        if self.width > MAX_EDIT_DIMENSION || self.height > MAX_EDIT_DIMENSION {
+            return Err(AppError::message(format!(
+                "画布尺寸超过单边上限 {MAX_EDIT_DIMENSION}"
+            )));
+        }
+        let pixels = u64::from(self.width) * u64::from(self.height);
+        if pixels > MAX_EDIT_PIXELS {
+            return Err(AppError::message(format!(
+                "画布尺寸 {}×{} 超过编辑上限 {} 百万像素",
+                self.width,
+                self.height,
+                MAX_EDIT_PIXELS / 1_000_000
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -109,7 +146,20 @@ impl Geometry {
 
 /// 翻转 → 旋转 → 裁剪 → 缩放；与前端 CSS `rotate(deg) scaleX() scaleY()` 的顺序一致。
 pub fn apply(image: DynamicImage, geometry: &Geometry) -> AppResult<DynamicImage> {
+    apply_fitted(image, geometry, None, [0, 0, 0, 0])
+}
+
+/// 在翻转/旋转之后、裁剪之前插入统一画布；单图编辑传 `None` 保持原顺序。
+pub fn apply_fitted(
+    image: DynamicImage,
+    geometry: &Geometry,
+    fit: Option<CanvasFit>,
+    pad: [u8; 4],
+) -> AppResult<DynamicImage> {
     geometry.validate()?;
+    if let Some(fit) = fit {
+        fit.validate()?;
+    }
     let pixel_count = u64::from(image.width()) * u64::from(image.height());
     if pixel_count > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(
@@ -123,16 +173,22 @@ pub fn apply(image: DynamicImage, geometry: &Geometry) -> AppResult<DynamicImage
 
     if image.color().has_alpha() {
         let buffer = image.into_rgba8();
-        Ok(DynamicImage::ImageRgba8(transform(buffer, geometry)?))
+        Ok(DynamicImage::ImageRgba8(transform(
+            buffer, geometry, fit, pad,
+        )?))
     } else {
         let buffer = image.into_rgb8();
-        Ok(DynamicImage::ImageRgb8(transform(buffer, geometry)?))
+        Ok(DynamicImage::ImageRgb8(transform(
+            buffer, geometry, fit, pad,
+        )?))
     }
 }
 
 fn transform<P>(
     mut buffer: ImageBuffer<P, Vec<u8>>,
     geometry: &Geometry,
+    fit: Option<CanvasFit>,
+    pad: [u8; 4],
 ) -> AppResult<ImageBuffer<P, Vec<u8>>>
 where
     P: Pixel<Subpixel = u8> + 'static,
@@ -154,6 +210,10 @@ where
         buffer = rotated;
     }
 
+    if let Some(fit) = fit {
+        buffer = fit_canvas(buffer, fit, pad)?;
+    }
+
     if let Some(crop) = geometry.crop {
         validate_crop(crop, buffer.width(), buffer.height())?;
         buffer = imageops::crop_imm(&buffer, crop.x, crop.y, crop.width, crop.height).to_image();
@@ -167,6 +227,77 @@ where
     }
 
     Ok(buffer)
+}
+
+/// cover：先按画布比例居中裁掉多余部分，再缩放到画布；
+/// contain：等比缩放到完整放入画布，剩余区域补 `pad`。
+///
+/// 先裁后缩而不是先放大再裁，避免极端长宽比放大出远超 50 MP 的中间图。
+fn fit_canvas<P>(
+    buffer: ImageBuffer<P, Vec<u8>>,
+    fit: CanvasFit,
+    pad: [u8; 4],
+) -> AppResult<ImageBuffer<P, Vec<u8>>>
+where
+    P: Pixel<Subpixel = u8> + 'static,
+{
+    let (source_width, source_height) = (buffer.width(), buffer.height());
+    if source_width == 0 || source_height == 0 {
+        return Err(AppError::message("画布适配的源图尺寸为空"));
+    }
+    match fit.mode {
+        FitMode::Cover => {
+            let target_ratio = f64::from(fit.width) / f64::from(fit.height);
+            let source_ratio = f64::from(source_width) / f64::from(source_height);
+            let cropped = if source_ratio > target_ratio {
+                let width = ((f64::from(source_height) * target_ratio).round() as u32)
+                    .clamp(1, source_width);
+                let x = (source_width - width) / 2;
+                imageops::crop_imm(&buffer, x, 0, width, source_height).to_image()
+            } else {
+                let height = ((f64::from(source_width) / target_ratio).round() as u32)
+                    .clamp(1, source_height);
+                let y = (source_height - height) / 2;
+                imageops::crop_imm(&buffer, 0, y, source_width, height).to_image()
+            };
+            Ok(imageops::resize(
+                &cropped,
+                fit.width,
+                fit.height,
+                FilterType::Lanczos3,
+            ))
+        }
+        FitMode::Contain => {
+            let scale = (f64::from(fit.width) / f64::from(source_width))
+                .min(f64::from(fit.height) / f64::from(source_height));
+            let width = ((f64::from(source_width) * scale).round() as u32).clamp(1, fit.width);
+            let height = ((f64::from(source_height) * scale).round() as u32).clamp(1, fit.height);
+            let resized = if (width, height) == (source_width, source_height) {
+                buffer
+            } else {
+                imageops::resize(&buffer, width, height, FilterType::Lanczos3)
+            };
+            if (width, height) == (fit.width, fit.height) {
+                return Ok(resized);
+            }
+            let pixel = *P::from_slice(&pad[..P::CHANNEL_COUNT as usize]);
+            let mut canvas = ImageBuffer::from_pixel(fit.width, fit.height, pixel);
+            let x = (fit.width - width) / 2;
+            let y = (fit.height - height) / 2;
+            imageops::replace(&mut canvas, &resized, i64::from(x), i64::from(y));
+            Ok(canvas)
+        }
+    }
+}
+
+/// 批量编辑按画布/原图尺寸复用同一套裁剪校验。
+pub fn validate_crop_public(crop: CropRect, width: u32, height: u32) -> AppResult<()> {
+    validate_crop(crop, width, height)
+}
+
+/// 批量编辑没有单独的目标尺寸，但输出尺寸仍要过 50MP / 单边上限。
+pub fn validate_resize_public(width: u32, height: u32) -> AppResult<()> {
+    validate_resize(ResizeSpec { width, height })
 }
 
 fn validate_crop(crop: CropRect, width: u32, height: u32) -> AppResult<()> {
@@ -211,6 +342,14 @@ fn validate_resize(resize: ResizeSpec) -> AppResult<()> {
     Ok(())
 }
 
+/// 批量编辑里 `quality: null` 的落点：JPEG 90、WebP 85、PNG 无损。
+pub fn default_quality(output: OutputFormat) -> u8 {
+    match output {
+        OutputFormat::WebP => 85,
+        OutputFormat::Jpeg | OutputFormat::Png => DEFAULT_QUALITY,
+    }
+}
+
 /// 是否真的需要写新内容；有损格式调整到非默认质量也算一次修改。
 pub fn has_changes(
     geometry: &Geometry,
@@ -218,9 +357,21 @@ pub fn has_changes(
     output: OutputFormat,
     quality: u8,
 ) -> bool {
+    has_changes_with_default(geometry, original_format, output, quality, DEFAULT_QUALITY)
+}
+
+/// 单图与批量共用：`fallback_quality` 是“没传质量”时该格式的落点，
+/// 有损格式调到非默认质量也算一次修改。
+pub fn has_changes_with_default(
+    geometry: &Geometry,
+    original_format: &str,
+    output: OutputFormat,
+    quality: u8,
+    fallback_quality: u8,
+) -> bool {
     !geometry.is_empty()
         || source_format(original_format) != Some(output)
-        || (output != OutputFormat::Png && quality != DEFAULT_QUALITY)
+        || (output != OutputFormat::Png && quality != fallback_quality)
 }
 
 /// 原图本身可直接对应的输出格式；GIF/TIFF/TGA/BMP 等需要转换。
@@ -532,6 +683,110 @@ mod tests {
             OutputFormat::Jpeg
         );
         assert!(OutputFormat::parse(Some("gif"), "png", false).is_err());
+    }
+
+    #[test]
+    fn cover_fits_canvas_before_cropping() {
+        let mut image = RgbImage::new(6, 4);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([x as u8 * 20, y as u8 * 30, 9]);
+        }
+        let geometry = Geometry {
+            crop: Some(CropRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }),
+            ..Geometry::default()
+        };
+        let result = apply_fitted(
+            DynamicImage::ImageRgb8(image),
+            &geometry,
+            Some(CanvasFit {
+                width: 4,
+                height: 4,
+                mode: FitMode::Cover,
+            }),
+            [255, 255, 255, 255],
+        )
+        .unwrap();
+        assert_eq!((result.width(), result.height()), (2, 2));
+    }
+
+    #[test]
+    fn contain_pads_with_requested_background() {
+        let mut image = RgbImage::new(4, 2);
+        for pixel in image.pixels_mut() {
+            *pixel = Rgb([10, 20, 30]);
+        }
+        let result = apply_fitted(
+            DynamicImage::ImageRgb8(image),
+            &Geometry::default(),
+            Some(CanvasFit {
+                width: 6,
+                height: 6,
+                mode: FitMode::Contain,
+            }),
+            [255, 255, 255, 255],
+        )
+        .unwrap();
+        assert_eq!((result.width(), result.height()), (6, 6));
+        assert_eq!(rgb(&result, 0, 0), [255, 255, 255]);
+        assert_eq!(rgb(&result, 3, 3), [10, 20, 30]);
+    }
+
+    #[test]
+    fn contain_keeps_transparency_for_rgba() {
+        let mut image = RgbaImage::new(2, 4);
+        for pixel in image.pixels_mut() {
+            *pixel = Rgba([200, 10, 10, 255]);
+        }
+        let result = apply_fitted(
+            DynamicImage::ImageRgba8(image),
+            &Geometry::default(),
+            Some(CanvasFit {
+                width: 6,
+                height: 6,
+                mode: FitMode::Contain,
+            }),
+            [0, 0, 0, 0],
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!(result.get_pixel(0, 0).0[3], 0);
+        assert_eq!(result.get_pixel(2, 3).0[3], 255);
+    }
+
+    #[test]
+    fn fit_runs_after_rotation_and_before_crop() {
+        let mut image = RgbImage::new(4, 2);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgb([x as u8 * 40, y as u8 * 80, 7]);
+        }
+        // 旋转后为 2×4；contain 到 2×4 不补底，再裁上半 2×2。
+        let geometry = Geometry {
+            rotate: 1,
+            crop: Some(CropRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }),
+            ..Geometry::default()
+        };
+        let result = apply_fitted(
+            DynamicImage::ImageRgb8(image),
+            &geometry,
+            Some(CanvasFit {
+                width: 2,
+                height: 4,
+                mode: FitMode::Contain,
+            }),
+            [0, 0, 0, 255],
+        )
+        .unwrap();
+        assert_eq!((result.width(), result.height()), (2, 2));
     }
 
     #[test]

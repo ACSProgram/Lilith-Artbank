@@ -5,9 +5,10 @@ import { Spinner } from "../../shared/components/Spinner";
 import { thumbnailUrl } from "../../shared/thumbUrl";
 import type { ViewerSessionItem } from "../../shared/viewerSession";
 import { withRetry } from "./api";
-import { cropToOriginal, transformedSize } from "./model";
+import { cropToOriginal, transformedSize } from "../../shared/editGeometry";
+import type { CropRect } from "../../shared/contracts/edit";
 import { PoseOverlay } from "./PoseOverlay";
-import type { CropRect, PoseData, ViewerSource } from "./types";
+import type { PoseData, ViewerSource } from "./types";
 
 interface ViewerStageProps {
   canvasRef: RefObject<HTMLDivElement | null>;

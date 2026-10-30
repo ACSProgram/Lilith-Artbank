@@ -120,6 +120,7 @@ impl AppState {
                 self.start_check_task(app, request)
             }
             BatchTaskKind::Export => self.start_export_task(app, request),
+            BatchTaskKind::Edit => self.start_edit_task(app, request),
         }
     }
 
@@ -490,10 +491,10 @@ impl AppState {
         &self,
         request: BatchTaskPreviewRequest,
     ) -> AppResult<BatchTaskPreview> {
-        let (database, _, _) = self
+        let (database, _, root) = self
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
-        batch_preview::preview(&database, &request)
+        batch_preview::preview(&database, &root, &request)
     }
 
     // ---------------- 维护：包回收、检查、孤儿、导出 ----------------

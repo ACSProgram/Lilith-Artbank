@@ -11,6 +11,7 @@ use crate::{
 /// 查看器与编辑保存共用的原图行快照。
 ///
 /// `phash` / `colors*` / `modified_at` 只用于编辑撤销的前置快照；查看器路径不读它们。
+#[derive(Clone)]
 pub struct ContentRow {
     pub id: i64,
     pub content_hash: String,

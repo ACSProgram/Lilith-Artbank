@@ -20,6 +20,7 @@ import { browserPreview } from "./api";
 import { useSimilarityBrowse } from "./useSimilarityBrowse";
 import { SimilarityGroupsDialog } from "./SimilarityGroupsDialog";
 import { BatchTaskDialog } from "./BatchTaskDialog";
+import { BatchEditDialog } from "./BatchEditDialog";
 import { MaintenanceDialog } from "./MaintenanceDialog";
 import { OptimizeDialog } from "./OptimizeDialog";
 import { useNotices } from "../shared/notices";
@@ -54,11 +55,16 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const similarity = useSimilarityBrowse();
   const { status: aiStatus, refresh: refreshAi } = useAiStatus(Boolean(current));
   const [dragging, setDragging] = useState(false);
+  const [batchEditIds, setBatchEditIds] = useState<number[] | null>(null);
 
   useEffect(() => {
     similarity.clear();
     // 图库切换时丢弃旧库的相似结果；clear 是稳定回调。
   }, [current?.id, similarity.clear]);
+
+  useEffect(() => {
+    setBatchEditIds(null);
+  }, [current?.id]);
 
   const {
     changeSignal,
@@ -309,6 +315,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                   setSimilarityGroupsOpen(true);
                 }}
                 onOpenBatchTasks={setBatchContext}
+                onOpenBatchEdit={setBatchEditIds}
                 onOpenMaintenance={setMaintenanceContext}
                 onOpenOptimize={(context) => {
                   setOptimizeContext(context);
@@ -386,6 +393,12 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
             status={aiStatus}
             onRefreshStatus={refreshAi}
             libraryId={current.id}
+          />
+          <BatchEditDialog
+            open={batchEditIds !== null}
+            imageIds={batchEditIds ?? []}
+            libraryId={current.id}
+            onClose={() => setBatchEditIds(null)}
           />
           <MaintenanceDialog
             open={maintenanceContext !== null}

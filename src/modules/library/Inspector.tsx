@@ -26,6 +26,8 @@ interface InspectorPanelProps {
   onChanged: (change: DataChange) => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: (ids: number[]) => void;
+  /** 打开批量像素编辑；只在多选且不在临时/回收站视图时可用。 */
+  onOpenBatchEdit?: (ids: number[]) => void;
   onTrash: (ids: number[]) => void;
   onRestore: (ids: number[]) => void;
   onDelete: (ids: number[]) => void;
@@ -55,6 +57,7 @@ export function InspectorPanel({
   onChanged,
   onAddToCollection,
   onRemoveFromCollection,
+  onOpenBatchEdit,
   onTrash,
   onRestore,
   onDelete,
@@ -146,6 +149,7 @@ export function InspectorPanel({
           onChanged={onChanged}
           onAddToCollection={onAddToCollection}
           onRemoveFromCollection={() => onRemoveFromCollection(selectedIds)}
+          onOpenBatchEdit={() => onOpenBatchEdit?.(selectedIds)}
           onTrash={() => onTrash(selectedIds)}
           onRestore={() => onRestore(selectedIds)}
           onDelete={() => onDelete(selectedIds)}

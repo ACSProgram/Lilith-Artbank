@@ -9,7 +9,7 @@ import {
 import { errorMessage } from "../../shared/errors";
 import type { ViewerSessionItem } from "../../shared/viewerSession";
 import { viewerApi } from "./api";
-import { rescaleZoom } from "./model";
+import { rescaleZoom } from "../../shared/editGeometry";
 import type { PoseData, ViewerFallback, ViewerSource } from "./types";
 
 type LoadState =

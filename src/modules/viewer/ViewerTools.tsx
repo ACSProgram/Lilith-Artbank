@@ -24,15 +24,14 @@ import {
   outputSize,
   resizeFromHeight,
   resizeFromWidth,
-  type GeometryState,
-} from "./model";
+} from "../../shared/editGeometry";
 import type {
   CropRect,
-  EditSizeEstimate,
+  GeometryState,
   OutputFormat,
   ResizeSpec,
-  ViewerSource,
-} from "./types";
+} from "../../shared/contracts/edit";
+import type { EditSizeEstimate, ViewerSource } from "./types";
 
 interface ViewerToolsProps {
   source: ViewerSource;

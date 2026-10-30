@@ -572,6 +572,7 @@ export function dataChangeForTaskKind(kind: string): DataChange {
     case "releaseGarbage":
       return { kind: "none", source: "task", reason: kind, similarity: "keep" };
     case "optimize":
+    case "edit":
       return {
         kind: "content",
         source: "task",

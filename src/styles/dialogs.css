@@ -323,3 +323,236 @@
 .splash p {
   margin: 0;
 }
+
+/* ---------- 批量编辑 ---------- */
+
+.batch-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.batch-edit-canvas-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  padding: 12px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.batch-edit-canvas-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.batch-edit-canvas {
+  position: relative;
+  overflow: hidden;
+  max-width: 100%;
+  background:
+    linear-gradient(45deg, var(--checker) 25%, transparent 25%) 0 0 / 16px 16px,
+    linear-gradient(-45deg, var(--checker) 25%, transparent 25%) 0 8px / 16px 16px,
+    var(--thumb-bg);
+  border-radius: 6px;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.batch-edit-layer {
+  position: absolute;
+  transform-origin: center;
+}
+
+.batch-edit-layer img {
+  position: absolute;
+  display: block;
+  max-width: none;
+  transform-origin: center;
+  -webkit-user-drag: none;
+}
+
+.batch-edit-crop {
+  position: absolute;
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 9999px var(--scrim-soft);
+  pointer-events: none;
+}
+
+.batch-edit-crop span {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  padding: 1px 6px;
+  color: var(--on-accent);
+  background: var(--scrim-strong);
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.batch-edit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.batch-edit-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+
+.batch-edit-section h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.batch-edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.batch-edit-size-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.batch-edit-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.batch-edit-quality {
+  width: 100%;
+}
+
+.batch-edit-reference {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+}
+
+.batch-edit-reference-item {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--thumb-bg);
+  cursor: pointer;
+}
+
+.batch-edit-reference-item.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.batch-edit-reference-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.batch-edit-previews {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.batch-edit-tile {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  background: var(--thumb-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.batch-edit-tile.is-reference {
+  border-color: var(--accent-border);
+}
+
+.batch-edit-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.batch-edit-heading h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.batch-edit-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.batch-edit-summary > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.batch-edit-summary dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.batch-edit-summary dl > div {
+  display: flex;
+  gap: 6px;
+}
+
+.batch-edit-summary dt {
+  color: var(--text-muted);
+}
+
+.batch-edit-summary dd {
+  margin: 0;
+}
+
+.batch-edit-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+@media (max-width: 760px) {
+  .batch-edit-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -63,6 +63,8 @@ pub enum TaskKind {
     OrphanMove,
     /// 缩略图包回收；空闲时自动提交，也可以手动「立即回收」。
     PackCompact,
+    /// 批量编辑：旋转、翻转、统一画布裁剪与输出格式。
+    Edit,
 }
 
 impl TaskKind {
@@ -88,6 +90,7 @@ impl TaskKind {
             Self::Export => "导出图片",
             Self::OrphanMove => "清理孤儿文件",
             Self::PackCompact => "回收缩略图包",
+            Self::Edit => "批量编辑",
         }
     }
 
@@ -421,6 +424,8 @@ pub enum BatchTaskKind {
     CheckFull,
     /// 导出到目录。
     Export,
+    /// 批量编辑：只接受选中集。
+    Edit,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -445,5 +450,7 @@ pub struct BatchTaskRequest {
     /// 导出：目标目录与是否附带 `manifest.csv`。
     pub target_dir: Option<String>,
     pub include_manifest: bool,
+    /// 批量编辑：整批共用一套 recipe。
+    pub edit: Option<crate::library::edit_batch::BatchEditOptions>,
     pub conflict: ConflictPolicy,
 }
