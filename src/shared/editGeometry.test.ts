@@ -2,12 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { EditableSource, GeometryState } from "./contracts/edit.ts";
 import {
+  clampCrop,
   fitZoom,
   fitZoomForSize,
   flipGeometry,
   gifStaticPreview,
   hasPixelChanges,
   initialGeometry,
+  rectBetween,
   rescaleZoom,
   resizeForNewBase,
   rotateGeometry,
@@ -149,4 +151,14 @@ test("gifStaticPreview only matches GIFs with a generated preview", () => {
   assert.equal(gifStaticPreview({ format: "gif", preview: false }), false);
   assert.equal(gifStaticPreview({ format: "png", preview: true }), false);
   assert.equal(gifStaticPreview(null), false);
+});
+
+test("clampCrop rounds fractional pointer coordinates to whole pixels", () => {
+  const rect = rectBetween({ x: 4.2, y: 8.6 }, { x: 188.4, y: 144.4 }, 262, 212);
+  assert.ok(rect);
+  const crop = clampCrop(rect, 262, 212);
+  assert.deepEqual(crop, { x: 4, y: 9, width: 184, height: 136 });
+  for (const value of Object.values(crop)) {
+    assert.ok(Number.isInteger(value), `${value} 应该是整数`);
+  }
 });

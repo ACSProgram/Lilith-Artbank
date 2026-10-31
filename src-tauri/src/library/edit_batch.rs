@@ -16,10 +16,7 @@ use crate::{
     },
     imageops::{
         edit as image_edit,
-        edit::{
-            CanvasFit, CropRect, FitMode, Geometry, MAX_EDIT_DIMENSION, MAX_EDIT_PIXELS,
-            OutputFormat,
-        },
+        edit::{CanvasFit, CropRect, FitMode, Geometry, MAX_EDIT_PIXELS, OutputFormat},
     },
     library::{
         BatchReporter, content,
@@ -42,8 +39,10 @@ const MIB: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BatchEditMode {
+    /// 每张保持翻转/旋转后的原始尺寸，不做画布适配与裁剪。
+    KeepSize,
+    /// 所有图片先适配同一块画布，再按画布坐标裁剪。
     Canvas,
-    SamePixel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -105,36 +104,25 @@ impl BatchEditOptions {
         {
             return Err(AppError::message("输出质量必须在 1-100 之间"));
         }
-        if self.mode == BatchEditMode::Canvas {
-            CanvasFit {
-                width: self.canvas.width,
-                height: self.canvas.height,
-                mode: match self.canvas.fit {
-                    BatchFit::Cover => FitMode::Cover,
-                    BatchFit::Contain => FitMode::Contain,
-                },
+        match self.mode {
+            BatchEditMode::KeepSize => {
+                if self.crop.is_some() {
+                    return Err(AppError::message("保持各自尺寸时不能裁剪"));
+                }
             }
-            .validate()?;
-            if let Some(crop) = self.crop {
-                image_edit::validate_crop_public(crop, self.canvas.width, self.canvas.height)?;
-            }
-        } else if let Some(crop) = self.crop {
-            if crop.width == 0 || crop.height == 0 {
-                return Err(AppError::message("裁剪区域不能为空"));
-            }
-            if crop.width > MAX_EDIT_DIMENSION || crop.height > MAX_EDIT_DIMENSION {
-                return Err(AppError::message(format!(
-                    "裁剪区域超过单边上限 {MAX_EDIT_DIMENSION}"
-                )));
-            }
-            let pixels = u64::from(crop.width) * u64::from(crop.height);
-            if pixels > MAX_EDIT_PIXELS {
-                return Err(AppError::message(format!(
-                    "裁剪区域 {}×{} 超过编辑上限 {} 百万像素",
-                    crop.width,
-                    crop.height,
-                    MAX_EDIT_PIXELS / 1_000_000
-                )));
+            BatchEditMode::Canvas => {
+                CanvasFit {
+                    width: self.canvas.width,
+                    height: self.canvas.height,
+                    mode: match self.canvas.fit {
+                        BatchFit::Cover => FitMode::Cover,
+                        BatchFit::Contain => FitMode::Contain,
+                    },
+                }
+                .validate()?;
+                if let Some(crop) = self.crop {
+                    image_edit::validate_crop_public(crop, self.canvas.width, self.canvas.height)?;
+                }
             }
         }
         Ok(())
@@ -186,7 +174,6 @@ pub struct BatchEditPreview {
     pub skip_breakdown: Vec<(String, u64)>,
     pub estimated_output_bytes: u64,
     pub available_bytes: Option<u64>,
-    pub uniform_dimensions: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,16 +270,7 @@ fn plan(row: &content::ContentRow, options: &BatchEditOptions) -> AppResult<Plan
                 || options.crop.is_some();
             (Some(fit), options.crop, width, height, fit_changes)
         }
-        BatchEditMode::SamePixel => {
-            if let Some(crop) = options.crop {
-                image_edit::validate_crop_public(crop, transformed_width, transformed_height)?;
-            }
-            let (width, height) = options
-                .crop
-                .map(|crop| (crop.width, crop.height))
-                .unwrap_or((transformed_width, transformed_height));
-            (None, options.crop, width, height, options.crop.is_some())
-        }
+        BatchEditMode::KeepSize => (None, None, transformed_width, transformed_height, false),
     };
 
     image_edit::validate_resize_public(output_width, output_height)?;
@@ -345,10 +323,9 @@ fn load_temp_ids(database: &LibraryDb, ids: &[i64]) -> AppResult<HashSet<i64>> {
     database.with_reader(|connection| temp::image_ids_in(connection, ids))
 }
 
-/// 预检：逐张读行，统计可处理数、跳过原因、体积与画布可用性。
+/// 预检：逐张读行，统计可处理数、跳过原因与体积。
 ///
-/// 只累积计数，不把整批行留在内存里；同一像素矩形遇到尺寸不一致立刻返回，
-/// 让界面退回统一画布，而不是逐张报裁剪越界。
+/// 只累积计数，不把整批行留在内存里。
 pub fn preview(
     database: &LibraryDb,
     root: &Path,
@@ -360,8 +337,6 @@ pub fn preview(
     let mut skips = Skips::default();
     let mut will_process = 0_u64;
     let mut estimated_output_bytes = 0_u64;
-    let mut first_size: Option<(u32, u32)> = None;
-    let mut uniform = true;
 
     for id in ids {
         let row = match content::load(database, *id) {
@@ -374,22 +349,6 @@ pub fn preview(
         if let Some(reason) = preview_skip(&row, &temp_ids) {
             skips.add(reason);
             continue;
-        }
-        let size = transformed_size(row.width, row.height, options.rotate);
-        match first_size {
-            None => first_size = Some(size),
-            Some(first) if first == size => {}
-            Some(_) if options.mode == BatchEditMode::SamePixel => {
-                return Ok(BatchEditPreview {
-                    total: ids.len() as u64,
-                    will_process: 0,
-                    skip_breakdown: skips.buckets(),
-                    estimated_output_bytes: 0,
-                    available_bytes: platform::fs::available_bytes(root),
-                    uniform_dimensions: false,
-                });
-            }
-            Some(_) => uniform = false,
         }
 
         let plan = plan(&row, options)?;
@@ -412,7 +371,6 @@ pub fn preview(
         skip_breakdown: skips.buckets(),
         estimated_output_bytes,
         available_bytes: platform::fs::available_bytes(root),
-        uniform_dimensions: uniform,
     })
 }
 
@@ -905,23 +863,34 @@ mod tests {
         assert!(error.contains("没有保留撤销副本"), "{error}");
     }
 
-    #[test]
-    fn preview_reports_uniform_dimensions_and_skips_unchanged() {
-        let fixture = build_library(&[(8, 6), (8, 6)]);
-        let same_pixel = BatchEditOptions {
+    fn keep_size_options() -> BatchEditOptions {
+        BatchEditOptions {
             rotate: 0,
-            mode: BatchEditMode::SamePixel,
+            flip_horizontal: false,
+            flip_vertical: false,
+            mode: BatchEditMode::KeepSize,
+            canvas: BatchCanvas {
+                width: 0,
+                height: 0,
+                fit: BatchFit::Contain,
+            },
+            crop: None,
             output_format: BatchOutputFormat::Keep,
-            ..options(true)
-        };
+            quality: None,
+            reversible: true,
+        }
+    }
+
+    #[test]
+    fn keep_size_preview_skips_unchanged_images() {
+        let fixture = build_library(&[(8, 6), (8, 6)]);
         let preview = super::preview(
             &fixture.session.db,
             &fixture.root,
             &fixture.ids,
-            &same_pixel,
+            &keep_size_options(),
         )
         .unwrap();
-        assert!(preview.uniform_dimensions);
         assert_eq!(preview.will_process, 0);
         assert_eq!(
             preview
@@ -931,28 +900,60 @@ mod tests {
                 .map(|(_, count)| *count),
             Some(2)
         );
+    }
 
-        let different = build_library(&[(8, 6), (10, 6)]);
-        let preview = super::preview(
-            &different.session.db,
-            &different.root,
-            &different.ids,
-            &same_pixel,
+    #[test]
+    fn keep_size_preserves_each_transformed_size() {
+        let fixture = build_library(&[(8, 6), (10, 4)]);
+        let operation = operation(&fixture.session.db, fixture.ids.len()).unwrap();
+        let report = run(
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.session.thumbs,
+            &fixture.ids,
+            &BatchEditOptions {
+                rotate: 1,
+                ..keep_size_options()
+            },
+            operation.id(),
+            &NoopReporter,
+            &ResourceTable::new(),
+            &ImageBudget::new(2),
         )
         .unwrap();
-        assert!(!preview.uniform_dimensions);
-        assert_eq!(preview.will_process, 0);
+        operation.finish("").unwrap();
+        assert_eq!(report.processed, 2);
+        assert_eq!(row_size(&fixture, fixture.ids[0]), (6, 8));
+        assert_eq!(row_size(&fixture, fixture.ids[1]), (4, 10));
+    }
 
-        // 统一画布不要求尺寸一致，但仍要如实报告；否则界面会误开放“同一像素矩形”。
+    #[test]
+    fn canvas_preview_accepts_mixed_sizes_without_uniform_check() {
+        let fixture = build_library(&[(8, 6), (10, 6)]);
         let preview = super::preview(
-            &different.session.db,
-            &different.root,
-            &different.ids,
+            &fixture.session.db,
+            &fixture.root,
+            &fixture.ids,
             &options(true),
         )
         .unwrap();
-        assert!(!preview.uniform_dimensions);
         assert_eq!(preview.will_process, 2);
+    }
+
+    #[test]
+    fn keep_size_rejects_crop() {
+        let error = BatchEditOptions {
+            crop: Some(CropRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }),
+            ..keep_size_options()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.to_string().contains("不能裁剪"), "{error}");
     }
 
     #[test]

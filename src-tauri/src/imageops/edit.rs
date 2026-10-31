@@ -245,6 +245,10 @@ where
     if source_width == 0 || source_height == 0 {
         return Err(AppError::message("画布适配的源图尺寸为空"));
     }
+    // 源尺寸已等于目标尺寸时跳过重采样，省掉一次全尺寸缩放。
+    if (source_width, source_height) == (fit.width, fit.height) {
+        return Ok(buffer);
+    }
     match fit.mode {
         FitMode::Cover => {
             let target_ratio = f64::from(fit.width) / f64::from(fit.height);

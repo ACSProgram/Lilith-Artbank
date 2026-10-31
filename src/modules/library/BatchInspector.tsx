@@ -233,19 +233,20 @@ export function BatchInspector({
 
   return (
     <div className="inspector-body">
-      <div className="batch-summary">
-        批量操作会作用于全部 {count.toLocaleString()} 张已选图片。
-      </div>
-
       {!inTemp && !inTrash ? (
         <section className="inspector-section">
           <h4>
             <Crop size={12} /> 像素编辑
           </h4>
-          <Button size="sm" variant="secondary" disabled={busy} onClick={onOpenBatchEdit}>
-            旋转、翻转或裁剪
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={<Crop size={13} />}
+            disabled={busy}
+            onClick={onOpenBatchEdit}
+          >
+            批量编辑图片
           </Button>
-          <span className="field-hint">整批使用同一套处理；输出会重新编码。</span>
         </section>
       ) : null}
 
@@ -297,6 +298,7 @@ export function BatchInspector({
         <div className="inspector-inline-actions">
           <Button
             size="sm"
+            variant="success"
             loading={busy}
             disabled={pendingTagCount === 0}
             onClick={applyAddTags}

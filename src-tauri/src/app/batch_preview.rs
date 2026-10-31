@@ -26,7 +26,7 @@ pub struct BatchTaskPreviewRequest {
     /// 仅 embedding 需要；由前端从 AI health 带入。
     #[serde(default)]
     pub capability: Option<PreviewCapability>,
-    /// 只有批量编辑需要：预检按 recipe 计算跳过原因、体积与统一画布可用性。
+    /// 只有批量编辑需要：预检按 recipe 计算跳过原因与体积。
     #[serde(default)]
     pub edit: Option<BatchEditOptions>,
 }
@@ -51,8 +51,6 @@ pub struct BatchTaskPreview {
     pub estimated_output_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uniform_dimensions: Option<bool>,
 }
 
 pub fn preview(
@@ -78,7 +76,6 @@ pub fn preview(
             ),
             estimated_output_bytes: Some(estimate.estimated_output_bytes),
             available_bytes: estimate.available_bytes,
-            uniform_dimensions: Some(estimate.uniform_dimensions),
         });
     }
     let filter = filter_for(request)?;
@@ -99,7 +96,6 @@ pub fn preview(
         skip_breakdown: None,
         estimated_output_bytes: None,
         available_bytes: None,
-        uniform_dimensions: None,
     })
 }
 

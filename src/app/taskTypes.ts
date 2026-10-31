@@ -249,7 +249,7 @@ export interface BatchTaskPreviewRequest {
   scope: TaskScope;
   overwrite: boolean;
   capability: BatchTaskPreviewCapability | null;
-  /** 只有批量编辑需要；预检按它计算跳过原因、体积与统一画布可用性。 */
+  /** 只有批量编辑需要；预检按它计算跳过原因与体积。 */
   edit?: BatchEditOptions | null;
 }
 
@@ -263,8 +263,6 @@ export interface BatchTaskPreview {
   estimatedOutputBytes?: number;
   /** 批量编辑：库所在磁盘的可用字节数；不可用时为空。 */
   availableBytes?: number | null;
-  /** 批量编辑：翻转/旋转后宽度与高度是否全部一致，决定能否用“同一像素矩形”。 */
-  uniformDimensions?: boolean;
 }
 
 export type TaskStartResult =

@@ -244,6 +244,8 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 主窗口的位置、大小与最大化由 `tauri-plugin-window-state` 持久化到系统应用配置目录，不保存全屏。启动后 `app::window_state::ensure_main_window_visible` 检查窗口与任一显示器是否至少有 120×40 物理像素的交集，完全离屏时移回主显示器并收缩到可见范围。
 
+`window_close` 与标题栏关闭按钮只隐藏主窗口到系统托盘，不结束进程；托盘菜单的“打开窗口”恢复窗口，“退出”调用 `AppHandle::exit`，仍走 `RunEvent::Exit` 的图库、AI 服务与 MCP 清理。托盘创建失败只记日志，不阻塞启动；再次启动应用时单实例插件会直接恢复并聚焦已有窗口。
+
 `LibraryInspection`：
 
 ```text

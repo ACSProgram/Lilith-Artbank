@@ -2241,13 +2241,3 @@
   gap: 6px;
 }
 
-.batch-summary {
-  margin-bottom: 9px;
-  padding: 7px 9px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-soft);
-  color: var(--text-muted);
-  font-size: 10.5px;
-  line-height: 1.6;
-}

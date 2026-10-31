@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -152,15 +153,20 @@ pub(crate) fn prepare(
 ) -> AppResult<Option<PreparedEdit>> {
     let paths = LibraryPaths::new(root);
     let source = row.path(&paths)?;
+    let started = Instant::now();
     let decoded = decode::decode(&source)?;
+    let decode_ms = started.elapsed().as_millis();
     if u64::from(decoded.width) * u64::from(decoded.height) > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(
             "原图解码后为 {}×{}，超过编辑上限",
             decoded.width, decoded.height
         )));
     }
+    let source_size = (decoded.width, decoded.height);
 
+    let transform_started = Instant::now();
     let processed = edit::apply_fitted(decoded.image, geometry, fit, pad)?;
+    let transform_ms = transform_started.elapsed().as_millis();
     let (width, height) = (processed.width(), processed.height());
     let has_alpha = output_format != OutputFormat::Jpeg && processed.color().has_alpha();
 
@@ -170,16 +176,39 @@ pub(crate) fn prepare(
         uuid::Uuid::new_v4(),
         output_format.extension()
     )));
+    let encode_started = Instant::now();
     let (new_hash, new_size) = write_encoded(temp.path(), &processed, output_format, quality)?;
+    let encode_ms = encode_started.elapsed().as_millis();
     if new_hash == row.content_hash {
         return Ok(None);
     }
 
+    let thumb_started = Instant::now();
     let thumb = thumbnail::encode(&processed)?;
+    let thumb_ms = thumb_started.elapsed().as_millis();
+    let phash_started = Instant::now();
     let hash = phash::compute(&processed);
+    let phash_ms = phash_started.elapsed().as_millis();
+    let colors_started = Instant::now();
     let (colors4, colors8) = colors::dominant(&processed);
+    let colors_ms = colors_started.elapsed().as_millis();
     let file_size =
         i64::try_from(new_size).map_err(|_| AppError::message("编辑结果大小超出数据库范围"))?;
+    log::debug!(
+        "编辑准备 image={} {}x{} -> {}x{}: decode={}ms transform={}ms encode={}ms thumb={}ms phash={}ms colors={}ms total={}ms",
+        row.id,
+        source_size.0,
+        source_size.1,
+        width,
+        height,
+        decode_ms,
+        transform_ms,
+        encode_ms,
+        thumb_ms,
+        phash_ms,
+        colors_ms,
+        started.elapsed().as_millis()
+    );
 
     Ok(Some(PreparedEdit {
         row: row.clone(),
@@ -574,9 +603,15 @@ fn write_encoded(
     format: OutputFormat,
     quality: u8,
 ) -> AppResult<(String, u64)> {
-    let mut writer = HashingFile::create(path)?;
+    // JPEG 编码器按字节写 BitWriter，直接落到 File 会变成每个字节一次系统调用。
+    let file = HashingFile::create(path)?;
+    let mut writer = io::BufWriter::with_capacity(256 * 1024, file);
     edit::encode(image, format, quality, &mut writer)?;
-    writer.finish()
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|error| AppError::message(format!("写入编辑结果失败：{}", error.error())))?;
+    file.finish()
 }
 
 /// 把旧原图暂存到撤销目录：优先硬链接（不占额外空间，且在提交前原路径仍有效），

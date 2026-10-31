@@ -9,7 +9,7 @@ mod library;
 mod mcp;
 mod platform;
 
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 /// `--headless` 分支：不创建用户可见窗口，只装配状态并执行验收命令。
 #[cfg(feature = "headless")]
@@ -29,13 +29,7 @@ pub fn run() {
     }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
-            |application, _args, _cwd| {
-                if let Some(window) = application.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
-            },
+            |application, _args, _cwd| app::window_state::show_main_window(application),
         ))
         .plugin(
             tauri_plugin_window_state::Builder::default()
@@ -47,7 +41,19 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .plugin(app::logging::plugin(log_dir, true));
+        .plugin(app::logging::plugin(log_dir, true))
+        // 关闭主窗口只隐藏到托盘；退出由托盘菜单显式触发。
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    log::warn!("隐藏主窗口失败：{error}");
+                }
+            }
+        });
     let builder = app::thumb_protocol::register(builder);
     let builder = app::img_protocol::register(builder);
 
@@ -83,6 +89,9 @@ pub fn run() {
             state.open_configured_library();
             application.manage(state);
             application.state::<app::state::AppState>().after_manage();
+            if let Err(error) = app::tray::install(application.handle()) {
+                log::warn!("系统托盘创建失败：{error}");
+            }
             // autoStart 在后台触发；健康检查不阻塞窗口出现。
             let handle = application.handle().clone();
             std::thread::spawn(move || {

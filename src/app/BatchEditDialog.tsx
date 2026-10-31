@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Crop, Play, Square } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  FlipHorizontal2,
+  FlipVertical2,
+  Play,
+  RotateCcw,
+  RotateCw,
+  Square,
+} from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { Field } from "../shared/components/Field";
 import { Modal } from "../shared/components/Modal";
@@ -11,7 +20,10 @@ import type {
   CropRect,
 } from "../shared/contracts/edit";
 import {
+  MAX_EDIT_DIMENSION,
+  MAX_EDIT_PIXELS,
   clamp,
+  clampCrop,
   defaultQualityFor,
   formatBytes,
   formatDimensions,
@@ -68,11 +80,11 @@ function pickSamples(ids: number[], count: number): number[] {
   return Array.from(new Set(picked));
 }
 
-function qualityLabel(format: BatchOutputFormat, quality: number | null): string {
+function qualityLabel(
+  format: Exclude<BatchOutputFormat, "keep">,
+  quality: number | null,
+): string {
   if (format === "png") return "无损";
-  if (format === "keep") {
-    return quality == null ? "按格式默认" : `统一质量 ${quality}`;
-  }
   return `质量 ${quality ?? defaultQualityFor(format)}`;
 }
 
@@ -210,11 +222,11 @@ export function BatchEditDialog({
   const [rotate, setRotate] = useState(0);
   const [flipHorizontal, setFlipHorizontal] = useState(false);
   const [flipVertical, setFlipVertical] = useState(false);
-  const [mode, setMode] = useState<BatchEditOptions["mode"]>("canvas");
+  const [mode, setMode] = useState<BatchEditOptions["mode"]>("keepSize");
   const [canvasWidth, setCanvasWidth] = useState(0);
   const [canvasHeight, setCanvasHeight] = useState(0);
   const [canvasTouched, setCanvasTouched] = useState(false);
-  const [fit, setFit] = useState<BatchFit>("cover");
+  const [fit, setFit] = useState<BatchFit>("contain");
   const [crop, setCrop] = useState<CropRect | null>(null);
   const [outputFormat, setOutputFormat] = useState<BatchOutputFormat>("keep");
   const [quality, setQuality] = useState<number | null>(null);
@@ -233,11 +245,11 @@ export function BatchEditDialog({
     setRotate(0);
     setFlipHorizontal(false);
     setFlipVertical(false);
-    setMode("canvas");
+    setMode("keepSize");
     setCanvasWidth(0);
     setCanvasHeight(0);
     setCanvasTouched(false);
-    setFit("cover");
+    setFit("contain");
     setCrop(null);
     setOutputFormat("keep");
     setQuality(null);
@@ -280,22 +292,6 @@ export function BatchEditDialog({
     setCrop(null);
   }, [referenceId, mode, rotate]);
 
-  const firstSize = details[0]
-    ? transformedSize(details[0].width, details[0].height, rotate)
-    : null;
-  const localUniform = details.every((item) => {
-    const size = transformedSize(item.width, item.height, rotate);
-    return (
-      !firstSize || (size.width === firstSize.width && size.height === firstSize.height)
-    );
-  });
-  const samePixelReady = localUniform && (preview?.uniformDimensions ?? true);
-  useEffect(() => {
-    if (mode === "samePixel" && previewStatus === "ready" && !samePixelReady) {
-      setMode("canvas");
-    }
-  }, [mode, previewStatus, samePixelReady]);
-
   const { start, find, cancel } = useTaskCenter();
   const task = taskId ? find(taskId) : null;
   const activeTask = task && isTaskActive(task) ? task : null;
@@ -309,21 +305,33 @@ export function BatchEditDialog({
       flipVertical,
       mode,
       canvas: { width: canvasWidth, height: canvasHeight, fit },
-      crop,
+      crop: mode === "canvas" ? crop : null,
       outputFormat,
       quality,
       reversible: true,
     }),
-    [rotate, flipHorizontal, flipVertical, mode, canvasWidth, canvasHeight, fit, crop, outputFormat, quality],
+    [
+      rotate,
+      flipHorizontal,
+      flipVertical,
+      mode,
+      canvasWidth,
+      canvasHeight,
+      fit,
+      crop,
+      outputFormat,
+      quality,
+    ],
   );
 
   const canvasValid =
-    canvasWidth >= 1 &&
-    canvasHeight >= 1 &&
-    canvasWidth <= 65_535 &&
-    canvasHeight <= 65_535 &&
-    canvasWidth * canvasHeight <= 50_000_000 &&
-    (mode === "canvas" || referenceSize != null);
+    mode === "keepSize" ||
+    (canvasWidth >= 1 &&
+      canvasHeight >= 1 &&
+      canvasWidth <= MAX_EDIT_DIMENSION &&
+      canvasHeight <= MAX_EDIT_DIMENSION &&
+      canvasWidth * canvasHeight <= MAX_EDIT_PIXELS &&
+      referenceSize != null);
 
   useEffect(() => {
     if (!open || activeTask || !canvasValid || selectedIds.length === 0) return;
@@ -331,6 +339,7 @@ export function BatchEditDialog({
     setPreviewStatus("loading");
     let cancelled = false;
     const timer = window.setTimeout(() => {
+      setError(null);
       void taskApi
         .previewBatch({
           kind: "edit",
@@ -357,17 +366,38 @@ export function BatchEditDialog({
   }, [open, activeTask, canvasValid, selectedIds, options]);
 
   const outputSize =
-    crop ??
-    (mode === "canvas"
-      ? { width: canvasWidth, height: canvasHeight }
-      : referenceSize ?? { width: 0, height: 0 });
+    mode === "canvas"
+      ? crop ?? { width: canvasWidth, height: canvasHeight }
+      : null;
 
-  const tooMany = (preview?.total ?? selectedIds.length) > REVERSIBLE_LIMIT;
+  const totalCount = preview?.total ?? selectedIds.length;
+  const willProcess = preview?.willProcess ?? 0;
+  const tooMany = totalCount > REVERSIBLE_LIMIT;
+  const summaryTone =
+    previewStatus === "error" ||
+    !canvasValid ||
+    tooMany ||
+    (previewStatus === "ready" && willProcess === 0)
+      ? "danger"
+      : previewStatus === "ready"
+        ? "success"
+        : "pending";
+  const summaryStatus = !canvasValid
+    ? "画布尺寸无效"
+    : previewStatus === "error"
+      ? "预检失败"
+      : tooMany
+        ? `超过可撤销上限（${totalCount.toLocaleString()} 张）`
+        : previewStatus === "ready"
+          ? willProcess === 0
+            ? "没有可处理的图片"
+            : `预检通过 · 可处理 ${willProcess.toLocaleString()} / ${totalCount.toLocaleString()} 张`
+          : "正在预检…";
   const canStart =
     !starting &&
     canvasValid &&
     previewStatus === "ready" &&
-    (preview?.willProcess ?? 0) > 0 &&
+    willProcess > 0 &&
     !activeTask;
 
   const launch = async (reversible: boolean) => {
@@ -437,262 +467,313 @@ export function BatchEditDialog({
     </>
   );
 
+  const qualityValue =
+    outputFormat === "jpeg" || outputFormat === "webp"
+      ? quality ?? defaultQualityFor(outputFormat)
+      : null;
+  const showQuality = qualityValue != null;
+
   return (
     <Modal
       open={open}
       title="批量编辑"
-      subtitle="整批使用同一套旋转、翻转、裁剪与输出设置；文件会重新编码。"
-      width={920}
+      subtitle={`对选中的 ${selectedIds.length.toLocaleString()} 张图片应用同一套设置。`}
+      width={1040}
+      height={760}
       onClose={onClose}
       footer={footer}
     >
       <div className="batch-edit">
-        <div className="batch-edit-canvas-wrap">
-          {reference && referenceSize && canvasValid ? (
-            <CropStage
-              detail={reference}
-              rotate={rotate}
-              flipHorizontal={flipHorizontal}
-              flipVertical={flipVertical}
-              mode={mode}
-              fit={fit}
-              canvasWidth={mode === "canvas" ? canvasWidth : referenceSize.width}
-              canvasHeight={mode === "canvas" ? canvasHeight : referenceSize.height}
-              crop={crop}
-              onCrop={setCrop}
-            />
-          ) : (
-            <div className="batch-edit-canvas-empty">
-              <Spinner size={16} />
-              <span>正在读取参考图…</span>
+        <div className="batch-edit-layout">
+          <div className="batch-edit-preview-pane">
+            <div className="batch-edit-canvas-wrap">
+              {reference && referenceSize && canvasValid ? (
+                <CropStage
+                  detail={reference}
+                  rotate={rotate}
+                  flipHorizontal={flipHorizontal}
+                  flipVertical={flipVertical}
+                  mode={mode}
+                  fit={fit}
+                  canvasWidth={mode === "canvas" ? canvasWidth : referenceSize.width}
+                  canvasHeight={mode === "canvas" ? canvasHeight : referenceSize.height}
+                  crop={mode === "canvas" ? crop : null}
+                  interactive={mode === "canvas"}
+                  onCrop={setCrop}
+                />
+              ) : reference && referenceSize ? (
+                <div className="batch-edit-canvas-empty">
+                  <span>画布尺寸无效，请调整宽高</span>
+                </div>
+              ) : (
+                <div className="batch-edit-canvas-empty">
+                  <Spinner size={16} />
+                  <span>正在读取参考图…</span>
+                </div>
+              )}
             </div>
-          )}
-        </div>
 
-        <div className="batch-edit-grid">
-          <section className="batch-edit-section">
-            <h4>方向</h4>
-            <div className="batch-edit-actions">
-              <Button size="sm" onClick={() => setRotate((value) => (value + 3) % 4)}>
-                左转 90°
-              </Button>
-              <Button size="sm" onClick={() => setRotate((value) => (value + 1) % 4)}>
-                右转 90°
-              </Button>
-              <Button size="sm" onClick={() => setFlipHorizontal((value) => !value)}>
-                水平翻转
-              </Button>
-              <Button size="sm" onClick={() => setFlipVertical((value) => !value)}>
-                垂直翻转
-              </Button>
-            </div>
-          </section>
+            <section className="batch-edit-preview-section">
+              <div className="batch-edit-heading">
+                <h4>效果预览</h4>
+                <span className="field-hint">点缩略图切换参考图</span>
+              </div>
+              <div className="batch-edit-previews">
+                {details.map((item) => {
+                  const active = item.id === reference?.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className="batch-edit-preview-button"
+                      aria-pressed={active}
+                      onClick={() => {
+                        setReferenceId(item.id);
+                        setCanvasTouched(false);
+                      }}
+                    >
+                      <PreviewTile
+                        detail={item}
+                        rotate={rotate}
+                        flipHorizontal={flipHorizontal}
+                        flipVertical={flipVertical}
+                        mode={mode}
+                        fit={fit}
+                        canvasWidth={canvasWidth}
+                        canvasHeight={canvasHeight}
+                        crop={mode === "canvas" ? crop : null}
+                        reference={active}
+                      />
+                      {active ? <span className="batch-edit-reference-badge">参考</span> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          </div>
 
-          <section className="batch-edit-section">
-            <h4>画布</h4>
-            <div className="batch-edit-mode">
-              <label className="toggle-row">
-                <input
-                  type="radio"
-                  checked={mode === "canvas"}
-                  onChange={() => setMode("canvas")}
-                />
-                <span>
-                  <strong>统一画布</strong>
-                  <small>按画布比例适配，再套同一个裁剪框。</small>
-                </span>
-              </label>
-              <label className="toggle-row">
-                <input
-                  type="radio"
-                  checked={mode === "samePixel"}
-                  disabled={!samePixelReady}
-                  onChange={() => setMode("samePixel")}
-                />
-                <span>
-                  <strong>同一像素矩形</strong>
-                  <small>
-                    {samePixelReady
-                      ? "所选图片尺寸一致，按原图像素直通裁剪。"
-                      : "所选图片在翻转/旋转后尺寸不一致。"}
-                  </small>
-                </span>
-              </label>
-            </div>
-            <div className="batch-edit-size-row">
-              <Field label="宽">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  value={canvasWidth || ""}
-                  disabled={mode === "samePixel"}
-                  onChange={(event) => {
-                    setCanvasTouched(true);
-                    setCanvasWidth(Math.max(1, Number(event.target.value) || 0));
-                  }}
-                />
-              </Field>
-              <Field label="高">
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  value={canvasHeight || ""}
-                  disabled={mode === "samePixel"}
-                  onChange={(event) => {
-                    setCanvasTouched(true);
-                    setCanvasHeight(Math.max(1, Number(event.target.value) || 0));
-                  }}
-                />
-              </Field>
-              <Field label="适配">
-                <select
-                  className="input"
-                  value={fit}
-                  disabled={mode === "samePixel"}
-                  onChange={(event) => setFit(event.target.value as BatchFit)}
+          <div className="batch-edit-controls">
+            <section className="batch-edit-section">
+              <h4>方向</h4>
+              <div className="batch-edit-direction">
+                <Button
+                  size="sm"
+                  icon={<RotateCcw size={13} />}
+                  onClick={() => setRotate((value) => (value + 3) % 4)}
                 >
-                  <option value="cover">cover（填满，裁掉超出）</option>
-                  <option value="contain">contain（完整放入，补底）</option>
-                </select>
-              </Field>
-            </div>
-            <div className="batch-edit-actions">
-              <Button
-                size="sm"
-                disabled={!referenceSize}
-                onClick={() => {
-                  if (!referenceSize) return;
-                  setCanvasTouched(false);
-                  setCanvasWidth(referenceSize.width);
-                  setCanvasHeight(referenceSize.height);
-                }}
-              >
-                使用参考图尺寸
-              </Button>
-              <Button size="sm" variant="ghost" disabled={!crop} onClick={() => setCrop(null)}>
-                清除裁剪
-              </Button>
-              <span className="field-hint">
-                输出 {formatDimensions(outputSize.width, outputSize.height)}
-              </span>
-            </div>
-          </section>
-
-          <section className="batch-edit-section">
-            <h4>输出</h4>
-            <div className="batch-edit-size-row">
-              <Field label="格式">
-                <select
-                  className="input"
-                  value={outputFormat}
-                  onChange={(event) => {
-                    const next = event.target.value as BatchOutputFormat;
-                    setOutputFormat(next);
-                    if (next === "png") setQuality(null);
-                  }}
+                  左转
+                </Button>
+                <Button
+                  size="sm"
+                  icon={<RotateCw size={13} />}
+                  onClick={() => setRotate((value) => (value + 1) % 4)}
                 >
-                  {(Object.keys(FORMAT_LABELS) as BatchOutputFormat[]).map((value) => (
-                    <option key={value} value={value}>
-                      {FORMAT_LABELS[value]}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="质量" hint={qualityLabel(outputFormat, quality)}>
-                <input
-                  className="batch-edit-quality"
-                  type="range"
-                  min={1}
-                  max={100}
-                  disabled={outputFormat === "png"}
-                  value={
-                    quality ??
-                    (outputFormat === "keep"
-                      ? 90
-                      : defaultQualityFor(outputFormat))
-                  }
-                  onChange={(event) => setQuality(Number(event.target.value))}
-                />
-              </Field>
-            </div>
-            <div className="batch-edit-actions">
-              <Button size="sm" variant="ghost" disabled={quality == null} onClick={() => setQuality(null)}>
-                按格式默认
-              </Button>
+                  右转
+                </Button>
+                <Button
+                  size="sm"
+                  variant={flipHorizontal ? "primary" : "secondary"}
+                  icon={<FlipHorizontal2 size={13} />}
+                  aria-pressed={flipHorizontal}
+                  onClick={() => setFlipHorizontal((value) => !value)}
+                >
+                  水平翻转
+                </Button>
+                <Button
+                  size="sm"
+                  variant={flipVertical ? "primary" : "secondary"}
+                  icon={<FlipVertical2 size={13} />}
+                  aria-pressed={flipVertical}
+                  onClick={() => setFlipVertical((value) => !value)}
+                >
+                  垂直翻转
+                </Button>
+              </div>
+            </section>
+
+            <section className="batch-edit-section">
+              <h4>尺寸</h4>
+              <div className="batch-edit-mode">
+                <label
+                  className={`batch-edit-mode-option${mode === "keepSize" ? " is-active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    checked={mode === "keepSize"}
+                    onChange={() => {
+                      setMode("keepSize");
+                      setCrop(null);
+                    }}
+                  />
+                  <span>
+                    <strong>保持各自原尺寸</strong>
+                    <small>只旋转或翻转，不缩放、不裁剪。</small>
+                  </span>
+                </label>
+                <label
+                  className={`batch-edit-mode-option${mode === "canvas" ? " is-active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    checked={mode === "canvas"}
+                    onChange={() => setMode("canvas")}
+                  />
+                  <span>
+                    <strong>统一尺寸裁剪</strong>
+                    <small>所有图片缩放到同一块画布，可再框选裁剪。</small>
+                  </span>
+                </label>
+              </div>
+
+              {mode === "canvas" ? (
+                <div className="batch-edit-canvas-options">
+                  <div className="batch-edit-size-row">
+                    <Field label="宽">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={MAX_EDIT_DIMENSION}
+                        value={canvasWidth || ""}
+                        onChange={(event) => {
+                          setCanvasTouched(true);
+                          setCanvasWidth(Math.max(1, Math.round(Number(event.target.value) || 0)));
+                        }}
+                      />
+                    </Field>
+                    <Field label="高">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={MAX_EDIT_DIMENSION}
+                        value={canvasHeight || ""}
+                        onChange={(event) => {
+                          setCanvasTouched(true);
+                          setCanvasHeight(Math.max(1, Math.round(Number(event.target.value) || 0)));
+                        }}
+                      />
+                    </Field>
+                  </div>
+                  <Field label="不同比例时">
+                    <select
+                      className="input"
+                      value={fit}
+                      onChange={(event) => setFit(event.target.value as BatchFit)}
+                    >
+                      <option value="contain">完整显示（可能补边）</option>
+                      <option value="cover">填满画布（会裁边）</option>
+                    </select>
+                  </Field>
+                  <div className="batch-edit-actions">
+                    <Button
+                      size="sm"
+                      disabled={!referenceSize}
+                      onClick={() => {
+                        if (!referenceSize) return;
+                        setCanvasTouched(false);
+                        setCanvasWidth(referenceSize.width);
+                        setCanvasHeight(referenceSize.height);
+                      }}
+                    >
+                      使用参考图尺寸
+                    </Button>
+                    {crop ? (
+                      <Button size="sm" variant="ghost" onClick={() => setCrop(null)}>
+                        清除裁剪
+                      </Button>
+                    ) : null}
+                  </div>
+                  <span className="field-hint">
+                    {crop
+                      ? `裁剪输出 ${formatDimensions(crop.width, crop.height)}；在左侧拖动可重新框选。`
+                      : `输出 ${formatDimensions(canvasWidth, canvasHeight)}；在左侧拖动可选择裁剪区域。`}
+                  </span>
+                </div>
+              ) : (
+                <span className="field-hint">旋转或翻转后，每张图片保留自己的尺寸。</span>
+              )}
+            </section>
+
+            <section className="batch-edit-section">
+              <h4>输出</h4>
+              <div className={`batch-edit-output-row${showQuality ? "" : " is-single"}`}>
+                <Field label="格式">
+                  <select
+                    className="input"
+                    value={outputFormat}
+                    onChange={(event) => {
+                      setOutputFormat(event.target.value as BatchOutputFormat);
+                      // 各格式沿用各自的默认质量；换格式时回到该格式的默认值。
+                      setQuality(null);
+                    }}
+                  >
+                    {(Object.keys(FORMAT_LABELS) as BatchOutputFormat[]).map((value) => (
+                      <option key={value} value={value}>
+                        {FORMAT_LABELS[value]}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                {showQuality ? (
+                  <Field label="质量" plain>
+                    <div className="batch-edit-quality-row">
+                      <input
+                        className="batch-edit-quality"
+                        type="range"
+                        min={1}
+                        max={100}
+                        value={qualityValue ?? 90}
+                        aria-label="输出质量"
+                        onChange={(event) => setQuality(Number(event.target.value))}
+                      />
+                      <span className="batch-edit-quality-value">{qualityValue}</span>
+                    </div>
+                  </Field>
+                ) : null}
+              </div>
+              {outputFormat === "keep" ? (
+                <span className="field-hint">
+                  保持原格式时用各格式默认质量：JPEG 90、WebP 85、PNG 无损。
+                </span>
+              ) : null}
+              {outputFormat === "png" ? (
+                <span className="field-hint">PNG 无损，不调整质量。</span>
+              ) : null}
               {outputFormat === "jpeg" && reference?.hasAlpha ? (
                 <span className="field-hint">JPEG 不支持透明，透明区域会合成到白色背景。</span>
               ) : null}
-            </div>
-          </section>
-
-          <section className="batch-edit-section">
-            <h4>参考图</h4>
-            <div className="batch-edit-reference">
-              {details.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={`batch-edit-reference-item${
-                    item.id === reference?.id ? " is-active" : ""
-                  }`}
-                  onClick={() => {
-                    setReferenceId(item.id);
-                    setCanvasTouched(false);
-                  }}
-                  title={`使用 #${item.id} 作为参考图`}
-                >
-                  <img src={thumbnailUrl(item.id, item.thumbVersion)} alt="" draggable={false} />
-                </button>
-              ))}
-            </div>
-          </section>
+            </section>
+          </div>
         </div>
 
-        <section className="batch-edit-section">
-          <div className="batch-edit-heading">
-            <h4>预览</h4>
-            <span className="field-hint">按选中顺序均匀取 {sampleIds.length} 张</span>
-          </div>
-          <div className="batch-edit-previews">
-            {details.map((item) => (
-              <PreviewTile
-                key={item.id}
-                detail={item}
-                rotate={rotate}
-                flipHorizontal={flipHorizontal}
-                flipVertical={flipVertical}
-                mode={mode}
-                fit={fit}
-                canvasWidth={canvasWidth}
-                canvasHeight={canvasHeight}
-                crop={crop}
-                reference={item.id === reference?.id}
-              />
-            ))}
-          </div>
-        </section>
-
-        <section className="batch-edit-summary">
-          <div>
-            <strong>确认</strong>
-            <span>
-              {previewStatus === "loading"
-                ? "正在预检…"
-                : previewStatus === "error"
-                  ? "预检失败"
-                  : `${preview?.total ?? selectedIds.length} 张 · 可处理 ${
-                      preview?.willProcess ?? "—"
-                    } 张`}
+        <section className={`batch-edit-summary is-${summaryTone}`}>
+          <div className="batch-edit-summary-head">
+            <span className="batch-edit-summary-icon" aria-hidden="true">
+              {summaryTone === "success" ? (
+                <CheckCircle2 size={17} />
+              ) : summaryTone === "danger" ? (
+                <AlertCircle size={17} />
+              ) : (
+                <Spinner size={14} />
+              )}
             </span>
+            <div className="batch-edit-summary-heading">
+              <strong>确认</strong>
+              <span aria-live="polite">{summaryStatus}</span>
+            </div>
           </div>
           <dl>
             <div>
               <dt>输出</dt>
               <dd>
-                {formatDimensions(outputSize.width, outputSize.height)} ·{" "}
-                {FORMAT_LABELS[outputFormat]} · {qualityLabel(outputFormat, quality)}
+                {outputSize
+                  ? formatDimensions(outputSize.width, outputSize.height)
+                  : "各自原尺寸"}{" "}
+                · {FORMAT_LABELS[outputFormat]}
+                {outputFormat !== "keep"
+                  ? ` · ${qualityLabel(outputFormat, quality)}`
+                  : ""}
               </dd>
             </div>
             <div>
@@ -707,12 +788,12 @@ export function BatchEditDialog({
               </dd>
             </div>
             <div>
-              <dt>会清空</dt>
-              <dd>编辑后的图片需要重新生成 embedding 与姿势。</dd>
+              <dt>图片特征</dt>
+              <dd>编辑后直接丢弃，需要在批量任务里重新生成。</dd>
             </div>
             <div>
-              <dt>会丢失</dt>
-              <dd>原文件的 EXIF/ICC 不保留；JPEG/WebP 再编码一次会有画质损失。</dd>
+              <dt>画质</dt>
+              <dd>重新编码会损失画质，原 EXIF/ICC 不保留。</dd>
             </div>
             {preview?.skipBreakdown?.length ? (
               <div>
@@ -770,6 +851,7 @@ function CropStage({
   canvasWidth,
   canvasHeight,
   crop,
+  interactive,
   onCrop,
 }: {
   detail: ImageDetails;
@@ -781,6 +863,7 @@ function CropStage({
   canvasWidth: number;
   canvasHeight: number;
   crop: CropRect | null;
+  interactive: boolean;
   onCrop: (crop: CropRect | null) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -811,42 +894,60 @@ function CropStage({
     };
   };
 
-  const shown = draft ?? crop;
+  const shown = interactive ? (draft ?? crop) : null;
   return (
     <div
       ref={ref}
-      className="batch-edit-canvas"
+      className={`batch-edit-canvas${interactive ? " is-interactive" : ""}`}
       style={{
         aspectRatio: `${box.width} / ${box.height}`,
-        width: `min(100%, ${Math.round(Math.min(680, (360 * box.width) / box.height))}px)`,
+        width: `min(100%, ${Math.round(Math.min(720, (400 * box.width) / box.height))}px)`,
       }}
-      onPointerDown={(event) => {
-        const next = point(event);
-        if (!next) return;
-        event.currentTarget.setPointerCapture(event.pointerId);
-        start.current = next;
-        setDraft(null);
-      }}
-      onPointerMove={(event) => {
-        const from = start.current;
-        if (!from) return;
-        const to = point(event);
-        if (!to) return;
-        setDraft(rectBetween(from, to, box.width, box.height));
-      }}
-      onPointerUp={(event) => {
-        const from = start.current;
-        start.current = null;
-        if (!from) return;
-        const to = point(event);
-        if (!to) return;
-        onCrop(rectBetween(from, to, box.width, box.height));
-        setDraft(null);
-      }}
-      onPointerCancel={() => {
-        start.current = null;
-        setDraft(null);
-      }}
+      onPointerDown={
+        interactive
+          ? (event) => {
+              const next = point(event);
+              if (!next) return;
+              event.currentTarget.setPointerCapture(event.pointerId);
+              start.current = next;
+              setDraft(null);
+            }
+          : undefined
+      }
+      onPointerMove={
+        interactive
+          ? (event) => {
+              const from = start.current;
+              if (!from) return;
+              const to = point(event);
+              if (!to) return;
+              setDraft(rectBetween(from, to, box.width, box.height));
+            }
+          : undefined
+      }
+      onPointerUp={
+        interactive
+          ? (event) => {
+              const from = start.current;
+              start.current = null;
+              if (!from) return;
+              const to = point(event);
+              if (!to) return;
+              // 后端裁剪框是 u32 像素；指针坐标必须取整后再提交。
+              const rect = rectBetween(from, to, box.width, box.height);
+              onCrop(rect ? clampCrop(rect, box.width, box.height) : null);
+              setDraft(null);
+            }
+          : undefined
+      }
+      onPointerCancel={
+        interactive
+          ? () => {
+              start.current = null;
+              setDraft(null);
+            }
+          : undefined
+      }
     >
       <div className="batch-edit-layer" style={layout.layer}>
         <img

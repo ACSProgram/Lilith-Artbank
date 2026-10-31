@@ -51,6 +51,15 @@ fn fit_to_monitor(rect: Rect, monitor: Rect) -> Rect {
     }
 }
 
+/// 从托盘或第二次启动恢复主窗口：显示、取消最小化并聚焦。
+pub fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 /// 窗口完全落在所有显示器之外时，移回主显示器并收缩到可见范围。
 pub fn ensure_main_window_visible(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {

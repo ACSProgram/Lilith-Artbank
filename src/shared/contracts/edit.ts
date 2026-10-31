@@ -49,7 +49,7 @@ export interface SaveEditRequest {
   quality: number;
 }
 
-export type BatchEditMode = "canvas" | "samePixel";
+export type BatchEditMode = "keepSize" | "canvas";
 export type BatchFit = "cover" | "contain";
 export type BatchOutputFormat = "keep" | OutputFormat;
 
@@ -66,7 +66,7 @@ export interface BatchEditOptions {
   flipVertical: boolean;
   mode: BatchEditMode;
   canvas: BatchCanvas;
-  /** canvas 模式是画布坐标；samePixel 模式是翻转/旋转后的原图像素坐标。 */
+  /** canvas 模式是画布坐标；keepSize 模式不裁剪，必须为 null。 */
   crop: CropRect | null;
   outputFormat: BatchOutputFormat;
   /** null 表示按每张图的输出格式取默认值。 */
