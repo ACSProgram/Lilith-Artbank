@@ -24,7 +24,8 @@ impl AppState {
     pub fn history_page(&self) -> AppResult<HistoryPage> {
         let (database, root) = self.query_source()?;
         let entries = history::list(&database)?;
-        let (pending_purge_count, pending_purge_bytes) = history::pending_summary(&database)?;
+        let (pending_purge_count, pending_purge_folder_count, pending_purge_bytes) =
+            history::pending_summary(&database)?;
         let storage = history::storage_usage(&database, &root)?;
         let history_task_active = self
             .tasks
@@ -47,6 +48,7 @@ impl AppState {
             entries,
             max_steps: self.settings.snapshot().history.max_steps,
             pending_purge_count,
+            pending_purge_folder_count,
             pending_purge_bytes,
             storage,
             recovery_needed,

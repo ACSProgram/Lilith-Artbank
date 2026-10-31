@@ -61,7 +61,8 @@ fn page_from_keyset(
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
                 images.thumb_width, images.thumb_height,
-                folders.trashed_at IS NOT NULL, {sort_selects}
+                folders.trashed_at IS NOT NULL,
+                coalesce(folders.original_path, folders.path), {sort_selects}
          FROM images
          JOIN folders ON folders.id = images.folder_id
          {} WHERE {}
@@ -78,7 +79,7 @@ fn page_from_keyset(
         let item = image_row_from_row(row, root)?;
         let mut sort_values = Vec::with_capacity(sort_count);
         for index in 0..sort_count {
-            sort_values.push(row.get::<_, i64>(18 + index)?);
+            sort_values.push(row.get::<_, i64>(19 + index)?);
         }
         Ok((item, sort_values))
     })?;

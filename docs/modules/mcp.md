@@ -56,7 +56,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
 | `search_images` | 结构化查询（`view` 可含 `temp`）、`pageSize` 1–50、`searchScope`、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述、标签名与文件夹名；`view` 只有 all/trash/collection/temp，跨回收站搜索用 `searchScope=library` |
 | `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览 |
-| `images_get` | `ids≤50` | 详情、`[{id,name}]` 形状的标签、描述、能力标记；临时图片 `folderPath` 为「临时」并带 `temporary: true` |
+| `images_get` | `ids≤50` | 详情、`[{id,name}]` 形状的标签、描述、能力标记；临时图片 `folderPath` 为「临时」并带 `temporary: true`；回收站图片的 `folderPath` 显示原路径 |
 | `image_sheet` | selector、`grid 1–5`、`resolution: thumb/detail` | 拼图图片、格子映射、`sheetId`、下一页 |
 | `library_sql` | `sql`、`export?`、`format: jsonl/csv?` | 列名、行、行数、`truncated`；导出时附 20 行预览、真实文件路径与格式 |
 
@@ -90,8 +90,8 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | 视图 | 内容 |
 | --- | --- |
 | `mcp_images` | 正常图片：id、文件夹、格式、宽高、字节、评分、描述、pHash/主色、导入/修改时间、内容哈希 |
-| `mcp_trash_images` / `mcp_temp_images` | 回收站图片与临时区图片；临时区文件夹固定显示「临时」 |
-| `mcp_folders` / `mcp_trash_folders` | 正常/回收站文件夹；根目录用空字符串表示 |
+| `mcp_trash_images` / `mcp_temp_images` | 回收站图片与临时区图片；回收站图片的文件夹显示 `original_path`（旧 v10 行回退到 `path`），临时区文件夹固定显示「临时」 |
+| `mcp_folders` / `mcp_trash_folders` | 正常/回收站文件夹；回收站行显示 `original_path`（旧 v10 行回退到 `path`），仓库内部路径不出现在响应里；根目录用空字符串表示 |
 | `mcp_tags` / `mcp_image_tags` | 标签、正常图片的标签关系与图片数 |
 | `mcp_collections` / `mcp_collection_items` | 集合、成员数与成员位置 |
 | `mcp_features` | 正常图片是否有 embedding/pose、模型与维度；不含 pack 名、偏移与向量本体 |
@@ -121,7 +121,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - 临时图片允许 `images_update`（评分、标签、描述），但不产生历史记录，结果里的 `operationId` 为 null；`images_move`、`images_trash` 与集合成员变更会同步拒绝临时图片（选择里有临时图就整批 `rejected`，不再先弹确认卡再让任务失败）。
 - `images_move` 的 `dryRun` 把「已经在目标文件夹」算进 `skipped`（另给 `alreadyInTarget`），全是这种情况直接 `noop`；任务快照的 `completed` 是已处理张数，`skipped` 是其中没有移动的张数，`failed` 与 `failures` 来自同一份移动报告。
 - `tags_modify` 三种动作都走操作记录、都能撤销：`rename` 只改名称，撞同名标签直接报错；`delete` 删除标签并从所有图片上移除它；`merge` 把 `tagId` 的图片全部并到 `targetId`（已存在的关系只去重），然后删除源标签行。`delete` / `merge` 可传 `expectedImages` 核对源标签当前图片数，不一致返回 `rejected`。三种动作不套 100 张阈值（范围是整个标签），询问档下 `delete` / `merge` 需确认、`rename` 直接执行。合并会删除源标签，撤销依赖操作记录。
-- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 把整棵子树移入回收站（含子文件夹与图片，保留原路径，可在界面恢复）。临时文件夹、根目录、已在回收站或正在释放的文件夹不能改名、移动或删除；目标路径落在回收站文件夹时拒绝。`delete` 的 dryRun 返回 `imageCount`、`subfolderCount`、`recoverable: true` 与“原文件留在原路径”的后果说明。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认；四种动作真正执行前都要申请该子树路径写资源（新建与移动还锁父级，避免同级序号并发）。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
+- `folders_modify` 四种动作都走操作记录、都能撤销：`create` 用 `path`（缺失的上级一起建），`rename` 用 `folderId` + `name`，`move` 用 `folderId` 加 `parentPath`（空串表示根目录）或 `parentId`，`delete` 把整棵子树搬入回收站仓库（含子文件夹与图片，原路径立即释放，可在界面恢复）。临时文件夹、根目录、已在回收站或正在释放的文件夹不能改名、移动或删除；删除后原路径可以立即新建同名文件夹。`delete` 的 dryRun 返回 `imageCount`、`subfolderCount`、`recoverable: true` 与“目录会搬入回收站仓库，原路径立即释放”的后果说明。询问档下 `create` / `rename` 直接执行，`move` / `delete` 需用户确认；四种动作真正执行前都要申请该子树路径写资源（新建与移动还锁父级，避免同级序号并发）。`images_move` 仍会为目标路径自动建目录，`folders_modify` 是显式入口。
 - `collections_create` 带 selector 时在同一事务里建集合并加入图片，只产生一条记录；撤销会删除整个集合，重做按原 id 与条目顺序恢复。
 - selector 可以解析到不存在、已在回收站或不在回收站的图片；出现这类 id 时整批拒绝并返回失败清单，不会静默少做。
 - 产生操作记录时在标题前加 `AI · `。一次 MCP 写入最多 100 万张（query / ids）；相似结果最多 10,000 张；拼图最多 25 格。
@@ -258,6 +258,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 ## 路径隐藏
 
 - `library_info` 不返回 `library.path` 与 `tempFolder.path`；`images_get` 不返回 `filePath`。查询结果里的文件夹始终是图库内相对路径。
+- 回收站文件夹搬入仓库后，`mcp_*` 视图、`images_get`、selector 预览与任务失败清单都显示 `original_path`，`.artbank/trash/...` 内部路径不出现在响应、错误或导出内容里。
 - 所有工具响应与错误都经过 `mcp/sanitize.rs` 的统一脱敏器，不只依赖各工具自觉：替换图库根、程序根、系统临时目录与 `.artbank` 绝对路径（含 `file://` 形式），大小写不敏感，替换成 `<library>` / `<app>` / `<temp>`。
 - 本次调用返回的导出文件路径及其父目录在脱敏时保留原样，否则会被“临时目录一律替换”一并抹掉；其它字段照常脱敏。
 - 审计日志可以保留完整路径便于本机排查；工具响应、错误与导出内容都不含图库根或程序根。

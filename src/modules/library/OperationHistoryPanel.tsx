@@ -260,6 +260,7 @@ export function OperationHistoryPanel({
     const accepted = await confirmReleasePending(
       confirm,
       page.pendingPurgeCount,
+      page.pendingPurgeFolderCount,
       page.pendingPurgeBytes,
     );
     if (!accepted) return;
@@ -453,13 +454,27 @@ export function OperationHistoryPanel({
             {page
               ? `记录 ${page.storage.recordCount.toLocaleString()} 条 · 撤销数据 ${formatBytes(page.storage.totalBytes)}`
               : "正在读取占用…"}
-            {page && page.pendingPurgeCount > 0
-              ? ` · 待释放 ${page.pendingPurgeCount.toLocaleString()} 张 · ${formatBytes(page.pendingPurgeBytes)}`
+            {page &&
+            (page.pendingPurgeCount > 0 || page.pendingPurgeFolderCount > 0)
+              ? ` · 待释放 ${[
+                  page.pendingPurgeCount > 0
+                    ? `${page.pendingPurgeCount.toLocaleString()} 张`
+                    : "",
+                  page.pendingPurgeFolderCount > 0
+                    ? `${page.pendingPurgeFolderCount.toLocaleString()} 个文件夹`
+                    : "",
+                  page.pendingPurgeBytes > 0
+                    ? formatBytes(page.pendingPurgeBytes)
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}`
               : ""}
             {page ? ` · 保留最近 ${page.maxSteps} 步` : ""}
           </span>
           <div className="operation-history-footer-actions">
-            {page && page.pendingPurgeCount > 0 ? (
+            {page &&
+            (page.pendingPurgeCount > 0 || page.pendingPurgeFolderCount > 0) ? (
               <Button
                 size="sm"
                 variant="secondary"

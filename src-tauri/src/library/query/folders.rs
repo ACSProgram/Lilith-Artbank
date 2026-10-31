@@ -31,6 +31,7 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
             .map(|(id, path)| FolderInfo {
                 id,
                 path: path.to_owned(),
+                storage_path: None,
                 sort_index: sort_indexes.get(&id).copied().unwrap_or(0),
                 direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
                 total_image_count: totals.get(&id).copied().unwrap_or(0),
@@ -43,7 +44,7 @@ pub fn list_folders(database: &LibraryDb) -> AppResult<Vec<FolderInfo>> {
 pub fn list_trash_folders(database: &LibraryDb) -> AppResult<TrashFolders> {
     database.with_reader(|connection| {
         let mut statement = connection.prepare(
-            "SELECT id, path, sort_index FROM folders
+            "SELECT id, path, original_path, sort_index FROM folders
              WHERE kind = 'normal' AND trashed_at IS NOT NULL AND purge_operation_id IS NULL
              ORDER BY path",
         )?;
@@ -52,7 +53,8 @@ pub fn list_trash_folders(database: &LibraryDb) -> AppResult<TrashFolders> {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -75,15 +77,16 @@ pub fn list_trash_folders(database: &LibraryDb) -> AppResult<TrashFolders> {
         let direct_by_id: HashMap<i64, u64> = direct.iter().copied().collect();
         let tree = FolderTree::new(
             rows.iter()
-                .map(|(id, path, _)| (*id, path.clone()))
+                .map(|(id, path, _, _)| (*id, path.clone()))
                 .collect::<Vec<_>>(),
         );
         let totals: HashMap<i64, u64> = tree.totals(direct);
         let folders: Vec<FolderInfo> = rows
             .into_iter()
-            .map(|(id, path, sort_index)| FolderInfo {
+            .map(|(id, path, original_path, sort_index)| FolderInfo {
                 id,
-                path,
+                path: original_path.unwrap_or_else(|| path.clone()),
+                storage_path: Some(path),
                 sort_index,
                 direct_image_count: direct_by_id.get(&id).copied().unwrap_or(0),
                 total_image_count: totals.get(&id).copied().unwrap_or(0),

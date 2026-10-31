@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v10、多级文件夹、文件夹与图片的回收站、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v11、多级文件夹、文件夹与图片的回收站（文件夹搬入仓库）、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,7 +36,7 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 10；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 11；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；建索引耗时与首次打开停顿见[性能基准](../guides/performance.md)。v1 库按 v1→v2→v3→v4 链式升级。
@@ -46,13 +46,14 @@ PRAGMA mmap_size = 268435456;
 - v7 → v8 只新增覆盖索引 `idx_images_visible_facets(deleted_at, purge_operation_id, folder_id, file_ext, score)`，不改数据与语义；收益与建索引成本见[性能基准](../guides/performance.md)。
 - v8 → v9 只新增覆盖索引 `idx_images_visible_bytes(deleted_at, folder_id, file_size)`，供文件夹概览的 `SUM(file_size)` 在索引内完成，不改数据与语义。分面索引保持窄，避免标签聚合因索引变宽而退化。
 - v9 → v10 给 `folders` 增加 `trashed_at` 与 `purge_operation_id` 两列，并建两个空集上的部分索引；只做 `ALTER TABLE ADD COLUMN`，不改现有行。旧 `folderDelete`（空文件夹物理删除）记录仍可解析与撤销。
+- v10 → v11 给 `folders` 增加 `original_path TEXT`，只做 `ALTER TABLE ADD COLUMN`，不搬目录；已有的原地回收站行保持 `original_path IS NULL`，新删除的文件夹才进入 `.artbank/trash/<trashed_at>/<根id>/`。
 
 ### 表
 
 | 表 | 作用 |
 | --- | --- |
 | `meta` | `appFormat`、`schemaVersion`、`libraryId`、`createdAt` |
-| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''`；每个祖先都有行，路径 NOCASE 唯一；`sort_index` 为手动排序位；`kind` 为 `normal` / `temp`，临时文件夹每个图库恰好一个；`trashed_at` 非空表示整棵子树在回收站，`purge_operation_id` 非空表示等待释放 |
+| `folders` | 图库内文件夹；`path` 为 `/` 分隔相对路径，根目录为 `''`；每个祖先都有行，路径 NOCASE 唯一；`sort_index` 为手动排序位；`kind` 为 `normal` / `temp`，临时文件夹每个图库恰好一个；`trashed_at` 非空表示整棵子树在回收站，`purge_operation_id` 非空表示等待释放；新回收站行的 `path` 是 `.artbank/trash/<trashed_at>/<根id>/...` 仓库内部路径，`original_path` 保存用户原路径（旧 v10 行为 `NULL`） |
 | `images` | 图片元数据与缩略图指针 |
 | `tags` / `image_tags` | 规范化标签与多对多关系 |
 | `collections` / `collection_items` | 手工集合与顺序 |
@@ -190,9 +191,9 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `place_folders` | `{ folderIds, parentId, sortIndex? }` | `FolderChange`（多文件夹一次移动/插入，一条记录） |
 | `reorder_folders` | `{ folderIds, parentId, sortIndex }` | `FolderChange`（同级受影响行） |
 | `apply_folder_order` | `{ folderId, key, descending, recursive, orders }` | `FolderChange`（一次性排序，一条记录） |
-| `delete_folder` | `{ folderId }` | `FolderChange`（整棵子树移入回收站；`removedIds` 含子树 id，`affectedImages` 为一起进入回收站的图片数） |
-| `get_trash_folders` | — | `TrashFolders`（回收站文件夹、根行直属图片数、回收站总图片数） |
-| `restore_folder` | `{ folderId }` | `FolderChange`（整个删除单元回到正常树） |
+| `delete_folder` | `{ folderId }` | `FolderChange`（整棵子树搬入回收站仓库、原路径立即释放；`removedIds` 含子树 id，`affectedImages` 为一起进入回收站的图片数） |
+| `get_trash_folders` | — | `TrashFolders`（回收站文件夹、根行直属图片数、回收站总图片数）；文件夹的 `path` 是原路径，`storagePath` 是仓库内部路径 |
+| `restore_folder` | `{ folderId }` | `FolderChange`（整个删除单元搬回原路径；原路径被占用时拒绝） |
 | `delete_folder_permanently` | `{ folderId }` | `FolderChange`（只写文件夹与图片的待释放标记） |
 | `get_tags` | `{ limit? }` | `TagInfo[]` |
 | `search_tags` | `{ query, limit? }` | `TagInfo[]` |
@@ -255,7 +256,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 `FolderChange`：`{ folders: FolderInfo[], removedIds: number[], affectedImages: number }`。文件夹写命令只回传受影响的行，前端按 id 就地合并（`applyFolderChange`），不再每次重取整棵树；`affectedImages` 只用于文件夹移入/移出回收站，其它写命令为 0。
 
-`FolderInfo`：`{ id, path, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。`sortIndex` 只在同级内比较，决定文件夹树的显示顺序。
+`FolderInfo`：`{ id, path, storagePath?, directImageCount, totalImageCount, sortIndex }`。`directImageCount` 只统计直接位于该文件夹的未删除图片，`totalImageCount` 包含全部后代；根目录的 `path` 为空字符串。回收站行的 `path` 是原路径（旧 v10 行回退到仓库路径），`storagePath` 只在回收站行返回，供前端按仓库路径建树，展示与面包屑仍用 `path`。`sortIndex` 只在同级内比较，决定文件夹树的显示顺序。
 
 编辑/集合/回收站命令的细节、返回结构与失败语义见 [浏览与检索](browse-and-query.md)。要点：
 
@@ -278,9 +279,12 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 重命名只改最后一段，保留父路径；仅大小写变化时通过临时目录中转（Windows 不能直接改大小写）。移动接收目标父文件夹 id，拒绝移动到自身或后代。
 - 重命名/移动会先改物理目录，再在单写事务里更新整个子树的 `path`；数据库失败时把目录移回。目标位置已有同名文件夹或磁盘目录时拒绝。
 - `place_folders` 一次把多个文件夹移动到同一父级，可插入到指定同级位置；父子同时选中只保留最外层父。先校验全部目录与名称冲突，再依次 rename，任一失败反向搬回；整次操作一条 `FolderMove` 记录。
-- 删除文件夹 = 整棵子树移入回收站：文件夹与全部子文件夹写同一个 `trashed_at`，其中仍正常的图片写同一个 `deleted_at`，物理文件与目录都留在原路径。空文件夹也走同一语义，不再有“只能删除空文件夹”的特例。正常树、导入目标、任务范围与 MCP 文件夹列表都看不到回收站文件夹；新建、重命名、移动、导入到已删除路径会被拒绝并提示先恢复或永久删除。
-- 恢复文件夹 = 恢复整个删除单元：选中删除单元里的任意一级，向上找到时间戳相同的最外层文件夹，整棵子树与随这次删除一起进入回收站的图片一起恢复。删除前已单独在回收站的图片保持删除；上级文件夹来自更早的另一次删除时拒绝恢复，先恢复上级文件夹。单张恢复图片前会在同一个写事务里确认所在文件夹不在回收站，因此不会与整目录删除擦肩，留下「正常图片位于已删除文件夹」的行。
-- 永久删除回收站文件夹只给子树文件夹与其中回收站图片写 `purge_operation_id`；文件夹立即从回收站树消失，行与空目录等释放任务清理。目录里仍有未纳管文件时保留行与待释放标记、不递归强删，并把这条写进释放任务的失败清单与日志；它不算「还有待释放文件」，等下次清空回收站重新标记时再试。
+- 删除文件夹 = 整棵子树搬入回收站仓库：在写事务里把根目录 rename 到 `.artbank/trash/<trashed_at>/<根文件夹id>/`，子树内部保留原目录名，原路径立即释放；随后全部子行写同一个 `trashed_at`，`path` 改为仓库内部路径，`original_path` 保存用户原路径，其中仍正常的图片写同一个 `deleted_at`。空文件夹同样搬移。正常树、导入目标、任务范围与 MCP 文件夹列表都看不到回收站文件夹；删除后可以在原位置立即新建同名文件夹。目录不存在、目标已存在或 rename 失败时整次删除失败，不会留下「行已改、目录未搬」的半截状态。
+- v10 已有的回收站文件夹保持原地语义：迁移只加 `original_path` 列，不搬目录；这些行的 `original_path` 为 `NULL`，恢复/释放继续沿旧路径工作，直到用户恢复或永久删除。
+- 恢复文件夹 = 恢复整个删除单元：选中删除单元里的任意一级，按 `trashed_at` 找到最外层文件夹，把仓库根目录 rename 回 `original_path`，再为整棵子树写回用户路径、清空 `original_path` 与 `trashed_at`。删除前已单独在回收站的图片保持删除；原路径已有同名文件夹（数据库行或磁盘目录）时拒绝恢复，提示先重命名或移走占用的文件夹，不做自动合并或改名；上级文件夹来自更早的另一次删除时也拒绝，先恢复上级。单张恢复图片前会在同一个写事务里确认所在文件夹不在回收站，因此不会与整目录删除擦肩，留下「正常图片位于已删除文件夹」的行。
+- 回收站树与面包屑展示 `original_path`，建树与子树定位使用仓库内部路径和文件夹 id；同一原路径被删除多次时按删除单元（`trashed_at`、id）区分，不会合并成一代。
+- 永久删除回收站文件夹只给子树文件夹与其中回收站图片写 `purge_operation_id`；文件夹立即从回收站树消失，仓库里的行、原图与目录等释放任务清理，原路径不受影响。目录里仍有未纳管文件时保留行与待释放标记、不递归强删，并把这条写进释放任务的失败清单与日志；它不算「还有待释放文件」，等下次清空回收站重新标记时再试。
+- 打开图库时对账 `.artbank/trash`：数据库仍是正常行而仓库目录存在时，把目录搬回原路径（未提交的删除）；数据库是回收站行而仓库目录缺失、原路径还在时，把原目录补搬回仓库；无法判定或原路径已被占用时只记日志、保留数据，等用户恢复或永久删除时再报错。
 - 文件夹命令都返回 `FolderChange`：`folders` 是受影响文件夹的最新状态，`removedIds` 是从正常树移除的子树 id，`affectedImages` 是这次操作涉及的图片数（其它写命令为 0）。前端按 id 增量合并树，不重取整棵树。
 - 文件夹写操作在改磁盘或数据库前先申请该子树路径写；读图任务（AI 描述/embedding/姿势、缩略图重建、估算、查看器）只在读原图期间持有短读锁，因此文件夹改名最多等当前这一张读完，不会被整个长任务挡住。读者拿到锁后按 id 重新读取数据库行，路径已变就重试，不会继续写旧路径。
 - 路径锁分三级：读、原地替换、写。读与读、读与原地替换都不互斥——原地替换的发布方式是“临时文件 + 原子重命名”，读者要么读到旧图要么读到新图，不会读到半个文件，所以图片空间优化期间查看器、MCP 拼图与复制照常可用；移动、删除、导入与另一个压缩仍是写，与替换互斥。
@@ -307,10 +311,10 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 历史保存在当前图库的 SQLite（`operations` / `operation_chunks` / `undo_runs`），换库后各自独立；最大步数来自设置 `history.maxSteps`。
 
-- 已接入：移入回收站、恢复、永久删除、清空回收站；文件夹移入回收站（`folderTrash`）、恢复回收站文件夹（`folderRestore`）、永久删除回收站文件夹（`folderPurge`）；导入、编辑保存、批量编辑（`batchEdit`，整批一条记录、逐张快照）、图片移动、文件夹创建/重命名/移动/删除/排序；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除/合并（`kind='tagMerge'`）、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述；图片空间优化（`kind='optimize'`，只记结果，不可撤销）；孤儿移入回收站（`kind='orphanMove'`，可撤销）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
+- 已接入：移入回收站、恢复、永久删除、清空回收站；文件夹移入回收站（`folderTrash`）、恢复回收站文件夹（`folderRestore`）、永久删除回收站文件夹（`folderPurge`）；`folderTrash` / `folderRestore` 的逆数据保存子树的原路径、仓库路径与删除时间戳，撤销/重做会搬移目录（旧 v10 chunk 缺字段时按原地回收站处理）；导入、编辑保存、批量编辑（`batchEdit`，整批一条记录、逐张快照）、图片移动、文件夹创建/重命名/移动/删除/排序；评分、描述（手工与单张 AI）、标签设置/增删/改名/删除/合并（`kind='tagMerge'`）、集合创建/重命名/删除/排序/加入/移出/运算、相似分组批量建集合、批量 AI 描述；图片空间优化（`kind='optimize'`，只记结果，不可撤销）；孤儿移入回收站（`kind='orphanMove'`，可撤销）。缩略图重建、embedding/pose 生成与相似扫描等派生数据不进入记录。
 - `orphanMove` 的 `data` 是 `(源绝对路径, 目标绝对路径)[]` 的 JSON 数组，整次清理写**一条**记录，撤销一次移回整批；原路径已被占用时跳过该条并计入「无法恢复」。它不改变图库内容，`releases_files()` 返回 `false`，不参与待释放统计。
 - 同步写入用 `history::write`：记录行、逆数据与业务更新在同一个 `IMMEDIATE` 事务里；`affected=0` 且没有逆数据时整条回滚，既不留下空记录，也不清空重做分支（没有实际改动的操作不算新时间线）。`write` 在同一个事务里删除 `undone` / `redoing` 记录：确实写入的新操作开启新时间线，灰色记录与其暂存文件不再可重做。
-- 写事务里的文件动作（搬移原图或目录、发布编辑结果、新建目录）通过 `draft.journal()` 记进 `library/fs_journal.rs` 的 `FileJournal`。事务提交成功才 `disarm()`；业务错误、SQL 失败、提交失败与 panic 展开都会在日志析构时逆序撤回，撤回失败只记日志。搬移文件、图片移动、编辑保存、文件夹新建/重命名/移动与孤儿清理都走这一条补偿路径，不再各写一套局部回滚。
+- 写事务里的文件动作（搬移原图或目录、发布编辑结果、新建目录）通过 `draft.journal()` 记进 `library/fs_journal.rs` 的 `FileJournal`。事务提交成功才 `disarm()`；业务错误、SQL 失败、提交失败与 panic 展开都会在日志析构时逆序撤回，撤回失败只记日志。搬移文件、图片移动、编辑保存、文件夹新建/重命名/移动、文件夹移入/恢复回收站与孤儿清理都走这一条补偿路径，不再各写一套局部回滚。
 - 长任务用 `history::LiveOperation` 包住 `begin_live`：每批在同一个事务里用 `append_live_in_tx` / `add_live_affected_in_tx` 追加逆数据，正常结束、取消、失败与 panic 都通过 `finish_live` 收尾；导入、批量编辑、批量 AI 描述与图片空间优化使用。排队取消或线程起不来时 guard 随闭包丢弃，空记录删除；进程被强杀时 Drop 不执行，仍由下次打开恢复。
 - `begin_live` 不结束重做分支：导入可能整批都是重复跳过，或排队未启动；只有确实写入内容的批次（导入批次、AI 描述写入、批量编辑与压缩批次）才调用 `discard_redo_in_tx`。批量编辑在第一批实际写入时清空重做分支，排队未启动不会清掉。崩溃留下的 `pending` 记录在下次打开时按 `origin_operation_id` 或已有 chunk / `affected` 转为 `applied`，没有内容则删除。撤销/重做运行中 panic 会把 `undo_runs` 标为失败；`undoing` / `redoing` 记录保留给下次打开续做，本次不自动重试。
 - 图片空间优化不写任何逆数据：每批事务内更新 `images` 并累加 `affected`，完成后用 `history::update_label` 把「N 张 · 省 X」写进标题。`run_undo` 在标记 `undoing` 之前预检链中含 `optimize` 就返回“压缩操作不可撤销，原图已删除”，不会留下假的 `undoFailed`；记录面板同样禁用撤销。
@@ -318,12 +322,12 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 - 重做从当前状态出发，选中的目标是“重做到这里”：先找出目标及下方连续的 `undone` / `redoing` 记录，按 id 升序重新应用。重做前把整批记录标为 `redoing`；崩溃后这些标记就是续做范围，不会顺带重做用户没选中的更新记录。取消或失败时未完成的记录恢复为 `undone`；失败原因保存在 `error`，修正后可再次重做。
 - 撤销失败会把记录标为 `undoFailed` 并保留错误；之后不能在它之前继续回退。可以对这条记录单独「重试撤销」，或「跳过」：跳过会把它标为 `undoSkipped`，仍留在时间线里，但不再参与撤销与重做，也不再阻挡更早记录。重做失败或部分重做后，UI 会阻止继续向更早记录撤销，直到重做重试成功（撤销失败则靠重试或跳过解除）。所有逆操作与重做操作都可重复执行。
 - 裁剪只处理 `applied` / `undoFailed` / `undoSkipped`，保留最新 `maxSteps` 条；每次成功写入、保存设置、打开图库与导入收尾后各裁剪一次。被裁掉的编辑/导入/批量编辑记录删除 `.artbank/undo/<id>/`，永久删除安排 `ReleaseGarbage`；`undo_runs` 中目标已被裁掉的行同事务清理。
-- `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；图片处理完后自底向上删除已无图片、已无子文件夹且磁盘目录为空的回收站文件夹行与目录。可重复执行，也可取消：每 400 行检查一次取消，停下时未处理的行仍带待释放标记，消息写「已停止，剩余待释放保留到下次」。有释放失败的终态是「部分失败」而不是「完成」，失败条数进失败清单与日志。「清空操作记录」只删掉全部记录、`undo_runs` 与暂存目录，不删除任何原图文件；已从回收站移除的图片会留在磁盘上，之后由单独的「释放待删文件」动作删除（自动释放或重新打开图库时也会清理）。
+- `ReleaseGarbage` 找 `purge_operation_id` 已没有对应 `operations` 行的批次，按 400 张一块删行、删文件；图片处理完后自底向上删除已无图片、已无子文件夹且磁盘目录为空的回收站文件夹行与目录。文件夹的 `path` 是仓库内部路径，释放只删仓库内容，原路径不受影响。可重复执行，也可取消：每 400 行检查一次取消，停下时未处理的行仍带待释放标记，消息写「已停止，剩余待释放保留到下次」。有释放失败的终态是「部分失败」而不是「完成」，失败条数进失败清单与日志。「清空操作记录」只删掉全部记录、`undo_runs` 与暂存目录，不删除任何原图文件；已从回收站移除的图片会留在磁盘上，之后由单独的「释放待删文件」动作删除（自动释放或重新打开图库时也会清理）。
 - 释放失败要落到用户看得见的地方：删文件失败与「回收站目录里还有未纳管文件」都写进任务的失败清单与日志，任务消息给出“N 项未能释放”。原图路径无法解析（哈希或扩展名不合法）的行不删行——删了就再也查不到——只清掉待释放标记并保留在回收站，失败清单里给出存库路径。
 - 「还有待释放文件」按磁盘事实判断：图片的无主标记只要有就算，文件夹的无主标记要看目录是不是不存在或已空。目录里还有未纳管文件的文件夹保留标记但不算待释放，因此不会每次写入或开库都白排一次释放任务；清空回收站会把这些无主标记改成新记录，下次释放再试。
 - 待释放行对查询不可见：图片与文件夹的 `purge_operation_id` 非空时分别从回收站视图、回收站树与全库搜索中排除。图片的待释放行一定有 `deleted_at`，普通视图与集合视图靠 `deleted_at IS NULL` 挡住；`rows_by_ids` 单独加同一条件。不要无条件加这条条件，它会让 20 万行按文件夹排序的首页从 39 ms 涨到 81 ms（见 [性能基准](../guides/performance.md)）。
 - 启动恢复在 `AppState::open_library` 做 DB 部分：pending 导入转 `applied` 或删除、收集最小 `undoing` id 与最大 `redoing` id、清理无主暂存目录与统计无主待释放批次；后台任务在 `application.manage` 之后安排，分别续做撤销与重做。
-- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`canRun` 表示此刻能否开始撤销或重做（没有运行中的任务且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed` / `undoSkipped`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
+- `HistoryPage`：`{ entries, maxSteps, pendingPurgeCount, pendingPurgeFolderCount, pendingPurgeBytes, storage, recoveryNeeded, canRun, blockedReason }`，`pendingPurgeFolderCount` 让纯文件夹待释放时记录面板仍显示「释放待删文件」入口；`canRun` 表示此刻能否开始撤销或重做（没有运行中的任务且列表非空）；`HistoryEntry`：`{ id, kind, label, createdAt, affected, status, error }`，`status` 为 `applied` / `undone` / `redoing` / `undoFailed` / `undoSkipped`。`pendingPurge*` 统计全部待释放行，不区分记录是否仍可撤销。
 - `HistoryStorage`：`{ recordCount, chunkCount, chunkBytes, undoFiles, undoBytes, totalBytes }`。逆数据用 `sum(length(data))` 统计，不读 BLOB 内容；`undo*` 递归统计 `.artbank/undo/` 的普通文件并跳过符号链接。操作记录面板显示记录数与占用；清空只删除记录与暂存，不对 SQLite 执行 `VACUUM`，数据库文件不会立即缩小。
 - `recoveryNeeded` 为真表示存在 `undoing` / `redoing` 记录且没有对应撤销/重做任务在跑；此时 `blockedReason` 提示重新打开图库恢复。
 - 界面入口在浏览工具栏“记录”按钮：灰色 `undone` 记录可选中重做，“当前状态”分隔线标出撤销位置；新操作后灰色记录消失。见 [浏览与检索](browse-and-query.md#操作记录)。
@@ -332,7 +336,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 
 - 原始逆数据写在 `ids` / `triples` / `moves` / `json` / `sortJson` chunks；撤销时另写 `redo` chunks（同一张表，`format='redo'`），只描述“撤销前是什么”，原始 chunks 不动。每次从 `applied` 进入撤销会先清掉旧 `redo` chunks；崩溃续做保留已写入的快照。
 - 回收站/恢复：`triples(imageId, oldDeletedAt, oldModifiedAt)`。撤销写回旧状态；重做使用撤销时捕获的 `ImageStates`（当前 `deleted_at` / `modified_at`）。永久删除/清空回收站撤销时先记下 `purge_operation_id` 的图片与文件夹 id，再清空标记；重做重新写标记。
-- 文件夹移入回收站：`json` 保存子树 `FolderRow`（id、路径、创建时间、排序位），`triples(imageId, 0, oldModifiedAt)` 保存一起进入回收站的图片。撤销把文件夹行的 `trashed_at` 清空并写回图片旧修改时间；重做重新写同一个时间戳。
+- 文件夹移入回收站：`json` 保存子树 `FolderRow`（id、仓库路径、创建时间、排序位、`originalPath`、`trashedAt`），`triples(imageId, 0, oldModifiedAt)` 保存一起进入回收站的图片。撤销把仓库根搬回原路径、清空文件夹行的回收站状态并写回图片旧修改时间；重做用新时间戳重新搬入仓库。旧 v10 chunk 没有原路径与时间戳字段，按原地回收站处理。
 - 恢复回收站文件夹：`json` 保存恢复的整个删除单元文件夹行，`triples(imageId, deletedAt, oldModifiedAt)` 保存恢复前的回收站时间戳与修改时间。撤销重新移入回收站并恢复图片状态；重做清空 `trashed_at` 与 `deleted_at`。
 - 永久删除回收站文件夹：撤销先记下 `purge_operation_id` 的文件夹 id（`PurgeFolderIds`）与图片 id，再清空标记；重做按原 id 重新写标记。释放任务已经删掉的行无法恢复，这一点由“过期或清空记录后不可撤销”的现有协议保证。
 - `moves`：`(imageId, fromFolderId, toFolderId, oldModifiedAt)`。撤销按当前 `folder_id` 判断：已是源文件夹就跳过，仍是目标文件夹才把文件移回并恢复 `modified_at`；文件移动失败会回滚本记录已完成的移动。重做按相反方向执行，并恢复撤销时的修改时间。移动时隐式新建的目标文件夹会在撤销后按空文件夹清理；重做按捕获的完整文件夹行重建。

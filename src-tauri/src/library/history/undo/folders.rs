@@ -37,12 +37,24 @@ pub(crate) fn undo_folder(
             if rows.is_empty() {
                 return Err(AppError::message("这条记录缺少重做数据"));
             }
-            match kind {
-                HistoryKind::FolderTrash => folders::undo_trash(&transaction, &rows, &triples)?,
-                HistoryKind::FolderRestore => folders::undo_restore(&transaction, &rows, &triples)?,
-                _ => {}
+            let mut journal = FileJournal::default();
+            let applied = match kind {
+                HistoryKind::FolderTrash => {
+                    folders::undo_trash(&transaction, root, &rows, &triples, &mut journal)
+                }
+                HistoryKind::FolderRestore => {
+                    folders::undo_restore(&transaction, root, &rows, &triples, &mut journal)
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = applied {
+                journal.rollback();
+                return Err(error);
             }
-            transaction.commit()?;
+            if let Err(error) = transaction.commit() {
+                journal.rollback();
+                return Err(error.into());
+            }
             return Ok(());
         }
         // 一次操作可能有多条文件夹路径变更；任何一条失败都算整次失败：
@@ -143,6 +155,8 @@ pub(super) fn folder_rows(
                 path: item.path.clone(),
                 created_at,
                 sort_index,
+                original_path: None,
+                trashed_at: None,
             });
         }
     }
@@ -171,12 +185,24 @@ pub(crate) fn redo_folder(
             if rows.is_empty() {
                 return Err(AppError::message("这条记录缺少重做数据"));
             }
-            match kind {
-                HistoryKind::FolderTrash => folders::redo_trash(&transaction, &rows, &triples)?,
-                HistoryKind::FolderRestore => folders::redo_restore(&transaction, &rows, &triples)?,
-                _ => {}
+            let mut journal = FileJournal::default();
+            let applied = match kind {
+                HistoryKind::FolderTrash => {
+                    folders::redo_trash(&transaction, root, &rows, &triples, &mut journal)
+                }
+                HistoryKind::FolderRestore => {
+                    folders::redo_restore(&transaction, root, &rows, &triples, &mut journal)
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = applied {
+                journal.rollback();
+                return Err(error);
             }
-            transaction.commit()?;
+            if let Err(error) = transaction.commit() {
+                journal.rollback();
+                return Err(error.into());
+            }
             return Ok(());
         }
         // 与撤销对称：任一条失败都逆序撤回已经落地的目录动作。

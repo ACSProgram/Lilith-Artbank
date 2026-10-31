@@ -218,7 +218,8 @@ fn build_preview(target_id: i64, entries: Vec<HistoryEntry>) -> OperationPreview
     }
 }
 
-pub fn pending_summary(database: &LibraryDb) -> AppResult<(u64, u64)> {
+/// `(待释放图片数, 待释放文件夹数, 图片字节数)`；文件夹本身不扫盘计体积。
+pub fn pending_summary(database: &LibraryDb) -> AppResult<(u64, u64, u64)> {
     database.with_reader(|connection| {
         let (count, bytes): (i64, i64) = connection.query_row(
             "SELECT count(*), coalesce(sum(file_size), 0) FROM images
@@ -226,7 +227,16 @@ pub fn pending_summary(database: &LibraryDb) -> AppResult<(u64, u64)> {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok((count.max(0) as u64, bytes.max(0) as u64))
+        let folders: i64 = connection.query_row(
+            "SELECT count(*) FROM folders WHERE purge_operation_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((
+            count.max(0) as u64,
+            folders.max(0) as u64,
+            bytes.max(0) as u64,
+        ))
     })
 }
 

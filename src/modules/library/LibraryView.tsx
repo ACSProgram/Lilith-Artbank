@@ -90,6 +90,8 @@ interface LibraryViewProps {
   onApplyBrowse: (next: BrowseState, pushHistory?: boolean) => void;
   onGoBack: () => void;
   onFoldersChanged?: () => void | Promise<void>;
+  /** 回收站树在本地清空/释放后立即重取；外部变化仍走 changeSignal。 */
+  onTrashFoldersChanged?: () => void | Promise<void>;
   onImageSelectionChange?: (imageIds: number[]) => void;
   /** 工作区、任务与 MCP 送来的数据变化；本地变化由 LibraryView 直接应用。 */
   changeSignal: DataChangeSignal | null;
@@ -170,6 +172,7 @@ export function LibraryView({
   onApplyBrowse,
   onGoBack,
   onFoldersChanged,
+  onTrashFoldersChanged,
   onImageSelectionChange,
   changeSignal,
   onOpenViewer,
@@ -1452,13 +1455,22 @@ export function LibraryView({
         countDelta: { trash: -report.deleted },
         similarity: "clear",
       });
+      void onTrashFoldersChanged?.();
     } catch (cause) {
       notify("清空回收站失败", "error", errorMessage(cause));
     } finally {
       setEmptyingTrash(false);
       setViewBusy(false);
     }
-  }, [applyChange, confirm, current?.trashCount, notify, trashFolders, viewBusy]);
+  }, [
+    applyChange,
+    confirm,
+    current?.trashCount,
+    notify,
+    onTrashFoldersChanged,
+    trashFolders,
+    viewBusy,
+  ]);
 
   const removeFromCurrentCollection = useCallback(
     async (ids: number[]): Promise<boolean> => {

@@ -11,8 +11,11 @@ pub const THUMBS_DIR: &str = "thumbs";
 pub const FEATURES_DIR: &str = "features";
 pub const TEMP_DIR: &str = "temp";
 pub const UNDO_DIR: &str = "undo";
+pub const TRASH_DIR: &str = "trash";
 pub const RECYCLE_DIR: &str = "recycle";
 pub const OUTPUT_DIR: &str = "output";
+/// 回收站仓库路径的内部上限：比用户路径的 512 多出固定前缀与 id。
+pub const INTERNAL_PATH_MAX: usize = 1024;
 /// 临时文件夹的默认内部目录名。迁移遇到同名普通文件夹时会追加后缀，
 /// 因此读写都以 `folders.kind = 'temp'` 记录的路径为准，不要直接拼这个常量。
 pub const TEMP_FOLDER_DIR: &str = ".artbank-temp";
@@ -37,6 +40,7 @@ pub struct LibraryPaths {
     pub features: PathBuf,
     pub temp: PathBuf,
     pub undo: PathBuf,
+    pub trash: PathBuf,
 }
 
 impl LibraryPaths {
@@ -50,6 +54,7 @@ impl LibraryPaths {
             features: data.join(FEATURES_DIR),
             temp: data.join(TEMP_DIR),
             undo: data.join(UNDO_DIR),
+            trash: data.join(TRASH_DIR),
             data,
             root,
         }
@@ -61,6 +66,7 @@ impl LibraryPaths {
         std::fs::create_dir_all(&self.features)?;
         std::fs::create_dir_all(&self.temp)?;
         std::fs::create_dir_all(&self.undo)?;
+        std::fs::create_dir_all(&self.trash)?;
         Ok(())
     }
 
@@ -107,9 +113,77 @@ pub fn normalize_folder(value: &str) -> AppResult<String> {
 
 /// 已存进数据库的文件夹路径（图片文件定位、撤销/重做）使用。
 ///
-/// 只额外允许临时文件夹的内部路径；其它保留目录仍然拒绝。
+/// 只额外允许临时文件夹与回收站仓库的内部路径；其它保留目录仍然拒绝。
 pub fn normalize_stored_folder(value: &str) -> AppResult<String> {
+    let raw = value.trim().replace('\\', "/");
+    if let Some(rest) = raw.trim_matches('/').strip_prefix(".artbank/trash/") {
+        return normalize_trash_folder(rest);
+    }
     normalize_folder_with(value, true)
+}
+
+/// 回收站仓库路径：`.artbank/trash/<trashed_at>/<根文件夹id>[/<相对原路径>]`。
+///
+/// 数量与长度按内部上限校验，不复用用户路径的 512 字符限制。
+pub fn normalize_trash_folder(value: &str) -> AppResult<String> {
+    let trimmed = value.trim_matches('/');
+    if trimmed.chars().count() > INTERNAL_PATH_MAX {
+        return Err(AppError::message("文件夹路径过长，请先缩短路径"));
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::message("文件夹路径包含控制字符"));
+    }
+    let mut segments = trimmed.split('/');
+    let stamp = segments
+        .next()
+        .ok_or_else(|| AppError::message("回收站路径无效"))?;
+    let root_id = segments
+        .next()
+        .ok_or_else(|| AppError::message("回收站路径无效"))?;
+    for (value, label) in [(stamp, "时间戳"), (root_id, "文件夹 id")] {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(AppError::message(format!("回收站路径的{label}无效")));
+        }
+    }
+    for segment in segments {
+        validate_stored_segment(segment)?;
+    }
+    if stamp.parse::<i64>().map(|value| value <= 0).unwrap_or(true)
+        || root_id
+            .parse::<i64>()
+            .map(|value| value <= 0)
+            .unwrap_or(true)
+    {
+        return Err(AppError::message("回收站路径无效"));
+    }
+    Ok(format!("{DATA_DIR}/{TRASH_DIR}/{trimmed}"))
+}
+
+/// 仓库内部路径的段校验：只拦非法目录名，不套用用户输入时的保留名录。
+fn validate_stored_segment(segment: &str) -> AppResult<()> {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return Err(AppError::message("文件夹路径包含空目录名"));
+    }
+    if segment.chars().count() > 255 {
+        return Err(AppError::message("文件夹名称过长"));
+    }
+    if segment.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::message("文件夹名称包含控制字符"));
+    }
+    if segment
+        .chars()
+        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\'))
+    {
+        return Err(AppError::message("文件夹名称包含 Windows 不允许的字符"));
+    }
+    if segment.ends_with(' ') || segment.ends_with('.') {
+        return Err(AppError::message("文件夹名称不能以空格或点结尾"));
+    }
+    Ok(())
+}
+
+pub fn trash_folder_path(stamp: i64, root_id: i64) -> String {
+    format!("{DATA_DIR}/{TRASH_DIR}/{stamp}/{root_id}")
 }
 
 fn normalize_folder_with(value: &str, allow_temp: bool) -> AppResult<String> {
@@ -308,6 +382,28 @@ mod tests {
         );
         assert!(normalize_stored_folder(".artbank").is_err());
         assert!(normalize_stored_folder("recycle").is_err());
+    }
+
+    #[test]
+    fn accepts_only_well_formed_trash_storage_paths() {
+        assert_eq!(
+            normalize_stored_folder(".artbank/trash/1712345678901/42/人物/速写").unwrap(),
+            ".artbank/trash/1712345678901/42/人物/速写"
+        );
+        assert!(normalize_stored_folder(".artbank/trash/1/2").is_ok());
+        for value in [
+            ".artbank/trash/0/2",
+            ".artbank/trash/+1/2",
+            ".artbank/trash/1/x",
+            ".artbank/trash/1/2/../逃逸",
+            ".artbank/trash/1",
+            ".artbank/trash",
+        ] {
+            assert!(normalize_stored_folder(value).is_err(), "{value} 应被拒绝");
+        }
+        let long = format!(".artbank/trash/1/2/{}", "a".repeat(INTERNAL_PATH_MAX));
+        assert!(normalize_stored_folder(&long).is_err());
+        assert!(normalize_folder(".artbank/trash/1/2").is_err());
     }
 
     #[test]

@@ -23,6 +23,7 @@ export interface LibraryData {
   setFolders: Dispatch<SetStateAction<FolderInfo[]>>;
   reloadFolders: () => Promise<void>;
   trashFolders: TrashFolders | null;
+  reloadTrashFolders: () => Promise<void>;
   selectedImageIds: number[];
   setSelectedImageIds: Dispatch<SetStateAction<number[]>>;
   viewerSession: ViewerSession | null;
@@ -128,6 +129,12 @@ export function useLibraryData(browse: LibraryBrowseController): LibraryData {
     void reloadTrashFolders();
   }, [browse.browse.view, current?.id, reloadTrashFolders]);
 
+  // 先取一次文件夹计数：只有空文件夹的回收站也要能直接「清空回收站」。
+  useEffect(() => {
+    if (current?.id == null) return;
+    void reloadTrashFolders();
+  }, [current?.id, reloadTrashFolders]);
+
   useEffect(() => {
     if (browse.browse.view !== "trash" || !changeSignal) return;
     void reloadTrashFolders();
@@ -212,6 +219,7 @@ export function useLibraryData(browse: LibraryBrowseController): LibraryData {
     setFolders,
     reloadFolders,
     trashFolders,
+    reloadTrashFolders,
     selectedImageIds,
     setSelectedImageIds,
     viewerSession,

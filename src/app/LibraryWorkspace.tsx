@@ -73,6 +73,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     setFolders,
     reloadFolders,
     trashFolders,
+    reloadTrashFolders,
     selectedImageIds,
     setSelectedImageIds,
     viewerSession,
@@ -179,6 +180,8 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     delta?: { images?: number; trash?: number },
     reason?: string,
   ) => {
+    // 文件夹写操作可能改变回收站里的文件夹数（含只有空文件夹的情况）。
+    void reloadTrashFolders();
     if (delta && ((delta.images ?? 0) !== 0 || (delta.trash ?? 0) !== 0)) {
       // 文件夹整棵移入/移出回收站：图片可见性也变了，按回收站变化刷新列表与计数。
       emitChange({
@@ -299,6 +302,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 onApplyBrowse={browse.applyBrowse}
                 onGoBack={browse.goBack}
                 onFoldersChanged={() => reloadFolders()}
+                onTrashFoldersChanged={() => reloadTrashFolders()}
                 onImageSelectionChange={setSelectedImageIds}
                 changeSignal={changeSignal}
                 onOpenViewer={setViewerSession}

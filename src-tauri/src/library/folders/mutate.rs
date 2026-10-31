@@ -711,11 +711,11 @@ pub fn subtree_folder_count(db: &LibraryDb, folder_id_value: i64) -> AppResult<u
 }
 
 pub(super) fn info_in(connection: &Connection, folder_id_value: i64) -> AppResult<FolderInfo> {
-    let (path, sort_index): (String, i64) = connection
+    let (path, original_path, sort_index): (String, Option<String>, i64) = connection
         .query_row(
-            "SELECT path, sort_index FROM folders WHERE id = ?1",
+            "SELECT path, original_path, sort_index FROM folders WHERE id = ?1",
             [folder_id_value],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or_else(|| AppError::message("文件夹不存在"))?;
@@ -738,7 +738,8 @@ pub(super) fn info_in(connection: &Connection, folder_id_value: i64) -> AppResul
     };
     Ok(FolderInfo {
         id: folder_id_value,
-        path,
+        path: original_path.clone().unwrap_or_else(|| path.clone()),
+        storage_path: original_path.map(|_| path),
         sort_index,
         direct_image_count: direct_image_count.max(0) as u64,
         total_image_count: total_image_count.max(0) as u64,

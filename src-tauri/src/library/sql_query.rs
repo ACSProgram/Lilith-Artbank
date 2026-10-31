@@ -61,7 +61,7 @@ CREATE TEMP VIEW mcp_images (
 SELECT
     i.id AS id,
     i.folder_id AS folder_id,
-    f.path AS folder,
+    coalesce(f.original_path, f.path) AS folder,
     i.format AS format,
     i.file_ext AS file_ext,
     i.file_size AS file_bytes,
@@ -93,7 +93,7 @@ CREATE TEMP VIEW mcp_trash_images (
 SELECT
     i.id AS id,
     i.folder_id AS folder_id,
-    f.path AS folder,
+    coalesce(f.original_path, f.path) AS folder,
     i.format AS format,
     i.file_ext AS file_ext,
     i.file_size AS file_bytes,
@@ -142,7 +142,7 @@ WHERE i.deleted_at IS NULL
 LIMIT -1;
 
 CREATE TEMP VIEW mcp_folders (id, path, sort_index, created_at_ms) AS
-SELECT id, path, sort_index, created_at AS created_at_ms
+SELECT id, coalesce(original_path, path) AS path, sort_index, created_at AS created_at_ms
 FROM folders
 WHERE kind = 'normal'
   AND trashed_at IS NULL
@@ -150,7 +150,7 @@ WHERE kind = 'normal'
 LIMIT -1;
 
 CREATE TEMP VIEW mcp_trash_folders (id, path, trashed_at_ms) AS
-SELECT id, path, trashed_at AS trashed_at_ms
+SELECT id, coalesce(original_path, path) AS path, trashed_at AS trashed_at_ms
 FROM folders
 WHERE kind = 'normal'
   AND trashed_at IS NOT NULL
@@ -1014,6 +1014,39 @@ mod tests {
             .run(&fixture.database, sql, QueryKind::Inline)
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn trash_views_show_original_paths_not_warehouse_paths() {
+        let fixture = fixture();
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at, trashed_at, original_path)
+                 VALUES ('.artbank/trash/123/9', 1, 123, '回收目录')",
+                [],
+            )
+            .unwrap();
+        let folder = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO images(
+                    id, content_hash, file_ext, folder_id, file_size, width, height,
+                    format, has_alpha, phash, colors4, colors8, score, description,
+                    imported_at, modified_at, deleted_at
+                 ) VALUES (3, ?1, 'png', ?2, 100, 10, 10, 'png', 0,
+                    zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1, 123)",
+                rusqlite::params!["f".repeat(64), folder],
+            )
+            .unwrap();
+        drop(connection);
+
+        let folders = inline(&fixture, "SELECT path FROM mcp_trash_folders");
+        assert_eq!(folders.rows[0]["path"], "回收目录");
+        let images = inline(&fixture, "SELECT folder FROM mcp_trash_images");
+        assert_eq!(images.rows[0]["folder"], "回收目录");
+        let raw = format!("{:?}", (folders.rows, images.rows));
+        assert!(!raw.contains(".artbank/trash"), "{raw}");
     }
 
     #[test]

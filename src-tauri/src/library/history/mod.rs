@@ -576,6 +576,12 @@ pub struct FolderRow {
     pub path: String,
     pub created_at: i64,
     pub sort_index: i64,
+    /// 回收站行的用户原路径；旧 chunk 缺这个字段时按“原地回收站”处理。
+    #[serde(default)]
+    pub original_path: Option<String>,
+    /// 删除单元时间戳；旧 chunk 缺这个字段时按“原地回收站”处理。
+    #[serde(default)]
+    pub trashed_at: Option<i64>,
 }
 
 /// 编辑撤销前的内容；重做时用它恢复行与文件。
@@ -1096,6 +1102,8 @@ pub struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
     pub max_steps: u32,
     pub pending_purge_count: u64,
+    /// 纯文件夹待释放时图片数为 0，界面仍要给出释放入口。
+    pub pending_purge_folder_count: u64,
     pub pending_purge_bytes: u64,
     pub storage: HistoryStorage,
     /// 上次撤销/重做异常中断，且此刻没有对应任务在跑。

@@ -691,7 +691,7 @@ fn excluded_labels(context: &ReadContext, selector: &Selector) -> Vec<String> {
 }
 
 pub fn compact_row(row: &ImageRow, temp_path: Option<&str>) -> Value {
-    let temporary = temp_path.is_some_and(|path| row.folder_path == path);
+    let temporary = temp_path.is_some_and(|path| row.storage_folder == path);
     let mut value = json!({
         "id": row.id,
         "folderId": row.folder_id,

@@ -1002,10 +1002,11 @@ fn perf_history_200k() {
     );
 
     let pending_start = Instant::now();
-    let (count, bytes) = history::pending_summary(&database).expect("pending summary");
+    let (count, folders, bytes) = history::pending_summary(&database).expect("pending summary");
     println!(
-        "[perf] pending summary ({} rows, {} bytes): {:.2}ms",
+        "[perf] pending summary ({} rows, {} folders, {} bytes): {:.2}ms",
         count,
+        folders,
         bytes,
         ms(pending_start.elapsed())
     );

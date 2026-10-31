@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -20,8 +20,10 @@ CREATE TABLE folders (
     sort_index INTEGER NOT NULL DEFAULT 0,
     -- normal=普通文件夹；temp=每个图库唯一的临时文件夹，只通过导入进入。
     kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal', 'temp')),
-    -- 非空表示整棵子树在回收站；文件仍留在原路径。
+    -- 非空表示整棵子树在回收站。`path` 是仓库内部路径，`original_path` 是用户原路径；
+    -- v10 的原地回收站行没有 `original_path`，恢复时沿用旧语义。
     trashed_at INTEGER,
+    original_path TEXT,
     -- 待释放：文件夹行与空目录在记录过期或清空记录后删除。
     purge_operation_id INTEGER
 ) STRICT;
@@ -276,7 +278,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         2 => {
             verify_meta(connection, manifest)?;
@@ -287,7 +290,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         3 => {
             verify_meta(connection, manifest)?;
@@ -297,7 +301,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         4 => {
             verify_meta(connection, manifest)?;
@@ -306,7 +311,8 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         5 => {
             verify_meta(connection, manifest)?;
@@ -314,29 +320,38 @@ pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppRes
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         6 => {
             verify_meta(connection, manifest)?;
             migrate_v6_to_v7(connection)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         7 => {
             verify_meta(connection, manifest)?;
             migrate_v7_to_v8(connection)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         8 => {
             verify_meta(connection, manifest)?;
             migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
         }
         9 => {
             verify_meta(connection, manifest)?;
-            migrate_v9_to_v10(connection)
+            migrate_v9_to_v10(connection)?;
+            migrate_v10_to_v11(connection)
+        }
+        10 => {
+            verify_meta(connection, manifest)?;
+            migrate_v10_to_v11(connection)
         }
         SCHEMA_VERSION => {
             verify_meta(connection, manifest)?;
@@ -542,6 +557,17 @@ fn migrate_v9_to_v10(connection: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v10 → v11：文件夹增加原路径。已有的回收站行保持 `NULL`，继续按“原地回收站”工作；
+/// 迁移本身不搬任何目录。
+fn migrate_v10_to_v11(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute("ALTER TABLE folders ADD COLUMN original_path TEXT", [])?;
+    mark_version(&transaction, 11)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v10 升级到 v11");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,11 +689,25 @@ mod tests {
             .unwrap();
     }
 
+    fn downgrade_to_v10(connection: &Connection) {
+        connection
+            .execute("ALTER TABLE folders DROP COLUMN original_path", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '10' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+    }
+
     fn downgrade_to_v9(connection: &Connection) {
         connection
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_folders_trash;
                  DROP INDEX IF EXISTS idx_folders_purge;
+                 ALTER TABLE folders DROP COLUMN original_path;
                  ALTER TABLE folders DROP COLUMN trashed_at;
                  ALTER TABLE folders DROP COLUMN purge_operation_id;",
             )
@@ -1212,6 +1252,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trashed, 0, "迁移不改现有行");
+        ensure(&mut connection, &manifest()).unwrap();
+    }
+
+    #[test]
+    fn migrates_v10_to_v11_without_moving_existing_trash_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        downgrade_to_v10(&connection);
+        assert_eq!(read_version(&connection).unwrap(), 10);
+        connection
+            .execute(
+                "INSERT INTO folders(path, created_at, trashed_at)
+                 VALUES ('旧回收站', 1, 5)",
+                [],
+            )
+            .unwrap();
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let (path, trashed, original): (String, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT path, trashed_at, original_path FROM folders WHERE path = '旧回收站'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "旧回收站", "迁移不搬也不改已有行");
+        assert_eq!(trashed, Some(5));
+        assert_eq!(original, None, "旧回收站保持原地语义");
         ensure(&mut connection, &manifest()).unwrap();
     }
 

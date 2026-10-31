@@ -627,12 +627,12 @@ pub(super) fn image_row_from_row(
 ) -> rusqlite::Result<ImageRow> {
     let content_hash: String = row.get(1)?;
     let file_ext: String = row.get(2)?;
-    let folder_path: String = row.get(4)?;
+    let storage_folder: String = row.get(4)?;
     let file_name = format!("{content_hash}.{file_ext}");
-    let file_path = if folder_path.is_empty() {
+    let file_path = if storage_folder.is_empty() {
         root.join(&file_name)
     } else {
-        root.join(folder_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+        root.join(storage_folder.replace('/', std::path::MAIN_SEPARATOR_STR))
             .join(&file_name)
     };
     Ok(ImageRow {
@@ -640,7 +640,8 @@ pub(super) fn image_row_from_row(
         content_hash,
         file_ext,
         folder_id: row.get(3)?,
-        folder_path,
+        folder_path: row.get(18)?,
+        storage_folder,
         folder_trashed: row.get::<_, i64>(17)? != 0,
         file_path: file_path.to_string_lossy().into_owned(),
         file_size: row.get(5)?,
@@ -670,7 +671,8 @@ pub fn rows_by_ids(database: &LibraryDb, root: &Path, ids: &[i64]) -> AppResult<
                 folders.path, images.file_size, images.width, images.height,
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
-                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL
+                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL,
+                coalesce(folders.original_path, folders.path)
          FROM images
          JOIN folders ON folders.id = images.folder_id
          WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"
@@ -709,7 +711,8 @@ pub(super) fn rows_for_ids(
                 folders.path, images.file_size, images.width, images.height,
                 images.format, images.has_alpha, images.score, images.imported_at,
                 images.modified_at, images.deleted_at, images.thumb_version,
-                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL
+                images.thumb_width, images.thumb_height, folders.trashed_at IS NOT NULL,
+                coalesce(folders.original_path, folders.path)
          FROM images
          JOIN folders ON folders.id = images.folder_id
          WHERE images.id IN ({placeholders}) AND images.purge_operation_id IS NULL"

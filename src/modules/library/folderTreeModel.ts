@@ -59,26 +59,30 @@ export function applyFolderChange(
 export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {
   const byId = new Map<number, FolderNode>();
   const byPath = new Map<string, FolderNode>();
-  const rootId = folders.find((folder) => folder.path === "")?.id ?? null;
+  // 回收站行用仓库内部路径建树，展示仍用原路径；同名多代删除单元因此不会合并。
+  const structurePath = (folder: FolderInfo) => folder.storagePath ?? folder.path;
+  const rootId = folders.find((folder) => structurePath(folder) === "")?.id ?? null;
 
   for (const folder of folders) {
-    if (!folder.path) continue;
+    const structure = structurePath(folder);
+    if (!structure) continue;
     const node: FolderNode = {
       ...folder,
       name: folderName(folder.path),
-      depth: folder.path.split("/").length - 1,
+      depth: 0,
       children: [],
     };
     byId.set(folder.id, node);
-    byPath.set(folder.path, node);
+    byPath.set(structure, node);
   }
 
   const nodes: FolderNode[] = [];
   for (const folder of folders) {
-    if (!folder.path) continue;
+    const structure = structurePath(folder);
+    if (!structure) continue;
     const node = byId.get(folder.id);
     if (!node) continue;
-    const parent = byPath.get(parentFolderPath(folder.path));
+    const parent = byPath.get(parentFolderPath(structure));
     if (parent) parent.children.push(node);
     else nodes.push(node);
   }
@@ -90,6 +94,15 @@ export function buildFolderTree(folders: FolderInfo[]): FolderTreeModel {
     for (const item of items) sortNodes(item.children);
   };
   sortNodes(nodes);
+
+  // 缩进按渲染层级算：回收站行的仓库路径深度与树的层级无关。
+  const assignDepth = (items: FolderNode[], depth: number) => {
+    for (const item of items) {
+      item.depth = depth;
+      assignDepth(item.children, depth + 1);
+    }
+  };
+  assignDepth(nodes, 0);
 
   return { nodes, byId, byPath, rootId };
 }
@@ -207,8 +220,16 @@ export function breadcrumbsFor(
   const trail: { id: number | null; label: string; path: string }[] = [
     { id: tree.rootId, label: "全部图片", path: "" },
   ];
-  for (const path of [...ancestorPaths(node.path), node.path]) {
-    trail.push({ id: tree.byPath.get(path)?.id ?? null, label: folderName(path), path });
+  const structure = node.storagePath ?? node.path;
+  for (const path of [...ancestorPaths(structure), structure]) {
+    // 仓库路径的中间层级（`.artbank/trash/<stamp>`）不是文件夹节点，不生成面包屑。
+    const ancestor = tree.byPath.get(path);
+    if (!ancestor) continue;
+    trail.push({
+      id: ancestor.id,
+      label: folderName(ancestor.path),
+      path: ancestor.path,
+    });
   }
   return trail;
 }

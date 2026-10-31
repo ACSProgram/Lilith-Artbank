@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyFolderChange,
+  breadcrumbsFor,
   buildFolderTree,
   childrenOf,
   defaultExpandedIds,
@@ -36,6 +37,38 @@ test("manual folder order follows sort index", () => {
   const tree = buildFolderTree(folders);
   assert.deepEqual(tree.nodes.map((node) => node.path), ["甲", "乙", "丙"]);
   assert.deepEqual(tree.byId.get(3)?.children.map((node) => node.path), ["甲/子"]);
+});
+
+test("trash rows build on storage paths while displaying original paths", () => {
+  const trash: FolderInfo[] = [
+    {
+      ...folder(10, "同名", 0, 1, 2),
+      storagePath: ".artbank/trash/1/10",
+    },
+    {
+      ...folder(11, "同名/子", 0, 1, 1),
+      storagePath: ".artbank/trash/1/10/子",
+    },
+    {
+      ...folder(12, "同名", 1, 1, 1),
+      storagePath: ".artbank/trash/2/12",
+    },
+  ];
+  const tree = buildFolderTree(trash);
+  assert.deepEqual(
+    tree.nodes.map((node) => node.id),
+    [10, 12],
+    "两代同名删除单元不能合并",
+  );
+  assert.deepEqual(tree.byId.get(10)?.children.map((node) => node.id), [11]);
+  assert.equal(tree.byId.get(11)?.path, "同名/子");
+  assert.equal(tree.byId.get(10)?.depth, 0, "回收站顶层按渲染层级缩进");
+  assert.equal(tree.byId.get(11)?.depth, 1);
+  assert.deepEqual(
+    breadcrumbsFor(tree, [11]).map((crumb) => crumb.path),
+    ["", "同名", "同名/子"],
+    "仓库路径的中间层级不生成面包屑",
+  );
 });
 
 test("one-time name sort orders direct children only", () => {

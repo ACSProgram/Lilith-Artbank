@@ -2353,7 +2353,8 @@ fn group_keeps_picks_first_row_by_sort() {
 fn trash_view_separates_folder_trash_from_loose_images() {
     let fixture = fixture();
     // fixture 里 id=5 已单独在回收站；整目录移入后 3、4 也进回收站。
-    folders::trash(&fixture.session.db, fixture.folder_scenery).unwrap();
+    std::fs::create_dir_all(fixture.root.join("风景")).unwrap();
+    folders::trash(&fixture.session.db, &fixture.root, fixture.folder_scenery).unwrap();
 
     let mut all = all_ids(
         LibraryQuery {
@@ -2405,6 +2406,14 @@ fn trash_view_separates_folder_trash_from_loose_images() {
             .iter()
             .all(|folder| folder.path != "风景"),
         "正常文件夹列表不含回收站文件夹"
+    );
+
+    let row = &rows_by_ids(&fixture.session.db, &fixture.root, &[3]).unwrap()[0];
+    assert_eq!(row.folder_path, "风景", "展示路径仍是用户原路径");
+    assert!(
+        row.storage_folder.starts_with(".artbank/trash/"),
+        "定位原图用仓库路径：{}",
+        row.storage_folder
     );
 }
 

@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::mutate::remove_folder_if_empty;
-use super::trash::{restore_folder_rows, trash_folder_rows};
+use super::trash::{apply_restore_unit, apply_trash_unit, next_trash_stamp};
 use super::{ensure_inside_root, folder_id, folder_path};
 
 /// 撤销“新建文件夹”：记录里的行仍然存在且为空时删目录与行；已经被移动或已有内容则失败。
@@ -136,13 +136,21 @@ pub(crate) fn undo_path_change(
     )
 }
 
-/// 撤销“文件夹移入回收站”：文件夹行回到正常树，图片恢复旧状态与修改时间。
+/// 旧 chunk 没有原路径与删除时间戳：按“原地回收站”处理，只改数据库状态。
+fn legacy_rows(rows: &[FolderRow]) -> bool {
+    rows.iter()
+        .all(|row| row.original_path.is_none() && row.trashed_at.is_none())
+}
+
+/// 撤销“文件夹移入回收站”：整个删除单元搬回原路径，图片恢复旧状态与修改时间。
 pub(crate) fn undo_trash(
     transaction: &Transaction<'_>,
+    root: &Path,
     rows: &[FolderRow],
     triples: &[(i64, i64, i64)],
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
-    restore_folder_rows(transaction, rows)?;
+    apply_restore_unit(transaction, root, rows, legacy_rows(rows), false, journal)?;
     for (image_id, deleted_at, modified_at) in triples {
         transaction.execute(
             "UPDATE images SET deleted_at = ?1, modified_at = ?2
@@ -161,14 +169,17 @@ pub(crate) fn undo_trash(
     Ok(())
 }
 
-/// 重做“文件夹移入回收站”：文件仍在原路径，只重新写隐藏时间。
+/// 重做“文件夹移入回收站”：用新时间戳把目录重新搬入仓库。
 pub(crate) fn redo_trash(
     transaction: &Transaction<'_>,
+    root: &Path,
     rows: &[FolderRow],
     triples: &[(i64, i64, i64)],
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
-    let stamp = now_ms();
-    trash_folder_rows(transaction, rows, stamp)?;
+    let legacy = legacy_rows(rows);
+    let stamp = next_trash_stamp(transaction, root)?;
+    apply_trash_unit(transaction, root, rows, stamp, legacy, journal)?;
     for (image_id, _, _) in triples {
         transaction.execute(
             "UPDATE images SET deleted_at = ?1, modified_at = ?1
@@ -182,29 +193,19 @@ pub(crate) fn redo_trash(
 /// 撤销“恢复文件夹”：重新移入回收站，图片回到恢复前的状态。
 pub(crate) fn undo_restore(
     transaction: &Transaction<'_>,
+    root: &Path,
     rows: &[FolderRow],
     triples: &[(i64, i64, i64)],
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
-    let stamp = triples
-        .iter()
-        .map(|(_, deleted_at, _)| *deleted_at)
-        .max()
-        .filter(|value| *value > 0)
-        .unwrap_or_else(now_ms);
-    trash_folder_rows(transaction, rows, stamp)?;
+    let legacy = legacy_rows(rows);
+    let stamp = next_trash_stamp(transaction, root)?;
+    apply_trash_unit(transaction, root, rows, stamp, legacy, journal)?;
     for (image_id, deleted_at, modified_at) in triples {
         transaction.execute(
             "UPDATE images SET deleted_at = ?1, modified_at = ?2
              WHERE id = ?3 AND purge_operation_id IS NULL",
-            params![
-                if *deleted_at == 0 {
-                    None
-                } else {
-                    Some(*deleted_at)
-                },
-                modified_at,
-                image_id
-            ],
+            params![(*deleted_at > 0).then_some(stamp), modified_at, image_id],
         )?;
     }
     Ok(())
@@ -213,11 +214,13 @@ pub(crate) fn undo_restore(
 /// 重做“恢复文件夹”：文件夹行与图片重新回到正常树。
 pub(crate) fn redo_restore(
     transaction: &Transaction<'_>,
+    root: &Path,
     rows: &[FolderRow],
     triples: &[(i64, i64, i64)],
+    journal: &mut FileJournal,
 ) -> AppResult<()> {
     let now = now_ms();
-    restore_folder_rows(transaction, rows)?;
+    apply_restore_unit(transaction, root, rows, legacy_rows(rows), false, journal)?;
     for (image_id, _, _) in triples {
         transaction.execute(
             "UPDATE images SET deleted_at = NULL, modified_at = ?1

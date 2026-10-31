@@ -47,7 +47,7 @@ export function confirmTrashFolder(
   return confirm({
     title: `把文件夹「${path}」移入回收站？`,
     message,
-    detail: "原文件留在原位置，可以整个文件夹恢复。",
+    detail: "目录会搬入回收站仓库，原路径立即释放；可以整个文件夹恢复。",
     confirmLabel: "移入回收站",
   });
 }
@@ -60,7 +60,8 @@ export function confirmRestoreFolder(
   return confirm({
     title: `恢复文件夹「${path}」？`,
     message: "这次一起删除的文件夹与图片会回到原位置。",
-    detail: "删除前已单独在回收站的图片仍留在回收站。",
+    detail:
+      "删除前已单独在回收站的图片仍留在回收站；原路径已被占用时会拒绝恢复，请先重命名或移走占用的文件夹。",
     confirmLabel: "恢复",
   });
 }
@@ -74,7 +75,7 @@ export function confirmDeleteFolderPermanently(
   const images = imageCount > 0 ? `和 ${count(imageCount)} 张图片` : "";
   return confirm({
     title: `永久删除文件夹「${path}」？`,
-    message: `文件夹${images}会从回收站移除；原图文件与文件夹目录要等这条记录从操作记录中清除后才释放。`,
+    message: `文件夹${images}会从回收站移除；回收站仓库里的原图与目录要等这条记录从操作记录中清除后才释放。`,
     detail: "清除操作记录后不能再撤销。",
     confirmLabel: "永久删除",
     danger: true,
@@ -180,11 +181,25 @@ export function confirmSkipUndo(confirm: ConfirmFn, label: string): Promise<bool
 export function confirmReleasePending(
   confirm: ConfirmFn,
   pendingCount: number,
+  pendingFolderCount: number,
   pendingBytes: number,
 ): Promise<boolean> {
+  const parts: string[] = [];
+  if (pendingCount > 0) {
+    parts.push(`原图文件（约 ${formatBytes(pendingBytes)}）`);
+  }
+  if (pendingFolderCount > 0) {
+    parts.push(`回收站文件夹目录（${count(pendingFolderCount)} 个）`);
+  }
+  const title =
+    pendingCount > 0 && pendingFolderCount > 0
+      ? `释放 ${count(pendingCount)} 张待删图片和 ${count(pendingFolderCount)} 个文件夹？`
+      : pendingFolderCount > 0
+        ? `释放 ${count(pendingFolderCount)} 个待删文件夹？`
+        : `释放 ${count(pendingCount)} 张待删图片？`;
   return confirm({
-    title: `释放 ${count(pendingCount)} 张待删图片？`,
-    message: `会删除这些图片的原图文件（约 ${formatBytes(pendingBytes)}），无法恢复。`,
+    title,
+    message: `会删除${parts.join("和")}，无法恢复。`,
     confirmLabel: "释放",
     danger: true,
   });

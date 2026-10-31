@@ -536,7 +536,7 @@ fn folder_trash_restore_only_revives_images_trashed_with_the_folder() {
         .unwrap();
     metadata::set_trashed(fixture.db(), &[old], true).unwrap();
 
-    let change = folders::trash(fixture.db(), fixture.folder).unwrap();
+    let change = folders::trash(fixture.db(), &fixture.root, fixture.folder).unwrap();
     assert_eq!(
         change.affected_images, 1,
         "只把原本正常的图片一起移入回收站"
@@ -549,7 +549,7 @@ fn folder_trash_restore_only_revives_images_trashed_with_the_folder() {
     let trash = crate::library::query::list_trash_folders(fixture.db()).unwrap();
     assert_eq!(trash.folders.len(), 2, "父与子都在回收站树里");
 
-    let change = folders::restore(fixture.db(), fixture.folder).unwrap();
+    let change = folders::restore(fixture.db(), &fixture.root, fixture.folder).unwrap();
     assert_eq!(change.affected_images, 1);
     let states = metadata::image_states(fixture.db(), &[fresh, old]).unwrap();
     assert!(
@@ -597,7 +597,7 @@ fn folder_purge_release_removes_empty_dirs_and_rows() {
     fs::create_dir_all(content.parent().unwrap()).unwrap();
     fs::write(&content, b"content").unwrap();
 
-    folders::trash(fixture.db(), parent).unwrap();
+    folders::trash(fixture.db(), &fixture.root, parent).unwrap();
     folders::delete_permanently(fixture.db(), parent).unwrap();
     trim(fixture.db(), 0).unwrap();
     assert!(has_orphan_purge(fixture.db(), &fixture.root).unwrap());
@@ -626,7 +626,22 @@ fn folder_release_defers_while_the_directory_is_not_empty() {
     fs::create_dir_all(&directory).unwrap();
     fs::write(directory.join("notes.txt"), "未纳管文件".as_bytes()).unwrap();
 
-    folders::trash(fixture.db(), folder_id).unwrap();
+    folders::trash(fixture.db(), &fixture.root, folder_id).unwrap();
+    let stored = fixture
+        .db()
+        .with_reader(|connection| {
+            Ok(connection.query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                [folder_id],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+    let directory = LibraryPaths::new(&fixture.root).folder_dir(&stored);
+    assert!(
+        directory.join("notes.txt").is_file(),
+        "未纳管文件随目录搬入仓库"
+    );
     folders::delete_permanently(fixture.db(), folder_id).unwrap();
     trim(fixture.db(), 0).unwrap();
     assert!(
@@ -637,9 +652,23 @@ fn folder_release_defers_while_the_directory_is_not_empty() {
     let handle = task();
     run_release(fixture.db(), &fixture.root, handle.clone()).unwrap();
     assert!(directory.exists(), "不能递归强删目录");
-    assert!(folders::find_id(fixture.db(), "整目录").unwrap().is_some());
+    let still_there: i64 = fixture
+        .db()
+        .with_reader(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM folders WHERE id = ?1",
+                [folder_id],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(still_there, 1, "未释放的文件夹行保留");
     let snapshot = handle.snapshot();
     assert_eq!(snapshot.failures.len(), 1, "暂不释放要进失败清单");
+    assert_eq!(
+        snapshot.failures[0].path, "整目录",
+        "失败清单展示原路径，不暴露仓库路径"
+    );
     assert!(snapshot.message.contains("未能释放"));
 
     fs::remove_file(directory.join("notes.txt")).unwrap();
@@ -1690,6 +1719,18 @@ fn undoes_and_redoes_folder_records_in_linear_order() {
             })
             .unwrap()
     };
+    let has_original = |path: &str| -> bool {
+        fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM folders WHERE original_path = ?1",
+                    [path],
+                    |row| row.get::<_, i64>(0),
+                )? > 0)
+            })
+            .unwrap()
+    };
 
     folders::create(fixture.db(), &fixture.root, "作品").unwrap();
     let created = list(fixture.db()).unwrap().remove(0).id;
@@ -1704,10 +1745,26 @@ fn undoes_and_redoes_folder_records_in_linear_order() {
     folders::reorder(fixture.db(), &[junk], root_id, 0).unwrap();
     assert_eq!(sort_of("杂物"), 0);
     assert_eq!(sort_of("人物"), 1);
-    folders::trash(fixture.db(), work).unwrap();
+    folders::trash(fixture.db(), &fixture.root, work).unwrap();
     let deleted = list(fixture.db()).unwrap().remove(0).id;
-    assert!(has("人物/成品"), "移入回收站保留文件夹行");
-    assert!(fixture.root.join("人物").join("成品").is_dir());
+    assert!(has_original("人物/成品"), "移入回收站保留文件夹行与原路径");
+    assert!(
+        !fixture.root.join("人物").join("成品").exists(),
+        "原路径立即释放"
+    );
+    assert!(
+        fixture
+            .db()
+            .with_reader(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM folders WHERE path LIKE '.artbank/trash/%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? > 0)
+            })
+            .unwrap(),
+        "目录搬入回收站仓库"
+    );
 
     run_undo(
         fixture.db(),
@@ -1745,11 +1802,11 @@ fn undoes_and_redoes_folder_records_in_linear_order() {
     );
     assert!(has("人物") && has("杂物"));
     assert!(!has("作品") && !has("成品"));
-    assert!(has("人物/成品"), "重做删除只写回收站状态，行仍在");
+    assert!(has_original("人物/成品"), "重做删除把行重新标记为回收站");
     assert_eq!(sort_of("杂物"), 0);
     assert_eq!(sort_of("人物"), 1);
     assert!(fixture.root.join("人物").is_dir());
-    assert!(fixture.root.join("人物").join("成品").is_dir());
+    assert!(!fixture.root.join("人物").join("成品").exists());
 }
 
 fn tag_id(database: &LibraryDb, name: &str) -> i64 {

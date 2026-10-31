@@ -172,19 +172,19 @@ impl AppState {
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
-        let (database, _) = self.query_source()?;
+        let (database, root) = self.query_source()?;
         let current = folder_service::info(&database, folder_id)?;
         let _guard =
             self.begin_folder_change("移入回收站", vec![PathScope::write(&current.path)])?;
-        self.mutate(|| folder_service::trash(&database, folder_id))
+        self.mutate(|| folder_service::trash(&database, &root, folder_id))
     }
 
     pub fn restore_folder(&self, folder_id: i64) -> AppResult<FolderChange> {
-        let (database, _) = self.query_source()?;
+        let (database, root) = self.query_source()?;
         let current = folder_service::info(&database, folder_id)?;
         let _guard =
             self.begin_folder_change("恢复文件夹", vec![PathScope::write(&current.path)])?;
-        self.mutate(|| folder_service::restore(&database, folder_id))
+        self.mutate(|| folder_service::restore(&database, &root, folder_id))
     }
 
     pub fn delete_folder_permanently(&self, folder_id: i64) -> AppResult<FolderChange> {

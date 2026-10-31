@@ -184,7 +184,8 @@ pub fn purge_by_operation(
         for chunk in operation_ids.chunks(SQL_CHUNK) {
             let marks = placeholders(chunk.len());
             let mut statement = connection.prepare(&format!(
-                "SELECT images.id, images.content_hash, images.file_ext, folders.path
+                "SELECT images.id, images.content_hash, images.file_ext, folders.path,
+                        folders.original_path
                  FROM images JOIN folders ON folders.id = images.folder_id
                  WHERE images.purge_operation_id IN ({marks})"
             ))?;
@@ -196,6 +197,7 @@ pub fn purge_by_operation(
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -207,8 +209,9 @@ pub fn purge_by_operation(
     let mut files = Vec::with_capacity(selected.len());
     // 路径无效的行不能删：删了用户既看不见也查不到，留着还能在检查图库里定位。
     let mut invalid: Vec<(i64, String, String)> = Vec::new();
-    for (image_id, content_hash, file_ext, folder_path) in selected {
-        let stored = format!("{folder_path}/{content_hash}.{file_ext}");
+    for (image_id, content_hash, file_ext, folder_path, original_path) in selected {
+        let display_folder = original_path.as_deref().unwrap_or(&folder_path);
+        let stored = format!("{display_folder}/{content_hash}.{file_ext}");
         match content_path(&paths, &folder_path, &content_hash, &file_ext) {
             Ok(path) => files.push((image_id, path)),
             Err(error) => {
@@ -308,25 +311,29 @@ fn purge_folders_for_operation(
     report: &mut DeleteReport,
 ) -> AppResult<()> {
     let paths = LibraryPaths::new(root);
-    let mut rows: Vec<(i64, String)> = Vec::new();
+    let mut rows: Vec<(i64, String, Option<String>)> = Vec::new();
     database.with_reader(|connection| {
         for chunk in operation_ids.chunks(SQL_CHUNK) {
             let marks = placeholders(chunk.len());
             let mut statement = connection.prepare(&format!(
-                "SELECT id, path FROM folders WHERE purge_operation_id IN ({marks})"
+                "SELECT id, path, original_path FROM folders WHERE purge_operation_id IN ({marks})"
             ))?;
             rows.extend(
                 statement
                     .query_map(params_from_iter(chunk.iter()), |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
         }
         Ok(())
     })?;
-    rows.sort_by_key(|(_, path)| std::cmp::Reverse(path.matches('/').count()));
-    for (folder_id, path) in rows {
+    rows.sort_by_key(|(_, path, _)| std::cmp::Reverse(path.matches('/').count()));
+    for (folder_id, path, original_path) in rows {
         let (images, children): (i64, i64) = database.with_reader(|connection| {
             let images: i64 = connection.query_row(
                 "SELECT count(*) FROM images WHERE folder_id = ?1",
@@ -381,7 +388,7 @@ fn purge_folders_for_operation(
         if let Some(reason) = deferred {
             report.failures.push(BatchFailure {
                 image_id: None,
-                path: path.clone(),
+                path: original_path.unwrap_or(path),
                 reason,
             });
             continue;

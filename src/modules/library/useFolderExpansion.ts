@@ -107,7 +107,7 @@ export function useFolderExpansion({
       for (const id of selectedFolderIds) {
         const node = tree.byId.get(id);
         if (!node) continue;
-        for (const path of ancestorPaths(node.path)) {
+        for (const path of ancestorPaths(node.storagePath ?? node.path)) {
           const ancestor = tree.byPath.get(path);
           if (ancestor && !next.has(ancestor.id)) {
             next.add(ancestor.id);

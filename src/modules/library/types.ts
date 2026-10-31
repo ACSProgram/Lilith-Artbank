@@ -73,7 +73,10 @@ export type StatsSnapshot =
 
 export interface FolderInfo {
   id: number;
+  /** 展示路径：回收站行是原路径。 */
   path: string;
+  /** 回收站行的仓库内部路径，只用于建树；正常行没有这个字段。 */
+  storagePath?: string | null;
   /** 同一父级下的手动排序位。 */
   sortIndex: number;
   /** 直接位于该文件夹的未删除图片数。 */
@@ -267,6 +270,7 @@ export interface HistoryPage {
   entries: HistoryEntry[];
   maxSteps: number;
   pendingPurgeCount: number;
+  pendingPurgeFolderCount: number;
   pendingPurgeBytes: number;
   storage: HistoryStorage;
   /** 上次撤销/重做异常中断，且此刻没有对应任务在跑。 */

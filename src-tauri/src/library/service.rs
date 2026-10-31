@@ -124,6 +124,9 @@ pub fn open(path: &Path, read_connections: u32) -> AppResult<LibrarySession> {
     clean_temporary_directory(path)?;
     let database = LibraryDb::open(&paths.database, read_connections)?;
     database.with_writer(|connection| schema::ensure(connection, &manifest))?;
+    if let Err(error) = crate::library::folders::reconcile_trash(&database, path) {
+        log::warn!("回收站对账失败：{error}");
+    }
     temp::ensure(&database, path)?;
     // 段文件必须在打开缩略图包之前清理：`ThumbPack::open` 会读磁盘上编号最大的
     // `.pack` 的头，残留的 `9999.pack` 会直接让图库打不开。

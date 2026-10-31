@@ -268,7 +268,7 @@ fn run_folders_modify(
                         "{} 张图片和 {} 个子文件夹会一起移入回收站",
                         current.total_image_count, subfolder_count
                     ),
-                    "原文件留在原路径，不会立即删除",
+                    "目录会搬入回收站仓库，原路径立即释放",
                     "可以在回收站里恢复整个文件夹",
                 ],
             });
@@ -286,7 +286,7 @@ fn run_folders_modify(
             }
             let _guard =
                 state.begin_folder_change("移入回收站", vec![PathScope::write(&current.path)])?;
-            let (_, operation_id) = folders::trash_with_id(database, target)?;
+            let (_, operation_id) = folders::trash_with_id(database, root, target)?;
             Ok(ToolOutcome::value(finish(
                 state,
                 "folders_modify",
@@ -510,7 +510,7 @@ mod tests {
                 .contains("根目录")
         );
 
-        folders::trash(&database, parent).unwrap();
+        folders::trash(&database, &root, parent).unwrap();
         assert!(
             folders::deletion_blocker(&database, parent)
                 .unwrap()
@@ -531,7 +531,7 @@ mod tests {
         )
         .unwrap();
         let target = folders::find_id(&database, "作品/线稿").unwrap().unwrap();
-        let (_, delete_id) = folders::trash_with_id(&database, target).unwrap();
+        let (_, delete_id) = folders::trash_with_id(&database, &root, target).unwrap();
 
         for operation_id in [create_id, rename_id, delete_id] {
             mark_ai_origin(&database, operation_id);

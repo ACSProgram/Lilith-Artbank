@@ -199,7 +199,11 @@ pub struct ImageRow {
     pub content_hash: String,
     pub file_ext: String,
     pub folder_id: i64,
+    /// 展示路径：回收站图片取文件夹原路径，不把仓库内部路径下发前端。
     pub folder_path: String,
+    /// 定位原图用的实际路径：新增文件夹搬入仓库后是仓库内部路径。
+    #[serde(skip)]
+    pub storage_folder: String,
     /// 所在文件夹已整目录移入回收站；这类图片不提供单张恢复/永久删除。
     pub folder_trashed: bool,
     pub file_path: String,
@@ -275,7 +279,11 @@ const FOLDER_STATS_TAG_LIMIT: usize = 8;
 #[serde(rename_all = "camelCase")]
 pub struct FolderInfo {
     pub id: i64,
+    /// 展示路径：正常文件夹是用户路径；回收站文件夹是 `original_path`（旧行回退到 `path`）。
     pub path: String,
+    /// 回收站行的仓库内部路径，只用于建树与子树定位；正常行不返回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_path: Option<String>,
     /// 同一父级下的手动排序位。
     pub sort_index: i64,
     /// 直接位于该文件夹的未删除图片数。

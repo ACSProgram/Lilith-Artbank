@@ -145,12 +145,19 @@ fn trashes_whole_subtree_and_restores_it() {
     let parent = id_of(&db, "父");
     let child = id_of(&db, "父/子");
 
-    let change = trash(&db, parent).unwrap();
+    let change = trash(&db, &root, parent).unwrap();
     assert_eq!(change.removed_ids.len(), 2);
-    assert!(root.join("父").is_dir());
-    assert!(root.join("父").join("子").is_dir());
-    assert_eq!(id_of(&db, "父"), parent, "行保留，只写 trashed_at");
-    assert_eq!(id_of(&db, "父/子"), child);
+    assert!(!root.join("父").exists(), "原路径立即释放");
+    let storage = stored_path(&db, parent);
+    assert!(root.join(&storage).join("子").is_dir(), "子树整体搬入仓库");
+    let trash_folders = query::list_trash_folders(&db).unwrap();
+    assert_eq!(trash_folders.folders.len(), 2);
+    assert!(
+        trash_folders
+            .folders
+            .iter()
+            .any(|folder| folder.path == "父" && folder.storage_path.as_deref() == Some(&storage))
+    );
     assert!(
         !query::list_folders(&db)
             .unwrap()
@@ -158,14 +165,8 @@ fn trashes_whole_subtree_and_restores_it() {
             .any(|folder| folder.path == "父" || folder.path == "父/子"),
         "正常树看不到回收站文件夹"
     );
-    let trash_folders = query::list_trash_folders(&db).unwrap();
-    assert_eq!(trash_folders.folders.len(), 2);
-    assert!(
-        create(&db, &root, "父/新").is_err(),
-        "回收站路径不能新建同名或子文件夹"
-    );
 
-    restore(&db, child).unwrap();
+    restore(&db, &root, child).unwrap();
     assert!(
         query::list_folders(&db)
             .unwrap()
@@ -173,9 +174,10 @@ fn trashes_whole_subtree_and_restores_it() {
             .any(|folder| folder.path == "父/子"),
         "恢复子树里的文件夹会带回整个删除单元"
     );
+    assert!(root.join("父").join("子").is_dir(), "恢复会搬回原路径");
     assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
 
-    trash(&db, parent).unwrap();
+    trash(&db, &root, parent).unwrap();
     let change = delete_permanently(&db, parent).unwrap();
     assert_eq!(change.removed_ids.len(), 2);
     assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
@@ -183,13 +185,134 @@ fn trashes_whole_subtree_and_restores_it() {
         .with_reader(|connection| {
             Ok(connection.query_row(
                 "SELECT count(*) FROM folders
-                     WHERE path IN ('父', '父/子') AND purge_operation_id IS NOT NULL",
-                [],
+                 WHERE id IN (?1, ?2) AND purge_operation_id IS NOT NULL",
+                [parent, child],
                 |row| row.get(0),
             )?)
         })
         .unwrap();
     assert_eq!(purged, 2, "永久删除只写待释放标记，行等释放任务清理");
+}
+
+#[test]
+fn after_trash_the_original_path_can_be_reused_and_restore_rejects_conflicts() {
+    let (_temp, db, root) = fixture();
+    create(&db, &root, "父/子").unwrap();
+    let parent = id_of(&db, "父");
+
+    trash(&db, &root, parent).unwrap();
+    create(&db, &root, "父").unwrap();
+    assert!(root.join("父").is_dir(), "删除后可以立即建同名文件夹");
+
+    let error = restore(&db, &root, parent).unwrap_err();
+    assert!(
+        error.to_string().contains("原位置已经有同名文件夹"),
+        "{error}"
+    );
+    assert!(stored_path(&db, parent).contains(".artbank/trash/"));
+}
+
+#[test]
+fn undo_and_redo_folder_restore_move_the_whole_unit() {
+    let (_temp, db, root) = fixture();
+    create(&db, &root, "父/子").unwrap();
+    let parent = id_of(&db, "父");
+    trash(&db, &root, parent).unwrap();
+    restore(&db, &root, parent).unwrap();
+    assert!(root.join("父").join("子").is_dir());
+
+    let target = undo_last(&db, &root);
+    assert!(!root.join("父").exists(), "撤销恢复会重新搬入仓库");
+    assert!(stored_path(&db, parent).contains(".artbank/trash/"));
+
+    redo(&db, &root, target);
+    assert!(root.join("父").join("子").is_dir(), "重做恢复会搬回原路径");
+    assert_eq!(stored_path(&db, parent), "父");
+}
+
+#[test]
+fn restores_v10_in_place_trash_rows_without_moving_directories() {
+    let (_temp, db, root) = fixture();
+    create(&db, &root, "旧目录").unwrap();
+    let folder = id_of(&db, "旧目录");
+    db.with_writer(|connection| {
+        connection.execute("UPDATE folders SET trashed_at = 5 WHERE id = ?1", [folder])?;
+        connection.execute(
+            "INSERT INTO images(
+                content_hash, file_ext, folder_id, file_size, width, height, format,
+                has_alpha, phash, colors4, colors8, score, description, imported_at,
+                modified_at, deleted_at
+             ) VALUES (?1, 'png', ?2, 10, 1, 1, 'png', 0,
+                zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1, 5)",
+            rusqlite::params!["d".repeat(64), folder],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    restore(&db, &root, folder).unwrap();
+    assert!(root.join("旧目录").is_dir(), "旧行不搬目录");
+    let (path, trashed): (String, Option<i64>) = db
+        .with_reader(|connection| {
+            Ok(connection.query_row(
+                "SELECT path, trashed_at FROM folders WHERE id = ?1",
+                [folder],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(path, "旧目录");
+    assert_eq!(trashed, None);
+    let deleted: Option<i64> = db
+        .with_reader(|connection| {
+            Ok(connection.query_row(
+                "SELECT deleted_at FROM images WHERE folder_id = ?1",
+                [folder],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(deleted, None, "同一次删除的图片一起恢复");
+}
+
+#[test]
+fn startup_reconcile_uses_the_database_as_the_source_of_truth() {
+    let (_temp, db, root) = fixture();
+    create(&db, &root, "未提交").unwrap();
+    let uncommitted = id_of(&db, "未提交");
+    let paths = LibraryPaths::new(&root);
+    let warehouse = paths.folder_dir(&format!(".artbank/trash/11/{uncommitted}"));
+    fs::create_dir_all(warehouse.parent().unwrap()).unwrap();
+    fs::rename(root.join("未提交"), &warehouse).unwrap();
+
+    create(&db, &root, "已提交").unwrap();
+    let committed = id_of(&db, "已提交");
+    trash(&db, &root, committed).unwrap();
+    let stored = stored_path(&db, committed);
+    fs::rename(paths.folder_dir(&stored), root.join("已提交")).unwrap();
+
+    reconcile_trash(&db, &root).unwrap();
+    assert!(root.join("未提交").is_dir(), "未提交的删除要撤回");
+    assert!(!warehouse.exists());
+    assert!(!root.join("已提交").exists());
+    let restored_storage = stored_path(&db, committed);
+    assert!(
+        paths.folder_dir(&restored_storage).is_dir(),
+        "已提交的删除要补搬"
+    );
+    assert!(restored_storage.contains(".artbank/trash/"));
+    assert_eq!(stored_path(&db, uncommitted), "未提交");
+}
+
+fn stored_path(db: &LibraryDb, id: i64) -> String {
+    db.with_reader(|connection| {
+        Ok(
+            connection.query_row("SELECT path FROM folders WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })?,
+        )
+    })
+    .unwrap()
 }
 
 #[test]
@@ -199,14 +322,14 @@ fn restore_keeps_separate_deletion_units_apart() {
     let parent = id_of(&db, "父");
     let child = id_of(&db, "父/子");
 
-    trash(&db, child).unwrap();
-    trash(&db, parent).unwrap();
+    trash(&db, &root, child).unwrap();
+    trash(&db, &root, parent).unwrap();
     assert!(
-        restore(&db, child).is_err(),
+        restore(&db, &root, child).is_err(),
         "上级文件夹来自另一次删除时不能单独恢复"
     );
 
-    restore(&db, parent).unwrap();
+    restore(&db, &root, parent).unwrap();
     assert!(
         query::list_trash_folders(&db)
             .unwrap()
@@ -215,7 +338,7 @@ fn restore_keeps_separate_deletion_units_apart() {
             .any(|folder| folder.path == "父/子"),
         "更早单独删除的子文件夹不随上级恢复"
     );
-    restore(&db, child).unwrap();
+    restore(&db, &root, child).unwrap();
     assert!(query::list_trash_folders(&db).unwrap().folders.is_empty());
 }
 
@@ -244,7 +367,7 @@ fn undo_restores_created_renamed_moved_deleted_and_reordered_folders() {
         .unwrap()
         .unwrap();
     reorder(&db, &[scenery_id, people], root_id, 0).unwrap();
-    trash(&db, sketch).unwrap();
+    trash(&db, &root, sketch).unwrap();
 
     let entries = history::list(&db).unwrap();
     let target = entries.last().unwrap().id;
@@ -290,9 +413,10 @@ fn undo_restores_created_renamed_moved_deleted_and_reordered_folders() {
     assert!(root.join("人物").is_dir());
     assert!(root.join("风景").is_dir());
     assert!(
-        root.join("风景").join("草稿").is_dir(),
-        "移入回收站不搬文件，重做后目录仍在原路径"
+        !root.join("风景").join("草稿").exists(),
+        "重做删除会把目录搬入回收站仓库"
     );
+    assert!(stored_path(&db, sketch).contains(".artbank/trash/"));
     assert!(!root.join("人物").join("速写").exists());
     assert!(!root.join("人物").join("草稿").exists());
     let order: Vec<String> = db
@@ -516,7 +640,7 @@ fn move_and_delete_labels_include_paths() {
     move_to(&db, &root, 子, 目标).unwrap();
     let entries = history::list(&db).unwrap();
     assert!(entries[0].label.contains("父/子"));
-    trash(&db, id_of(&db, "目标/子")).unwrap();
+    trash(&db, &root, id_of(&db, "目标/子")).unwrap();
     let entries = history::list(&db).unwrap();
     assert_eq!(entries[0].kind, HistoryKind::FolderTrash);
     assert!(entries[0].label.contains("目标/子"));

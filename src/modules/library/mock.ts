@@ -1459,6 +1459,7 @@ export function mockOperationHistory(): HistoryPage {
     entries,
     maxSteps: 100,
     pendingPurgeCount: 0,
+    pendingPurgeFolderCount: 0,
     pendingPurgeBytes: 0,
     storage: {
       recordCount: entries.length,

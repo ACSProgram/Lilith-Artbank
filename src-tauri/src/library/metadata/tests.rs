@@ -632,7 +632,8 @@ fn release_keeps_rows_whose_content_path_is_invalid() {
 fn rejecting_a_restore_from_a_trashed_folder_leaves_no_record() {
     let fixture = fixture();
     let image_id = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
-    crate::library::folders::trash(&fixture.session.db, fixture.folder).unwrap();
+    fs::create_dir_all(LibraryPaths::new(&fixture.root).folder_dir("人物")).unwrap();
+    crate::library::folders::trash(&fixture.session.db, &fixture.root, fixture.folder).unwrap();
     let before = history::list(&fixture.session.db).unwrap().len();
 
     assert!(set_trashed(&fixture.session.db, &[image_id], false).is_err());
@@ -640,6 +641,24 @@ fn rejecting_a_restore_from_a_trashed_folder_leaves_no_record() {
         history::list(&fixture.session.db).unwrap().len(),
         before,
         "被拒的恢复不该写记录"
+    );
+}
+
+/// 回收站文件夹里的图片：展示原路径，定位原图仍走仓库路径。
+#[test]
+fn image_details_show_the_original_folder_for_trashed_images() {
+    let fixture = fixture();
+    let image_id = insert_image(&fixture, "a", "jpg", 1, fixture.folder);
+    fs::create_dir_all(LibraryPaths::new(&fixture.root).folder_dir("人物")).unwrap();
+    crate::library::folders::trash(&fixture.session.db, &fixture.root, fixture.folder).unwrap();
+
+    let details = image_details(&fixture.session.db, &fixture.root, image_id).unwrap();
+    assert_eq!(details.folder_path, "人物");
+    assert!(details.folder_trashed);
+    assert!(
+        details.file_path.contains(".artbank"),
+        "原图定位仍用仓库路径：{}",
+        details.file_path
     );
 }
 

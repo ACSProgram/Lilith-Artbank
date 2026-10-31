@@ -222,7 +222,7 @@ pub fn build(
             tags: row.tags.clone(),
             folder_path: Some(super::tools::read::display_folder(
                 &row.folder_path,
-                temp_path.as_deref() == Some(row.folder_path.as_str()),
+                temp_path.as_deref() == Some(row.storage_folder.as_str()),
             )),
             status: CellStatus::Image,
             thumb_missing: false,

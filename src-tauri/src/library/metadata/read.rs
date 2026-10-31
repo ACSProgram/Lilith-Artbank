@@ -95,6 +95,7 @@ pub fn image_details(database: &LibraryDb, root: &Path, image_id: i64) -> AppRes
         return Err(AppError::message("图片 id 无效"));
     }
     database.with_reader(|connection| {
+        let mut storage_folder = String::new();
         let mut details = connection
             .query_row(
                 "SELECT images.id, images.content_hash, images.file_ext, images.folder_id,
@@ -103,18 +104,21 @@ pub fn image_details(database: &LibraryDb, root: &Path, image_id: i64) -> AppRes
                         images.description_source, images.description_model,
                         images.imported_at, images.modified_at, images.deleted_at,
                         images.thumb_version, images.thumb_width, images.thumb_height,
-                        images.colors4, images.colors8, folders.trashed_at IS NOT NULL
+                        images.colors4, images.colors8, folders.trashed_at IS NOT NULL,
+                        folders.original_path
                  FROM images
                  JOIN folders ON folders.id = images.folder_id
                  WHERE images.id = ?1",
                 [image_id],
                 |row| {
+                    storage_folder = row.get(4)?;
+                    let original_path: Option<String> = row.get(23)?;
                     Ok(ImageDetails {
                         id: row.get(0)?,
                         content_hash: row.get(1)?,
                         file_ext: row.get(2)?,
                         folder_id: row.get(3)?,
-                        folder_path: row.get(4)?,
+                        folder_path: original_path.unwrap_or_else(|| storage_folder.clone()),
                         folder_trashed: row.get::<_, i64>(22)? != 0,
                         file_size: row.get(5)?,
                         width: row.get(6)?,
@@ -143,7 +147,7 @@ pub fn image_details(database: &LibraryDb, root: &Path, image_id: i64) -> AppRes
 
         let file_name = format!("{}.{}", details.content_hash, details.file_ext);
         details.file_path = LibraryPaths::new(root)
-            .content_file(&details.folder_path, &file_name)
+            .content_file(&storage_folder, &file_name)
             .to_string_lossy()
             .into_owned();
 
