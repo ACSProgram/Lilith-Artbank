@@ -9,9 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
 use crate::library::viewer::{PoseData, PoseLandmark};
+
+use super::{descriptors::QuantizedVector, pack::FeatureKind};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -133,6 +136,14 @@ pub struct Embedding {
     pub vector: Vec<f32>,
 }
 
+/// 同一次图片塔前向返回的全局向量与可选语义描述子。
+#[derive(Debug, Clone)]
+pub struct ImageFeatures {
+    pub embedding: Embedding,
+    pub spp: Option<QuantizedVector>,
+    pub maxsim: Option<QuantizedVector>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Description {
     pub model: String,
@@ -149,6 +160,19 @@ struct EmbeddingResponse {
     /// 文本 embedding 被服务端截断时置位；客户端只记日志，不改变结果。
     #[serde(default)]
     truncated: bool,
+    /// 语义描述子：int8 摊平记录，以 base64 传输。
+    #[serde(default)]
+    features: HashMap<String, FeaturePayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeaturePayload {
+    #[serde(default)]
+    dtype: String,
+    dim: u32,
+    #[serde(default)]
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +292,7 @@ impl AiClient {
         })
     }
 
+    #[cfg(test)]
     pub fn embed_image(&self, model: &str, bytes: &[u8]) -> Result<Embedding, AiError> {
         let url = query_url(&self.url("/v1/embed/image"), &[("model", model)]);
         self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
@@ -280,6 +305,31 @@ impl AiClient {
             )?;
             let parsed: EmbeddingResponse = parse_body(&body)?;
             embedding_from(parsed)
+        })
+    }
+
+    /// 一次前向取回全局向量与指定的语义描述子；服务端缺少任一项都按错误处理。
+    pub fn embed_image_features(
+        &self,
+        model: &str,
+        features: &[&str],
+        bytes: &[u8],
+    ) -> Result<ImageFeatures, AiError> {
+        let joined = features.join(",");
+        let url = query_url(
+            &self.url("/v1/embed/image"),
+            &[("model", model), ("features", &joined)],
+        );
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/octet-stream"),
+                Some(bytes),
+                timeout,
+            )?;
+            let parsed: EmbeddingResponse = parse_body(&body)?;
+            image_features_from(parsed, features)
         })
     }
 
@@ -512,6 +562,60 @@ fn send(
         .map_err(|error| AiError::transport(format!("读取 AI 服务响应失败：{error}")))
 }
 
+fn image_features_from(
+    mut response: EmbeddingResponse,
+    requested: &[&str],
+) -> Result<ImageFeatures, AiError> {
+    // 先把描述子取走，剩下的大响应体按值交给 embedding_from，避免再克隆 1536 维向量。
+    let mut payloads = std::mem::take(&mut response.features);
+    let embedding = embedding_from(response)?;
+    Ok(ImageFeatures {
+        embedding,
+        spp: take_descriptor(&mut payloads, "spp", FeatureKind::Spp, requested)?,
+        maxsim: take_descriptor(&mut payloads, "maxsim", FeatureKind::MaxSim, requested)?,
+    })
+}
+
+/// 取回一种描述子并校验 dtype / 维度 / 长度；没有请求这种描述子时返回 `None`。
+fn take_descriptor(
+    payloads: &mut HashMap<String, FeaturePayload>,
+    name: &str,
+    kind: FeatureKind,
+    requested: &[&str],
+) -> Result<Option<QuantizedVector>, AiError> {
+    if !requested.contains(&name) {
+        return Ok(None);
+    }
+    let payload = payloads
+        .remove(name)
+        .ok_or_else(|| AiError::invalid(format!("语义服务没有返回 {name} 特征，请检查白化基")))?;
+    let expected = kind.fixed_dim().expect("语义描述子有固定维度");
+    if payload.dtype != "i8" {
+        return Err(AiError::invalid(format!(
+            "{name} 特征类型是 {}，应为 i8",
+            payload.dtype
+        )));
+    }
+    if payload.dim != expected {
+        return Err(AiError::invalid(format!(
+            "{name} 特征声明 {dim} 维，应为 {expected}",
+            dim = payload.dim
+        )));
+    }
+    let bytes = BASE64
+        .decode(payload.data.as_bytes())
+        .map_err(|error| AiError::invalid(format!("{name} 特征编码无效：{error}")))?;
+    if bytes.len() != expected as usize {
+        return Err(AiError::invalid(format!(
+            "{name} 特征长度 {} 与 {expected} 不一致",
+            bytes.len()
+        )));
+    }
+    QuantizedVector::new(expected, bytes.into_iter().map(|byte| byte as i8).collect())
+        .map(Some)
+        .map_err(|error| AiError::invalid(error.to_string()))
+}
+
 fn embedding_from(response: EmbeddingResponse) -> Result<Embedding, AiError> {
     if response
         .status
@@ -659,6 +763,74 @@ mod tests {
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].body, b"image-bytes");
         assert!(requests[1].path.contains("model=siglip2-test"));
+    }
+
+    #[test]
+    fn parses_quantized_semantic_features() {
+        let spp = BASE64.encode(vec![7_u8; FeatureKind::SPP_RECORD_DIM as usize]);
+        let maxsim = BASE64.encode(vec![9_u8; FeatureKind::MAXSIM_RECORD_DIM as usize]);
+        let server = MockServer::start(move |request, _| {
+            assert!(request.path.contains("features=global%2Cspp%2Cmaxsim"));
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "status": "success",
+                    "model": "siglip2-test",
+                    "dim": 4,
+                    "normalized": true,
+                    "vector": [1.0, 0.0, 0.0, 0.0],
+                    "features": {
+                        "spp": {"kind": "spp", "dtype": "i8", "dim": 8192, "data": spp},
+                        "maxsim": {"kind": "maxsim", "dtype": "i8", "dim": 2048, "data": maxsim}
+                    }
+                })
+                .to_string(),
+            )
+        });
+        let client = AiClient::new(&server.url());
+        let result = client
+            .embed_image_features("siglip2-test", &["global", "spp", "maxsim"], b"image")
+            .unwrap();
+        assert_eq!(result.embedding.dim, 4);
+        let spp = result.spp.unwrap();
+        assert_eq!(spp.dim, FeatureKind::SPP_RECORD_DIM);
+        assert_eq!(spp.values.len(), FeatureKind::SPP_RECORD_DIM as usize);
+        assert_eq!(spp.values[0], 7);
+        let maxsim = result.maxsim.unwrap();
+        assert_eq!(maxsim.dim, FeatureKind::MAXSIM_RECORD_DIM);
+        assert_eq!(maxsim.values[0], 9);
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_semantic_features() {
+        let server = MockServer::start(|_, _| {
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "status": "success",
+                    "model": "m",
+                    "dim": 2,
+                    "vector": [1.0, 0.0],
+                    "features": {
+                        "spp": {"dtype": "f16", "dim": 8192, "data": ""}
+                    }
+                })
+                .to_string(),
+            )
+        });
+        let client = AiClient::new(&server.url());
+        let error = client
+            .embed_image_features("m", &["global", "spp"], b"x")
+            .unwrap_err();
+        assert!(error.message.contains("应为 i8"), "{}", error.message);
+        let error = client
+            .embed_image_features("m", &["global", "maxsim"], b"x")
+            .unwrap_err();
+        assert!(
+            error.message.contains("没有返回 maxsim"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

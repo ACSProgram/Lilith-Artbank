@@ -66,7 +66,7 @@
 2. 编码到 `.artbank/temp/edit-<uuid>.<ext>`，边写边计算 BLAKE3，写完 `sync_all`。
 3. 新哈希与**另一张**图片冲突：拒绝保存并提示，不自动合并。
 4. 新哈希与当前图片相同：不产生新文件，返回 `changed=false`。
-5. 在同一个写事务里：检查冲突 → 把旧原图硬链接到 `.artbank/undo/<operationId>/<oldHash>.<ext>`（失败退化为复制，原路径此时仍然有效）→ 发布 `<folder>/<newHash>.<ext>`（同内容孤儿文件存在时复用）→ 追加缩略图到 pack → 更新 `images` 行（id 不变；内容哈希、扩展名、大小、宽高、格式、alpha、pHash、主色、缩略图指针、`thumb_version + 1`、`modified_at`）→ 删除该图的 `feature_blobs`（embedding/pose）→ 写入编辑前快照（含 `phash` / `colors*` / `modified_at`）与记录。
+5. 在同一个写事务里：检查冲突 → 把旧原图硬链接到 `.artbank/undo/<operationId>/<oldHash>.<ext>`（失败退化为复制，原路径此时仍然有效）→ 发布 `<folder>/<newHash>.<ext>`（同内容孤儿文件存在时复用）→ 追加缩略图到 pack → 更新 `images` 行（id 不变；内容哈希、扩展名、大小、宽高、格式、alpha、pHash、主色、缩略图指针、`thumb_version + 1`、`modified_at`）→ 删除该图的 `feature_blobs`（embedding / pose / spp / maxsim 全部 kind）→ 写入编辑前快照（含 `phash` / `colors*` / `modified_at`）与记录。
 6. 标签、评分、描述、集合、导入时间与 `description_source` 保留；描述默认不随内容变化而清空。
 7. 提交后删除旧原图（若已无引用）与该图旧哈希的预览缓存；暂存链接继续保留供撤销与重做。删除失败只记日志，留给维护任务。
 8. 撤销编辑时，当前哈希必须等于本次新哈希（已是旧哈希则视为已完成）；用暂存文件恢复内容列、重新编码缩略图（`thumb_version + 1`）、清空 `feature_blobs`，把新原图移入 `.artbank/undo/<op>/redo-*` 而不是删除，并清掉它的预览缓存。记录保留为 `undone`。

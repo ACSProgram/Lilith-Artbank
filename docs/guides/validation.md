@@ -234,7 +234,7 @@ node tools/perf/thumb_bench/server.mjs
 不进入常驻测试：依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
 
 ```bash
-python_embeded\python.exe -m py_compile server\main.py server\clip_cache.py server\pose_engine.py server\image_io.py
+python_embeded\python.exe -m py_compile server\main.py server\clip_cache.py server\image_features.py server\pose_engine.py server\image_io.py server\tools\fit_basis.py
 python_embeded\python.exe server\main.py --port 18766 --model-dir resources\models\siglip2-giant-opt-patch16-384
 curl.exe http://127.0.0.1:18766/v1/health
 # 另开一个终端：
@@ -242,6 +242,7 @@ curl.exe -X POST -H "Content-Type: application/json" -d "{\"capabilities\":[\"im
 curl.exe -X POST http://127.0.0.1:18766/v1/shutdown
 ```
 
+- 新模型目录先运行 `server/tools/fit_basis.py` 生成 `spp_basis.npz` / `maxsim_basis.npz`，否则 `/v1/models/ensure` 的图片能力会以缺基失败。
 - 图片塔与文本塔应分别加载；加载另一塔时旧塔让位。
 - 空闲 300 秒后 health 的两个塔都变回 `ready=false`；可用 `--idle-unload-seconds` 调短验证。
 - 并发上限：同时发 5 个以上推理请求时，超出 4 个的部分应立刻返回 `503 {"error":"server_busy"}`，同一时刻 `/v1/health` 仍是 200。

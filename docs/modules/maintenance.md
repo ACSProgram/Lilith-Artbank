@@ -59,7 +59,7 @@
 
 ## 特征包维护
 
-- embedding/pose 存放在 `features/<kind>-<model>-<dim>-<dtype>-<hash>.pack`，`feature_blobs` 记录 model/dim/offset/length。
+- embedding / pose / spp / maxsim 存放在 `features/<kind>-<model>-<dim>-<dtype>-<hash>.pack`，`feature_blobs` 记录 model/dim/offset/length；语义描述子（spp / maxsim）随 embedding 一起由同一次前向写入，编辑图片时与 embedding 一起清空。
 - 模型变更后，旧向量保留但标记为不兼容；重算走批量任务。
 - 特征包同样只追加，但**不做压缩**：维护页只显示每个包的条数、已用与垃圾字节。模型切换会让整包作废重算，压了没有意义。
 

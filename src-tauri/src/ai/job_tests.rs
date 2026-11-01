@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rusqlite::params;
 
 use super::*;
@@ -78,7 +79,9 @@ fn context(
 }
 
 fn mock_server() -> MockServer {
-    MockServer::start(|request, _| {
+    let spp = BASE64.encode(vec![1_u8; FeatureKind::SPP_RECORD_DIM as usize]);
+    let maxsim = BASE64.encode(vec![2_u8; FeatureKind::MAXSIM_RECORD_DIM as usize]);
+    MockServer::start(move |request, _| {
         if request.path.starts_with("/v1/health") {
             MockResponse::json(
                 200,
@@ -102,7 +105,21 @@ fn mock_server() -> MockServer {
                     "model": "siglip2-test",
                     "dim": 4,
                     "normalized": true,
-                    "vector": [0.6, 0.8, 0.0, 0.0]
+                    "vector": [0.6, 0.8, 0.0, 0.0],
+                    "features": {
+                        "spp": {
+                            "kind": "spp",
+                            "dtype": "i8",
+                            "dim": FeatureKind::SPP_RECORD_DIM,
+                            "data": spp
+                        },
+                        "maxsim": {
+                            "kind": "maxsim",
+                            "dtype": "i8",
+                            "dim": FeatureKind::MAXSIM_RECORD_DIM,
+                            "data": maxsim
+                        }
+                    }
                 })
                 .to_string(),
             )
@@ -178,6 +195,29 @@ fn runs_embedding_pose_and_description_jobs() {
         })
         .unwrap();
     assert_eq!(embedding, ("siglip2-test".into(), 4));
+    let descriptors: Vec<(String, u32)> = session
+        .db
+        .with_reader(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT kind, dim FROM feature_blobs
+                 WHERE image_id = 1 AND kind IN ('spp', 'maxsim') ORDER BY kind",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(
+        descriptors,
+        vec![
+            ("maxsim".into(), FeatureKind::MAXSIM_RECORD_DIM),
+            ("spp".into(), FeatureKind::SPP_RECORD_DIM),
+        ],
+        "一次前向要同时写入两种语义描述子"
+    );
 
     let job = task("pose", AiJobKind::Pose, "选中 1 张");
     execute(&context, &job, &request(AiJobKind::Pose))

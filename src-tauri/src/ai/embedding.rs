@@ -8,12 +8,11 @@ use crate::{
     app::error::{AppError, AppResult},
     library::{
         db::LibraryDb,
-        service::now_ms,
         similarity::{self as library_similarity, UnionFind},
     },
 };
 
-use super::pack::{FeatureDtype, FeatureKind, FeatureStore, record_slice};
+use super::pack::{FeatureDtype, FeatureKind, FeatureStore, record_slice, write_pointer};
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 2_000;
 pub const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -57,31 +56,14 @@ pub fn store(
         FeatureDtype::F16,
         &bytes,
     )?;
-    let now = now_ms();
-    database.with_writer(|connection| {
-        connection.execute(
-            "INSERT INTO feature_blobs(
-                image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
-             ) VALUES (?1, 'embedding', ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(image_id, kind) DO UPDATE SET
-                model = excluded.model,
-                dim = excluded.dim,
-                pack_name = excluded.pack_name,
-                pack_offset = excluded.pack_offset,
-                pack_length = excluded.pack_length,
-                updated_at = excluded.updated_at",
-            params![
-                image_id,
-                model,
-                dim,
-                location.pack_name,
-                location.offset as i64,
-                location.length as i64,
-                now
-            ],
-        )?;
-        Ok(())
-    })
+    write_pointer(
+        database,
+        image_id,
+        FeatureKind::Embedding,
+        model,
+        dim,
+        &location,
+    )
 }
 
 /// 取出参与检索的行指针：同 model/dim、未删除；按包名与偏移排序，便于顺序读。

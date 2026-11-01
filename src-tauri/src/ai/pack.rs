@@ -8,8 +8,12 @@ use std::{
 
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
+use rusqlite::params;
 
-use crate::app::error::{AppError, AppResult};
+use crate::{
+    app::error::{AppError, AppResult},
+    library::{db::LibraryDb, query::FeatureDemand, service::now_ms},
+};
 
 const MAGIC: &[u8; 8] = b"ARTBFTR1";
 const VERSION: u32 = 1;
@@ -24,28 +28,63 @@ const SYNC_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 pub enum FeatureKind {
     Embedding,
     Pose,
+    Spp,
+    MaxSim,
 }
 
 impl FeatureKind {
+    /// SPP 把 24×24 patch 池化成 8×8 格，每格白化到 128 维后摊平。
+    pub const SPP_GRID_SIDE: u32 = 8;
+    pub const SPP_DIM_PER_CELL: u32 = 128;
+    pub const SPP_RECORD_DIM: u32 =
+        Self::SPP_GRID_SIDE * Self::SPP_GRID_SIDE * Self::SPP_DIM_PER_CELL;
+    /// MaxSim 取注意力 top-32 个局部，每个白化到 64 维后摊平。
+    pub const MAXSIM_LOCALS: u32 = 32;
+    pub const MAXSIM_DIM_PER_LOCAL: u32 = 64;
+    pub const MAXSIM_RECORD_DIM: u32 = Self::MAXSIM_LOCALS * Self::MAXSIM_DIM_PER_LOCAL;
+
     fn code(self) -> u8 {
         match self {
             Self::Embedding => 1,
             Self::Pose => 2,
+            Self::Spp => 3,
+            Self::MaxSim => 4,
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Embedding => "embedding",
             Self::Pose => "pose",
+            Self::Spp => "spp",
+            Self::MaxSim => "maxsim",
         }
     }
+
+    /// 记录在包里的维度由 kind 固定；摊平后的形状不写进包头。
+    pub fn fixed_dim(self) -> Option<u32> {
+        match self {
+            Self::Spp => Some(Self::SPP_RECORD_DIM),
+            Self::MaxSim => Some(Self::MAXSIM_RECORD_DIM),
+            _ => None,
+        }
+    }
+}
+
+/// 语义批量任务的待处理条件：三种描述子缺一不可。
+pub fn semantic_feature_demands(embedding_dim: u32) -> Vec<FeatureDemand> {
+    vec![
+        FeatureDemand::new(FeatureKind::Embedding.name(), embedding_dim),
+        FeatureDemand::new(FeatureKind::Spp.name(), FeatureKind::SPP_RECORD_DIM),
+        FeatureDemand::new(FeatureKind::MaxSim.name(), FeatureKind::MAXSIM_RECORD_DIM),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureDtype {
     F16,
     F32,
+    I8,
 }
 
 impl FeatureDtype {
@@ -53,6 +92,7 @@ impl FeatureDtype {
         match self {
             Self::F16 => 1,
             Self::F32 => 2,
+            Self::I8 => 3,
         }
     }
 
@@ -60,6 +100,7 @@ impl FeatureDtype {
         match self {
             Self::F16 => "f16",
             Self::F32 => "f32",
+            Self::I8 => "i8",
         }
     }
 }
@@ -69,6 +110,45 @@ pub struct FeatureLocation {
     pub pack_name: String,
     pub offset: u64,
     pub length: u32,
+}
+
+/// 把一条追加结果的指针写进 `feature_blobs`；同图同 kind 覆盖旧指针。
+///
+/// 所有描述子共用这一份写入：embedding 与 spp/maxsim 只差包内编码，指针形状一致。
+pub fn write_pointer(
+    database: &LibraryDb,
+    image_id: i64,
+    kind: FeatureKind,
+    model: &str,
+    dim: u32,
+    location: &FeatureLocation,
+) -> AppResult<()> {
+    let updated_at = now_ms();
+    database.with_writer(|connection| {
+        connection.execute(
+            "INSERT INTO feature_blobs(
+                image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(image_id, kind) DO UPDATE SET
+                model = excluded.model,
+                dim = excluded.dim,
+                pack_name = excluded.pack_name,
+                pack_offset = excluded.pack_offset,
+                pack_length = excluded.pack_length,
+                updated_at = excluded.updated_at",
+            params![
+                image_id,
+                kind.name(),
+                model,
+                dim,
+                location.pack_name,
+                location.offset as i64,
+                location.length as i64,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +250,15 @@ impl FeatureStore {
             )));
         }
 
+        if let Some(expected) = kind.fixed_dim()
+            && dim != expected
+        {
+            return Err(AppError::message(format!(
+                "{} 特征维度应为 {expected}，实际 {dim}",
+                kind.name()
+            )));
+        }
+
         let pack_name = pack_name(kind, model, dim, dtype);
         let root = self.root()?;
         std::fs::create_dir_all(&root)?;
@@ -246,6 +335,7 @@ fn expected_record_len(dtype: FeatureDtype, dim: u32) -> usize {
     match dtype {
         FeatureDtype::F16 => dim as usize * 2,
         FeatureDtype::F32 => dim as usize * 4,
+        FeatureDtype::I8 => dim as usize,
     }
 }
 
@@ -339,6 +429,8 @@ fn read_header(file: &mut File, path: &Path) -> AppResult<PackHeader> {
     let kind = match header[12] {
         1 => FeatureKind::Embedding,
         2 => FeatureKind::Pose,
+        3 => FeatureKind::Spp,
+        4 => FeatureKind::MaxSim,
         other => {
             return Err(AppError::message(format!(
                 "特征包 {} 类型 {other} 不受支持",
@@ -349,6 +441,7 @@ fn read_header(file: &mut File, path: &Path) -> AppResult<PackHeader> {
     let dtype = match header[13] {
         1 => FeatureDtype::F16,
         2 => FeatureDtype::F32,
+        3 => FeatureDtype::I8,
         other => {
             return Err(AppError::message(format!(
                 "特征包 {} 数据类型 {other} 不受支持",
@@ -358,7 +451,10 @@ fn read_header(file: &mut File, path: &Path) -> AppResult<PackHeader> {
     };
     let dim = u32::from_le_bytes(header[16..20].try_into().expect("dim"));
     let record_len = u32::from_le_bytes(header[20..24].try_into().expect("record length"));
-    if dim == 0 || record_len as usize != expected_record_len(dtype, dim) {
+    if dim == 0
+        || record_len as usize != expected_record_len(dtype, dim)
+        || kind.fixed_dim().is_some_and(|expected| expected != dim)
+    {
         return Err(AppError::message(format!(
             "特征包 {} 的维度信息无效",
             path.display()
@@ -515,6 +611,78 @@ mod tests {
                 .read(&next.pack_name, next.offset, next.length)
                 .unwrap(),
             vec![1_u8; 8]
+        );
+    }
+
+    #[test]
+    fn appends_quantized_spp_and_maxsim_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FeatureStore::new();
+        store.set_root(temp.path().to_path_buf());
+        let spp = vec![7_u8; FeatureKind::Spp.fixed_dim().unwrap() as usize];
+        let maxsim = vec![9_u8; FeatureKind::MaxSim.fixed_dim().unwrap() as usize];
+        let first = store
+            .append(
+                FeatureKind::Spp,
+                "model",
+                FeatureKind::Spp.fixed_dim().unwrap(),
+                FeatureDtype::I8,
+                &spp,
+            )
+            .unwrap();
+        let second = store
+            .append(
+                FeatureKind::MaxSim,
+                "model",
+                FeatureKind::MaxSim.fixed_dim().unwrap(),
+                FeatureDtype::I8,
+                &maxsim,
+            )
+            .unwrap();
+        assert!(first.pack_name.starts_with("spp-model-8192-i8-"));
+        assert!(second.pack_name.starts_with("maxsim-model-2048-i8-"));
+        assert_eq!(first.length, 8_192);
+        assert_eq!(second.length, 2_048);
+        assert_eq!(
+            store
+                .read(&first.pack_name, first.offset, first.length)
+                .unwrap(),
+            spp
+        );
+        assert_eq!(
+            store
+                .read(&second.pack_name, second.offset, second.length)
+                .unwrap(),
+            maxsim
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_fixed_dimension_for_descriptor_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FeatureStore::new();
+        store.set_root(temp.path().to_path_buf());
+        assert!(
+            store
+                .append(
+                    FeatureKind::Spp,
+                    "model",
+                    128,
+                    FeatureDtype::I8,
+                    &[0_u8; 128]
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .append(
+                    FeatureKind::MaxSim,
+                    "model",
+                    64,
+                    FeatureDtype::I8,
+                    &[0_u8; 64]
+                )
+                .is_err()
         );
     }
 

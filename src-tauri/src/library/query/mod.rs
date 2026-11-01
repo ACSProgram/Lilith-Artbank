@@ -332,14 +332,31 @@ pub enum PendingFilter {
     /// 重做类任务：只要行未删除就处理。
     All,
     Thumbnail,
-    Embedding {
+    /// 缺任一描述子就算待处理：embedding / spp / maxsim 出自同一次前向。
+    Features {
         model: String,
-        dim: u32,
+        dims: Vec<FeatureDemand>,
     },
     Pose,
     Description {
         overwrite: bool,
     },
+}
+
+/// 一种描述子的 kind 与记录维度。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureDemand {
+    pub kind: String,
+    pub dim: u32,
+}
+
+impl FeatureDemand {
+    pub fn new(kind: impl Into<String>, dim: u32) -> Self {
+        Self {
+            kind: kind.into(),
+            dim,
+        }
+    }
 }
 
 impl PendingFilter {
@@ -354,17 +371,27 @@ impl PendingFilter {
             Self::Thumbnail => {
                 format!("{active} AND (images.thumb_segment = 0 OR images.thumb_length <= 0)")
             }
-            Self::Embedding { model, dim } => {
-                params.push(Value::Text(model.clone()));
-                params.push(Value::Integer(i64::from(*dim)));
-                format!(
-                    "{active} AND NOT EXISTS (
-                         SELECT 1 FROM feature_blobs pending_features
-                         WHERE pending_features.image_id = images.id
-                           AND pending_features.kind = 'embedding'
-                           AND pending_features.model = ?
-                           AND pending_features.dim = ?)"
-                )
+            Self::Features { model, dims } => {
+                let mut checks = Vec::with_capacity(dims.len());
+                for demand in dims {
+                    params.push(Value::Text(demand.kind.clone()));
+                    params.push(Value::Text(model.clone()));
+                    params.push(Value::Integer(i64::from(demand.dim)));
+                    checks.push(
+                        "NOT EXISTS (
+                             SELECT 1 FROM feature_blobs pending_features
+                             WHERE pending_features.image_id = images.id
+                               AND pending_features.kind = ?
+                               AND pending_features.model = ?
+                               AND pending_features.dim = ?)"
+                            .to_owned(),
+                    );
+                }
+                if checks.is_empty() {
+                    format!("{active} AND 0")
+                } else {
+                    format!("{active} AND ({})", checks.join(" OR "))
+                }
             }
             Self::Pose => format!(
                 "{active} AND NOT EXISTS (

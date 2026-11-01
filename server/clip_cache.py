@@ -16,6 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from image_features import (
+    Basis,
+    FeatureBasisMissing,
+    capture_attention,
+    load_image_bases,
+    v_projection,
+)
+
 LOGGER = logging.getLogger("artbank.clip")
 
 TOWER_PREFIX = {"image": "vision_model.", "text": "text_model."}
@@ -85,6 +93,13 @@ class _LoadedTower:
     device: Any
     dtype: Any
     last_used: float
+    # 图片塔额外持有两份白化基、V 投影权重与注意力捕获；文本塔这几项为空。
+    spp_basis: Optional[Basis] = None
+    maxsim_basis: Optional[Basis] = None
+    v_weight: Any = None
+    v_bias: Any = None
+    attention: Optional[dict] = None
+    attention_handle: Any = None
 
 
 class ClipCache:
@@ -192,6 +207,21 @@ class ClipCache:
             self._restore_position_ids(model, device)
             model.to(device)
             model.eval()
+            spp_basis = maxsim_basis = v_weight = v_bias = attention = None
+            attention_handle = None
+            if kind == "image":
+                # 基与图片塔一起加载：缺少基时整项图片能力不可用，不做静默降级。
+                try:
+                    spp_basis, maxsim_basis = load_image_bases(self._info.model_dir)
+                except FeatureBasisMissing as error:
+                    raise CapabilityUnavailable(str(error)) from error
+                v_weight, v_bias = v_projection(model)
+                attention = {}
+                attention_handle = (
+                    model.vision_model.head.attention.register_forward_hook(
+                        capture_attention(attention)
+                    )
+                )
             warmup = self._warmup_locked(kind, model, processor, config, device, dtype)
         except CapabilityUnavailable:
             raise
@@ -213,6 +243,12 @@ class ClipCache:
                 device=device,
                 dtype=dtype,
                 last_used=time.monotonic(),
+                spp_basis=spp_basis,
+                maxsim_basis=maxsim_basis,
+                v_weight=v_weight,
+                v_bias=v_bias,
+                attention=attention,
+                attention_handle=attention_handle,
             )
         LOGGER.info(
             "已加载%s：model=%s device=%s dtype=%s 耗时=%.1fs（含预热 %.1fs）",
@@ -323,6 +359,11 @@ class ClipCache:
         if tower is None:
             return
         kind = tower.kind
+        if tower.attention_handle is not None:
+            try:
+                tower.attention_handle.remove()
+            except Exception:
+                pass
         with self._state_lock:
             self._tower = None
         # 这里的局部引用是模型的最后一个持有者；先放掉它，gc 与 empty_cache

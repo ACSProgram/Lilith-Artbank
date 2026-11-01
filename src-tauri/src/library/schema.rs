@@ -5,7 +5,7 @@ use crate::{
     library::manifest::LibraryManifest,
 };
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -124,12 +124,13 @@ CREATE TABLE thumb_segments (
     created_at INTEGER NOT NULL
 ) STRICT;
 
--- 嵌入向量与姿势数据不放进主库：主库只记录它们在 feature pack 中的位置，
+-- 嵌入向量、姿势与语义描述子不放进主库：主库只记录它们在 feature pack 中的位置，
 -- 避免几十万条 1536 维向量把元数据库撑到数百 MB。
--- dim 对 embedding 是向量维度，对 pose 是 landmark 个数（33）；包内记录长度以包头为准。
+-- dim 对 embedding 是向量维度，对 pose 是 landmark 个数（33），对 spp/maxsim 是摊平后的
+-- int8 元素数；包内记录长度以包头为准。
 CREATE TABLE feature_blobs (
     image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose')),
+    kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose', 'spp', 'maxsim')),
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
     pack_name TEXT NOT NULL,
@@ -264,103 +265,41 @@ pub fn initialize(connection: &mut Connection, manifest: &LibraryManifest) -> Ap
     Ok(())
 }
 
+/// 把图库升到 `SCHEMA_VERSION`：逐级升，缺一级就整体失败，不做跳级。
 pub fn ensure(connection: &mut Connection, manifest: &LibraryManifest) -> AppResult<()> {
     let version = read_version(connection)?;
-    match version {
-        0 => initialize(connection, manifest),
-        1 => {
-            verify_meta(connection, manifest)?;
-            migrate_v1_to_v2(connection)?;
-            migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        2 => {
-            verify_meta(connection, manifest)?;
-            migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        3 => {
-            verify_meta(connection, manifest)?;
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        4 => {
-            verify_meta(connection, manifest)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        5 => {
-            verify_meta(connection, manifest)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        6 => {
-            verify_meta(connection, manifest)?;
-            migrate_v6_to_v7(connection)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        7 => {
-            verify_meta(connection, manifest)?;
-            migrate_v7_to_v8(connection)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        8 => {
-            verify_meta(connection, manifest)?;
-            migrate_v8_to_v9(connection)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        9 => {
-            verify_meta(connection, manifest)?;
-            migrate_v9_to_v10(connection)?;
-            migrate_v10_to_v11(connection)
-        }
-        10 => {
-            verify_meta(connection, manifest)?;
-            migrate_v10_to_v11(connection)
-        }
-        SCHEMA_VERSION => {
-            verify_meta(connection, manifest)?;
-            Ok(())
-        }
-        other => Err(AppError::message(format!(
-            "图库 schema 版本 {other} 高于当前程序支持的 {SCHEMA_VERSION}"
-        ))),
+    if version == 0 {
+        return initialize(connection, manifest);
     }
+    if version > SCHEMA_VERSION {
+        return Err(AppError::message(format!(
+            "图库 schema 版本 {version} 高于当前程序支持的 {SCHEMA_VERSION}"
+        )));
+    }
+    verify_meta(connection, manifest)?;
+    let mut current = version;
+    while current < SCHEMA_VERSION {
+        match current {
+            1 => migrate_v1_to_v2(connection)?,
+            2 => migrate_v2_to_v3(connection)?,
+            3 => migrate_v3_to_v4(connection)?,
+            4 => migrate_v4_to_v5(connection)?,
+            5 => migrate_v5_to_v6(connection)?,
+            6 => migrate_v6_to_v7(connection)?,
+            7 => migrate_v7_to_v8(connection)?,
+            8 => migrate_v8_to_v9(connection)?,
+            9 => migrate_v9_to_v10(connection)?,
+            10 => migrate_v10_to_v11(connection)?,
+            11 => migrate_v11_to_v12(connection)?,
+            other => {
+                return Err(AppError::message(format!(
+                    "图库 schema 版本 {other} 没有升级路径"
+                )));
+            }
+        }
+        current += 1;
+    }
+    Ok(())
 }
 
 fn verify_meta(connection: &Connection, manifest: &LibraryManifest) -> AppResult<()> {
@@ -565,6 +504,37 @@ fn migrate_v10_to_v11(connection: &mut Connection) -> AppResult<()> {
     mark_version(&transaction, 11)?;
     transaction.commit()?;
     log::info!("图库 schema 已从 v10 升级到 v11");
+    Ok(())
+}
+
+/// v11 → v12：feature_blobs 的 kind 增加 `spp` / `maxsim`。
+///
+/// SQLite 不能改已有的 CHECK 约束，只能重建表；已有行原样复制，不改任何指针。
+fn migrate_v11_to_v12(connection: &mut Connection) -> AppResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE feature_blobs_v12 (
+            image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose', 'spp', 'maxsim')),
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            pack_name TEXT NOT NULL,
+            pack_offset INTEGER NOT NULL,
+            pack_length INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (image_id, kind)
+         ) STRICT;
+         INSERT INTO feature_blobs_v12(
+            image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
+         )
+         SELECT image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
+         FROM feature_blobs;
+         DROP TABLE feature_blobs;
+         ALTER TABLE feature_blobs_v12 RENAME TO feature_blobs;",
+    )?;
+    mark_version(&transaction, 12)?;
+    transaction.commit()?;
+    log::info!("图库 schema 已从 v11 升级到 v12");
     Ok(())
 }
 
@@ -1325,5 +1295,89 @@ mod tests {
         assert_eq!(optimized_at, 0);
         assert_eq!(imported_at, 7);
         assert_eq!(modified_at, 7);
+    }
+
+    #[test]
+    fn migrates_v11_to_v12_and_allows_semantic_feature_kinds() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        configure(&connection).unwrap();
+        initialize(&mut connection, &manifest()).unwrap();
+        // 还原 v11 的 feature_blobs：kind 只允许 embedding / pose。
+        connection
+            .execute_batch(
+                "CREATE TABLE feature_blobs_v11 (
+                    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN ('embedding', 'pose')),
+                    model TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    pack_name TEXT NOT NULL,
+                    pack_offset INTEGER NOT NULL,
+                    pack_length INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (image_id, kind)
+                 ) STRICT;
+                 INSERT INTO feature_blobs_v11
+                 SELECT image_id, kind, model, dim, pack_name, pack_offset, pack_length, updated_at
+                 FROM feature_blobs;
+                 DROP TABLE feature_blobs;
+                 ALTER TABLE feature_blobs_v11 RENAME TO feature_blobs;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images(
+                    content_hash, file_ext, folder_id, file_size, width, height, format,
+                    has_alpha, phash, colors4, colors8, score, description, imported_at, modified_at
+                 ) VALUES (?1, 'png', 1, 10, 4, 3, 'png', 0, zeroblob(32), zeroblob(16),
+                           zeroblob(32), 0, '', 1, 1)",
+                [("c".repeat(64))],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO feature_blobs
+                 VALUES (1, 'embedding', 'm', 1536, 'e.pack', 32, 3072, 1);
+                 INSERT INTO feature_blobs
+                 VALUES (1, 'pose', 'm', 33, 'p.pack', 32, 132, 1);",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 11).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = '11' WHERE key = 'schemaVersion'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO feature_blobs
+                     VALUES (1, 'spp', 'm', 8192, 's.pack', 32, 8192, 1)",
+                    [],
+                )
+                .is_err(),
+            "v11 不允许 spp"
+        );
+
+        ensure(&mut connection, &manifest()).unwrap();
+        assert_eq!(read_version(&connection).unwrap(), SCHEMA_VERSION);
+        let kept: i64 = connection
+            .query_row("SELECT count(*) FROM feature_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 2, "迁移保留已有指针");
+        connection
+            .execute(
+                "INSERT INTO feature_blobs
+                 VALUES (1, 'spp', 'm', 8192, 's.pack', 32, 8192, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO feature_blobs
+                 VALUES (1, 'maxsim', 'm', 2048, 'x.pack', 32, 2048, 1)",
+                [],
+            )
+            .unwrap();
     }
 }

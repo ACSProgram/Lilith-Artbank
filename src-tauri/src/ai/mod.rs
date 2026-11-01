@@ -1,4 +1,5 @@
 pub mod client;
+pub mod descriptors;
 pub mod embedding;
 pub mod input;
 pub mod job;

@@ -1956,6 +1956,13 @@ fn insert_feature(connection: &Connection, image_id: i64, kind: &str, model: &st
         .unwrap();
 }
 
+fn embedding_only(model: &str, dim: u32) -> PendingFilter {
+    PendingFilter::Features {
+        model: model.to_owned(),
+        dims: vec![FeatureDemand::new("embedding", dim)],
+    }
+}
+
 #[test]
 fn pending_stats_follow_scope_and_thumbnail_pointer() {
     let fixture = fixture();
@@ -2046,10 +2053,7 @@ fn pending_embedding_binds_model_and_dim_in_order() {
     let alpha = pending_stats(
         database,
         LibraryQuery::default(),
-        &PendingFilter::Embedding {
-            model: "alpha".into(),
-            dim: 4,
-        },
+        &embedding_only("alpha", 4),
     )
     .unwrap();
     assert_eq!(
@@ -2062,20 +2066,14 @@ fn pending_embedding_binds_model_and_dim_in_order() {
     let alpha8 = pending_stats(
         database,
         LibraryQuery::default(),
-        &PendingFilter::Embedding {
-            model: "alpha".into(),
-            dim: 8,
-        },
+        &embedding_only("alpha", 8),
     )
     .unwrap();
     assert_eq!(alpha8.will_process, 3);
     let beta = pending_stats(
         database,
         LibraryQuery::default(),
-        &PendingFilter::Embedding {
-            model: "beta".into(),
-            dim: 4,
-        },
+        &embedding_only("beta", 4),
     )
     .unwrap();
     assert_eq!(beta.will_process, 3);
@@ -2090,6 +2088,43 @@ fn pending_embedding_binds_model_and_dim_in_order() {
         .unwrap();
     let pose = pending_stats(database, LibraryQuery::default(), &PendingFilter::Pose).unwrap();
     assert_eq!(pose.will_process, 3, "姿势不按模型判断");
+}
+
+#[test]
+fn semantic_features_are_pending_until_every_kind_exists() {
+    let fixture = fixture();
+    fixture
+        .session
+        .db
+        .with_writer(|connection| {
+            insert_feature(connection, 1, "embedding", "model", 4);
+            insert_feature(connection, 2, "embedding", "model", 4);
+            insert_feature(connection, 2, "spp", "model", 8);
+            insert_feature(connection, 2, "maxsim", "model", 16);
+            insert_feature(connection, 3, "spp", "model", 8);
+            insert_feature(connection, 3, "maxsim", "model", 16);
+            Ok(())
+        })
+        .unwrap();
+    let filter = PendingFilter::Features {
+        model: "model".into(),
+        dims: vec![
+            FeatureDemand::new("embedding", 4),
+            FeatureDemand::new("spp", 8),
+            FeatureDemand::new("maxsim", 16),
+        ],
+    };
+    let stats = pending_stats(&fixture.session.db, LibraryQuery::default(), &filter).unwrap();
+    assert_eq!(
+        stats,
+        PendingStats {
+            total: 4,
+            will_process: 3
+        },
+        "只有三种都齐的图才算完成"
+    );
+    let pending = selected_pending_ids(&fixture.session.db, &[2, 3, 1], &filter).unwrap();
+    assert_eq!(pending, vec![3, 1]);
 }
 
 #[test]
@@ -2177,15 +2212,8 @@ fn selected_pending_embedding_binds_json_before_model_and_dim() {
             Ok(())
         })
         .unwrap();
-    let stats = selected_pending_stats(
-        &fixture.session.db,
-        &[1, 2],
-        &PendingFilter::Embedding {
-            model: "alpha".into(),
-            dim: 4,
-        },
-    )
-    .unwrap();
+    let stats =
+        selected_pending_stats(&fixture.session.db, &[1, 2], &embedding_only("alpha", 4)).unwrap();
     assert_eq!(
         stats,
         PendingStats {
@@ -2193,15 +2221,8 @@ fn selected_pending_embedding_binds_json_before_model_and_dim() {
             will_process: 1
         }
     );
-    let pending = selected_pending_ids(
-        &fixture.session.db,
-        &[2, 1],
-        &PendingFilter::Embedding {
-            model: "alpha".into(),
-            dim: 4,
-        },
-    )
-    .unwrap();
+    let pending =
+        selected_pending_ids(&fixture.session.db, &[2, 1], &embedding_only("alpha", 4)).unwrap();
     assert_eq!(pending, vec![2]);
 }
 
@@ -2294,10 +2315,7 @@ fn pending_stats_bind_pending_join_and_filter_params_in_order() {
             },
             ..Default::default()
         },
-        &PendingFilter::Embedding {
-            model: "alpha".into(),
-            dim: 4,
-        },
+        &embedding_only("alpha", 4),
     )
     .unwrap();
     assert_eq!(

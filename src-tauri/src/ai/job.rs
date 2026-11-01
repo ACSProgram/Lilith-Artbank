@@ -24,8 +24,8 @@ use crate::{
 
 use super::{
     client::{AiClient, AiError, Capability, Health},
-    embedding, input,
-    pack::FeatureStore,
+    descriptors, embedding, input,
+    pack::{FeatureKind, FeatureStore, semantic_feature_demands},
     pose,
 };
 
@@ -137,9 +137,9 @@ pub fn execute(
                 let dim = capability.dim.ok_or_else(|| {
                     AppError::message("health 没有返回 embedding 维度，无法判断缺失项")
                 })?;
-                PendingFilter::Embedding {
+                PendingFilter::Features {
                     model: capability.model.clone(),
-                    dim,
+                    dims: semantic_feature_demands(dim),
                 }
             }
             (AiJobKind::Pose, false) => PendingFilter::Pose,
@@ -288,22 +288,47 @@ fn process_one(
                 holder,
                 cancel,
             )?;
+            // 三种描述子出自同一次前向：缺什么补什么时也把三个都重写一遍，
+            // embedding 是确定性结果，覆盖无害，换来「跑一次就自洽」。
             let result = client
-                .embed_image(&capability.model, &bytes)
+                .embed_image_features(&capability.model, &["global", "spp", "maxsim"], &bytes)
                 .map_err(|error| AppError::message(error.to_string()))?;
-            if result.model != capability.model {
+            if result.embedding.model != capability.model {
                 return Err(AppError::message(format!(
                     "服务返回的 embedding 模型 {0} 与 health 中的 {1} 不一致",
-                    result.model, capability.model
+                    result.embedding.model, capability.model
                 )));
             }
+            // 校验放在写之前：缺任一条就整张不写，下次仍是待处理，不会留下半张图。
+            let spp = result
+                .spp
+                .ok_or_else(|| AppError::message("语义服务没有返回构图特征"))?;
+            let maxsim = result
+                .maxsim
+                .ok_or_else(|| AppError::message("语义服务没有返回主体特征"))?;
             embedding::store(
                 &context.database,
                 &context.store,
                 image_id,
-                &result.model,
-                result.dim,
-                &result.vector,
+                &result.embedding.model,
+                result.embedding.dim,
+                &result.embedding.vector,
+            )?;
+            descriptors::store(
+                &context.database,
+                &context.store,
+                image_id,
+                &result.embedding.model,
+                FeatureKind::Spp,
+                &spp,
+            )?;
+            descriptors::store(
+                &context.database,
+                &context.store,
+                image_id,
+                &result.embedding.model,
+                FeatureKind::MaxSim,
+                &maxsim,
             )?;
             Ok(Outcome::Done)
         }

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import sys
@@ -24,6 +25,7 @@ from clip_cache import (
     ModelNotReady,
     prewarm_imports,
 )
+from image_features import MAXSIM_RECORD_DIM, SPP_RECORD_DIM, encode
 from image_io import ImageDecodeError, decode_image
 from pose_engine import PoseEngine
 
@@ -36,6 +38,7 @@ MAX_INFERENCE_CONCURRENCY = 4
 POSE_MODEL = "mediapipe-pose"
 CLIP_CAPABILITIES = {"imageEmbedding": "image", "textEmbedding": "text"}
 KNOWN_CAPABILITIES = {"imageEmbedding", "textEmbedding", "pose", "description"}
+IMAGE_FEATURES = {"spp": SPP_RECORD_DIM, "maxsim": MAXSIM_RECORD_DIM}
 
 
 def _torch() -> tuple[Any, Any]:
@@ -75,6 +78,22 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+def _quantized(kind: str, dim: int, values: Any) -> dict:
+    data = values.tobytes() if hasattr(values, "tobytes") else bytes(values)
+    if len(data) != dim:
+        raise ApiError(
+            500,
+            "dimension_mismatch",
+            f"{kind} 记录长度 {len(data)} 与声明 {dim} 不一致",
+        )
+    return {
+        "kind": kind,
+        "dtype": "i8",
+        "dim": dim,
+        "data": base64.b64encode(data).decode("ascii"),
+    }
 
 
 class ApiState:
@@ -210,11 +229,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         info = self.server.state.cache.info
         if info is not None:
             for name, kind in CLIP_CAPABILITIES.items():
-                capabilities[name] = {
+                capability = {
                     "ready": self.server.state.cache.ready(kind),
                     "model": info.model_name,
                     "dim": info.dim,
                 }
+                if kind == "image":
+                    # 描述子与图片塔同源；塔能加载就说明两份基已经就位。
+                    capability["features"] = [
+                        {"kind": feature_kind, "dim": dim, "dtype": "i8"}
+                        for feature_kind, dim in IMAGE_FEATURES.items()
+                    ]
+                capabilities[name] = capability
         capabilities["pose"] = {
             "ready": self.server.state.pose.ready(),
             "model": POSE_MODEL,
@@ -262,13 +288,17 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _embed_image(self) -> dict:
         info = self._check_model(self._query_value("model"))
+        requested = self._parse_features()
         if not self.server.state.cache.ready("image"):
             raise ModelNotReady("图片塔未加载，请先调用 /v1/models/ensure")
         body = self._read_body()
         torch, functional = _torch()
         image = decode_image(body)
+        extras: dict[str, dict] = {}
         try:
             with self.server.state.cache.use("image") as tower:
+                if tower.attention is not None:
+                    tower.attention.pop("weights", None)
                 inputs = tower.processor(images=image, return_tensors="pt")
                 pixel_values = inputs["pixel_values"].to(
                     device=tower.device, dtype=tower.dtype
@@ -278,6 +308,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 vector = output.pooler_output[0].float()
                 vector = functional.normalize(vector, p=2, dim=-1)
                 values = vector.detach().cpu().tolist()
+
+                if "spp" in requested or "maxsim" in requested:
+                    if (
+                        tower.attention is None
+                        or tower.spp_basis is None
+                        or tower.maxsim_basis is None
+                    ):
+                        raise ApiError(
+                            500,
+                            "descriptor_unavailable",
+                            "图片塔没有语义描述子所需的注意力捕获或白化基",
+                        )
+                    attention = tower.attention.get("weights")
+                    if attention is None:
+                        raise ApiError(500, "attention_missing", "没有捕获到图片塔注意力")
+                    hidden = output.last_hidden_state[0].float()
+                    projected = hidden @ tower.v_weight.T + tower.v_bias
+                    features = encode(
+                        hidden,
+                        attention,
+                        projected,
+                        tower.spp_basis,
+                        tower.maxsim_basis,
+                    )
+                    if "spp" in requested:
+                        extras["spp"] = _quantized("spp", SPP_RECORD_DIM, features["spp"])
+                    if "maxsim" in requested:
+                        extras["maxsim"] = _quantized(
+                            "maxsim", MAXSIM_RECORD_DIM, features["maxsim"]
+                        )
         finally:
             image.close()
 
@@ -287,13 +347,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "dimension_mismatch",
                 f"模型返回 {len(values)} 维，声明 {info.dim} 维",
             )
-        return {
+        payload = {
             "status": "success",
             "model": info.model_name,
             "dim": len(values),
             "normalized": True,
             "vector": values,
         }
+        if extras:
+            payload["features"] = extras
+        return payload
 
     def _embed_text(self) -> dict:
         payload = self._read_json()
@@ -378,6 +441,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         if requested and requested != info.model_name:
             raise ApiError(404, "model_not_found", f"模型不存在：{requested}")
         return info
+
+    def _parse_features(self) -> set[str]:
+        raw = self._query_value("features")
+        if not raw.strip():
+            return {"global"}
+        values = {part.strip().lower() for part in raw.split(",") if part.strip()}
+        unknown = values - {"global", "spp", "maxsim"}
+        if unknown:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知的 features：{', '.join(sorted(unknown))}；只接受 global / spp / maxsim",
+            )
+        return values
 
     def _query_value(self, name: str) -> str:
         values = parse_qs(urlsplit(self.path).query).get(name)

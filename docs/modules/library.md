@@ -1,6 +1,6 @@
 # 图库与元数据
 
-图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v11、多级文件夹、文件夹与图片的回收站（文件夹搬入仓库）、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
+图库是一个目录加上 `.artbank/` 数据区。应用侧由 `AppState` 持有唯一的当前图库会话，元数据由 SQLite 管理。本文件记录当前已实现的图库契约，包括单库设置 v7、schema v12、多级文件夹、文件夹与图片的回收站（文件夹搬入仓库）、临时文件夹与操作记录/撤销；AI 任务与 feature pack 见 [AI 服务](ai-service.md)。
 
 ## 图库清单
 
@@ -36,7 +36,7 @@ PRAGMA mmap_size = 268435456;
 ```
 
 - 写连接只有一条；读连接默认 4 条，`query_only=ON`。
-- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 11；版本高于程序支持值时拒绝打开。
+- schema 版本写在 `PRAGMA user_version` 与 `meta.schemaVersion`。当前为 12；版本高于程序支持值时拒绝打开。
 - v1 → v2 迁移只新增 `folders(path COLLATE NOCASE)` 唯一索引。迁移前检查是否存在仅大小写不同的重复路径；有冲突则拒绝打开并保留 v1，不做自动改名或合并。
 - v2 → v3 迁移给 `folders` 加 `sort_index INTEGER NOT NULL DEFAULT 0`，并按 `path`（NOCASE）顺序编号，升级后文件夹的显示顺序不变。
 - v3 → v4 迁移只新增修改时间与像素尺寸两个索引，不改数据；建索引耗时与首次打开停顿见[性能基准](../guides/performance.md)。v1 库按 v1→v2→v3→v4 链式升级。
@@ -47,6 +47,7 @@ PRAGMA mmap_size = 268435456;
 - v8 → v9 只新增覆盖索引 `idx_images_visible_bytes(deleted_at, folder_id, file_size)`，供文件夹概览的 `SUM(file_size)` 在索引内完成，不改数据与语义。分面索引保持窄，避免标签聚合因索引变宽而退化。
 - v9 → v10 给 `folders` 增加 `trashed_at` 与 `purge_operation_id` 两列，并建两个空集上的部分索引；只做 `ALTER TABLE ADD COLUMN`，不改现有行。旧 `folderDelete`（空文件夹物理删除）记录仍可解析与撤销。
 - v10 → v11 给 `folders` 增加 `original_path TEXT`，只做 `ALTER TABLE ADD COLUMN`，不搬目录；已有的原地回收站行保持 `original_path IS NULL`，新删除的文件夹才进入 `.artbank/trash/<trashed_at>/<根id>/`。
+- v11 → v12 重建 `feature_blobs`，把 kind 的 CHECK 从 `embedding / pose` 放开到 `embedding / pose / spp / maxsim`；SQLite 不能改已有 CHECK，所以按“建新表 → 复制全部指针 → 删旧表 → 改名”执行，不改任何行。
 
 ### 表
 
@@ -58,7 +59,7 @@ PRAGMA mmap_size = 268435456;
 | `tags` / `image_tags` | 规范化标签与多对多关系 |
 | `collections` / `collection_items` | 手工集合与顺序 |
 | `thumb_segments` | 缩略图包分段；0 号为占位段 |
-| `feature_blobs` | embedding / pose 在 feature pack 中的位置 |
+| `feature_blobs` | embedding / pose / spp / maxsim 在 feature pack 中的位置 |
 | `operations` / `operation_chunks` | 操作记录与逆数据；批量操作只记一条，大列表用原始 BLOB |
 | `undo_runs` | 一次撤销或重做运行的起点、状态与起止时间 |
 | `image_search` | FTS5 external-content 表，索引 `images.description` |

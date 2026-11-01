@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 /// 5xx 重试测试的全局尝试次数；测试开始前重置，避免同一进程里的其它用例污染。
@@ -286,6 +287,11 @@ fn respond(request: &StubRequest, _index: usize, config: &StubConfig) -> (u16, V
                 "model": config.image_model,
                 "dim": config.image_dim,
                 "vector": image_vector(&request.body, config.image_dim),
+                // 与 Rust 侧 FeatureKind 的固定维度一致：SPP 8192、MaxSim 2048 个 int8。
+                "features": {
+                    "spp": quantized_payload("spp", 8192),
+                    "maxsim": quantized_payload("maxsim", 2048),
+                },
             }),
         ),
         "/v1/embed/text" => embed_text(&text, config),
@@ -356,6 +362,16 @@ fn embed_text(body: &str, config: &StubConfig) -> (u16, Value) {
             "vector": vector,
         }),
     )
+}
+
+/// 一条定长 int8 描述子；验收只校验形状与协议，值本身不影响结论。
+fn quantized_payload(kind: &str, dim: usize) -> Value {
+    json!({
+        "kind": kind,
+        "dtype": "i8",
+        "dim": dim,
+        "data": BASE64.encode(vec![0_u8; dim]),
+    })
 }
 
 /// 4 个象限的平均 RGB（8 维）：轻微像素差异只会让向量微动，适合验证语义分组。

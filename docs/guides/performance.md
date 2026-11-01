@@ -109,6 +109,7 @@
 | 逐块 `IN(400)` 统计 | 490 条语句 | 11.95–14.15 s | 不可用于预览 |
 
 - 读连接带 `PRAGMA query_only=1`，不能建临时表；选择集用 JSON1 的 `json_each`，bundled SQLite 自带。
+- 采用语义描述子后，待处理条件从单个 embedding 的 `NOT EXISTS` 变成 embedding / spp / maxsim 三个 `NOT EXISTS` 的 OR；上表“全库缺 embedding”是改前的单 kind 实测，回填完成后需要用真实库复测这一行。
 - 预览有 250 ms 去抖、加载态与按数据版本失效的缓存；真实 39 万行的 p50/p95 需要实现后用复制库复测，超过约 1.5 s 再评估索引或收窄默认范围。
 
 ## 批量编辑（测试库 6 张）

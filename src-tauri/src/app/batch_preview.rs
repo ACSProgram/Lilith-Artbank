@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    ai::pack::semantic_feature_demands,
     app::{
         error::{AppError, AppResult},
         tasks::{BatchTaskKind, TaskScope, TaskSkipBucket},
@@ -126,9 +127,9 @@ fn filter_for(request: &BatchTaskPreviewRequest) -> AppResult<Option<PendingFilt
                     Some(capability)
                         if !capability.model.trim().is_empty() && capability.dim > 0 =>
                     {
-                        Some(PendingFilter::Embedding {
+                        Some(PendingFilter::Features {
                             model: capability.model.clone(),
-                            dim: capability.dim,
+                            dims: semantic_feature_demands(capability.dim),
                         })
                     }
                     _ => None,
