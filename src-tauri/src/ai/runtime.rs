@@ -30,7 +30,7 @@ use crate::{
     library::{
         db::LibraryDb,
         paths::LibraryPaths,
-        query::{self, ImageRow},
+        query::{self, FeatureDemand, ImageRow, LibraryQuery, PendingFilter},
         similarity::{self as library_similarity, GroupProgress},
         thumbs::ThumbPack,
         viewer::PoseData,
@@ -39,12 +39,68 @@ use crate::{
 
 use super::{
     client::{AiClient, Health},
-    embedding,
+    descriptors, embedding,
     job::{self, AiJobKind, AiJobRequest, JobContext},
-    pack::FeatureStore,
+    pack::{FeatureKind, FeatureStore, semantic_feature_demands},
     pose,
     process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus, launch_spec},
 };
+
+/// 两段式重排：全局阈值命中里取前 20% 计算描述子分数，下限 200 张。
+const RERANK_RATIO: f64 = 0.2;
+const MIN_RERANK_CANDIDATES: usize = 200;
+
+/// 「语义特征」指标下的三种口径；只有后两种读 SPP / MaxSim 描述子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeatureMode {
+    Overall,
+    Subject,
+    Composition,
+}
+
+impl FeatureMode {
+    fn parse(value: Option<&str>, kind: &str) -> AppResult<Self> {
+        let mode = match value.unwrap_or("overall") {
+            "overall" => Self::Overall,
+            "subject" => Self::Subject,
+            "composition" => Self::Composition,
+            other => {
+                return Err(AppError::message(format!(
+                    "featureMode 只能是 overall、subject 或 composition，收到 {other}"
+                )));
+            }
+        };
+        if kind != "embedding" && mode != Self::Overall {
+            return Err(AppError::message(
+                "featureMode 只适用于「语义特征」指标（kind=embedding）",
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn descriptor_kind(self) -> Option<FeatureKind> {
+        match self {
+            Self::Overall => None,
+            Self::Subject => Some(FeatureKind::MaxSim),
+            Self::Composition => Some(FeatureKind::Spp),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overall => "整体",
+            Self::Subject => "偏重主体",
+            Self::Composition => "偏重构图",
+        }
+    }
+}
+
+/// 全库还缺多少张的语义描述子；批量任务跑完这个数会归零。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticFeaturePending {
+    pub remaining: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +154,7 @@ impl MeanSlot {
             dim,
             count: 0,
             vector: None,
-            message: Some("正在计算 embedding 均值…".into()),
+            message: Some("正在计算语义特征均值…".into()),
         }
     }
 
@@ -235,6 +291,20 @@ fn parse_score_threshold(value: Option<f64>, label: &str) -> AppResult<Option<f3
         Some(value) if value.is_finite() && (-1.0..=1.0).contains(&value) => Ok(Some(value as f32)),
         Some(_) => Err(AppError::message(format!("{label}必须在 -1 到 1 之间"))),
     }
+}
+
+/// 非临时区里缺任一描述子的图片数；与批量任务的待处理清单同一条件。
+fn feature_pending(database: &LibraryDb, model: &str, dim: u32) -> AppResult<u64> {
+    let dims: Vec<FeatureDemand> = semantic_feature_demands(dim);
+    Ok(query::pending_stats(
+        database,
+        LibraryQuery::default(),
+        &PendingFilter::Features {
+            model: model.to_owned(),
+            dims,
+        },
+    )?
+    .will_process)
 }
 
 /// 单张参考直接用自身主色；多张时等权合并成一组代表色。
@@ -650,7 +720,7 @@ impl AiRuntime {
         policy: ConflictPolicy,
     ) -> AppResult<TaskStartResult> {
         if !matches!(kind, AiJobKind::Embedding | AiJobKind::Pose) {
-            return Err(AppError::message("临时区只支持生成 embedding 或姿势特征"));
+            return Err(AppError::message("临时区只支持生成语义特征或姿势特征"));
         }
         let label = format!("临时区 {} 张 · {}", image_ids.len(), kind.label());
         let request = AiJobRequest {
@@ -865,11 +935,15 @@ impl AiRuntime {
     /// 目标图相似：`phash`、`color4`、`color8`、`embedding`、`pose`。
     ///
     /// 单张参考图支持全部指标；多张参考图只支持主色与 embedding 的平均。
+    /// `embedding` 另有 `feature_mode`：overall 用全局向量；subject / composition
+    /// 先按全局相似度粗筛 20%，再分别用 MaxSim / SPP 重排。
     /// `scope` 把扫描收窄到当前视图/选择/文件夹/集合；`None` 与全库等价。
     /// 结果写入统一的 token 缓存，后续分页与全选复用 `get_similarity_page` / `get_similarity_ids`。
+    #[allow(clippy::too_many_arguments)]
     pub fn find_similar_images(
         &self,
         kind: &str,
+        feature_mode: Option<&str>,
         target_ids: &[i64],
         threshold: Option<f64>,
         limit: Option<usize>,
@@ -881,6 +955,7 @@ impl AiRuntime {
             .unwrap_or(library_similarity::DEFAULT_LIMIT)
             .clamp(1, library_similarity::MAX_LIMIT);
         let targets = reference_ids(target_ids)?;
+        let mode = FeatureMode::parse(feature_mode, kind)?;
         let exclude: HashSet<i64> = targets.iter().copied().collect();
         let allowed = self.resolve_similarity_scope(&handles.database, scope)?;
         let (hits, total_hits): (Vec<(i64, f32)>, usize) = match kind {
@@ -932,14 +1007,28 @@ impl AiRuntime {
             }
             "embedding" => {
                 let threshold = parse_score_threshold(threshold, "语义相似度下限")?;
-                self.similar_ids_by_embedding(
-                    &handles,
-                    &targets,
-                    &exclude,
-                    threshold,
-                    limit,
-                    allowed.as_ref(),
-                )?
+                match mode {
+                    FeatureMode::Overall => self.similar_ids_by_embedding(
+                        &handles,
+                        &targets,
+                        &exclude,
+                        threshold,
+                        limit,
+                        allowed.as_ref(),
+                    )?,
+                    mode => {
+                        let target_id = single_reference(&targets, mode.label())?;
+                        self.similar_ids_by_feature(
+                            &handles,
+                            target_id,
+                            mode,
+                            &exclude,
+                            threshold,
+                            limit,
+                            allowed.as_ref(),
+                        )?
+                    }
+                }
             }
             "pose" => {
                 let target_id = single_reference(&targets, "姿势")?;
@@ -1034,6 +1123,115 @@ impl AiRuntime {
         )
     }
 
+    /// SPP / MaxSim 两段式：全局阈值粗筛 → 取前 20% → 按描述子重排。
+    ///
+    /// 阈值始终是 embedding 相似度；描述子只改变候选集内部的顺序。
+    #[allow(clippy::too_many_arguments)]
+    fn similar_ids_by_feature(
+        &self,
+        handles: &LibraryHandles,
+        target_id: i64,
+        mode: FeatureMode,
+        exclude: &HashSet<i64>,
+        threshold: Option<f32>,
+        limit: usize,
+        allowed: Option<&HashSet<i64>>,
+    ) -> AppResult<(Vec<(i64, f32)>, usize)> {
+        let kind = mode
+            .descriptor_kind()
+            .ok_or_else(|| AppError::message("整体模式不需要描述子重排"))?;
+        let embedding_target = embedding::target(&handles.database, &self.inner.store, target_id)?
+            .ok_or_else(|| AppError::message("这张图片还没有语义特征，请先运行 AI 任务"))?;
+        let Some((descriptor_model, target_bytes)) =
+            descriptors::target(&handles.database, &self.inner.store, target_id, kind)?
+        else {
+            return Err(AppError::message(format!(
+                "这张图片还没有「{}」需要的语义描述子，请先运行批量任务生成语义特征",
+                mode.label()
+            )));
+        };
+        // 描述子与全局向量必须出自同一次前向；模型换过而旧记录还在时直接说清楚，
+        // 否则重排会在候选里找不到任何记录，报成“缺少特征”。
+        if descriptor_model != embedding_target.model {
+            return Err(AppError::message(format!(
+                "这张图片的语义描述子来自旧模型（{}），与当前向量模型（{}）不一致，请重新生成语义特征",
+                descriptor_model, embedding_target.model
+            )));
+        }
+        let pending = feature_pending(
+            &handles.database,
+            &embedding_target.model,
+            embedding_target.dim,
+        )?;
+        if pending > 0 {
+            return Err(AppError::message(format!(
+                "全库还有 {pending} 张图片没有语义特征，补齐后才能用「{}」",
+                mode.label()
+            )));
+        }
+        let prepared = descriptors::PreparedDescriptor::new(kind, target_bytes)?;
+
+        let mean = self.ensure_mean(handles, &embedding_target.model, embedding_target.dim)?;
+        let (mut candidates, total_hits) = embedding::search_all_with_total(
+            &handles.database,
+            &self.inner.store,
+            &embedding_target.model,
+            embedding_target.dim,
+            &embedding_target.vector,
+            &mean.vector,
+            embedding::SearchFilter {
+                allowed,
+                excluded: Some(exclude),
+                min_score: threshold,
+            },
+        )?;
+        if candidates.is_empty() {
+            return Ok((Vec::new(), total_hits));
+        }
+
+        let keep = ((candidates.len() as f64 * RERANK_RATIO).ceil() as usize)
+            .max(MIN_RERANK_CANDIDATES)
+            .min(candidates.len());
+        if candidates.len() > keep {
+            candidates.select_nth_unstable_by(keep, embedding::by_score_desc);
+            candidates.truncate(keep);
+        }
+
+        let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+        let (scored, missing) = descriptors::rerank(
+            &handles.database,
+            &self.inner.store,
+            kind,
+            &embedding_target.model,
+            &prepared,
+            &ids,
+            limit,
+        )?;
+        if missing > 0 {
+            return Err(AppError::message(format!(
+                "{missing} 张候选图还没有「{}」需要的描述子，请先运行批量任务补齐语义特征",
+                mode.label()
+            )));
+        }
+        Ok((scored, total_hits))
+    }
+
+    /// 全库还缺多少张语义描述子；界面与 MCP 的模式门限共用。
+    ///
+    /// 模型与维度取全库张数最多的那一组，与相似分组同口径。
+    pub fn semantic_feature_pending(&self) -> AppResult<SemanticFeaturePending> {
+        let handles = self.handles()?;
+        let model = embedding::distinct_groups(&handles.database)?
+            .into_iter()
+            .next();
+        let Some((model, dim, _)) = model else {
+            return Ok(SemanticFeaturePending { remaining: 0 });
+        };
+        Ok(SemanticFeaturePending {
+            remaining: feature_pending(&handles.database, &model, dim)?,
+        })
+    }
+
     /// 相似分组：两种指标可以单独启用，也可以同时启用（同时满足才归组）。
     ///
     /// `scope` 只决定「在哪些图片之间找组」：全库不解析 id，其它范围先解析成 id 集合，
@@ -1059,7 +1257,7 @@ impl AiRuntime {
         let (groups, truncated, missing) = if embedding_enabled {
             let model_rows = embedding::distinct_groups(&handles.database)?;
             let Some((model, dim, _)) = model_rows.into_iter().next() else {
-                return Err(AppError::message("还没有图片 embedding，请先运行 AI 任务"));
+                return Err(AppError::message("还没有图片语义特征，请先运行 AI 任务"));
             };
             let mean = self.ensure_mean(&handles, &model, dim)?;
             // 只开语义时，pHash 仅用来产生候选，不参与筛选；同时开启时按用户阈值收窄候选。
@@ -1301,10 +1499,10 @@ impl AiRuntime {
                 *slot = MeanSlot::empty(
                     Some(model.to_owned()),
                     Some(dim),
-                    "还没有图片 embedding，请先运行 AI 任务",
+                    "还没有图片语义特征，请先运行 AI 任务",
                 );
                 Err(AppError::message(
-                    "还没有图片 embedding，请先运行 AI 任务生成",
+                    "还没有图片语义特征，请先运行 AI 任务生成",
                 ))
             }
             Err(error) => {
@@ -1330,7 +1528,7 @@ impl AiRuntime {
             };
             let Some((model, dim, _)) = groups.first().cloned() else {
                 if generation == inner.generation.load(Ordering::SeqCst) {
-                    *inner.mean.write() = MeanSlot::missing("还没有图片 embedding");
+                    *inner.mean.write() = MeanSlot::missing("还没有图片语义特征");
                 }
                 return;
             };
@@ -1346,7 +1544,7 @@ impl AiRuntime {
             match result {
                 Ok(mean) if mean.count > 0 => *slot = MeanSlot::ready(&model, dim, &mean),
                 Ok(_) => {
-                    *slot = MeanSlot::empty(Some(model.clone()), Some(dim), "还没有图片 embedding")
+                    *slot = MeanSlot::empty(Some(model.clone()), Some(dim), "还没有图片语义特征")
                 }
                 Err(error) => *slot = MeanSlot::failed(&model, dim, error.to_string()),
             }
@@ -1534,7 +1732,141 @@ impl SupervisorSlot {
 
 #[cfg(test)]
 mod tests {
-    use super::SupervisorSlot;
+    use super::{AiRuntime, FeatureKind, FeatureMode, SupervisorSlot, descriptors, embedding};
+
+    fn descriptor_vector(kind: FeatureKind, peaks: &[usize]) -> descriptors::QuantizedVector {
+        let block_dim = match kind {
+            FeatureKind::Spp => FeatureKind::SPP_DIM_PER_CELL,
+            FeatureKind::MaxSim => FeatureKind::MAXSIM_DIM_PER_LOCAL,
+            _ => unreachable!(),
+        };
+        let mut values = vec![0_i8; kind.fixed_dim().unwrap() as usize];
+        for (block, peak) in peaks.iter().enumerate() {
+            values[block * block_dim as usize + peak] = 127;
+        }
+        descriptors::QuantizedVector {
+            dim: kind.fixed_dim().unwrap(),
+            values,
+        }
+    }
+
+    /// 三种口径共用同一批阈值命中；构图模式按 SPP 重排后顺序应改变。
+    #[test]
+    fn composition_mode_reranks_after_global_threshold() {
+        use crate::ai::pack::{FeatureStore, semantic_feature_demands};
+        use crate::library::{paths::LibraryPaths, service};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let (session, _) = service::create(&root, "语义模式测试", 1).unwrap();
+        session
+            .db
+            .with_writer(|connection| {
+                for id in 1..=3 {
+                    connection.execute(
+                        "INSERT INTO images(
+                            id, content_hash, file_ext, folder_id, file_size, width, height,
+                            format, has_alpha, phash, colors4, colors8, score, description,
+                            imported_at, modified_at
+                         ) VALUES (?1, ?2, 'png', 1, 10, 4, 4, 'png', 0,
+                            zeroblob(32), zeroblob(16), zeroblob(32), 0, '', 1, 1)",
+                        rusqlite::params![id, format!("{id:064x}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let paths = LibraryPaths::new(&root);
+        std::fs::create_dir_all(&paths.features).unwrap();
+        let packs = FeatureStore::new();
+        packs.set_root(paths.features.clone());
+        embedding::store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        embedding::store(&session.db, &packs, 2, "model", 4, &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        embedding::store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let query_spp: Vec<usize> = (0..64).collect();
+        let shifted_spp: Vec<usize> = (0..64).map(|index| (index + 1) % 64).collect();
+        for (id, peaks) in [(1, &query_spp), (2, &shifted_spp), (3, &query_spp)] {
+            descriptors::store(
+                &session.db,
+                &packs,
+                id,
+                "model",
+                FeatureKind::Spp,
+                &descriptor_vector(FeatureKind::Spp, peaks),
+            )
+            .unwrap();
+            descriptors::store(
+                &session.db,
+                &packs,
+                id,
+                "model",
+                FeatureKind::MaxSim,
+                &descriptor_vector(FeatureKind::MaxSim, &(0..32).collect::<Vec<_>>()),
+            )
+            .unwrap();
+        }
+        packs.clear();
+
+        let runtime = AiRuntime::new();
+        runtime.library_opened(
+            "test".into(),
+            session.db.clone(),
+            session.thumbs.clone(),
+            root.clone(),
+        );
+
+        let overall = runtime
+            .find_similar_images("embedding", None, &[1], None, Some(10), None)
+            .unwrap();
+        assert_eq!(
+            runtime.similarity_ids(&overall.token).unwrap(),
+            vec![2, 3],
+            "整体模式按全局余弦排序"
+        );
+
+        let composition = runtime
+            .find_similar_images("embedding", Some("composition"), &[1], None, Some(10), None)
+            .unwrap();
+        assert_eq!(
+            runtime.similarity_ids(&composition.token).unwrap(),
+            vec![3, 2],
+            "构图模式在粗筛候选里按 SPP 重排"
+        );
+
+        // 少一条描述子时门限必须拒绝，并给出剩余张数。
+        session
+            .db
+            .with_writer(|connection| {
+                connection.execute(
+                    "DELETE FROM feature_blobs WHERE image_id = 3 AND kind = 'spp'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = runtime
+            .find_similar_images("embedding", Some("composition"), &[1], None, Some(10), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("还有 1 张图片没有语义特征"), "{error}");
+        assert_eq!(semantic_feature_demands(4).len(), 3);
+    }
+
+    #[test]
+    fn feature_mode_only_applies_to_semantic_kind() {
+        assert_eq!(
+            FeatureMode::parse(None, "embedding").unwrap(),
+            FeatureMode::Overall
+        );
+        assert_eq!(
+            FeatureMode::parse(Some("composition"), "embedding").unwrap(),
+            FeatureMode::Composition
+        );
+        assert!(FeatureMode::parse(Some("subject"), "embedding").is_ok());
+        assert!(FeatureMode::parse(Some("subject"), "phash").is_err());
+        assert!(FeatureMode::parse(Some("unknown"), "embedding").is_err());
+    }
 
     /// 状态刷新会反复调用 `spawn_supervisor`：同一代次只能有一个监督线程。
     #[test]

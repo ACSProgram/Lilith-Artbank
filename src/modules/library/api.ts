@@ -413,11 +413,19 @@ export const libraryApi = {
         imageId,
         pose: true,
         embedding: true,
+        spp: true,
+        maxsim: true,
         colors: true,
         phash: true,
       }));
     }
     return invoke<ImageCapabilities[]>("get_image_capabilities", { imageIds });
+  },
+
+  /** 全库还缺多少张语义描述子；0 表示三种口径都可用。 */
+  async getSemanticFeaturePending(): Promise<{ remaining: number }> {
+    if (!isTauri()) return { remaining: 0 };
+    return invoke<{ remaining: number }>("get_semantic_feature_pending");
   },
 
   async getFeatureSummary(): Promise<FeatureSummary> {

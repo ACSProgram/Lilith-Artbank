@@ -248,13 +248,11 @@ pub fn target_average(
     }
     if missing > 0 {
         return Err(AppError::message(format!(
-            "{missing} 张参考图还没有 embedding，请先运行 AI 任务"
+            "{missing} 张参考图还没有语义特征，请先运行 AI 任务"
         )));
     }
     let Some(model) = model else {
-        return Err(AppError::message(
-            "参考图还没有 embedding，请先运行 AI 任务",
-        ));
+        return Err(AppError::message("参考图还没有语义特征，请先运行 AI 任务"));
     };
     let count = ids.len() as f32;
     for value in &mut sum {
@@ -649,6 +647,44 @@ pub fn search_rows_with_total(
     limit: usize,
     filter: SearchFilter,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
+    let mut scored = scan_rows(store, rows, dim, query, mean, filter)?;
+    let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
+    let total = scored.len();
+    if scored.len() > limit {
+        // 只做部分选择再排序，避免为取 top-K 对全量结果排序。
+        scored.select_nth_unstable_by(limit, by_score_desc);
+        scored.truncate(limit);
+    }
+    scored.sort_by(by_score_desc);
+    Ok((scored, total))
+}
+
+/// 全库/范围内按中心化余弦打分，返回所有过阈值命中（未排序）。
+///
+/// 两段式重排要先拿到阈值后的总数再决定截断比例，因此不能在扫描时截断。
+pub fn search_all_with_total(
+    database: &LibraryDb,
+    store: &FeatureStore,
+    model: &str,
+    dim: u32,
+    query: &[f32],
+    mean: &[f32],
+    filter: SearchFilter,
+) -> AppResult<(Vec<(i64, f32)>, usize)> {
+    let rows = rows(database, model, dim, filter.allowed.is_some())?;
+    let scored = scan_rows(store, rows, dim, query, mean, filter)?;
+    let total = scored.len();
+    Ok((scored, total))
+}
+
+fn scan_rows(
+    store: &FeatureStore,
+    rows: Vec<EmbeddingRow>,
+    dim: u32,
+    query: &[f32],
+    mean: &[f32],
+    filter: SearchFilter,
+) -> AppResult<Vec<(i64, f32)>> {
     if query.len() != dim as usize || mean.len() != dim as usize {
         return Err(AppError::message("查询向量与模型维度不一致"));
     }
@@ -658,7 +694,7 @@ pub fn search_rows_with_total(
         .filter(|row| filter.allows(row.image_id))
         .collect();
     if rows.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     }
     let dim_usize = dim as usize;
     let mut dot_qq = 0.0_f32;
@@ -716,19 +752,10 @@ pub fn search_rows_with_total(
             .collect();
         scored.extend(partial);
     }
-
-    let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
-    let total = scored.len();
-    if scored.len() > limit {
-        // 只做部分选择再排序，避免为取 top-K 对全量结果排序。
-        scored.select_nth_unstable_by(limit, by_score_desc);
-        scored.truncate(limit);
-    }
-    scored.sort_by(by_score_desc);
-    Ok((scored, total))
+    Ok(scored)
 }
 
-fn by_score_desc(left: &(i64, f32), right: &(i64, f32)) -> std::cmp::Ordering {
+pub(crate) fn by_score_desc(left: &(i64, f32), right: &(i64, f32)) -> std::cmp::Ordering {
     right
         .1
         .partial_cmp(&left.1)
@@ -960,6 +987,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// 两段式重排要先拿到阈值后的全部候选，不能在这里截断。
+    #[test]
+    fn search_all_keeps_every_thresholded_candidate() {
+        let (_temp, session, root) = fixture();
+        let packs = FeatureStore::new();
+        packs.set_root(root.join(".artbank/features"));
+        for id in 1..=3 {
+            insert_image(&session.db, id);
+        }
+        store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 2, "model", 4, &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let mean = mean(&session.db, &packs, "model", 4).unwrap();
+        let (hits, total) = search_all_with_total(
+            &session.db,
+            &packs,
+            "model",
+            4,
+            &[1.0, 0.0, 0.0, 0.0],
+            &mean.vector,
+            SearchFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(hits.len(), 3);
+
+        let (hits, total) = search_all_with_total(
+            &session.db,
+            &packs,
+            "model",
+            4,
+            &[1.0, 0.0, 0.0, 0.0],
+            &mean.vector,
+            SearchFilter {
+                min_score: Some(0.5),
+                ..SearchFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 2, "阈值在扫描阶段生效");
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]

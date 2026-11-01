@@ -44,8 +44,8 @@ const GROUP_THUMBS = 6;
 const PAGE_SIZE = 50;
 
 function metricLabel(result: SimilarityGroupsResult): string {
-  if (result.phash && result.embedding) return "pHash + 语义";
-  return result.phash ? "pHash" : "语义";
+  if (result.phash && result.embedding) return "pHash + 语义特征";
+  return result.phash ? "pHash" : "语义特征";
 }
 
 export function SimilarityGroupsDialog({
@@ -388,7 +388,7 @@ export function SimilarityGroupsDialog({
               title={
                 embeddingAvailable
                   ? undefined
-                  : "还没有图片 embedding，可以先在批量任务里生成。"
+                  : "还没有图片语义特征，可以先在批量任务里生成。"
               }
             >
               <input

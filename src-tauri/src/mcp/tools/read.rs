@@ -86,6 +86,28 @@ pub enum SimilarMode {
     Text,
 }
 
+/// `kind=embedding` 的三种语义特征口径；整体沿用现有全局向量。
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FeatureMode {
+    #[default]
+    Overall,
+    Subject,
+    Composition,
+}
+
+impl FeatureMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Overall => "overall",
+            Self::Subject => "subject",
+            Self::Composition => "composition",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FindSimilarScope {
@@ -156,7 +178,11 @@ pub struct FindSimilarInput {
     #[schemars(description = "phash / color4 / color8 / embedding / pose；默认 phash")]
     pub kind: Option<String>,
     #[schemars(
-        description = "pHash 用 0-256 距离上限，省略时 6；其它指标用 -1 到 1 的分数下限，省略不限制"
+        description = "kind=embedding 时的语义特征口径：overall 整体（默认）、subject 偏重主体、composition 偏重构图；其它 kind 不能传非 overall"
+    )]
+    pub feature_mode: FeatureMode,
+    #[schemars(
+        description = "pHash 用 0-256 距离上限，省略时 6；其它指标用 -1 到 1 的分数下限，省略不限制。featureMode=subject/composition 时阈值仍是整体相似度，不是重排分"
     )]
     pub threshold: Option<f64>,
     #[schemars(description = "最多返回结果数，1-10000")]
@@ -465,8 +491,22 @@ pub fn find_similar(
                     "多张参考图只支持 color4、color8 或 embedding",
                 ));
             }
+            if input.feature_mode != FeatureMode::Overall {
+                if kind != "embedding" {
+                    return Err(AppError::message(
+                        "featureMode 只适用于 kind=embedding（语义特征）",
+                    ));
+                }
+                if target_ids.len() > 1 {
+                    return Err(AppError::message(format!(
+                        "featureMode={} 只支持单张参考图，不能用 targetIds 取平均",
+                        input.feature_mode.as_str()
+                    )));
+                }
+            }
             let result = ai.find_similar_images(
                 kind,
+                Some(input.feature_mode.as_str()),
                 &target_ids,
                 input.threshold,
                 Some(limit),
@@ -485,6 +525,11 @@ pub fn find_similar(
             )
         }
         SimilarMode::Text => {
+            if input.feature_mode != FeatureMode::Overall {
+                return Err(AppError::message(
+                    "featureMode 只适用于 mode=image 且 kind=embedding",
+                ));
+            }
             let text = input
                 .text
                 .as_deref()
@@ -516,10 +561,23 @@ pub fn find_similar(
     let temp_path = temp_folder_path(context)?;
     let preview = ai.similarity_page(&token, 0, Some(preview_limit))?;
     let scores = ai.similarity_scores(&token)?;
-    let score_kind = if matches!(kind.as_str(), "phash" | "color4" | "color8") {
+    // 偏重主体/偏重构图的排序分与阈值不是同一刻度，status 里只给顺序、不给绝对分。
+    let show_scores = input.feature_mode == FeatureMode::Overall;
+    let score_kind = if !show_scores {
+        "none"
+    } else if matches!(kind.as_str(), "phash" | "color4" | "color8") {
         "distance"
     } else {
         "similarity"
+    };
+    let feature_mode = match input.mode {
+        SimilarMode::Image => json!(input.feature_mode.as_str()),
+        SimilarMode::Text => Value::Null,
+    };
+    let note = if show_scores {
+        "total 是范围与阈值过滤后的全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）；phash/color 的 score 是距离，越小越近，embedding/pose/semantic 的 score 是相似度，越大越近。多张参考图只用于 color4/color8/embedding 的平均。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。"
+    } else {
+        "featureMode 为 subject/composition 时先按整体相似度阈值粗筛前 20%，再按局部/构图特征重排；threshold 仍是整体相似度，不是重排分，所以 score 字段返回 null。total 是粗筛后的候选数，returned 只含重排后的前一部分（再受 limit 截断）。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。"
     };
     Ok(json!({
         "token": token,
@@ -528,6 +586,7 @@ pub fn find_similar(
             SimilarMode::Text => "text",
         },
         "kind": kind,
+        "featureMode": feature_mode,
         "scoreKind": score_kind,
         "scope": scope_label,
         "total": total_hits,
@@ -536,15 +595,19 @@ pub fn find_similar(
         "elapsedMs": elapsed_ms,
         "preview": preview.items.iter().map(|row| {
             let mut value = compact_row(row, temp_path.as_deref());
-            value["score"] = match scores.get(&row.id) {
-                Some(score) => json!(((f64::from(*score)) * 1e6).round() / 1e6),
-                None => Value::Null,
+            value["score"] = if show_scores {
+                match scores.get(&row.id) {
+                    Some(score) => json!(((f64::from(*score)) * 1e6).round() / 1e6),
+                    None => Value::Null,
+                }
+            } else {
+                Value::Null
             };
             value
         }).collect::<Vec<_>>(),
         "nextOffset": preview.next_offset,
         "detail": extra,
-        "note": "total 是范围与阈值过滤后的全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）；phash/color 的 score 是距离，越小越近，embedding/pose/semantic 的 score 是相似度，越大越近。多张参考图只用于 color4/color8/embedding 的平均。结果只有一个结果槽；下一次 find_similar 会让这个 token 失效。",
+        "note": note,
     }))
 }
 
@@ -594,6 +657,8 @@ pub fn images_get(context: &ReadContext, ids: &[i64]) -> AppResult<Value> {
             "capabilities": {
                 "pose": flags.pose,
                 "embedding": flags.embedding,
+                "spp": flags.spp,
+                "maxsim": flags.maxsim,
                 "colors": flags.colors,
                 "phash": flags.phash,
             },
@@ -1232,6 +1297,36 @@ mod tests {
         assert_eq!(averaged["detail"]["referenceCount"], 2);
         assert_eq!(averaged["total"], 1);
         assert_eq!(averaged["preview"][0]["id"], 3);
+
+        // featureMode 只属于语义特征，且这两种口径不支持多图平均。
+        assert!(
+            find_similar(
+                &fixture.context,
+                &fixture.ai,
+                &FindSimilarInput {
+                    mode: SimilarMode::Image,
+                    feature_mode: FeatureMode::Subject,
+                    target_id: Some(1),
+                    kind: Some("phash".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            find_similar(
+                &fixture.context,
+                &fixture.ai,
+                &FindSimilarInput {
+                    mode: SimilarMode::Image,
+                    feature_mode: FeatureMode::Composition,
+                    target_ids: Some(vec![1, 2]),
+                    kind: Some("embedding".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

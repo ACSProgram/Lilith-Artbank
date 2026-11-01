@@ -72,7 +72,7 @@ impl TaskKind {
         match self {
             Self::Import => "导入",
             Self::Thumbnail => "重建缩略图",
-            Self::AiEmbedding => "生成 embedding",
+            Self::AiEmbedding => "生成语义特征",
             Self::AiPose => "生成姿势",
             Self::AiDescription => "生成描述",
             Self::SimilarityGroups => "相似分组",

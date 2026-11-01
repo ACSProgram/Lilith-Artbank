@@ -30,7 +30,9 @@ pub const MAX_TEMP_FEATURE_IDS: usize = 100;
 pub struct TempFeaturesInput {
     #[schemars(description = "临时文件夹里的图片 id，最多 100 张；混入普通图片时整批拒绝")]
     pub ids: Vec<i64>,
-    #[schemars(description = "embedding 或 pose")]
+    #[schemars(
+        description = "embedding 生成语义特征（整图/主体/构图三个描述子一次写入），或 pose 生成姿势"
+    )]
     pub kind: String,
 }
 

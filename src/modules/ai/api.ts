@@ -7,7 +7,7 @@ import type {
   SemanticSearchResult,
   SimilarityPage,
 } from "./types";
-import type { SimilarKind } from "../../shared/similarity";
+import type { FeatureMode, SimilarKind } from "../../shared/similarity";
 import type { TaskScope } from "../../shared/scope";
 
 export const aiBrowserPreview =
@@ -36,7 +36,7 @@ function offlineStatus(): AiStatus {
       model: null,
       dim: null,
       count: 0,
-      message: "浏览器预览没有图库 embedding",
+      message: "浏览器预览没有图库语义特征",
     },
   };
 }
@@ -85,6 +85,7 @@ export const aiApi = {
 
   async findSimilarImages(request: {
     kind: SimilarKind;
+    mode: FeatureMode;
     targetIds: number[];
     threshold?: number | null;
     limit?: number | null;
@@ -93,6 +94,7 @@ export const aiApi = {
     requireTauri("相似检索");
     return invoke<ImageSimilarityResult>("find_similar_images", {
       kind: request.kind,
+      featureMode: request.mode,
       targetIds: request.targetIds,
       threshold: request.threshold ?? null,
       limit: request.limit ?? null,

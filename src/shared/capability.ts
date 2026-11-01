@@ -14,7 +14,7 @@ export function aiTaskAvailability(online: boolean): ActionAvailability {
     : { enabled: false, reason: "AI 服务离线，批量任务需要本机 AI 服务" };
 }
 
-/** 语义搜索需要文本模型和至少一张图片 embedding。 */
+/** 语义搜索需要文本模型和至少一张图片的语义特征。 */
 export function semanticSearchAvailability(
   online: boolean,
   embeddingCount: number,
@@ -23,7 +23,7 @@ export function semanticSearchAvailability(
     return { enabled: false, reason: "AI 服务离线，语义搜索需要文本模型" };
   }
   if (embeddingCount === 0) {
-    return { enabled: false, reason: "还没有图片 embedding，可在批量任务里生成" };
+    return { enabled: false, reason: "还没有图片语义特征，可在批量任务里生成" };
   }
   return ALLOW;
 }
@@ -36,6 +36,6 @@ export function presenceAvailability(
   if (!summary) return ALLOW;
   if (summary[field] > 0) return ALLOW;
   const label =
-    field === "description" ? "描述" : field === "embedding" ? "embedding" : "姿势";
+    field === "description" ? "描述" : field === "embedding" ? "语义特征" : "姿势";
   return { enabled: false, reason: `当前图库还没有${label}` };
 }

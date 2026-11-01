@@ -239,8 +239,13 @@ impl AiClient {
     }
 
     fn build(base_url: &str, cancel: Option<CancelSignal>) -> Self {
+        // 不复用空闲连接：AI 服务会被重启（改设置、崩溃退避重启），池里的旧连接已经死了，
+        // 复用它会拿到一次 RST（Windows 上是 10054），健康探活不重试就会闪一次「服务不可用」。
+        // 目标在 127.0.0.1，每次新建连接的开销远小于一次推理。
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
+            .max_idle_connections(0)
+            .max_idle_connections_per_host(0)
             .build();
         Self {
             base_url: base_url.trim().trim_end_matches('/').to_owned(),

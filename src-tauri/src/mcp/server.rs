@@ -294,7 +294,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。mode=text 是语义搜索，请用英文短语描述画面（例如 a woman in a red cloak, side view）：中文也能用，但命中质量明显下降。scope 可选 library/folder/collection/selection/view/temp，默认 Entire library。threshold 一律是上限：pHash 是 0-256 的距离上限，color4/color8 是 0-1 的距离上限，embedding/pose 是 -1 到 1 的相似度下限（距离越小越像、相似度越大越像，所以 embedding/pose 传 1 会什么都命中，color 传 0 会什么都筛掉）。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
+        description = "找相似：mode=image 用参考图与 kind（phash/color4/color8/embedding/pose）；targetIds 可传多张参考图，但多张只支持 color4/color8/embedding 的平均，最多 100 张。kind=embedding 时可用 featureMode 选语义特征口径：overall 整体（默认）、subject 偏重主体、composition 偏重构图；后两种只支持单张参考图，且图库需先补齐语义特征，否则返回明确错误。mode=text 是语义搜索，请用英文短语描述画面（例如 a woman in a red cloak, side view）：中文也能用，但命中质量明显下降。scope 可选 library/folder/collection/selection/view/temp，默认 Entire library。threshold 一律是上限：pHash 是 0-256 的距离上限，color4/color8 是 0-1 的距离上限，embedding/pose 是 -1 到 1 的相似度下限（距离越小越像、相似度越大越像，所以 embedding/pose 传 1 会什么都命中，color 传 0 会什么都筛掉）。featureMode=subject/composition 时 threshold 仍是整体相似度：先按它粗筛前 20%，再按局部/构图特征重排，因此 preview.score 为 null（threshold 与重排分不是同一刻度）。total 是范围与阈值过滤后的全部命中数，returned 是可翻页/可全选的条数（受 limit 截断）。scoreKind=distance 时 score 越小越近，similarity 时越大越近。结果只有一个结果槽，下一次 find_similar 会让当前 token 失效。"
     )]
     async fn find_similar(
         &self,

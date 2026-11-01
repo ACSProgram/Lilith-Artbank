@@ -59,14 +59,14 @@ type DialogKind = Extract<
 
 const KIND_LABELS: Record<DialogKind, string> = {
   thumbnail: "重建缩略图",
-  aiEmbedding: "Embedding",
+  aiEmbedding: "语义特征",
   aiPose: "姿势",
   aiDescription: "描述",
 };
 
 const KIND_HINTS: Record<DialogKind, string> = {
   thumbnail: "为原图重新生成缩略图，可选重算 pHash 与主色。",
-  aiEmbedding: "为图片生成语义向量，用于语义搜索与找相似。",
+  aiEmbedding: "为图片生成语义特征，用于语义搜索与找相似；缺的部分会自动补齐。",
   aiPose: "识别画面里的人物姿势，用于按姿势找相似。",
   aiDescription: "为没有描述的图片生成文字描述。",
 };

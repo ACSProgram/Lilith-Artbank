@@ -174,9 +174,9 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
   const semanticBlockedReason = !aiStatus?.online
     ? "AI 服务离线，语义搜索需要文本模型"
     : mean?.phase === "failed"
-      ? (mean.message ?? "embedding 均值计算失败，请重新打开图库")
+      ? (mean.message ?? "语义特征均值计算失败，请重新打开图库")
       : mean?.phase === "missing" && mean.count === 0
-        ? (mean.message ?? "还没有图片 embedding，可在批量任务里生成")
+        ? (mean.message ?? "还没有图片语义特征，可在批量任务里生成")
         : null;
 
   const handleDataChanged = (

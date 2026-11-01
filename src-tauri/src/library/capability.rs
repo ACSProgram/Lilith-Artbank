@@ -17,6 +17,8 @@ pub struct ImageCapabilities {
     pub image_id: i64,
     pub pose: bool,
     pub embedding: bool,
+    pub spp: bool,
+    pub maxsim: bool,
     pub colors: bool,
     pub phash: bool,
 }
@@ -54,6 +56,12 @@ pub fn image_capabilities(
                         EXISTS(SELECT 1 FROM feature_blobs
                                WHERE feature_blobs.image_id = images.id
                                  AND feature_blobs.kind = 'embedding'),
+                        EXISTS(SELECT 1 FROM feature_blobs
+                               WHERE feature_blobs.image_id = images.id
+                                 AND feature_blobs.kind = 'spp'),
+                        EXISTS(SELECT 1 FROM feature_blobs
+                               WHERE feature_blobs.image_id = images.id
+                                 AND feature_blobs.kind = 'maxsim'),
                         length(images.colors4) = 16 AND length(images.colors8) = 32,
                         length(images.phash) = 32
                  FROM images WHERE images.id IN ({marks})"
@@ -64,8 +72,10 @@ pub fn image_capabilities(
                     image_id: row.get(0)?,
                     pose: row.get::<_, i64>(1)? != 0,
                     embedding: row.get::<_, i64>(2)? != 0,
-                    colors: row.get::<_, i64>(3)? != 0,
-                    phash: row.get::<_, i64>(4)? != 0,
+                    spp: row.get::<_, i64>(3)? != 0,
+                    maxsim: row.get::<_, i64>(4)? != 0,
+                    colors: row.get::<_, i64>(5)? != 0,
+                    phash: row.get::<_, i64>(6)? != 0,
                 })
             })?;
             result.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
@@ -170,6 +180,12 @@ mod tests {
                      VALUES (1, 'pose', 'm', 33, 'p.bin', 0, 12, 1)",
                     [],
                 )?;
+                connection.execute(
+                    "INSERT INTO feature_blobs(image_id, kind, model, dim, pack_name,
+                        pack_offset, pack_length, updated_at)
+                     VALUES (1, 'spp', 'm', 8192, 'p.bin', 0, 8192, 1)",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -177,7 +193,8 @@ mod tests {
         let caps = image_capabilities(&session.db, &[1, 2, 1]).unwrap();
         assert_eq!(caps.len(), 2);
         assert!(caps[0].pose && caps[0].phash && caps[0].colors && !caps[0].embedding);
-        assert!(!caps[1].pose && !caps[1].embedding);
+        assert!(caps[0].spp && !caps[0].maxsim);
+        assert!(!caps[1].pose && !caps[1].embedding && !caps[1].spp && !caps[1].maxsim);
 
         let summary = feature_summary(&session.db).unwrap();
         assert_eq!(summary.description, 1);

@@ -55,7 +55,7 @@ impl AiJobKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Embedding => "embedding",
+            Self::Embedding => "语义特征",
             Self::Pose => "姿势",
             Self::Description => "描述",
         }
@@ -203,7 +203,8 @@ fn run_job(
     ids: Vec<i64>,
     operation_id: Option<i64>,
 ) -> AppResult<()> {
-    let holder = HolderInfo::new(task.id(), request.kind.label()).with_path_note("正在读取");
+    let holder =
+        HolderInfo::new(task.id(), request.kind.task_kind().label()).with_path_note("正在读取");
     let cancel = || task.should_cancel();
     let mut consecutive_failures = 0_usize;
     for image_id in ids {

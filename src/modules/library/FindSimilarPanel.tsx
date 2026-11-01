@@ -18,8 +18,10 @@ import {
   type ScopeChoice,
 } from "../../shared/scope";
 import {
+  FEATURE_MODE_LABELS,
   MAX_SIMILAR_REFERENCE,
   similarKindLabel,
+  type FeatureMode,
   type FindSimilarConfig,
   type SimilarKind,
 } from "../../shared/similarity";
@@ -52,6 +54,7 @@ type ThresholdMap = Record<SimilarKind, ThresholdSetting>;
 
 const SINGLE_KINDS: SimilarKind[] = ["phash", "color4", "color8", "embedding", "pose"];
 const AVERAGE_KINDS: SimilarKind[] = ["color4", "color8", "embedding"];
+const FEATURE_MODES: FeatureMode[] = ["overall", "subject", "composition"];
 
 /** pHash 是 256 位；界面滑杆只覆盖实际有用的前 64 位距离，“不限”才放开到全范围。 */
 const PHASH_SLIDER_MAX = 64;
@@ -134,6 +137,48 @@ function scopeLabelOf(
   return `${name}${includeSubfolders ? "（含子文件夹）" : "（不含子文件夹）"}`;
 }
 
+interface RadioOptionProps {
+  group: string;
+  label: string;
+  active: boolean;
+  disabled: boolean;
+  /** 只在不可用时给：写在选项后面说明原因。 */
+  reason?: string;
+  icon?: typeof ScanSearch;
+  onSelect: () => void;
+}
+
+/** 指标与语义特征模式共用的一行单选项；不可用时整行置灰并带原因。 */
+function RadioOption({
+  group,
+  label,
+  active,
+  disabled,
+  reason,
+  icon: Icon,
+  onSelect,
+}: RadioOptionProps) {
+  return (
+    <label
+      className={`find-similar-kind${active ? " is-active" : ""}${
+        disabled ? " is-disabled" : ""
+      }`}
+      title={reason}
+    >
+      <input
+        type="radio"
+        name={group}
+        checked={active}
+        disabled={disabled}
+        onChange={onSelect}
+      />
+      {Icon ? <Icon size={13} /> : null}
+      <span>{label}</span>
+      {disabled && reason ? <em>{reason}</em> : null}
+    </label>
+  );
+}
+
 export function FindSimilarPanel({
   open,
   reference,
@@ -144,7 +189,10 @@ export function FindSimilarPanel({
 }: FindSimilarPanelProps) {
   const [capabilities, setCapabilities] = useState<ImageCapabilities[] | null>(null);
   const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
+  const [pendingSemantic, setPendingSemantic] = useState<number | null>(null);
+  const [pendingError, setPendingError] = useState<string | null>(null);
   const [kind, setKind] = useState<SimilarKind>("phash");
+  const [featureMode, setFeatureMode] = useState<FeatureMode>("overall");
   const [thresholds, setThresholds] = useState<ThresholdMap>(defaultThresholds);
   const [limitText, setLimitText] = useState(String(DEFAULT_RESULTS));
   const [scope, setScope] = useState<ScopeChoice>("view");
@@ -176,6 +224,25 @@ export function FindSimilarPanel({
     };
   }, [open, idsKey, context]);
 
+  // 新模式要等全库补齐；面板每次打开都重新读一次，回填完成后不用重开面板。
+  useEffect(() => {
+    if (!open) return;
+    let disposed = false;
+    setPendingSemantic(null);
+    setPendingError(null);
+    void libraryApi
+      .getSemanticFeaturePending()
+      .then((next) => {
+        if (!disposed) setPendingSemantic(next.remaining);
+      })
+      .catch((cause: unknown) => {
+        if (!disposed) setPendingError(errorMessage(cause));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [open, context]);
+
   useEffect(() => {
     const current = contextRef.current;
     if (!open || !current) return;
@@ -197,6 +264,12 @@ export function FindSimilarPanel({
         : average
           ? "color8"
           : "phash",
+    );
+    // 多张参考图没有定义 SPP / MaxSim 的平均，退回「整体」。
+    setFeatureMode(
+      !average && initial?.mode && FEATURE_MODES.includes(initial.mode)
+        ? initial.mode
+        : "overall",
     );
     const nextThresholds = defaultThresholds();
     if (initial) {
@@ -277,7 +350,7 @@ export function FindSimilarPanel({
         ? { enabled: true }
         : {
             enabled: false,
-            reason: `${missingEmbedding} 张参考图还没有 embedding`,
+            reason: `${missingEmbedding} 张参考图还没有语义特征`,
           };
     map.pose =
       missingPose === 0
@@ -288,6 +361,56 @@ export function FindSimilarPanel({
           };
     return map;
   }, [capabilities, capabilitiesError, capabilityMap, missingReferenceIds, reference]);
+
+  /** 三种口径的可用性：参考图本身有该特征，且全库没有待补齐的图。 */
+  const modeAvailability = useMemo(() => {
+    const unavailable = (reason: string) => ({ enabled: false, reason });
+    const map = {} as Record<FeatureMode, { enabled: boolean; reason?: string }>;
+    if (!reference || !capabilities) {
+      const reason = capabilitiesError ?? "正在读取参考图能力";
+      for (const value of FEATURE_MODES) map[value] = unavailable(reason);
+      return map;
+    }
+    if (missingReferenceIds.length > 0) {
+      const reason = `有 ${missingReferenceIds.length} 张参考图已不存在或不在图库中`;
+      for (const value of FEATURE_MODES) map[value] = unavailable(reason);
+      return map;
+    }
+    const embedding = metricAvailability.embedding;
+    map.overall = embedding.enabled
+      ? { enabled: true }
+      : unavailable(embedding.reason ?? "语义特征当前不可用");
+    if (!embedding.enabled) {
+      map.subject = unavailable(embedding.reason ?? "语义特征当前不可用");
+      map.composition = unavailable(embedding.reason ?? "语义特征当前不可用");
+      return map;
+    }
+    const missing = (field: "spp" | "maxsim") =>
+      reference.ids.filter((id) => !capabilityMap.get(id)?.[field]).length;
+    const gate = (field: "spp" | "maxsim", label: string) => {
+      if (average) return unavailable(`${label}只支持 1 张参考图`);
+      const count = missing(field);
+      if (count > 0) return unavailable(`${count} 张参考图还没有语义特征`);
+      if (pendingError) return unavailable("暂时无法读取语义特征生成进度");
+      if (pendingSemantic == null) return unavailable("正在读取语义特征生成进度");
+      if (pendingSemantic > 0)
+        return unavailable(`语义特征还在生成（剩余 ${pendingSemantic} 张）`);
+      return { enabled: true };
+    };
+    map.subject = gate("maxsim", "偏重主体");
+    map.composition = gate("spp", "偏重构图");
+    return map;
+  }, [
+    average,
+    capabilities,
+    capabilitiesError,
+    capabilityMap,
+    metricAvailability,
+    missingReferenceIds,
+    pendingError,
+    pendingSemantic,
+    reference,
+  ]);
 
   useEffect(() => {
     if (!open || !capabilities) return;
@@ -327,12 +450,15 @@ export function FindSimilarPanel({
   const threshold = thresholds[kind];
   const percent = thresholdPercent(kind, threshold.value);
   const metricAvailable = metricAvailability[kind]?.enabled === true;
+  const modeAvailable =
+    kind !== "embedding" || modeAvailability[featureMode].enabled === true;
   const referenceCount = reference?.ids.length ?? 0;
   const canStart =
     reference != null &&
     context != null &&
     limitValid &&
     metricAvailable &&
+    modeAvailable &&
     referenceCount <= MAX_SIMILAR_REFERENCE;
 
   const start = () => {
@@ -343,6 +469,10 @@ export function FindSimilarPanel({
     }
     if (!metricAvailable) {
       setError(metricAvailability[kind]?.reason ?? "这个指标当前不可用");
+      return;
+    }
+    if (!modeAvailable) {
+      setError(modeAvailability[featureMode].reason ?? "这个模式当前不可用");
       return;
     }
     const builtScope = buildScope(scope, context, { includeSubfolders });
@@ -360,6 +490,7 @@ export function FindSimilarPanel({
         : null;
     onStart({
       kind,
+      mode: kind === "embedding" ? featureMode : "overall",
       targetIds: reference.ids,
       threshold: rawThreshold,
       limit,
@@ -423,7 +554,7 @@ export function FindSimilarPanel({
           <div className="find-similar-reference-text">
             <span>
               {average
-                ? "只比较主色与语义的平均"
+                ? "只比较主色与语义特征的平均"
                 : previewItems[0]
                   ? fileNameOf(previewItems[0].filePath)
                   : "当前选中图片"}
@@ -439,32 +570,49 @@ export function FindSimilarPanel({
               const option = metricAvailability[value];
               const Icon = METRIC_ICONS[value];
               return (
-                <label
+                <RadioOption
                   key={value}
-                  className={`find-similar-kind${kind === value ? " is-active" : ""}${
-                    option.enabled ? "" : " is-disabled"
-                  }`}
-                  title={option.reason}
-                >
-                  <input
-                    type="radio"
-                    name="find-similar-kind"
-                    checked={kind === value}
-                    disabled={!option.enabled}
-                    onChange={() => setKind(value)}
-                  />
-                  <Icon size={13} />
-                  <span>{similarKindLabel(value, average)}</span>
-                  {option.enabled ? null : <em>{option.reason}</em>}
-                </label>
+                  group="find-similar-kind"
+                  label={similarKindLabel(value, average)}
+                  active={kind === value}
+                  disabled={!option.enabled}
+                  reason={option.reason}
+                  icon={Icon}
+                  onSelect={() => setKind(value)}
+                />
               );
             })}
           </div>
         </section>
 
+        {kind === "embedding" ? (
+          <section className="filter-section">
+            <div
+              className="find-similar-kinds find-similar-modes"
+              role="radiogroup"
+              aria-label="语义特征模式"
+            >
+              {FEATURE_MODES.map((value) => {
+                const option = modeAvailability[value];
+                return (
+                  <RadioOption
+                    key={value}
+                    group="find-similar-feature-mode"
+                    label={FEATURE_MODE_LABELS[value]}
+                    active={featureMode === value}
+                    disabled={!option.enabled}
+                    reason={option.reason}
+                    onSelect={() => setFeatureMode(value)}
+                  />
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
+
         <section className="filter-section">
           <div className="find-similar-section-head">
-            <h4>最低相似度</h4>
+            <h4>{kind === "embedding" ? "最低整体相似度" : "最低相似度"}</h4>
             <label className="find-similar-unlimited">
               <input
                 type="checkbox"
@@ -488,7 +636,7 @@ export function FindSimilarPanel({
                 step={1}
                 value={threshold.limited ? percent : 0}
                 disabled={!threshold.limited}
-                aria-label="最低相似度"
+                aria-label={kind === "embedding" ? "最低整体相似度" : "最低相似度"}
                 onChange={(event) =>
                   setThresholds((previous) => ({
                     ...previous,

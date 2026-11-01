@@ -272,7 +272,7 @@ Content-Type: application/octet-stream
 
 ## 本地检索
 
-相似度有三类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding）、feature pack（pose）。三者都只返回 id + 分数，按 token 分页后再回填元数据。
+相似度有四类数据源：常驻视觉索引（pHash + 4/8 主色）、feature pack（embedding / SPP / MaxSim）、feature pack（pose）。都只返回 id + 分数，按 token 分页后再回填元数据。
 
 - **常驻视觉索引**（`library/similarity.rs` 的 `VisualIndex`）：载入 `images` 中 `phash`/`colors4`/`colors8` 完整、未删除的行（临时区行带 `is_temp` 标记），pHash 存 4×u64，两套主色预转 OKLab（`colors::prepare_palette`），20 万行约 46 MB。用 `count(*) + max(id)` 判断是否仍然有效，导入等新增行会让它重建；编辑、移入/恢复/永久删除、清空回收站经 `invalidate_similarity()` 显式失效。全库扫描与相似分组（任何范围）都跳过临时行；显式范围仍可用于找相似与语义搜索。
 - **pHash 相似**：参考图 256 位哈希，Hamming 距离升序、同距离按 id 升序；遍历常驻索引做位运算扫描，不再查库。只支持单张参考图。
@@ -280,9 +280,11 @@ Content-Type: application/octet-stream
 - **均值中心化**：打开图库后在后台线程扫描当前 model/dim 的普通图 embedding，求 fp32 均值并保存在内存；不阻塞开库，也不随新增/编辑更新，关闭并重新打开图库刷新。MCP 的临时区特征生成完成后会显式失效均值缓存。均值按 4096 行分块用 rayon 并行累加再合并（主库全量 × 1536 维）；语义搜索遇到 `Computing` 时等待后台结果（最多 15 s）而不是同步重算。
 - **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。慢阶段通过 `semantic-stage` 事件上报（加载文本模型 / 生成查询向量 / 计算均值 / 扫描向量），界面显示在搜索框下方。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
 - **相似 embedding**：参考图的 image embedding（单张，或多张平均后归一化）同样减均值后扫描。参考图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
+- **偏重主体 / 偏重构图**：`kind=embedding` 下另有 `featureMode`。`overall` 走上面的全局向量；`subject` 用 MaxSim、`composition` 用 SPP。两者都是两段式：先按全局 embedding 与同一个阈值扫描并排序，取前 `ceil(20% × 阈值后命中数)`（下限 200 张），再读取候选的对应描述子重排。SPP 是对位格子余弦的平均，MaxSim 是候选局部与参考局部双向最近邻的平均；int8 量化 scale 在余弦里自然抵消，Rust 侧不需要基文件。候选缺描述子时整次拒绝，不把两种排序混在一起。
+- **模式门限**：参考图本身必须有对应描述子；全库（不含临时区）不能还有待补齐的语义描述子，否则返回“语义特征还在生成（剩余 N 张）”。门限与批量任务共用 `PendingFilter::Features`，回填完成后无需单独操作。
 - **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做加权 k-means（初始质心按权重最高、随后每次取最远点，不用随机种子），保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
 - **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
-- **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。
+- **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。三种语义特征口径共用同一个 embedding 阈值：它只决定粗筛入口，不按当前模式过滤；`subject` / `composition` 的排序分与阈值不是同一刻度，因此界面不显示绝对分，MCP 的 `preview.score` 返回 null。
 - **姿势相似**：`ai/pose_similarity.rs`，33 点按躯干、四肢 2D/3D、PCA、径向签名、凸包面积加权，镜像后取较大值；每个 pose 包 mmap 一次后顺序切片。移植自旧程序 `MediaPipePoseData::similarity`，现在按本仓库自己的算法维护，权重与索引可以为精度或性能调整（`pose_similarity.rs` 的 golden 值测试要随改动一起更新）。移植来历见 `docs/planning/archive/2026-10-23-S5取消与AI模型调整.md`。
 - **相似组**：pHash 用 8 段 ×32 位分段索引先并查集分团；阈值 ≤7 时鸽笼原理保证至少有一段完全相同，不会漏候选，完全相同的哈希先并组。单个分段的候选组超过 4,096 张、总检查数超过 2,000 万或组数超过 5,000 时只标记 `truncated` 而不展开。embedding 复核组复用同一批 pHash 候选，再用中心化余弦把组内语义不一致的图片拆开；缺 embedding 的张数记入 `missing`。分组只看范围：临时图片在任何范围都不参与；`scope` 省略或 `library` 时不解析 id，其它范围先解析成 id 集合再过滤分段索引，组内成员不会越出范围。
 - **扫描实现**：feature pack mmap + rayon 分块顺序扫描，收集分数后用部分选择取 top-K（不整体排序）。不把 30 万-50 万条向量读进堆，也不逐条查 SQLite。20 万条 1536 维的查询预算由本机基准记录在 `docs/guides/performance.md`。
@@ -309,7 +311,9 @@ Content-Type: application/octet-stream
 | `start_ai_job` / `cancel_ai_job` / `get_ai_job_status` | 已删除；批量任务统一走 `start_batch_task` |
 | `ai_describe_image` / `ai_generate_pose` | 单张交互式生成 |
 | `semantic_search` | 文本 → embedding → 本地中心化余弦扫描 |
-| `find_similar_images` | 参考图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，`targetIds` 支持单张或最多 100 张平均（多张只允许 color4/color8/embedding）；可选 `threshold`、`limit`（默认 2000，上限 10000）与 `scope` |
+| `find_similar_images` | 参考图找相似：`kind` 为 `phash`/`color4`/`color8`/`embedding`/`pose`，`targetIds` 支持单张或最多 100 张平均（多张只允许 color4/color8/embedding）；`kind=embedding` 时可传 `featureMode`（`overall`/`subject`/`composition`，缺省 overall，后两种只支持单张）；可选 `threshold`、`limit`（默认 2000，上限 10000）与 `scope` |
+| `get_image_capabilities` | 按 id 返回 `phash`/`colors`/`embedding`/`spp`/`maxsim`/`pose` 是否已有 |
+| `get_semantic_feature_pending` | 全库（不含临时区）还缺语义描述子的张数；找相似面板用它决定模式是否可用 |
 | `start_batch_task` | 统一任务入口：重建缩略图、embedding / pose / description、相似分组（`scope` 可选）；立即返回 `{ status: "started", task }`，`task.phase` 为 `queued`（已排队）或 `preparing`（已拿到资源） |
 | `preview_batch_task` | 只读预览：返回 `{ total, willProcess }`（“范围 N 张 / 将处理 M 张”）；`kind` 只接受缩略图与三类 AI 任务，缺模型维度时 `willProcess` 为 `null`。与任务启动共用 `query::PendingFilter` 的同一套待处理条件，异步执行以免阻塞窗口事件循环 |
 | `list_tasks` / `cancel_task` | 任务列表与取消；进度通过 `task-progress` / `task-finished` 推送 |
@@ -332,13 +336,13 @@ Content-Type: application/octet-stream
 - `src-tauri/src/app/tasks/`：任务总线、资源准入（`concurrency/resources.rs`）、默认排队（FIFO + 路径写优先）、panic 兜底与统一事件；`handle.rs` 放任务句柄，`bus.rs` 放总线与进度泵。
 - `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
-- `src-tauri/src/ai/descriptors.rs`：SPP / MaxSim 的 int8 落盘；维度由 kind 固定，指针写入与 embedding 共用 `pack::write_pointer`。
+- `src-tauri/src/ai/descriptors.rs`：SPP / MaxSim 的 int8 落盘、参考图与候选指针读取、对位余弦与双向 MaxSim 打分、两段式候选重排；维度由 kind 固定，指针写入与 embedding 共用 `pack::write_pointer`。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
 - `src-tauri/src/ai/pose_similarity.rs`：姿势相似度与 golden 值测试。
 - `src-tauri/src/library/similarity.rs`：常驻视觉索引、pHash/主色相似、pHash 分段分组。
 - `src-tauri/src/ai/job.rs`：批量任务、待处理过滤（与预览共用 `PendingFilter`）、取消、失败清单。
 - `src-tauri/src/ai/input.rs`：缩略图（embedding/pose）与 1536px WebP（description）输入。
-- `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`，保留规则编辑器是 `KeepSortPicker.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/modules/library/FindSimilarPanel.tsx`：参考图、指标、阈值、数量与范围（工具栏下拉面板）；`src/shared/similarity.ts`：kind 与中文标签；`src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`：批量任务、空间优化、找相似与相似分组共用的范围语义与单选框。
+- `src/modules/ai/`：类型、API、服务状态；批量任务与相似分组对话框在 `src/app/`（`BatchTaskDialog.tsx`、`SimilarityGroupsDialog.tsx`，保留规则编辑器是 `KeepSortPicker.tsx`），任务中心在 `src/app/TaskCenterProvider.tsx` / `TaskCapsule.tsx`；`src/app/useSimilarityBrowse.ts`：语义搜索与找相似共用的结果数据源（分页、全选、重试）；`src/modules/library/FindSimilarPanel.tsx`：参考图、指标、语义特征三模式、阈值、数量与范围（工具栏下拉面板）；`src/shared/similarity.ts`：kind、语义特征模式与中文标签；`src/shared/scope.ts` + `src/shared/components/ScopePicker.tsx`：批量任务、空间优化、找相似与相似分组共用的范围语义与单选框。
 
 限制：
 
@@ -351,12 +355,12 @@ Content-Type: application/octet-stream
 - 相似分组的 pHash 阈值只支持 0-7；更大阈值只能用单张“找相似”。语义复核固定取全库第一名的模型与维度，范围里的图片若属于旧模型会计入 `missing`。
 - 常驻视觉索引 20 万行约 46 MB，随图库打开常驻；索引失效后首次查询要重建（见性能文档，真实美术库数字待实测）。
 - 被托管的服务进程在运行中退出后只标记失败，不自动重启；需要用户手动启动。
-- 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。
+- 客户端串行推理，没有并发设置；批量任务按图片顺序逐张请求。客户端不复用空闲连接：服务会被重启（改设置或崩溃后重开），池里的旧连接可能已经死掉，复用它会拿到一次 RST，健康探活不重试就会闪一次“不可用”。目标在 `127.0.0.1`，每次新建连接的开销远小于一次推理。
 - 图片塔与文本塔同一时间只驻留一个；切换任务类型需要重新加载（tokenizer 0.9 s + 首次 forward 2.4 s），最后一次使用后空闲 5 分钟自动卸载。塔未加载时 `/v1/embed/*` 返回 503，下一次任务开始前的 ensure 会重新加载。
 - 依赖预热让被托管的服务进程常驻约 420 MB；只有整场会话完全不用 AI 时才是净浪费，可在设置里关掉。
 - 语义搜索依赖 health 在 `ready=false` 时仍返回图片模型名与维度；外部服务实现必须遵守这一点。
 - 描述能力未实现；批量任务中的描述项按缺少能力置灰。
-- 语义特征的 SPP / MaxSim 目前只做生产与落盘；找相似的「偏重主体 / 偏重构图」模式、两段式重排与界面属于检索批次的未完成部分，暂不可选。
+- 找相似的「偏重主体 / 偏重构图」已可用，但真实库回填与散读带宽尚未实测；回填完成前这两个模式会显示剩余张数并置灰。
 - 模型目录没有白化基时图片能力整体不可用；旧模型目录需要先运行 `server/tools/fit_basis.py` 生成两份基，再启动批量任务回填。
 - 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。
 - 便携包只包含 exe、`server/` 与资源清单，不包含 `python_embeded/`、`resources/models/`；不生成 NSIS 安装器。

@@ -55,7 +55,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `tags_list` | `query?`、`limit?`、`cursor?` | 有图片的标签 id、名称、图片数、`total`、`nextCursor`；0 张标签不返回 |
 | `collections_list` | — | 集合 id、名称、数量、顺序 |
 | `search_images` | 结构化查询（`view` 可含 `temp`）、`pageSize` 1–50、`searchScope`、`includeFacets?` | 总数、紧凑行、下一页游标；`search` 同时匹配描述、标签名与文件夹名；`view` 只有 all/trash/collection/temp，跨回收站搜索用 `searchScope=library` |
-| `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览 |
+| `find_similar` | `mode: image/text`、`targetId` 或 `targetIds`（≤100，多张只支持平均主色/语义）、文本、`kind`、`featureMode`（embedding 时的整体/主体/构图）、阈值、`scope`、`limit` | token、范围、全部命中数、可翻页数、带分数的预览（新模式为 null） |
 | `images_get` | `ids≤50` | 详情、`[{id,name}]` 形状的标签、描述、能力标记；临时图片 `folderPath` 为「临时」并带 `temporary: true`；回收站图片的 `folderPath` 显示原路径 |
 | `image_sheet` | selector、`grid 1–5`、`resolution: thumb/detail` | 拼图图片、格子映射、`sheetId`、下一页 |
 | `library_sql` | `sql`、`export?`、`format: jsonl/csv?` | 列名、行、行数、`truncated`；导出时附 20 行预览、真实文件路径与格式 |
@@ -63,14 +63,15 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `tags_list` 与 `folders_list` 都有 `total` 与 `nextCursor`：同级或标签超过 `limit` 时给出游标，原样传给 `cursor` 取下一页；单页上限仍是 500（`tags_list` 默认 100、`folders_list` 默认 200）。游标是 offset 语义的不透明字符串，解析失败报“游标无效”，不静默回到第一页。翻页不回快照：两次调用之间有写入时可能重复或漏掉条目，返回里的 `pagingNote` 已写明。
 - `search_images` 始终返回 `total`；`pageSize` 超出 1–50 直接报错，不静默截断。分面计数按需开启，2 字搜索与超大集合较慢。开 `includeFacets` 时额外返回 `facetsNote`：标签分面不应用 `tagIds` / `tagPresence` / `excludeTagIds`，选中一个标签后仍能看到其它标签的计数；其余分面各自排除自身维度。搜索与集合视图的分面按命中集统计，那里的标签分面只含命中集内的标签。分面只给 `tagId` 与计数，名称用 `tags_list` 取。
 - `find_similar` 的 `total` 是范围与阈值过滤后的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
-- `find_similar` 的 `threshold` 一律是上限：pHash 是 0–256 距离上限（省略时默认 6），`color4` / `color8` 是 0–1 距离上限，`embedding` / `pose` 是 -1–1 的相似度下限；省略都不做阈值过滤。方向容易记错：`color` 传 0 会筛掉全部、传 1 等于不筛，`embedding` 传 1 会全部命中。多张参考图只支持 `color4`/`color8`/`embedding` 的平均，最多 100 张；`phash` 与 `pose` 只接受单张。
+- `featureMode` 只在 `mode=image` 且 `kind=embedding` 时有效：`overall`（默认）沿用全局向量；`subject` 用 MaxSim、`composition` 用 SPP，先按整体相似度阈值粗筛前 20%，再按描述子重排。后两种只支持单张参考图，传多张直接报错；其它 `kind` 或 `mode=text` 传非 `overall` 也报错。特征未生成时返回明确错误（含剩余张数），不返回空结果。这两种模式下 `scoreKind=none`、预览 `score` 为 null，因为阈值与重排分不是同一刻度。
+- `find_similar` 的 `threshold` 一律是上限：pHash 是 0–256 距离上限（省略时默认 6），`color4` / `color8` 是 0–1 距离上限，`embedding` / `pose` 是 -1–1 的相似度下限；省略都不做阈值过滤。方向容易记错：`color` 传 0 会筛掉全部、传 1 等于不筛，`embedding` 传 1 会全部命中。多张参考图只支持 `color4`/`color8`/`embedding` 的平均，最多 100 张；`phash` 与 `pose` 只接受单张。所有 `featureMode` 共用 embedding 阈值。
 - `find_similar` 的 `scope` 与界面一致：`library`（默认）、`folder`（`folderId`、`includeSubfolders`，默认包含）、`collection`（`collectionId`）、`selection`（`imageIds`）、`view`（结构化 `query`）、`temp`（临时文件夹）。全库不解析 id；其它范围在 Rust 侧解析成 id 集合后与扫描取交集。全库扫描（`scope` 省略或 `library`）不包含临时图片；`scope=temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图片。
 - 语义搜索（`mode=text`）要求用英文短语：中文向量彼此挤在一起，实测无关句余弦 0.607 对英文 0.328，「用自己的描述找回自己」中文 1/3、英文 3/3。工具描述与界面占位文案都写明这一点；这一轮不做翻译层，也不换文本塔。
 - 语义搜索连接不上 AI 服务时只返回“AI 服务未启动或无法连接”，不带内部地址与 OS 错误。
 - `image_sheet` 的 `detail` 只允许 3×3 及以下，直接从原图解码；`thumb` 读缩略图包。输出格子标签始终按新拼图布局编号；以拼图格子为来源时，来源标签放在 `sourceLabel`（与输出标签相同时省略）。拼图按“画布 32 MiB + 最大一格解码”一次申请全进程 1.5 GiB 字节预算（与导入、压缩、查看器共用），逐格解码不再各自排队。
 - 每个格子带 `status`：`image` 有图、`missing` 有图但缩略图/原图读不出来、`empty` 这一格本来没有图；`thumbMissing` 只对 `missing` 为 true。被 `excludeCells` 排除的格子不占 `cells`，单独列在顶层 `excludedCells`。
 - AI 要给用户留下一组结果时，服务端指令与 `collections_create` 描述都要求优先创建集合（例如「AI · 主题」），不要复制文件到图库外；复制会产生不参与去重/标签的副本。需要把结果交给外部脚本时，用 `library_sql` 的导出参数写 JSONL/CSV 文件，不复制原图。
-- `images_get` 的 `capabilities.embedding` / `pose` 读的是 `feature_blobs` 是否存在，意思是「算没算过向量」，不代表参与全库相似扫描：回收站与临时区的图片即使有向量也不会进入全库扫描结果。
+- `images_get` 的 `capabilities.embedding` / `spp` / `maxsim` / `pose` 读的是 `feature_blobs` 是否存在，意思是「算没算过特征」，不代表参与全库相似扫描：回收站与临时区的图片即使有特征也不会进入全库扫描结果。三种语义描述子出自同一次前向，批量任务会一次补齐。
 - `library_info` 的 `tempFolder` 给出临时文件夹是否可用、图片数与生命周期说明；内部路径不返回。普通查询默认不含临时图片，必须显式 `view: "temp"` 或使用显式 id。
 - `library_info.features` 只统计普通图库（不含临时区）；临时区自己的特征数在 `tempEmbeddings` / `tempPoses`，AI 不应把它们当成整库覆盖度。`limits.maxTempFeatureImages` 是临时区单次生成的特征张数上限（100）。
 
@@ -178,7 +179,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `temp_features_generate` | `ids`（≤100）、`kind: embedding/pose` | `taskId`；完成后在 `tasks_get` 看逐张结果与失败清单 |
 
 - 只接受临时文件夹里的图片 id；混入不存在、已删除或普通图库图片时整批拒绝（`status: "rejected"` + `invalidIds`），不做部分执行。
-- 只做 `embedding` 与 `pose`，不生成描述；不写操作记录，不需要 `confirmedCount`。任务占 `ai.service` 与内容写者：其它 AI 任务与内容写任务排队等待，文件夹维护不必等整个任务结束。
+- 只做 `embedding` 与 `pose`，不生成描述；`kind=embedding` 一次前向会同时写全局向量、SPP 与 MaxSim 三条记录，因此临时图也能直接用于 `featureMode=subject/composition`。不写操作记录，不需要 `confirmedCount`。任务占 `ai.service` 与内容写者：其它 AI 任务与内容写任务排队等待，文件夹维护不必等整个任务结束。
 - 询问档每次确认；完全档直接执行；只读档拒绝。
 - 临时区导入时已经算好 pHash 与主色，粗筛不需要生成；这个工具只补语义与姿势。库内没有对应特征时，生成临时特征也搜不出结果，工具描述要求先看 `library_info.features`。
 - 特征写进 `feature_blobs`，临时区清空时随 `images` 行级联删除；feature pack 里的字节不会立刻回收，留待维护任务处理。

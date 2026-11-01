@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { aiApi } from "../modules/ai/api";
 import type { ImageRow } from "../modules/library/types";
 import { PAGE_SIZE, type SimilarityBrowseState } from "../modules/library/model";
-import type { FindSimilarConfig, SimilarKind } from "../shared/similarity";
+import type {
+  FeatureMode,
+  FindSimilarConfig,
+  SimilarKind,
+} from "../shared/similarity";
 import { errorMessage } from "../shared/errors";
 
 const DEFAULT_RESULTS_LIMIT = 2_000;
@@ -16,6 +20,7 @@ interface InternalState {
   mode: "semantic" | "similar";
   text: string;
   kind: SimilarKind | null;
+  featureMode: FeatureMode | null;
   targetIds: number[];
   scopeLabel: string;
   token: string | null;
@@ -37,6 +42,7 @@ const INITIAL: InternalState = {
   mode: "semantic",
   text: "",
   kind: null,
+  featureMode: null,
   targetIds: [],
   scopeLabel: "",
   token: null,
@@ -110,6 +116,7 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
       mode: request.type,
       text: request.type === "semantic" ? request.text : "",
       kind: request.type === "similar" ? request.config.kind : null,
+      featureMode: request.type === "similar" ? request.config.mode : null,
       targetIds: request.type === "similar" ? request.config.targetIds : [],
       scopeLabel: request.type === "similar" ? request.config.scopeLabel : "",
     };
@@ -122,6 +129,7 @@ export function useSimilarityBrowse(): SimilarityBrowseState {
             ? await aiApi.semanticSearch(request.text, DEFAULT_RESULTS_LIMIT)
             : await aiApi.findSimilarImages({
                 kind: request.config.kind,
+                mode: request.config.mode,
                 targetIds: request.config.targetIds,
                 threshold: request.config.threshold,
                 limit: request.config.limit,

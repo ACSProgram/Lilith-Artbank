@@ -1959,8 +1959,8 @@ export function LibraryView({
     }
     const presence = [
       ["描述", browse.filters.description],
-      ["Embedding", browse.filters.embedding],
-      ["Pose", browse.filters.pose],
+      ["语义特征", browse.filters.embedding],
+      ["姿势", browse.filters.pose],
     ] as const;
     for (const [label, value] of presence) {
       if (value === "has") parts.push(`有${label}`);

@@ -6,8 +6,8 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::{
     ai::runtime::{
-        AiDescriptionResult, AiStatus, ImageSimilarityResult, SemanticSearchResult,
-        SimilarityGroupsResult, SimilarityPage,
+        AiDescriptionResult, AiStatus, ImageSimilarityResult, SemanticFeaturePending,
+        SemanticSearchResult, SimilarityGroupsResult, SimilarityPage,
     },
     app::{
         batch_preview::{BatchTaskPreview, BatchTaskPreviewRequest},
@@ -1120,6 +1120,16 @@ pub fn get_feature_summary(state: State<'_, AppState>) -> Result<FeatureSummary,
     })
 }
 
+/// 语义描述子的全库待处理张数；找相似面板用它决定新模式是否可用。
+#[tauri::command]
+pub fn get_semantic_feature_pending(
+    state: State<'_, AppState>,
+) -> Result<SemanticFeaturePending, String> {
+    trace::read("get_semantic_feature_pending", || {
+        AppError::command(state.ai.semantic_feature_pending())
+    })
+}
+
 #[tauri::command]
 pub async fn ai_describe_image(
     state: State<'_, AppState>,
@@ -1186,6 +1196,7 @@ pub async fn semantic_search(
 pub async fn find_similar_images(
     state: State<'_, AppState>,
     kind: String,
+    feature_mode: Option<String>,
     target_ids: Vec<i64>,
     threshold: Option<f64>,
     limit: Option<usize>,
@@ -1194,7 +1205,14 @@ pub async fn find_similar_images(
     trace::read_async_with("find_similar_images", trace::SLOW_SEARCH_MS, async move {
         let runtime = state.ai.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            runtime.find_similar_images(&kind, &target_ids, threshold, limit, scope.as_ref())
+            runtime.find_similar_images(
+                &kind,
+                feature_mode.as_deref(),
+                &target_ids,
+                threshold,
+                limit,
+                scope.as_ref(),
+            )
         })
         .await
         .map_err(|error| error.to_string())?
@@ -1513,6 +1531,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         get_optimize_estimate,
         get_image_capabilities,
         get_feature_summary,
+        get_semantic_feature_pending,
         get_pack_stats,
         start_pack_compact,
         get_inspection_report,

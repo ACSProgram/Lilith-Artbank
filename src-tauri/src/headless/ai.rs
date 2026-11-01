@@ -131,6 +131,7 @@ pub(super) fn dispatch(
                     .ai
                     .find_similar_images(
                         &request.kind,
+                        request.feature_mode.as_deref(),
                         &request.target_ids,
                         request.threshold,
                         request.limit,
@@ -323,6 +324,7 @@ pub(super) fn scenario(app: &tauri::AppHandle, options: &Options) -> Result<Valu
             .ai
             .find_similar_images(
                 &similar.kind,
+                similar.feature_mode.as_deref(),
                 &similar.target_ids,
                 similar.threshold,
                 similar.limit,
@@ -466,6 +468,8 @@ struct SearchFlowRequest {
 #[serde(rename_all = "camelCase")]
 struct SimilarRequest {
     kind: String,
+    #[serde(default)]
+    feature_mode: Option<String>,
     #[serde(default)]
     target_ids: Vec<i64>,
     #[serde(default)]

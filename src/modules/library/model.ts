@@ -7,7 +7,11 @@ import type {
   SortKey,
   SortSpec,
 } from "./types";
-import type { FindSimilarConfig, SimilarKind } from "../../shared/similarity";
+import type {
+  FeatureMode,
+  FindSimilarConfig,
+  SimilarKind,
+} from "../../shared/similarity";
 import type { TagFilterAction, TagFilterScope } from "../../shared/tagFilter";
 
 /** 与 Rust `query::DEFAULT_LIMIT` 保持一致。 */
@@ -504,6 +508,8 @@ export interface SimilarityBrowseState {
   mode: "semantic" | "similar";
   text: string;
   kind: SimilarKind | null;
+  /** kind 为 embedding 时的三种口径；语义搜索为 null。 */
+  featureMode: FeatureMode | null;
   targetIds: number[];
   scopeLabel: string;
   token: string | null;

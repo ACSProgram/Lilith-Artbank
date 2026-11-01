@@ -419,8 +419,8 @@ export function FilterPanel({
           <div className="filter-presence">
             {[
               { key: "description" as const, label: "描述" },
-              { key: "embedding" as const, label: "Embedding" },
-              { key: "pose" as const, label: "Pose" },
+              { key: "embedding" as const, label: "语义特征" },
+              { key: "pose" as const, label: "姿势" },
             ].map((field) => {
               const availability = presenceAvailability(field.key, featureSummary);
               return (

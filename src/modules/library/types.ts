@@ -294,6 +294,8 @@ export interface ImageCapabilities {
   imageId: number;
   pose: boolean;
   embedding: boolean;
+  spp: boolean;
+  maxsim: boolean;
   colors: boolean;
   phash: boolean;
 }

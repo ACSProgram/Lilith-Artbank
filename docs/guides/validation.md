@@ -92,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File tools/acceptance/run.ps1 -Targets accep
 ```bash
 npm run typecheck        # tsc --noEmit
 npm run build            # tsc + vite build
-npm run test:web         # node --test：几何换算、标签筛选、文件夹树、失效计划、范围、标签名
+npm run test:web         # node --test：几何换算、标签筛选、文件夹树、失效计划、范围、标签名、相似标签
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -107,7 +107,7 @@ git diff --check
 - **浏览/查询**：`cargo test` 覆盖键集分页、多级排序、筛选、搜索、计数、全选 id、集合、子树筛选与直属筛选；性能跑 `perf_metadata_200k`。另有三类结构断言：`EXPLAIN QUERY PLAN` 不得再用 `idx_images_active_*` 回表（`active_count_plan_*`、`folder_counts_plan_*`）、`list_tags_page` 新形状与旧 SQL 逐行一致（回收站/临时区/阈值回退三种边界）、`folder_infos` 只回传请求的 id 且计数与整树一致。
 - **元数据/回收站**：详情、评分/描述、标签增删改合并、文件夹移动回滚、软删除/恢复/永久删除/清空、延迟释放；文件夹整树移入回收站、删除单元恢复、删除单元之间不串恢复、永久删除后释放空目录与行、`trashLoose` 直属图片与文件夹计数；文件操作测试只用临时图库。
 - **查看器/编辑**：几何顺序（翻转→旋转→裁剪→缩放）、裁剪坐标、输出格式与 alpha、编辑上限；保存事务（新哈希发布、旧文件清理、元数据保留、`feature_blobs` 清空、冲突/无修改/回收站拒绝、只改质量也保存、体积预估与真实保存一致）；查看器源（直接服务、预览生成/复用/4096 上限、EXIF 方向、缺失原图）。前端同跑 `test:web` 与 typecheck/build。
-- **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录。`acceptance_ai` 用进程内假 `/v1` 跑完整协议、重试、维度校验、语义搜索分页、相似分组与临时区；真实模型质量与显存仍手工。
+- **AI**：`cargo test --lib ai::` 覆盖客户端 mock（health/embedding/describe/pose 解析、5xx 重试、4xx 不重试）、feature pack 追加与包头校验、均值中心化与 top-K、批量任务与手写描述保护；`rows_skip_trashed_and_temp_images` 固定“回收站与临时区被排除”的口径，`mean_of_chunk_skips_corrupt_records` 覆盖并行累加跳过损坏记录；`descriptors::tests` 覆盖 SPP 对位余弦、MaxSim 双向最近邻与置换不变、两段式重排和缺记录计数，`search_all_keeps_every_thresholded_candidate` 固定“粗筛阶段不截断”的契约。`acceptance_ai` 用进程内假 `/v1` 跑完整协议、重试、维度校验、语义搜索分页、相似分组与临时区；真实模型质量与显存仍手工。
 - **MCP**：`cargo test --lib mcp`，覆盖设置迁移与端口校验、Bearer 校验、selector 解析、三档阈值与确认过期、`library_info` 的 `writeAllowed` / `approval`、列表游标、标签缺失/排除筛选、`tags_modify` 与标签合并的撤销重做、`dryRun` 的 `willChange`、撤销/重做预览、导入输入预检与回执、临时区口径、`folders_modify` 四种动作与删除 dryRun 的子树计数、审计单行截断。`cargo test --lib library::sql_query` 覆盖 `mcp_*` 视图、authorizer 与函数白名单、列名规则、内联/导出上限、JSONL/CSV 映射、TTL 清理；`mcp::sanitize` 覆盖路径脱敏与导出路径豁免。`acceptance_mcp` 通过真实 `--mcp-stdio` 子进程验证生命周期、三档、审批拒绝/批准/过期/换库清空、工具列表与调用、口令轮换、端口占用与审计日志；真实第三方客户端与便携包仍手工。
 - **空间优化**：判据与阶梯编码、PSNR/坏点、EXIF/ICC 搬运、分层估算与只读、凭证指纹与候选集合核对、执行后只改内容列、旧图删除、校准记录；`acceptance_optimize` 在小纹理图上跑估算→改选/漂移→执行，并验证参数/集合指纹、缺失/变化拒绝或裁剪、全部跳过与临时区拒绝。
 - `server/` 只做一次性检查，不加入常驻测试：它依赖用户提供的 `python_embeded`，不能让日常测试在没有该环境的机器上失败。
@@ -153,6 +153,8 @@ npm run tauri dev
 # 确认进度、取消、失败清单；搜索框切到“语义”输入英文短语并 Enter，首次搜索应提示正在加载文本模型
 # 查看器无 pose 时点击“生成姿势骨架”
 # 右键图片“设为相似参考” → 工具栏“相似”打开面板 → 查找相似 → 点击结果条里的比较图文件名打开查看器
+# 语义特征下依次切「整体 / 偏重主体 / 偏重构图」：回填未完成时后两项显示剩余张数并置灰；
+# 回填完成后三项都能出结果，阈值仍写「最低整体相似度」，后两项结果不显示绝对分数
 # 描述未实现：批量任务里的描述项应置灰
 ```
 

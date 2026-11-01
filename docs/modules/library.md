@@ -233,10 +233,10 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `estimate_edit_size` | `{ request }` | `EditSizeEstimate`（`fileSize`、`exact`） |
 | `get_image_pose` | `{ imageId }` | `PoseData \| null`（feature pack） |
 | `copy_images` | `{ imageIds }` | `number`（以 `CF_HDROP` 文件引用写剪贴板，单张与多选通用） |
-| `get_image_capabilities` | `{ imageIds }` | `ImageCapabilities[]`（pose / embedding / colors / phash） |
+| `get_image_capabilities` | `{ imageIds }` | `ImageCapabilities[]`（pose / embedding / spp / maxsim / colors / phash） |
 | `get_feature_summary` | — | `FeatureSummary`（普通图库的描述 / embedding / 姿势 / pHash / 主色数量；不含临时区） |
 | `start_batch_task` / `list_tasks` / `cancel_task` | 见 [AI 服务](ai-service.md) | 统一任务入口、任务列表与取消；事件 `task-progress` / `task-finished` |
-| AI 命令（status/ensure/任务/描述/pose/语义搜索） | 见 [AI 服务](ai-service.md) | — |
+| AI 命令（status/ensure/任务/描述/pose/语义搜索/语义特征待处理） | 见 [AI 服务](ai-service.md) | — |
 | `window_set_fullscreen` | `{ value }` | `boolean`（写入后回读的真实状态） |
 | `copy_text` | `{ text }` | `null` |
 | `window_minimize` / `window_toggle_maximize` / `window_is_maximized` / `window_close` | — | 窗口控制 |

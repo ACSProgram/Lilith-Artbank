@@ -708,7 +708,11 @@ export function LibrarySummaries({
                   {similarityTargetLabel}
                 </button>
                 {similarity.kind
-                  ? ` · ${similarKindLabel(similarity.kind, averageReference)}`
+                  ? ` · ${similarKindLabel(
+                      similarity.kind,
+                      averageReference,
+                      similarity.featureMode ?? "overall",
+                    )}`
                   : ""}
                 {similarity.scopeLabel ? ` · 范围：${similarity.scopeLabel}` : ""}
               </>
