@@ -1,9 +1,8 @@
 import { useEffect, useRef } from "react";
 import {
   CheckSquare,
-  Copy,
   Eye,
-  Hash,
+  FolderOutput,
   Image as ImageIcon,
   Layers,
   RotateCcw,
@@ -28,6 +27,7 @@ interface LibraryContextMenuProps {
   menu: ContextMenuState;
   inCollection: boolean;
   inTemp: boolean;
+  inTrash: boolean;
   hasActive: boolean;
   hasDeleted: boolean;
   /** 回收站行都属于已删除文件夹：不提供单张恢复/永久删除。 */
@@ -35,9 +35,8 @@ interface LibraryContextMenuProps {
   onClose: () => void;
   onOpenViewer: () => void;
   onSetSimilarReference: () => void;
-  onCopyPaths: () => void;
-  onCopyHashes: () => void;
   onCopyImage: () => void;
+  onExportSelected: () => void;
   onAddToCollection: () => void;
   onRemoveFromCollection: () => void;
   onTrash: () => void;
@@ -54,15 +53,15 @@ export function LibraryContextMenu({
   menu,
   inCollection,
   inTemp,
+  inTrash,
   hasActive,
   hasDeleted,
   deletedUnderFolder,
   onClose,
   onOpenViewer,
   onSetSimilarReference,
-  onCopyPaths,
-  onCopyHashes,
   onCopyImage,
+  onExportSelected,
   onAddToCollection,
   onRemoveFromCollection,
   onTrash,
@@ -130,7 +129,7 @@ export function LibraryContextMenu({
 
   const left = Math.min(menu.x, Math.max(8, window.innerWidth - CONTEXT_MENU_MAX_WIDTH));
   const top = Math.min(menu.y, Math.max(8, window.innerHeight - CONTEXT_MENU_MAX_HEIGHT));
-  const multiple = menu.items.length > 1 ? menu.items.length : null;
+  const copyCount = menu.ids.length > 1 ? menu.ids.length : null;
   const referenceCount = menu.ids.length;
   const averageReference = referenceCount > 1;
   const referenceAvailability: ActionAvailability =
@@ -152,33 +151,29 @@ export function LibraryContextMenu({
       style={{ left, top }}
       onContextMenu={(event) => event.preventDefault()}
     >
-      <MenuSection title="打开">
+      <MenuSection>
         <button type="button" className="context-menu-item" onClick={onOpenViewer}>
           <Eye size={14} />
           <span>打开查看器</span>
         </button>
       </MenuSection>
 
-      <MenuSection title="复制">
-        <button type="button" className="context-menu-item" onClick={onCopyPaths}>
-          <Copy size={14} />
-          <span>文件路径</span>
-          {multiple ? <em>{multiple}</em> : null}
-        </button>
-        <button type="button" className="context-menu-item" onClick={onCopyHashes}>
-          <Hash size={14} />
-          <span>内容哈希</span>
-          {multiple ? <em>{multiple}</em> : null}
-        </button>
+      <MenuSection>
         <button type="button" className="context-menu-item" onClick={onCopyImage}>
           <ImageIcon size={14} />
-          <span>图片</span>
-          {multiple ? <em>首张</em> : null}
+          <span>复制图片</span>
+          {copyCount ? <em>{copyCount}</em> : null}
         </button>
       </MenuSection>
 
       {!inTemp ? (
-        <MenuSection title="整理">
+        <MenuSection>
+          {!inTrash ? (
+            <button type="button" className="context-menu-item" onClick={onExportSelected}>
+              <FolderOutput size={14} />
+              <span>导出到文件夹…</span>
+            </button>
+          ) : null}
           <button type="button" className="context-menu-item" onClick={onAddToCollection}>
             <Layers size={14} />
             <span>加入集合…</span>
@@ -193,7 +188,7 @@ export function LibraryContextMenu({
       ) : null}
 
       {referenceCount > 0 ? (
-        <MenuSection title="相似">
+        <MenuSection>
           <button
             type="button"
             className="context-menu-item"
@@ -211,7 +206,7 @@ export function LibraryContextMenu({
       ) : null}
 
       {!inTemp && (hasActive || hasDeleted) ? (
-        <MenuSection title="危险操作">
+        <MenuSection>
           {hasActive ? (
             <button type="button" className="context-menu-item" onClick={onTrash}>
               <Trash2 size={14} />
@@ -242,7 +237,7 @@ export function LibraryContextMenu({
         </MenuSection>
       ) : null}
 
-      <MenuSection title="选择">
+      <MenuSection>
         <button type="button" className="context-menu-item" onClick={onSelectAllMatches}>
           <CheckSquare size={14} />
           <span>全部匹配项</span>

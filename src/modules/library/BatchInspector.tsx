@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Crop, FolderInput, Layers, Star, Tags } from "lucide-react";
+import { Copy, Crop, FolderInput, Hash, Layers, Star, Tags } from "lucide-react";
 import { Button, IconButton } from "../../shared/components/Button";
 import { FolderPickerDialog } from "../../shared/components/FolderPickerDialog";
 import { Spinner } from "../../shared/components/Spinner";
@@ -127,6 +127,27 @@ export function BatchInspector({
         similarity: "keep",
       }),
     );
+  };
+
+  const copySelection = async (
+    copy: (ids: number[]) => Promise<number>,
+    what: string,
+  ) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const copied = await copy(imageIds);
+      const missing = imageIds.length - copied;
+      notify(
+        `已复制 ${copied.toLocaleString()} 条${what}`,
+        "success",
+        missing > 0 ? `另有 ${missing.toLocaleString()} 张已不在图库` : undefined,
+      );
+    } catch (cause) {
+      notify(`复制${what}失败`, "error", errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const applyAddTags = () => {
@@ -271,6 +292,28 @@ export function BatchInspector({
           <Button size="sm" loading={busy} disabled={score === "unset"} onClick={applyScore}>
             应用
           </Button>
+        </div>
+      </section>
+
+      <section className="inspector-section">
+        <h4>
+          <Hash size={12} /> 复制
+        </h4>
+        <div className="inspector-inline-actions">
+          <IconButton
+            label="复制内容哈希"
+            disabled={busy}
+            onClick={() => void copySelection(libraryApi.copyImageHashes, "内容哈希")}
+          >
+            <Hash size={13} />
+          </IconButton>
+          <IconButton
+            label="复制文件路径"
+            disabled={busy}
+            onClick={() => void copySelection(libraryApi.copyImagePaths, "文件路径")}
+          >
+            <Copy size={13} />
+          </IconButton>
         </div>
       </section>
 

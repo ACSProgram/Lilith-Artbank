@@ -208,6 +208,19 @@ export function ImageViewer({
   const redoHistory = useCallback(() => {
     applyHistoryGeometry(history.redo());
   }, [applyHistoryGeometry, history.redo]);
+  /**
+   * 复制当前图片；Ctrl+C 与工具栏共用。
+   *
+   * 定义在按键监听之前，才能进它的依赖数组；否则快捷键会拿到旧的 `activeId`。
+   */
+  const copyImage = useCallback(async () => {
+    try {
+      await viewerApi.copyImages([activeId]);
+      notify("图片已复制到剪贴板", "success");
+    } catch (cause) {
+      notify("复制图片失败", "error", errorMessage(cause));
+    }
+  }, [activeId, notify]);
   const { estimate, loading: estimating } = useEditEstimate(
     activeId,
     source,
@@ -383,6 +396,11 @@ export function ImageViewer({
         return;
       }
       if (editingText) return;
+      if (modified && key === "c") {
+        event.preventDefault();
+        void copyImage();
+        return;
+      }
 
       switch (event.key) {
         case "Escape":
@@ -436,6 +454,7 @@ export function ImageViewer({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     actualSize,
+    copyImage,
     cropping,
     fitView,
     fullscreen,
@@ -576,15 +595,6 @@ export function ImageViewer({
       notify("姿势识别失败", "error", errorMessage(cause));
     } finally {
       setPoseBusy(false);
-    }
-  };
-
-  const copyImage = async () => {
-    try {
-      await viewerApi.copyImage(activeId);
-      notify("图片已复制到剪贴板", "success");
-    } catch (cause) {
-      notify("复制图片失败", "error", errorMessage(cause));
     }
   };
 

@@ -67,11 +67,11 @@ export const viewerApi = {
     return invoke<EditSizeEstimate>("estimate_edit_size", { request });
   },
 
-  async copyImage(imageId: number): Promise<void> {
+  async copyImages(imageIds: number[]): Promise<number> {
     if (!isTauri()) {
       throw new Error("浏览器预览无法复制图片到剪贴板");
     }
-    return invoke("copy_image", { imageId });
+    return invoke<number>("copy_images", { imageIds });
   },
 
   async getImagePose(imageId: number): Promise<PoseData | null> {

@@ -60,16 +60,17 @@
 
 ## 命令记录
 
-101 个 Tauri 命令里 93 个走包装，分两档：
+106 个 Tauri 命令里 98 个走包装，分两档：
 
 | 档 | 成功 | 失败 | 慢 |
 | --- | --- | --- | --- |
-| 写命令（59） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
+| 写命令（64） | `started` + `finished`，带 `elapsed_ms` | `WARN command failed` | — |
 | 读命令（34） | 不记录 | `WARN command failed` | 超过阈值记 `WARN command slow` |
 
 - **写命令**指会改变图库状态或有外部副作用的命令：设置与图库开关、导入、文件夹、标签、
   评分与描述、移动与回收站、撤销与重做、集合、像素编辑、AI 服务、任务、MCP 审批，
-  以及 `reveal_path` / `copy_text` / `copy_image` 这类外部副作用。
+  以及 `reveal_path` / `copy_text` / `copy_images` / `copy_image_paths` / `copy_image_hashes`
+  这类外部副作用。
 - **读命令**指不改变状态的查询。其中 `query_images`、`query_image_ids`、
   `get_image_states`、`get_viewer_source` 会随滚动与翻页反复触发，成功路径必须零落盘。
 - 写命令成对记录的价值在崩溃现场：只有 `started` 没有 `finished`，说明进程死在这次操作里。

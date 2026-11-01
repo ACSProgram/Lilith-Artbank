@@ -105,10 +105,10 @@ impl CanvasFit {
         let pixels = u64::from(self.width) * u64::from(self.height);
         if pixels > MAX_EDIT_PIXELS {
             return Err(AppError::message(format!(
-                "画布尺寸 {}×{} 超过编辑上限 {} 百万像素",
+                "画布尺寸 {}×{} 超过编辑上限 {} 万像素",
                 self.width,
                 self.height,
-                MAX_EDIT_PIXELS / 1_000_000
+                MAX_EDIT_PIXELS / 10_000
             )));
         }
         Ok(())
@@ -163,11 +163,10 @@ pub fn apply_fitted(
     let pixel_count = u64::from(image.width()) * u64::from(image.height());
     if pixel_count > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(
-            "图片为 {}×{}（{:.1} 百万像素），超过编辑上限 {} 百万像素",
+            "图片为 {}×{}，超过编辑上限 {} 万像素",
             image.width(),
             image.height(),
-            pixel_count as f64 / 1_000_000.0,
-            MAX_EDIT_PIXELS / 1_000_000
+            MAX_EDIT_PIXELS / 10_000
         )));
     }
 
@@ -337,10 +336,10 @@ fn validate_resize(resize: ResizeSpec) -> AppResult<()> {
     let pixels = u64::from(resize.width) * u64::from(resize.height);
     if pixels > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(
-            "目标尺寸 {}×{} 超过编辑上限 {} 百万像素",
+            "目标尺寸 {}×{} 超过编辑上限 {} 万像素",
             resize.width,
             resize.height,
-            MAX_EDIT_PIXELS / 1_000_000
+            MAX_EDIT_PIXELS / 10_000
         )));
     }
     Ok(())

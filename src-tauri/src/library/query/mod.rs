@@ -9,6 +9,7 @@ use crate::app::error::{AppError, AppResult};
 
 mod folders;
 mod page;
+mod paths;
 mod pending;
 mod sql;
 mod stats;
@@ -20,6 +21,7 @@ mod tests;
 pub(crate) use folders::normalize_scope_ids;
 pub use folders::{folder_infos, list_folders, list_trash_folders};
 pub use page::{query_ids, query_page};
+pub use paths::{hashes_for_ids, paths_for_ids};
 pub use pending::{pending_stats, selected_pending_ids, selected_pending_stats};
 pub use sql::rows_by_ids;
 #[cfg(test)]

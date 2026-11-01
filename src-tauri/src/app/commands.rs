@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +23,7 @@ use crate::{
         BatchReporter,
         capability::{FeatureSummary, ImageCapabilities},
         collections::{CollectionInfo, CombineMode},
+        db::LibraryDb,
         edit::{self, EditRequest, EditResult, EditSizeEstimate},
         folders::FolderSortKey,
         history::HistoryPage,
@@ -1226,19 +1227,99 @@ pub fn get_similarity_ids(state: State<'_, AppState>, token: String) -> Result<V
     })
 }
 
-#[tauri::command]
-pub async fn copy_image(state: State<'_, AppState>, image_id: i64) -> Result<(), String> {
-    trace::write_async("copy_image", async move {
-        let (path, guard) = state
-            .copy_source(image_id)
-            .map_err(|error| error.to_string())?;
+/// 复制命令取文本的方式：给图库、根目录与 id，回一组文本与缺失条数。
+type CopyLoad = fn(&LibraryDb, &Path, &[i64]) -> AppResult<(Vec<String>, usize)>;
+/// 复制命令写剪贴板的方式：整组文本一次写进去。
+type CopyWrite = fn(&[String]) -> AppResult<()>;
+
+/// 三个复制命令共用的形状：取当前图库 → 阻塞线程里按 id 取文本 → 写剪贴板 → 只回条数。
+///
+/// `load` 决定取路径还是取哈希，`write` 决定写成文本还是文件引用；两者都用函数指针，
+/// 以便整块搬进 `spawn_blocking`。文本不经过 IPC，前端只拿到实际复制的条数。
+async fn copy_selection(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+    command: &'static str,
+    load: CopyLoad,
+    write: CopyWrite,
+) -> Result<u64, String> {
+    if image_ids.is_empty() {
+        return Err("没有可复制的图片".to_owned());
+    }
+    let (database, root) = state
+        .current_library()
+        .ok_or_else(|| "尚未打开图库".to_owned())?;
+    trace::write_async(command, async move {
         tauri::async_runtime::spawn_blocking(move || {
-            let _guard = guard;
-            crate::platform::clipboard::copy_image(&path).map_err(|error| error.to_string())
+            let (texts, _) =
+                load(&database, &root, &image_ids).map_err(|error| error.to_string())?;
+            if texts.is_empty() {
+                return Err("没有可复制的图片".to_owned());
+            }
+            write(&texts).map_err(|error| error.to_string())?;
+            Ok(texts.len() as u64)
         })
         .await
         .map_err(|error| error.to_string())?
     })
+    .await
+}
+
+/// 哈希没有文件夹维度，补一个丢弃根目录的适配器给 `copy_selection`。
+fn hashes_texts(
+    database: &LibraryDb,
+    _root: &Path,
+    image_ids: &[i64],
+) -> AppResult<(Vec<String>, usize)> {
+    crate::library::query::hashes_for_ids(database, image_ids)
+}
+
+fn write_lines(texts: &[String]) -> AppResult<()> {
+    crate::platform::clipboard::copy_text(&texts.join("\n"))
+}
+
+/// 以文件引用复制任意数量图片到剪贴板，保持传入顺序；返回实际复制的条数。
+#[tauri::command]
+pub async fn copy_images(state: State<'_, AppState>, image_ids: Vec<i64>) -> Result<u64, String> {
+    copy_selection(
+        state,
+        image_ids,
+        "copy_images",
+        crate::library::query::paths_for_ids,
+        crate::platform::clipboard::copy_file_list,
+    )
+    .await
+}
+
+/// 复制选中图片的绝对路径，保持传入顺序；返回实际复制的条数。
+#[tauri::command]
+pub async fn copy_image_paths(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+) -> Result<u64, String> {
+    copy_selection(
+        state,
+        image_ids,
+        "copy_image_paths",
+        crate::library::query::paths_for_ids,
+        write_lines,
+    )
+    .await
+}
+
+/// 复制选中图片的内容哈希，保持传入顺序；返回实际复制的条数。
+#[tauri::command]
+pub async fn copy_image_hashes(
+    state: State<'_, AppState>,
+    image_ids: Vec<i64>,
+) -> Result<u64, String> {
+    copy_selection(
+        state,
+        image_ids,
+        "copy_image_hashes",
+        hashes_texts,
+        write_lines,
+    )
     .await
 }
 
@@ -1417,7 +1498,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         save_image_edit,
         estimate_edit_size,
         get_image_pose,
-        copy_image,
+        copy_images,
+        copy_image_paths,
+        copy_image_hashes,
         get_ai_status,
         ai_start_service,
         ai_stop_service,

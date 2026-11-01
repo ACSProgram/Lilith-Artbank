@@ -12,7 +12,6 @@ import {
 import { useAppRuntime } from "../../app/runtimeContext";
 import { useNotices } from "../../shared/notices";
 import { useTaskActive } from "../../app/taskContext";
-import { copyText } from "../../shared/clipboard";
 import { confirmDelete, confirmEmptyTrash, confirmTrash } from "../../shared/confirm";
 import { errorMessage } from "../../shared/errors";
 import { LIST_COLUMNS, type ThumbFit, type UiSettings } from "../../shared/settings";
@@ -100,7 +99,7 @@ interface LibraryViewProps {
   onCloseViewer?: () => void;
   /** 计数类状态变化：打开着的任务/找相似对话框需要重取范围数量。 */
   onContextsChanged?: () => void;
-  onCopyImage: (imageId: number) => void;
+  onCopyImages: (imageIds: number[]) => void;
   onOpenImport?: () => void;
   /** 开始把网格/列表中的图片拖到文件夹。 */
   onBeginImageDrag: (imageIds: number[], label: string, event: ReactPointerEvent<HTMLDivElement>) => void;
@@ -109,6 +108,8 @@ interface LibraryViewProps {
   onOpenBatchTasks?: (context: BatchTaskContextInfo) => void;
   /** 批量像素编辑；只接受选中集。 */
   onOpenBatchEdit?: (imageIds: number[]) => void;
+  /** 把选中图片导出到文件夹；由工作区选择目录并交给任务面板。 */
+  onExportSelected?: (imageIds: number[]) => void;
   onOpenOptimize?: (context: BatchTaskContextInfo) => void;
   /** 打开维护与检查；与批量任务共用同一份范围上下文。 */
   onOpenMaintenance?: (context: BatchTaskContextInfo) => void;
@@ -178,13 +179,14 @@ export function LibraryView({
   onOpenViewer,
   onCloseViewer,
   onContextsChanged,
-  onCopyImage,
+  onCopyImages,
   onOpenImport,
   onBeginImageDrag,
   similarity,
   onOpenSimilarityGroups,
   onOpenBatchTasks,
   onOpenBatchEdit,
+  onExportSelected,
   onOpenOptimize,
   onOpenMaintenance,
   onGenerateDescription,
@@ -1299,39 +1301,6 @@ export function LibraryView({
     }
   }, [notify, resolveResultIds, selectingAll]);
 
-  const copyPaths = useCallback(async () => {
-    const targets = contextMenu?.items ?? [];
-    if (targets.length === 0) return;
-    try {
-      await copyText(targets.map((item) => item.filePath).join("\n"));
-      const hidden = contextMenu && contextMenu.ids.length > targets.length
-        ? contextMenu.ids.length - targets.length
-        : 0;
-      notify(
-        `已复制 ${targets.length.toLocaleString()} 条文件路径`,
-        "success",
-        hidden > 0
-          ? `另有 ${hidden.toLocaleString()} 张未复制`
-          : undefined,
-      );
-    } catch (cause) {
-      notify("复制路径失败", "error", errorMessage(cause));
-    }
-    setContextMenu(null);
-  }, [contextMenu, notify]);
-
-  const copyHashes = useCallback(async () => {
-    const targets = contextMenu?.items ?? [];
-    if (targets.length === 0) return;
-    try {
-      await copyText(targets.map((item) => item.contentHash).join("\n"));
-      notify(`已复制 ${targets.length.toLocaleString()} 条内容哈希`, "success");
-    } catch (cause) {
-      notify("复制哈希失败", "error", errorMessage(cause));
-    }
-    setContextMenu(null);
-  }, [contextMenu, notify]);
-
   const trashSelected = useCallback(
     async (ids: number[]): Promise<boolean> => {
       if (ids.length === 0 || viewBusy) return false;
@@ -1865,6 +1834,10 @@ export function LibraryView({
     [applyBrowse, clearSelection, similarityClear],
   );
 
+  /** Delete 与 Ctrl+C 共用的目标集：有选中就作用于整个选中集，否则退回活动图。 */
+  const keyTargetIds = () =>
+    selected.size > 0 ? [...selected] : activeId != null ? [activeId] : [];
+
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
     const key = event.key;
@@ -1896,6 +1869,14 @@ export function LibraryView({
       void selectAllMatches();
       return;
     }
+    if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "c") {
+      const ids = keyTargetIds();
+      if (ids.length > 0) {
+        event.preventDefault();
+        onCopyImages(ids);
+      }
+      return;
+    }
     if (key === "Enter") {
       const target =
         items.find((item) => item.id === activeId) ?? items.find((item) => selected.has(item.id));
@@ -1907,7 +1888,7 @@ export function LibraryView({
     }
     if (key === "Delete" || key === "Backspace") {
       event.preventDefault();
-      const ids = selected.size > 0 ? [...selected] : activeId != null ? [activeId] : [];
+      const ids = keyTargetIds();
       if (ids.length === 0) return;
       if (effectiveView === "temp") {
         notify("临时图片不能移入回收站", "info", "关闭、切换图库或退出应用时会自动清空。");
@@ -2238,6 +2219,7 @@ export function LibraryView({
           menu={contextMenu}
           inCollection={effectiveView === "collection"}
           inTemp={effectiveView === "temp"}
+          inTrash={effectiveView === "trash"}
           hasActive={contextHasActive}
           hasDeleted={contextHasDeleted}
           deletedUnderFolder={contextDeletedUnderFolder}
@@ -2247,12 +2229,15 @@ export function LibraryView({
             setContextMenu(null);
             if (item) activateItem(item);
           }}
-          onCopyPaths={() => void copyPaths()}
-          onCopyHashes={() => void copyHashes()}
           onCopyImage={() => {
-            const item = contextMenu.items[0];
+            const ids = contextMenu.ids;
             setContextMenu(null);
-            if (item) onCopyImage(item.id);
+            onCopyImages(ids);
+          }}
+          onExportSelected={() => {
+            const ids = contextMenu.ids;
+            setContextMenu(null);
+            onExportSelected?.(ids);
           }}
           onSetSimilarReference={() =>
             handleSetSimilarReference(contextMenu.ids, contextMenu.items)

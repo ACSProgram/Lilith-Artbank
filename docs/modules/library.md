@@ -231,7 +231,7 @@ ui                 { theme, gridThumbPx, thumbFit, thumbCacheCount,
 | `save_image_edit` | `{ request }` | `EditResult` |
 | `estimate_edit_size` | `{ request }` | `EditSizeEstimate`（`fileSize`、`exact`） |
 | `get_image_pose` | `{ imageId }` | `PoseData \| null`（feature pack） |
-| `copy_image` | `{ imageId }` | `null` |
+| `copy_images` | `{ imageIds }` | `number`（以 `CF_HDROP` 文件引用写剪贴板，单张与多选通用） |
 | `get_image_capabilities` | `{ imageIds }` | `ImageCapabilities[]`（pose / embedding / colors / phash） |
 | `get_feature_summary` | — | `FeatureSummary`（普通图库的描述 / embedding / 姿势 / pHash / 主色数量；不含临时区） |
 | `start_batch_task` / `list_tasks` / `cancel_task` | 见 [AI 服务](ai-service.md) | 统一任务入口、任务列表与取消；事件 `task-progress` / `task-finished` |

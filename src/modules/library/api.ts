@@ -203,6 +203,20 @@ export const libraryApi = {
     return invoke<SelectionTags>("get_selection_tags", { imageIds });
   },
 
+  /** 按选中顺序复制文件路径；浏览器预览没有剪贴板命令，只回报条数。 */
+  async copyImagePaths(imageIds: number[]): Promise<number> {
+    if (imageIds.length === 0) return 0;
+    if (!isTauri()) return imageIds.length;
+    return invoke<number>("copy_image_paths", { imageIds });
+  },
+
+  /** 按选中顺序复制内容哈希；浏览器预览没有剪贴板命令，只回报条数。 */
+  async copyImageHashes(imageIds: number[]): Promise<number> {
+    if (imageIds.length === 0) return 0;
+    if (!isTauri()) return imageIds.length;
+    return invoke<number>("copy_image_hashes", { imageIds });
+  },
+
   async updateImageScore(imageId: number, score: number): Promise<void> {
     if (!isTauri()) {
       mockUpdateScore(imageId, score);

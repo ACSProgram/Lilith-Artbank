@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FolderOpen, Images, Trash2, Upload } from "lucide-react";
 import { Button } from "../shared/components/Button";
 import { ImportDialog } from "../modules/import/ImportDialog";
@@ -31,6 +32,7 @@ import { errorMessage } from "../shared/errors";
 import { useLibraryData } from "./useLibraryData";
 import { useTaskDialogs } from "./useTaskDialogs";
 import { useFolderDrag } from "./useFolderDrag";
+import { useTaskCenter } from "./taskContext";
 
 interface LibraryWorkspaceProps {
   onOpenSettings: () => void;
@@ -40,6 +42,7 @@ interface LibraryWorkspaceProps {
 export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWorkspaceProps) {
   const { current, settings } = useAppRuntime();
   const { notify } = useNotices();
+  const { start: startTask } = useTaskCenter();
   const statsStore = useMemo(
     () =>
       current?.id
@@ -243,12 +246,51 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
     browse.applyBrowse(browseToFolder(browse.browse, folderId));
   };
 
-  const handleCopyImage = async (imageId: number) => {
+  const handleCopyImages = async (imageIds: number[]) => {
+    if (imageIds.length === 0) return;
     try {
-      await viewerApi.copyImage(imageId);
-      notify("图片已复制到剪贴板", "success");
+      const copied = await viewerApi.copyImages(imageIds);
+      const missing = imageIds.length - copied;
+      notify(
+        copied > 1 ? `已复制 ${copied.toLocaleString()} 张图片` : "图片已复制到剪贴板",
+        "success",
+        missing > 0 ? `另有 ${missing.toLocaleString()} 张已不在图库` : undefined,
+      );
     } catch (error) {
       notify("复制图片失败", "error", errorMessage(error));
+    }
+  };
+
+  const exportSelected = async (imageIds: number[]) => {
+    if (imageIds.length === 0) return;
+    let targetDir: string;
+    try {
+      const picked = await openDialog({ directory: true, multiple: false });
+      if (typeof picked !== "string") return;
+      targetDir = picked;
+    } catch (error) {
+      notify("选择导出目录失败", "error", errorMessage(error));
+      return;
+    }
+    try {
+      const result = await startTask({
+        kind: "export",
+        scope: { type: "selected", imageIds },
+        overwrite: false,
+        recalcVisuals: false,
+        prompt: null,
+        maxTokens: null,
+        targetDir,
+        includeManifest: false,
+        conflict: "queue",
+      });
+      if (result.status === "conflict") {
+        notify("任务暂时无法开始，请稍后再试", "error");
+        return;
+      }
+      notify(`已开始导出 ${imageIds.length.toLocaleString()} 张`, "info");
+    } catch (error) {
+      notify("导出失败", "error", errorMessage(error));
     }
   };
 
@@ -308,7 +350,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 onOpenViewer={setViewerSession}
                 onCloseViewer={() => setViewerSession(null)}
                 onContextsChanged={handleContextsChanged}
-                onCopyImage={(imageId) => void handleCopyImage(imageId)}
+                onCopyImages={(imageIds) => void handleCopyImages(imageIds)}
                 onOpenImport={() => openImport()}
                 onBeginImageDrag={(imageIds, label, event) =>
                   beginDrag({ kind: "images", imageIds, label }, event)
@@ -320,6 +362,7 @@ export function LibraryWorkspace({ onOpenSettings, onChangeLibrary }: LibraryWor
                 }}
                 onOpenBatchTasks={setBatchContext}
                 onOpenBatchEdit={setBatchEditIds}
+                onExportSelected={(imageIds) => void exportSelected(imageIds)}
                 onOpenMaintenance={setMaintenanceContext}
                 onOpenOptimize={(context) => {
                   setOptimizeContext(context);

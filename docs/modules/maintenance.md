@@ -149,7 +149,7 @@
 
 ## 导出
 
-入口在维护页的「导出」分区，走 `start_batch_task` 的 `kind = "export"`（范围 + 选项的形状与批量任务一致，单开一个命令会让范围解析、预览、取消、进度各写两遍）。实现 `src-tauri/src/library/maintenance_actions.rs`。
+入口在维护页的「导出」分区，走 `start_batch_task` 的 `kind = "export"`（范围 + 选项的形状与批量任务一致，单开一个命令会让范围解析、预览、取消、进度各写两遍）。实现 `src-tauri/src/library/maintenance_actions.rs`。浏览区右键「导出到文件夹…」是另一个入口，固定 `scope = { type: "selected" }`、不附 `manifest.csv`，与维护页共用同一任务；临时区与回收站不显示这个入口。
 
 - 复制原图到用户选的目录，保留库里的文件名（`<content_hash>.<ext>`）。8 MB 缓冲流式复制，几百 MB 的原图不整个读进内存。
 - 目标已存在同名文件：**跳过并计数**，不覆盖、不改名——用户的目录里可能已经有同一次导出的结果，覆盖会悄悄吃掉别的东西。

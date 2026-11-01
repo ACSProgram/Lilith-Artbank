@@ -201,7 +201,7 @@ export function ViewerTools({
         ) : null}
         {!source.editable && !source.deleted ? (
           <p className="viewer-tool-note is-warning">
-            图片超过 {(source.maxEditPixels / 1_000_000).toLocaleString()} 百万像素，仅支持查看。
+            图片超过 {(source.maxEditPixels / 10_000).toLocaleString()} 万像素，仅支持查看。
           </p>
         ) : null}
         {gifStaticPreview(source) ? (

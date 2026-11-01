@@ -360,10 +360,10 @@ fn resolve(
     }
     if row.pixel_count() > MAX_EDIT_PIXELS {
         return Err(AppError::message(format!(
-            "图片为 {}×{}，超过编辑上限 {} 百万像素",
+            "图片为 {}×{}，超过编辑上限 {} 万像素",
             row.width,
             row.height,
-            MAX_EDIT_PIXELS / 1_000_000
+            MAX_EDIT_PIXELS / 10_000
         )));
     }
     let output_format =

@@ -427,15 +427,6 @@ impl AppState {
             .ok_or_else(|| AppError::message("尚未打开图库"))
     }
 
-    pub(crate) fn copy_source(&self, image_id: i64) -> AppResult<(PathBuf, ResourceGuard)> {
-        let (database, root) = self.query_source()?;
-        let holder = Self::short_holder("复制图片", "正在读取图片");
-        let (row, guard) =
-            content::try_lock_original(&database, &self.resources(), image_id, &holder)?;
-        let path = row.path(&crate::library::paths::LibraryPaths::new(&root))?;
-        Ok((path, guard))
-    }
-
     pub fn image_capabilities(&self, image_ids: &[i64]) -> AppResult<Vec<ImageCapabilities>> {
         let (database, _) = self.query_source()?;
         capability::image_capabilities(&database, image_ids)

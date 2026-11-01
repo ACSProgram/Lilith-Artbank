@@ -2482,3 +2482,58 @@ fn subtree_counts_survive_mismatched_path_case() {
     .unwrap();
     assert_eq!(stats.subfolder_count, 2, "子文件夹数按祖先关系算");
 }
+
+#[test]
+fn copy_paths_follow_input_order_and_skip_missing() {
+    let fixture = fixture();
+    let paths = crate::library::paths::LibraryPaths::new(&fixture.root);
+    let hash = |seed: &str| format!("{seed:0>64}");
+
+    let (texts, missing) = paths_for_ids(&fixture.session.db, &fixture.root, &[3, 1, 2]).unwrap();
+    assert_eq!(missing, 0);
+    assert_eq!(
+        texts,
+        vec![
+            paths
+                .content_file("风景", &format!("{}.jpg", hash("c")))
+                .to_string_lossy()
+                .into_owned(),
+            paths
+                .content_file("人物", &format!("{}.jpg", hash("a")))
+                .to_string_lossy()
+                .into_owned(),
+            paths
+                .content_file("人物", &format!("{}.png", hash("b")))
+                .to_string_lossy()
+                .into_owned(),
+        ]
+    );
+
+    let (texts, missing) = paths_for_ids(&fixture.session.db, &fixture.root, &[1, 999, 2]).unwrap();
+    assert_eq!(missing, 1);
+    assert_eq!(texts.len(), 2);
+    assert!(texts[0].ends_with(&format!("{}.jpg", hash("a"))));
+    assert!(texts[1].ends_with(&format!("{}.png", hash("b"))));
+
+    let (texts, missing) = paths_for_ids(&fixture.session.db, &fixture.root, &[]).unwrap();
+    assert!(texts.is_empty());
+    assert_eq!(missing, 0);
+}
+
+#[test]
+fn copy_hashes_follow_input_order_and_skip_missing() {
+    let fixture = fixture();
+    let hash = |seed: &str| format!("{seed:0>64}");
+
+    let (texts, missing) = hashes_for_ids(&fixture.session.db, &[5, 3, 1]).unwrap();
+    assert_eq!(missing, 0);
+    assert_eq!(texts, vec![hash("e"), hash("c"), hash("a")]);
+
+    let (texts, missing) = hashes_for_ids(&fixture.session.db, &[1, 999, 2]).unwrap();
+    assert_eq!(missing, 1);
+    assert_eq!(texts, vec![hash("a"), hash("b")]);
+
+    let (texts, missing) = hashes_for_ids(&fixture.session.db, &[]).unwrap();
+    assert!(texts.is_empty());
+    assert_eq!(missing, 0);
+}
