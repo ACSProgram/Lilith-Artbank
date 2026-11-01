@@ -348,6 +348,8 @@ pub enum PendingFilter {
 pub struct FeatureDemand {
     pub kind: String,
     pub dim: u32,
+    /// 非空时按包名判断：包名已经包含基身份，换基后旧记录不再算“已有”。
+    pub pack_name: Option<String>,
 }
 
 impl FeatureDemand {
@@ -355,6 +357,15 @@ impl FeatureDemand {
         Self {
             kind: kind.into(),
             dim,
+            pack_name: None,
+        }
+    }
+
+    pub fn with_pack_name(kind: impl Into<String>, dim: u32, pack_name: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            dim,
+            pack_name: Some(pack_name.into()),
         }
     }
 }
@@ -374,6 +385,19 @@ impl PendingFilter {
             Self::Features { model, dims } => {
                 let mut checks = Vec::with_capacity(dims.len());
                 for demand in dims {
+                    if let Some(pack_name) = &demand.pack_name {
+                        params.push(Value::Text(demand.kind.clone()));
+                        params.push(Value::Text(pack_name.clone()));
+                        checks.push(
+                            "NOT EXISTS (
+                                 SELECT 1 FROM feature_blobs pending_features
+                                 WHERE pending_features.image_id = images.id
+                                   AND pending_features.kind = ?
+                                   AND pending_features.pack_name = ?)"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
                     params.push(Value::Text(demand.kind.clone()));
                     params.push(Value::Text(model.clone()));
                     params.push(Value::Integer(i64::from(demand.dim)));

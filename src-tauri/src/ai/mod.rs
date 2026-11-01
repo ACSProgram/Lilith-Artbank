@@ -1,3 +1,4 @@
+pub mod basis;
 pub mod client;
 pub mod descriptors;
 pub mod embedding;

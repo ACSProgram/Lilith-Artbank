@@ -166,12 +166,13 @@ impl PreparedDescriptor {
     }
 }
 
-/// 读取某张图片的描述子原始记录；没有记录或记录损坏时返回 `None`。
+/// 读取某张图片的描述子原始记录；没有记录、记录损坏或不属于指定基时返回 `None`。
 pub fn target(
     database: &LibraryDb,
     store: &FeatureStore,
     image_id: i64,
     kind: FeatureKind,
+    pack_name: &str,
 ) -> AppResult<Option<(String, Vec<u8>)>> {
     let dim = kind
         .fixed_dim()
@@ -186,8 +187,9 @@ pub fn target(
                  WHERE feature_blobs.image_id = ?1
                    AND feature_blobs.kind = ?2
                    AND feature_blobs.dim = ?3
+                   AND feature_blobs.pack_name = ?4
                    AND images.deleted_at IS NULL",
-                rusqlite::params![image_id, kind.name(), dim],
+                rusqlite::params![image_id, kind.name(), dim, pack_name],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -210,37 +212,37 @@ pub fn target(
 
 /// 按描述子重排候选：返回 (按分数降序的命中, 缺少描述子的张数)。
 ///
+/// 只读 `pack_name` 指定的那一个包：包名已经带基身份，换基后的旧记录不在候选里。
 /// 缺少记录或记录损坏都计入 missing；调用方决定是否整次拒绝，避免混入全局顺序。
+#[allow(clippy::too_many_arguments)]
 pub fn rerank(
     database: &LibraryDb,
     store: &FeatureStore,
     kind: FeatureKind,
     model: &str,
+    pack_name: &str,
     prepared: &PreparedDescriptor,
     image_ids: &[i64],
     limit: usize,
 ) -> AppResult<(Vec<(i64, f32)>, usize)> {
-    let pointers = pointers(database, kind, model, image_ids)?;
-    let mut by_pack: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
-    for (id, (pack_name, offset)) in pointers {
-        by_pack.entry(pack_name).or_default().push((id, offset));
-    }
+    let pointers = pointers(database, kind, model, pack_name, image_ids)?;
     let record_len = kind
         .fixed_dim()
         .ok_or_else(|| AppError::message(format!("{} 不是语义描述子", kind.name())))?
         as usize;
-    let mut scored = Vec::with_capacity(image_ids.len());
-    for (pack_name, rows) in by_pack {
-        let map = store.mmap(&pack_name)?;
-        let partial: Vec<(i64, f32)> = rows
-            .par_iter()
-            .filter_map(|(id, offset)| {
-                record_slice(&map, *offset, record_len)
-                    .and_then(|record| prepared.score(record))
-                    .map(|score| (*id, score))
-            })
-            .collect();
-        scored.extend(partial);
+    let rows: Vec<(i64, u64)> = pointers.into_iter().collect();
+    let mut scored = Vec::with_capacity(rows.len());
+    if !rows.is_empty() {
+        let map = store.mmap(pack_name)?;
+        scored.extend(
+            rows.par_iter()
+                .filter_map(|(id, offset)| {
+                    record_slice(&map, *offset, record_len)
+                        .and_then(|record| prepared.score(record))
+                        .map(|score| (*id, score))
+                })
+                .collect::<Vec<(i64, f32)>>(),
+        );
     }
     let missing = image_ids.len().saturating_sub(scored.len());
     // 与 embedding 扫描同一套顺序：分数降序，同分按 id 升序。
@@ -249,13 +251,14 @@ pub fn rerank(
     Ok((scored, missing))
 }
 
-/// 批量读取候选图的描述子指针；缺失的 id 不会出现在结果里。
+/// 批量读取候选图的描述子偏移；缺失的 id 与不属于指定基的记录不会出现在结果里。
 fn pointers(
     database: &LibraryDb,
     kind: FeatureKind,
     model: &str,
+    pack_name: &str,
     image_ids: &[i64],
-) -> AppResult<HashMap<i64, (String, u64)>> {
+) -> AppResult<HashMap<i64, u64>> {
     let dim = kind
         .fixed_dim()
         .ok_or_else(|| AppError::message(format!("{} 不是语义描述子", kind.name())))?;
@@ -263,33 +266,28 @@ fn pointers(
     for chunk in image_ids.chunks(400) {
         let marks = placeholders(chunk.len());
         let sql = format!(
-            "SELECT image_id, pack_name, pack_offset
+            "SELECT image_id, pack_offset
              FROM feature_blobs
-             WHERE kind = ?1 AND model = ?2 AND dim = ?3
+             WHERE kind = ?1 AND model = ?2 AND dim = ?3 AND pack_name = ?4
                AND image_id IN ({marks})"
         );
         let mut values = vec![
             Value::Text(kind.name().to_owned()),
             Value::Text(model.to_owned()),
             Value::Integer(i64::from(dim)),
+            Value::Text(pack_name.to_owned()),
         ];
         values.extend(chunk.iter().map(|id| Value::Integer(*id)));
         let rows = database.with_reader(|connection| {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
                 .query_map(params_from_iter(values.iter()), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)? as u64,
-                    ))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
-        for (id, pack_name, offset) in rows {
-            found.insert(id, (pack_name, offset));
-        }
+        found.extend(rows);
     }
     Ok(found)
 }
@@ -318,6 +316,7 @@ pub fn store(
     store: &FeatureStore,
     image_id: i64,
     model: &str,
+    basis_id: Option<&str>,
     kind: FeatureKind,
     vector: &QuantizedVector,
 ) -> AppResult<()> {
@@ -333,7 +332,7 @@ pub fn store(
     }
     // 长度与内容的一致性由 QuantizedVector::new 与 FeatureStore::append 分别守住。
     let bytes: Vec<u8> = vector.values.iter().map(|value| *value as u8).collect();
-    let location = store.append(kind, model, expected, FeatureDtype::I8, &bytes)?;
+    let location = store.append(kind, model, expected, FeatureDtype::I8, basis_id, &bytes)?;
     write_pointer(database, image_id, kind, model, expected, &location)
 }
 
@@ -367,6 +366,16 @@ mod tests {
         (temp, session, store)
     }
 
+    fn pack_of(kind: FeatureKind) -> String {
+        crate::ai::pack::pack_name(
+            kind,
+            "model",
+            kind.fixed_dim().unwrap(),
+            crate::ai::pack::FeatureDtype::I8,
+            None,
+        )
+    }
+
     #[test]
     fn stores_quantized_records_and_updates_pointers() {
         let (_temp, session, packs) = fixture();
@@ -375,7 +384,16 @@ mod tests {
             vec![3_i8; FeatureKind::SPP_RECORD_DIM as usize],
         )
         .unwrap();
-        store(&session.db, &packs, 1, "model", FeatureKind::Spp, &spp).unwrap();
+        store(
+            &session.db,
+            &packs,
+            1,
+            "model",
+            None,
+            FeatureKind::Spp,
+            &spp,
+        )
+        .unwrap();
         let (kind, dim, length): (String, u32, u32) = session
             .db
             .with_reader(|connection| {
@@ -465,15 +483,37 @@ mod tests {
             vec![3_i8; FeatureKind::SPP_RECORD_DIM as usize],
         )
         .unwrap();
-        store(&session.db, &packs, 1, "model", FeatureKind::Spp, &spp).unwrap();
+        store(
+            &session.db,
+            &packs,
+            1,
+            "model",
+            None,
+            FeatureKind::Spp,
+            &spp,
+        )
+        .unwrap();
 
-        let (model, bytes) = target(&session.db, &packs, 1, FeatureKind::Spp)
-            .unwrap()
-            .unwrap();
+        let (model, bytes) = target(
+            &session.db,
+            &packs,
+            1,
+            FeatureKind::Spp,
+            &pack_of(FeatureKind::Spp),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(model, "model");
         assert_eq!(bytes.len(), FeatureKind::SPP_RECORD_DIM as usize);
 
-        let pointers = pointers(&session.db, FeatureKind::Spp, "model", &[1, 2]).unwrap();
+        let pointers = pointers(
+            &session.db,
+            FeatureKind::Spp,
+            "model",
+            &pack_of(FeatureKind::Spp),
+            &[1, 2],
+        )
+        .unwrap();
         assert_eq!(pointers.len(), 1);
         assert!(pointers.contains_key(&1));
     }
@@ -511,6 +551,7 @@ mod tests {
             &packs,
             1,
             "model",
+            None,
             FeatureKind::Spp,
             &as_vector(&query_bytes),
         )
@@ -520,6 +561,7 @@ mod tests {
             &packs,
             2,
             "model",
+            None,
             FeatureKind::Spp,
             &as_vector(&shifted_bytes),
         )
@@ -529,6 +571,7 @@ mod tests {
             &packs,
             3,
             "model",
+            None,
             FeatureKind::Spp,
             &as_vector(&shifted_bytes),
         )
@@ -540,6 +583,7 @@ mod tests {
             &packs,
             FeatureKind::Spp,
             "model",
+            &pack_of(FeatureKind::Spp),
             &prepared,
             &[2, 3, 1],
             10,
@@ -554,6 +598,7 @@ mod tests {
             &packs,
             FeatureKind::Spp,
             "model",
+            &pack_of(FeatureKind::Spp),
             &prepared,
             &[1, 99],
             10,
@@ -567,13 +612,25 @@ mod tests {
         let (_temp, session, packs) = fixture();
         assert!(QuantizedVector::new(4, vec![0; 3]).is_err());
         let wrong = QuantizedVector::new(4, vec![0; 4]).unwrap();
-        assert!(store(&session.db, &packs, 1, "model", FeatureKind::Spp, &wrong).is_err());
         assert!(
             store(
                 &session.db,
                 &packs,
                 1,
                 "model",
+                None,
+                FeatureKind::Spp,
+                &wrong
+            )
+            .is_err()
+        );
+        assert!(
+            store(
+                &session.db,
+                &packs,
+                1,
+                "model",
+                None,
                 FeatureKind::Embedding,
                 &wrong
             )

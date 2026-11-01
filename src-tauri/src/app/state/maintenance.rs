@@ -10,6 +10,7 @@ use tauri::AppHandle;
 
 use crate::{
     ai::{
+        basis,
         job::{AiJobKind, AiJobRequest},
         runtime::{GroupOptions, SimilarityGroupsResult},
     },
@@ -494,7 +495,9 @@ impl AppState {
         let (database, _, root) = self
             .library_handles()
             .ok_or_else(|| AppError::message("尚未打开图库"))?;
-        batch_preview::preview(&database, &root, &request)
+        let settings = self.settings.snapshot().ai;
+        let basis_id = basis::active_basis(&settings, &root)?.map(|active| active.id);
+        batch_preview::preview(&database, &root, &request, basis_id.as_deref())
     }
 
     // ---------------- 维护：包回收、检查、孤儿、导出 ----------------

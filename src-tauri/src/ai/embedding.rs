@@ -54,6 +54,7 @@ pub fn store(
         model,
         dim,
         FeatureDtype::F16,
+        None,
         &bytes,
     )?;
     write_pointer(
@@ -1257,6 +1258,7 @@ mod perf_tests {
                     "bench-model",
                     DIM,
                     FeatureDtype::F16,
+                    None,
                     &bytes,
                 )
                 .unwrap();

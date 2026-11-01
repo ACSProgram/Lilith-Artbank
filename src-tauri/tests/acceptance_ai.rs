@@ -375,6 +375,11 @@ fn configure_ai(
     stub: &acceptance_support::ai_stub::Stub,
     report: &mut Report,
 ) {
+    // 假服务不跑模型；小库会直接复制这份通用兜底，不需要拟合端点。
+    let clip_model = workspace.scratch().join("clip-model-stub");
+    fs::create_dir_all(&clip_model).expect("无法创建假模型目录");
+    fs::write(clip_model.join("spp_basis.npz"), b"stub-spp-basis").expect("无法写入通用基");
+    fs::write(clip_model.join("maxsim_basis.npz"), b"stub-maxsim-basis").expect("无法写入通用基");
     let settings = headless(workspace, "settings").action("get").finish();
     report.record(&settings);
     settings.expect_ok();
@@ -385,7 +390,7 @@ fn configure_ai(
     value["ai"]["pythonPath"] = Value::Null;
     value["ai"]["serverScript"] = Value::Null;
     value["ai"]["modelPath"] = Value::Null;
-    value["ai"]["clipModelPath"] = Value::Null;
+    value["ai"]["clipModelPath"] = json!(clip_model.to_string_lossy());
     value["ai"]["prewarmImports"] = json!(false);
     let saved = headless(workspace, "settings")
         .action("save")

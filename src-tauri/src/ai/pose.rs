@@ -52,6 +52,7 @@ pub fn store(
         model,
         POSE_VALUES as u32,
         FeatureDtype::F32,
+        None,
         &bytes,
     )?;
     let now = now_ms();

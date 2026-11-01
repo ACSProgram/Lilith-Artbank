@@ -96,6 +96,8 @@ class _LoadedTower:
     # 图片塔额外持有两份白化基、V 投影权重与注意力捕获；文本塔这几项为空。
     spp_basis: Optional[Basis] = None
     maxsim_basis: Optional[Basis] = None
+    # 当前加载的基身份；None 表示没有指定具体基（例如拟合时只借用图片塔）。
+    basis_id: Optional[str] = None
     v_weight: Any = None
     v_bias: Any = None
     attention: Optional[dict] = None
@@ -132,7 +134,9 @@ class ClipCache:
         with self._state_lock:
             return self._tower is not None and self._tower.kind == kind
 
-    def ensure(self, kind: str) -> None:
+    def ensure(
+        self, kind: str, basis: Optional[tuple[Path, str]] = None
+    ) -> None:
         if kind not in TOWER_PREFIX:
             raise CapabilityUnavailable(f"未知的 CLIP 塔：{kind}")
         if self._info is None:
@@ -141,11 +145,21 @@ class ClipCache:
             # 不把旧塔存进局部变量：局部引用会活到加载新塔的那一刻，等于两块塔
             # 同时占显存，和“同一时间只驻留一个塔”的前提相冲突。
             if self._tower is not None and self._tower.kind == kind:
-                self._tower.last_used = time.monotonic()
-                return
+                # `basis=None` 表示不要求特定基：拟合或只要全局向量时直接复用。
+                if kind != "image" or basis is None or self._tower.basis_id == basis[1]:
+                    self._tower.last_used = time.monotonic()
+                    return
             if self._tower is not None:
                 self._unload_locked("切换模型塔")
-            self._load_locked(kind)
+            self._load_locked(kind, basis)
+
+    def basis_info(self) -> tuple[Optional[str], Optional[int]]:
+        """当前图片塔的基身份与训练样本数；塔未加载或缺基时为空。"""
+        with self._state_lock:
+            tower = self._tower
+            if tower is None or tower.kind != "image" or tower.spp_basis is None:
+                return None, None
+            return tower.basis_id, tower.spp_basis.samples
 
     @contextmanager
     def use(self, kind: str) -> Iterator[_LoadedTower]:
@@ -166,7 +180,9 @@ class ClipCache:
         with self._lock:
             self._unload_locked("服务关闭")
 
-    def _load_locked(self, kind: str) -> None:
+    def _load_locked(
+        self, kind: str, basis: Optional[tuple[Path, str]] = None
+    ) -> None:
         started = time.monotonic()
         try:
             torch, deps = import_deps()
@@ -209,12 +225,20 @@ class ClipCache:
             model.eval()
             spp_basis = maxsim_basis = v_weight = v_bias = attention = None
             attention_handle = None
+            basis_id = None
             if kind == "image":
-                # 基与图片塔一起加载：缺少基时整项图片能力不可用，不做静默降级。
+                # 有显式基目录时必须加载成功；没有显式基时先看模型目录的通用兜底，
+                # 连兜底也没有就只加载塔本身（拟合和全局向量仍然可用）。
+                basis_dir = basis[0] if basis is not None else self._info.model_dir
+                basis_id = basis[1] if basis is not None else None
                 try:
-                    spp_basis, maxsim_basis = load_image_bases(self._info.model_dir)
+                    spp_basis, maxsim_basis = load_image_bases(basis_dir)
                 except FeatureBasisMissing as error:
-                    raise CapabilityUnavailable(str(error)) from error
+                    if basis is not None:
+                        raise CapabilityUnavailable(str(error)) from error
+                    LOGGER.warning(
+                        "图片塔没有白化基，语义描述子暂不可用：%s", error
+                    )
                 v_weight, v_bias = v_projection(model)
                 attention = {}
                 attention_handle = (
@@ -245,17 +269,19 @@ class ClipCache:
                 last_used=time.monotonic(),
                 spp_basis=spp_basis,
                 maxsim_basis=maxsim_basis,
+                basis_id=basis_id,
                 v_weight=v_weight,
                 v_bias=v_bias,
                 attention=attention,
                 attention_handle=attention_handle,
             )
         LOGGER.info(
-            "已加载%s：model=%s device=%s dtype=%s 耗时=%.1fs（含预热 %.1fs）",
+            "已加载%s：model=%s device=%s dtype=%s basis=%s 耗时=%.1fs（含预热 %.1fs）",
             TOWER_LABEL[kind],
             self._info.model_name,
             device,
             dtype,
+            basis_id or ("通用兜底" if spp_basis is not None else "无"),
             time.monotonic() - started,
             warmup,
         )

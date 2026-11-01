@@ -73,6 +73,7 @@ impl AppState {
             session.thumbs.clone(),
             PathBuf::from(&info.path),
         );
+        self.prepare_semantic_basis();
         // 刚开库算「人在」，别让空闲循环在用户还没碰过界面时先动手。
         activity::touch();
         *self.library.lock() = Some(session);
@@ -112,6 +113,7 @@ impl AppState {
             session.thumbs.clone(),
             PathBuf::from(&info.path),
         );
+        self.prepare_semantic_basis();
         // 刚开库算「人在」，别让空闲循环在用户还没碰过界面时先动手。
         activity::touch();
         *self.library.lock() = Some(session);
@@ -132,6 +134,14 @@ impl AppState {
             self.after_library_open();
         }
         Ok(info)
+    }
+
+    /// 开库只做轻量基准备：已有就用，小库复制通用兜底；大库等第一次生成语义特征时再拟合。
+    fn prepare_semantic_basis(&self) {
+        let settings = self.settings.snapshot().ai;
+        if let Err(error) = self.ai.prepare_local_basis(&settings) {
+            log::warn!("准备语义特征基失败：{error}");
+        }
     }
 
     /// 开库时起空闲回收线程；换库时先停旧的，避免两个循环同时提交任务。

@@ -30,7 +30,7 @@ use crate::{
     library::{
         db::LibraryDb,
         paths::LibraryPaths,
-        query::{self, FeatureDemand, ImageRow, LibraryQuery, PendingFilter},
+        query::{self, ImageRow, LibraryQuery, PendingFilter},
         similarity::{self as library_similarity, GroupProgress},
         thumbs::ThumbPack,
         viewer::PoseData,
@@ -38,10 +38,11 @@ use crate::{
 };
 
 use super::{
+    basis,
     client::{AiClient, Health},
     descriptors, embedding,
     job::{self, AiJobKind, AiJobRequest, JobContext},
-    pack::{FeatureKind, FeatureStore, semantic_feature_demands},
+    pack::{self, FeatureKind, FeatureStore, semantic_feature_demands},
     pose,
     process::{AiProcess, MAX_START_ATTEMPTS, ProcessState, ProcessStatus, launch_spec},
 };
@@ -95,7 +96,7 @@ impl FeatureMode {
     }
 }
 
-/// 全库还缺多少张的语义描述子；批量任务跑完这个数会归零。
+/// 范围内还缺多少张的语义描述子；批量任务跑完这个数会归零。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SemanticFeaturePending {
@@ -293,18 +294,33 @@ fn parse_score_threshold(value: Option<f64>, label: &str) -> AppResult<Option<f3
     }
 }
 
-/// 非临时区里缺任一描述子的图片数；与批量任务的待处理清单同一条件。
-fn feature_pending(database: &LibraryDb, model: &str, dim: u32) -> AppResult<u64> {
-    let dims: Vec<FeatureDemand> = semantic_feature_demands(dim);
-    Ok(query::pending_stats(
-        database,
-        LibraryQuery::default(),
-        &PendingFilter::Features {
-            model: model.to_owned(),
-            dims,
-        },
-    )?
-    .will_process)
+/// 某个范围内还缺多少张语义描述子；`scope` 省略表示全库（不含临时区）。
+///
+/// 与批量任务的待处理清单同一条件。范围化既让门限只看用户选的这批图，也让
+/// 计数从全库几十万行降到范围内的行数。
+fn pending_descriptors(
+    handles: &LibraryHandles,
+    model: &str,
+    dim: u32,
+    basis_id: Option<&str>,
+    scope: Option<&TaskScope>,
+) -> AppResult<u64> {
+    let filter = PendingFilter::Features {
+        model: model.to_owned(),
+        dims: semantic_feature_demands(model, dim, basis_id),
+    };
+    let stats = match scope {
+        Some(TaskScope::Selected { image_ids }) => {
+            query::selected_pending_stats(&handles.database, image_ids, &filter)?
+        }
+        Some(scope) => query::pending_stats(
+            &handles.database,
+            scope.to_library_query()?.unwrap_or_default(),
+            &filter,
+        )?,
+        None => query::pending_stats(&handles.database, LibraryQuery::default(), &filter)?,
+    };
+    Ok(stats.will_process)
 }
 
 /// 单张参考直接用自身主色；多张时等权合并成一组代表色。
@@ -443,6 +459,9 @@ impl AiRuntime {
     ) {
         let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.inner.store.set_root(LibraryPaths::new(&root).features);
+        if let Err(error) = basis::release_pending(&database, &root) {
+            log::warn!("打开图库时释放旧语义特征包失败：{error}");
+        }
         *self.inner.library.write() = Some(LibraryHandles {
             generation,
             library_id,
@@ -470,6 +489,21 @@ impl AiRuntime {
     pub fn invalidate_similarity(&self) {
         *self.inner.results.lock() = None;
         *self.inner.visuals.write() = None;
+    }
+
+    /// 图库打开时的轻量准备：库内已有基直接用；小库复制通用兜底。
+    ///
+    /// 大库的专用基等到第一次生成语义特征时在批量任务里拟合，不在这里启动任务。
+    pub fn prepare_local_basis(
+        &self,
+        settings: &AiSettings,
+    ) -> AppResult<Option<basis::FeatureBasis>> {
+        let handles = self.handles()?;
+        let result = basis::prepare_local(&handles.database, settings, &handles.root);
+        if let Err(error) = basis::release_pending(&handles.database, &handles.root) {
+            log::warn!("释放旧语义特征包失败：{error}");
+        }
+        result
     }
 
     pub fn status(&self, settings: &AiSettings) -> AiStatus {
@@ -1026,6 +1060,7 @@ impl AiRuntime {
                             threshold,
                             limit,
                             allowed.as_ref(),
+                            scope,
                         )?
                     }
                 }
@@ -1125,7 +1160,8 @@ impl AiRuntime {
 
     /// SPP / MaxSim 两段式：全局阈值粗筛 → 取前 20% → 按描述子重排。
     ///
-    /// 阈值始终是 embedding 相似度；描述子只改变候选集内部的顺序。
+    /// 阈值始终是 embedding 相似度；描述子只改变候选集内部的顺序。门限跟着 `scope`：
+    /// 用户只处理了某个文件夹时，只要那个范围内齐了就能用这两种口径。
     #[allow(clippy::too_many_arguments)]
     fn similar_ids_by_feature(
         &self,
@@ -1136,14 +1172,38 @@ impl AiRuntime {
         threshold: Option<f32>,
         limit: usize,
         allowed: Option<&HashSet<i64>>,
+        scope: Option<&TaskScope>,
     ) -> AppResult<(Vec<(i64, f32)>, usize)> {
         let kind = mode
             .descriptor_kind()
             .ok_or_else(|| AppError::message("整体模式不需要描述子重排"))?;
         let embedding_target = embedding::target(&handles.database, &self.inner.store, target_id)?
             .ok_or_else(|| AppError::message("这张图片还没有语义特征，请先运行 AI 任务"))?;
-        let Some((descriptor_model, target_bytes)) =
-            descriptors::target(&handles.database, &self.inner.store, target_id, kind)?
+        let committed = basis::load_meta(&handles.database)?;
+        let basis_id = match &committed {
+            Some(basis) if basis.model != embedding_target.model => {
+                return Err(AppError::message(format!(
+                    "语义特征基属于旧模型（{}），与当前向量模型（{}）不一致，请重新生成语义特征",
+                    basis.model, embedding_target.model
+                )));
+            }
+            Some(basis) => Some(basis.id.as_str()),
+            None => None,
+        };
+        let expected_pack = pack::pack_name(
+            kind,
+            &embedding_target.model,
+            kind.fixed_dim().expect("描述子有固定维度"),
+            pack::FeatureDtype::I8,
+            basis_id,
+        );
+        let Some((descriptor_model, target_bytes)) = descriptors::target(
+            &handles.database,
+            &self.inner.store,
+            target_id,
+            kind,
+            &expected_pack,
+        )?
         else {
             return Err(AppError::message(format!(
                 "这张图片还没有「{}」需要的语义描述子，请先运行批量任务生成语义特征",
@@ -1158,14 +1218,21 @@ impl AiRuntime {
                 descriptor_model, embedding_target.model
             )));
         }
-        let pending = feature_pending(
-            &handles.database,
+        let pending = pending_descriptors(
+            handles,
             &embedding_target.model,
             embedding_target.dim,
+            basis_id,
+            scope,
         )?;
         if pending > 0 {
+            let where_ = if matches!(scope, None | Some(TaskScope::Library)) {
+                "全库"
+            } else {
+                "当前范围"
+            };
             return Err(AppError::message(format!(
-                "全库还有 {pending} 张图片没有语义特征，补齐后才能用「{}」",
+                "{where_}还有 {pending} 张图片没有语义特征，补齐后才能用「{}」",
                 mode.label()
             )));
         }
@@ -1203,6 +1270,7 @@ impl AiRuntime {
             &self.inner.store,
             kind,
             &embedding_target.model,
+            &expected_pack,
             &prepared,
             &ids,
             limit,
@@ -1216,10 +1284,16 @@ impl AiRuntime {
         Ok((scored, total_hits))
     }
 
-    /// 全库还缺多少张语义描述子；界面与 MCP 的模式门限共用。
+    /// 范围内还缺多少张语义描述子；界面与 MCP 的模式门限共用。
     ///
-    /// 模型与维度取全库张数最多的那一组，与相似分组同口径。
-    pub fn semantic_feature_pending(&self) -> AppResult<SemanticFeaturePending> {
+    /// 模型与维度取全库张数最多的那一组，与相似分组同口径。基身份优先用已提交的
+    /// `meta.feature_basis`；meta 还没写成功时退回库内文件，宁可多报待补齐张数，
+    /// 也不让旧包里的记录被当成“已有”。`scope` 省略表示全库。
+    pub fn semantic_feature_pending(
+        &self,
+        settings: &AiSettings,
+        scope: Option<&TaskScope>,
+    ) -> AppResult<SemanticFeaturePending> {
         let handles = self.handles()?;
         let model = embedding::distinct_groups(&handles.database)?
             .into_iter()
@@ -1227,8 +1301,12 @@ impl AiRuntime {
         let Some((model, dim, _)) = model else {
             return Ok(SemanticFeaturePending { remaining: 0 });
         };
+        let basis_id = match basis::load_meta(&handles.database)? {
+            Some(basis) => Some(basis.id),
+            None => basis::active_basis(settings, &handles.root)?.map(|active| active.id),
+        };
         Ok(SemanticFeaturePending {
-            remaining: feature_pending(&handles.database, &model, dim)?,
+            remaining: pending_descriptors(&handles, &model, dim, basis_id.as_deref(), scope)?,
         })
     }
 
@@ -1784,6 +1862,18 @@ mod tests {
         embedding::store(&session.db, &packs, 1, "model", 4, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         embedding::store(&session.db, &packs, 2, "model", 4, &[0.9, 0.1, 0.0, 0.0]).unwrap();
         embedding::store(&session.db, &packs, 3, "model", 4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        let basis_id = "0123456789abcdef";
+        crate::ai::basis::save_meta(
+            &session.db,
+            &crate::ai::basis::FeatureBasis {
+                model: "model".into(),
+                id: basis_id.into(),
+                samples: 3,
+                source: "library".into(),
+                fitted_at: 1,
+            },
+        )
+        .unwrap();
         let query_spp: Vec<usize> = (0..64).collect();
         let shifted_spp: Vec<usize> = (0..64).map(|index| (index + 1) % 64).collect();
         for (id, peaks) in [(1, &query_spp), (2, &shifted_spp), (3, &query_spp)] {
@@ -1792,6 +1882,7 @@ mod tests {
                 &packs,
                 id,
                 "model",
+                Some(basis_id),
                 FeatureKind::Spp,
                 &descriptor_vector(FeatureKind::Spp, peaks),
             )
@@ -1801,6 +1892,7 @@ mod tests {
                 &packs,
                 id,
                 "model",
+                Some(basis_id),
                 FeatureKind::MaxSim,
                 &descriptor_vector(FeatureKind::MaxSim, &(0..32).collect::<Vec<_>>()),
             )
@@ -1850,7 +1942,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("还有 1 张图片没有语义特征"), "{error}");
-        assert_eq!(semantic_feature_demands(4).len(), 3);
+        assert_eq!(
+            semantic_feature_demands("model", 4, Some(basis_id)).len(),
+            3
+        );
     }
 
     #[test]

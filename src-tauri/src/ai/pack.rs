@@ -72,11 +72,30 @@ impl FeatureKind {
 }
 
 /// 语义批量任务的待处理条件：三种描述子缺一不可。
-pub fn semantic_feature_demands(embedding_dim: u32) -> Vec<FeatureDemand> {
+///
+/// `basis_id` 是当前生效的基身份。`spp` / `maxsim` 按包含基身份的包名判断，
+/// 换基后旧包里的记录自动变成“待处理”；传 `None` 表示还没有可用的基，
+/// 两种描述子一律按缺失处理。
+pub fn semantic_feature_demands(
+    model: &str,
+    embedding_dim: u32,
+    basis_id: Option<&str>,
+) -> Vec<FeatureDemand> {
+    let descriptor = |kind: FeatureKind| {
+        let dim = kind.fixed_dim().expect("描述子有固定维度");
+        match basis_id {
+            Some(basis_id) => FeatureDemand::with_pack_name(
+                kind.name(),
+                dim,
+                pack_name(kind, model, dim, FeatureDtype::I8, Some(basis_id)),
+            ),
+            None => FeatureDemand::with_pack_name(kind.name(), dim, "__no_basis__"),
+        }
+    };
     vec![
         FeatureDemand::new(FeatureKind::Embedding.name(), embedding_dim),
-        FeatureDemand::new(FeatureKind::Spp.name(), FeatureKind::SPP_RECORD_DIM),
-        FeatureDemand::new(FeatureKind::MaxSim.name(), FeatureKind::MAXSIM_RECORD_DIM),
+        descriptor(FeatureKind::Spp),
+        descriptor(FeatureKind::MaxSim),
     ]
 }
 
@@ -217,6 +236,12 @@ impl FeatureStore {
         }
     }
 
+    /// 关闭所有写句柄。切基后释放旧包前调用：Windows 上只要还有句柄就删不掉文件。
+    pub fn release_handles(&self) {
+        self.sync_writers();
+        self.writers.lock().clear();
+    }
+
     fn root(&self) -> AppResult<PathBuf> {
         let root = self.root.read().clone();
         if root.as_os_str().is_empty() {
@@ -230,12 +255,16 @@ impl FeatureStore {
     }
 
     /// 追加一条记录；返回数据库需要保存的指针。
+    ///
+    /// `basis_id` 只对 `spp` / `maxsim` 有意义；embedding 与 pose 传 `None`，
+    /// 包名与存量记录保持一致。
     pub fn append(
         &self,
         kind: FeatureKind,
         model: &str,
         dim: u32,
         dtype: FeatureDtype,
+        basis_id: Option<&str>,
         bytes: &[u8],
     ) -> AppResult<FeatureLocation> {
         if bytes.is_empty() || dim == 0 {
@@ -259,7 +288,7 @@ impl FeatureStore {
             )));
         }
 
-        let pack_name = pack_name(kind, model, dim, dtype);
+        let pack_name = pack_name(kind, model, dim, dtype, basis_id);
         let root = self.root()?;
         std::fs::create_dir_all(&root)?;
         let path = root.join(&pack_name);
@@ -468,7 +497,13 @@ fn read_header(file: &mut File, path: &Path) -> AppResult<PackHeader> {
     })
 }
 
-fn pack_name(kind: FeatureKind, model: &str, dim: u32, dtype: FeatureDtype) -> String {
+pub(crate) fn pack_name(
+    kind: FeatureKind,
+    model: &str,
+    dim: u32,
+    dtype: FeatureDtype,
+    basis_id: Option<&str>,
+) -> String {
     let mut slug = String::new();
     for ch in model.chars().take(48) {
         if ch.is_ascii_alphanumeric() {
@@ -478,7 +513,15 @@ fn pack_name(kind: FeatureKind, model: &str, dim: u32, dtype: FeatureDtype) -> S
         }
     }
     let slug = slug.trim_matches('-');
-    let digest = blake3::hash(model.as_bytes()).to_hex();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.as_bytes());
+    if let Some(basis_id) = basis_id {
+        // 为 None 时哈希输入与旧版本完全一致，存量包名不变。
+        hasher.update(b"|basis|");
+        hasher.update(basis_id.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let digest = digest.to_hex();
     let hash = &digest[..8];
     format!(
         "{}-{}-{}-{}-{}.pack",
@@ -506,6 +549,7 @@ mod tests {
                 "siglip2-giant-opt-patch16-384",
                 4,
                 FeatureDtype::F16,
+                None,
                 &[0_u8; 8],
             )
             .unwrap();
@@ -515,6 +559,7 @@ mod tests {
                 "siglip2-giant-opt-patch16-384",
                 4,
                 FeatureDtype::F16,
+                None,
                 &[1_u8; 8],
             )
             .unwrap();
@@ -548,6 +593,7 @@ mod tests {
                     "model",
                     4,
                     FeatureDtype::F16,
+                    None,
                     &[0_u8; 7]
                 )
                 .is_err()
@@ -558,6 +604,7 @@ mod tests {
                 "model",
                 4,
                 FeatureDtype::F16,
+                None,
                 &[0_u8; 8],
             )
             .unwrap();
@@ -579,6 +626,7 @@ mod tests {
                 "model",
                 4,
                 FeatureDtype::F16,
+                None,
                 &[0_u8; 8],
             )
             .unwrap();
@@ -598,6 +646,7 @@ mod tests {
                 "model",
                 4,
                 FeatureDtype::F16,
+                None,
                 &[1_u8; 8],
             )
             .unwrap();
@@ -627,6 +676,7 @@ mod tests {
                 "model",
                 FeatureKind::Spp.fixed_dim().unwrap(),
                 FeatureDtype::I8,
+                None,
                 &spp,
             )
             .unwrap();
@@ -636,6 +686,7 @@ mod tests {
                 "model",
                 FeatureKind::MaxSim.fixed_dim().unwrap(),
                 FeatureDtype::I8,
+                None,
                 &maxsim,
             )
             .unwrap();
@@ -669,6 +720,7 @@ mod tests {
                     "model",
                     128,
                     FeatureDtype::I8,
+                    None,
                     &[0_u8; 128]
                 )
                 .is_err()
@@ -680,6 +732,7 @@ mod tests {
                     "model",
                     64,
                     FeatureDtype::I8,
+                    None,
                     &[0_u8; 64]
                 )
                 .is_err()
@@ -693,9 +746,42 @@ mod tests {
             "SigLIP2/giant opt patch16-384",
             1536,
             FeatureDtype::F16,
+            None,
         );
         assert!(name.starts_with("embedding-siglip2-giant-opt-patch16-384-1536-f16-"));
         assert!(name.ends_with(".pack"));
         assert!(!name.contains('/'));
+    }
+
+    #[test]
+    fn basis_changes_descriptor_pack_but_not_embedding_pack() {
+        let embedding = pack_name(
+            FeatureKind::Embedding,
+            "model",
+            1536,
+            FeatureDtype::F16,
+            None,
+        );
+        let legacy = blake3::hash(b"model").to_hex();
+        assert_eq!(
+            embedding,
+            format!("embedding-model-1536-f16-{}.pack", &legacy[..8]),
+            "embedding 传 None 时哈希输入必须与旧版本完全一致"
+        );
+        let first = pack_name(
+            FeatureKind::Spp,
+            "model",
+            8192,
+            FeatureDtype::I8,
+            Some("0123456789abcdef"),
+        );
+        let second = pack_name(
+            FeatureKind::Spp,
+            "model",
+            8192,
+            FeatureDtype::I8,
+            Some("fedcba9876543210"),
+        );
+        assert_ne!(first, second, "换基后描述子必须落到新包");
     }
 }

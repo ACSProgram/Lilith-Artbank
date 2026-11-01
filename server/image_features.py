@@ -5,8 +5,9 @@
   SPP     24×24 patch → 8×8 均值池化 → 白化到 128 维 → 每格 L2 归一化 → int8
   MaxSim  注意力 top-32 → 池化头 V 投影 → 白化到 64 维 → 每位 L2 归一化 → int8
 
-白化基是离线拟合产物，与模型一起冻结：``spp_basis.npz`` / ``maxsim_basis.npz``
-放在模型目录（与 ``config.json`` 同级）。基缺失时图片能力整体不可用，不做静默降级。
+白化基属于图库派生数据：``spp_basis.npz`` / ``maxsim_basis.npz`` 放在图库内的
+``.artbank/basis/<clip_model>/``。模型目录里的同名文件是通用兜底，只在小库凑不够
+样本时复制到库内。基缺失时全局 embedding 仍可用，但语义描述子不可用。
 
 两种描述子都会摊平成一条 int8 记录；量化的固定 scale 写在基文件里，
 所以相似度计算（余弦/点积）中 scale 会自然抵消，读取端不需要逐条元数据。
@@ -14,7 +15,10 @@
 
 from __future__ import annotations
 
+import io
 import math
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -62,11 +66,11 @@ class Basis:
         return quantized.astype(np.int8)
 
 
-def load_basis(model_dir: Path, kind: str) -> Basis:
-    path = model_dir / f"{kind}_basis.npz"
+def load_basis(basis_dir: Path, kind: str) -> Basis:
+    path = basis_dir / f"{kind}_basis.npz"
     if not path.is_file():
         raise FeatureBasisMissing(
-            f"缺少{_label(kind)}白化基 {path.name}；请先用 server/tools/fit_basis.py 生成"
+            f"缺少{_label(kind)}白化基 {path.name}；请等待应用准备语义特征基"
         )
     try:
         with np.load(path, allow_pickle=False) as data:
@@ -108,9 +112,9 @@ def load_basis(model_dir: Path, kind: str) -> Basis:
     )
 
 
-def load_image_bases(model_dir: Path) -> tuple[Basis, Basis]:
-    """图片塔加载时一并载入两份基；任一缺失都让图片能力不可用。"""
-    return load_basis(model_dir, "spp"), load_basis(model_dir, "maxsim")
+def load_image_bases(basis_dir: Path) -> tuple[Basis, Basis]:
+    """从库内基目录（或模型目录的通用兜底）载入两份基。"""
+    return load_basis(basis_dir, "spp"), load_basis(basis_dir, "maxsim")
 
 
 def v_projection(model: Any) -> tuple[Any, Any]:
@@ -213,3 +217,201 @@ def _to_numpy(value: Any) -> np.ndarray:
 
 def _label(kind: str) -> str:
     return {"spp": "构图", "maxsim": "主体"}.get(kind, kind)
+
+
+class SppAccumulator:
+    """流式累加 64 格的均值与协方差，避免把所有图同时放进内存。"""
+
+    def __init__(self) -> None:
+        self.sum: np.ndarray | None = None
+        self.gram: np.ndarray | None = None
+        self.cells = 0
+        self.images = 0
+
+    def add(self, hidden: np.ndarray) -> None:
+        cells = pool_cells(np.asarray(hidden, dtype=np.float32), SPP_CELLS).astype(
+            np.float64
+        )
+        if self.sum is None:
+            dim = cells.shape[1]
+            self.sum = np.zeros(dim, dtype=np.float64)
+            self.gram = np.zeros((dim, dim), dtype=np.float64)
+        self.sum += cells.sum(axis=0)
+        self.gram += cells.T @ cells
+        self.cells += len(cells)
+        self.images += 1
+
+    def finish(self, out_dim: int) -> tuple[np.ndarray, np.ndarray]:
+        if self.sum is None or self.gram is None or self.cells < 2:
+            raise ValueError("SPP 基至少需要 2 个格子样本")
+        mean = self.sum / self.cells
+        cov = (self.gram - self.cells * np.outer(mean, mean)) / (self.cells - 1)
+        values, vectors = np.linalg.eigh(cov)
+        return _top_whitening(mean, values, vectors, out_dim)
+
+
+class MaxsimAccumulator:
+    """用蓄水池抽样的方式保留固定数量的图片 top-32 局部。
+
+    拟合接口不知道总共会收到多少张；先按索引收集再抽样会把分布偏向先到的图片。
+    蓄水池在流式输入上仍是均匀抽样，内存上限由 ``reserve`` 决定。
+    """
+
+    def __init__(self, reserve: int) -> None:
+        self.reserve = max(1, int(reserve))
+        self.blocks: list[np.ndarray] = []
+        self.seen = 0
+        self._rng = np.random.default_rng(0)
+
+    def add(self, attention: np.ndarray, projected: np.ndarray) -> None:
+        top = attention_top(attention, MAXSIM_TOP, tokens=projected.shape[0])
+        local = projected[top].astype(np.float32)
+        # 与研究阶段一致：拟合前来一次逐 patch L2 归一化；服务端计算时同样处理。
+        local /= np.maximum(np.linalg.norm(local, axis=-1, keepdims=True), 1e-8)
+        self.seen += 1
+        if len(self.blocks) < self.reserve:
+            self.blocks.append(local)
+            return
+        slot = int(self._rng.integers(0, self.seen))
+        if slot < self.reserve:
+            self.blocks[slot] = local
+
+    @property
+    def samples(self) -> int:
+        return len(self.blocks)
+
+    def finish(self, out_dim: int) -> tuple[np.ndarray, np.ndarray]:
+        if not self.blocks:
+            raise ValueError("MaxSim 基没有训练样本")
+        samples = np.concatenate(self.blocks, axis=0)
+        if len(samples) < 2:
+            raise ValueError("MaxSim 基至少需要 2 个局部样本")
+        mean = samples.mean(axis=0, dtype=np.float64)
+        centred = samples - mean
+        cov = centred.T @ centred / (len(centred) - 1)
+        values, vectors = np.linalg.eigh(cov)
+        return _top_whitening(mean, values, vectors, out_dim)
+
+
+def _top_whitening(
+    mean: np.ndarray, values: np.ndarray, vectors: np.ndarray, out_dim: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """取方差最大的 out_dim 个方向，除以各自标准差，得到白化投影。
+
+    只保留主轴、不补齐残差方向，等于「截断白化」：普通 PCA 保留的正是所有图共有的
+    大方差分量，MaxSim 降维后局部特征会朝同一处偏、退化成整图相似，所以这里必须
+    除以标准差。
+    """
+    order = np.argsort(-values)[:out_dim]
+    scales = np.sqrt(np.maximum(values[order], 1e-8))
+    projection = (vectors[:, order] / scales).astype(np.float32)
+    return mean.astype(np.float32), projection
+
+
+def basis_npz_bytes(
+    *,
+    kind: str,
+    mean: np.ndarray,
+    projection: np.ndarray,
+    in_dim: int,
+    out_dim: int,
+    samples: int,
+    **extra: int,
+) -> bytes:
+    """把一份白化基写成 npz 字节；服务端直接把字节交给应用落盘。"""
+    buffer = io.BytesIO()
+    np.savez(
+        buffer,
+        version=np.int32(BASIS_VERSION),
+        kind=np.array(kind),
+        samples=np.int32(samples),
+        in_dim=np.int32(in_dim),
+        out_dim=np.int32(out_dim),
+        mean=np.asarray(mean, dtype=np.float32),
+        projection=np.asarray(projection, dtype=np.float32),
+        scale=np.float32(BASIS_SCALE),
+        **{key: np.int32(value) for key, value in extra.items()},
+    )
+    return buffer.getvalue()
+
+
+@dataclass
+class BasisSample:
+    model: str
+    index: int
+    spp: SppAccumulator
+    maxsim: MaxsimAccumulator
+
+    def add(self, hidden: Any, attention: Any, projected: Any) -> int:
+        self.spp.add(_to_numpy(hidden))
+        self.maxsim.add(_to_numpy(attention), _to_numpy(projected))
+        return self.index
+
+    def finish(self) -> tuple[bytes, bytes, int]:
+        spp_mean, spp_projection = self.spp.finish(SPP_DIM)
+        maxsim_mean, maxsim_projection = self.maxsim.finish(MAXSIM_DIM)
+        in_dim = int(spp_mean.size)
+        spp_bytes = basis_npz_bytes(
+            kind="spp",
+            mean=spp_mean,
+            projection=spp_projection,
+            in_dim=in_dim,
+            out_dim=SPP_DIM,
+            samples=self.spp.images,
+            cells=SPP_CELLS,
+        )
+        maxsim_bytes = basis_npz_bytes(
+            kind="maxsim",
+            mean=maxsim_mean,
+            projection=maxsim_projection,
+            in_dim=in_dim,
+            out_dim=MAXSIM_DIM,
+            samples=self.maxsim.samples,
+            top=MAXSIM_TOP,
+        )
+        return spp_bytes, maxsim_bytes, self.spp.images
+
+
+class BasisRegistry:
+    """`/v1/basis/*` 的内存累积器；一次只允许一个拟合会话。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: dict[str, BasisSample] = {}
+
+    def start(self, model: str, maxsim_sample: int) -> str:
+        if not model.strip():
+            raise ValueError("model 不能为空")
+        if maxsim_sample <= 0:
+            raise ValueError("maxsimSample 必须大于 0")
+        with self._lock:
+            sample_id = uuid.uuid4().hex
+            self._samples.clear()
+            self._samples[sample_id] = BasisSample(
+                model=model,
+                index=0,
+                spp=SppAccumulator(),
+                maxsim=MaxsimAccumulator(maxsim_sample),
+            )
+            return sample_id
+
+    def add(
+        self, sample_id: str, hidden: Any, attention: Any, projected: Any
+    ) -> int:
+        with self._lock:
+            sample = self._samples.get(sample_id)
+            if sample is None:
+                raise KeyError("拟合会话不存在或已结束")
+            sample.index += 1
+            return sample.add(hidden, attention, projected)
+
+    def finish(self, sample_id: str) -> tuple[bytes, bytes, int]:
+        with self._lock:
+            sample = self._samples.pop(sample_id, None)
+            if sample is None:
+                raise KeyError("拟合会话不存在或已结束")
+            return sample.finish()
+
+    def cancel(self, sample_id: str) -> bool:
+        with self._lock:
+            return self._samples.pop(sample_id, None) is not None

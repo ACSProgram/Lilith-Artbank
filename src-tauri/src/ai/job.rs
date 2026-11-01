@@ -23,6 +23,7 @@ use crate::{
 };
 
 use super::{
+    basis::{self, ActiveBasis},
     client::{AiClient, AiError, Capability, Health},
     descriptors, embedding, input,
     pack::{FeatureKind, FeatureStore, semantic_feature_demands},
@@ -126,10 +127,39 @@ pub fn execute(
     let health = client
         .health()
         .map_err(|error| AppError::message(format!("AI 服务不可用：{error}")))?;
-    let capability =
-        ensure_capability(&client, &health, request.kind.capability()).map_err(|error| {
+
+    // 语义特征依赖库内白化基。小库直接用通用兜底；大库在第一次生成语义特征时
+    // 才拟合专用基，开库时不跑重任务。取消或失败都不会切换 meta。
+    let basis = if request.kind == AiJobKind::Embedding {
+        match resolve_basis(context, task)? {
+            Some(active) => Some(active),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
+    if let Some(active) = &basis {
+        let meta = basis::load_meta(&context.database)?;
+        if meta.as_ref().is_some_and(|meta| meta.id != active.id) {
+            task.set_message("检测到库内基已更换，正在重新生成语义描述子…");
+        } else if meta
+            .as_ref()
+            .is_some_and(|meta| meta.source == basis::SOURCE_UNIVERSAL)
+        {
+            task.set_message("正在准备语义特征模型（使用通用兜底基）…");
+        }
+    }
+
+    let capability = match &basis {
+        Some(active) => ensure_image_capability(&client, &health, active).map_err(|error| {
             AppError::message(format!("无法加载{}模型：{error}", request.kind.label()))
-        })?;
+        })?,
+        None => {
+            ensure_capability(&client, &health, request.kind.capability()).map_err(|error| {
+                AppError::message(format!("无法加载{}模型：{error}", request.kind.label()))
+            })?
+        }
+    };
 
     let ids = {
         let filter = match (request.kind, request.overwrite) {
@@ -139,7 +169,11 @@ pub fn execute(
                 })?;
                 PendingFilter::Features {
                     model: capability.model.clone(),
-                    dims: semantic_feature_demands(dim),
+                    dims: semantic_feature_demands(
+                        &capability.model,
+                        dim,
+                        basis.as_ref().map(|basis| basis.id.as_str()),
+                    ),
                 }
             }
             (AiJobKind::Pose, false) => PendingFilter::Pose,
@@ -178,9 +212,30 @@ pub fn execute(
         request,
         &client,
         &capability,
+        basis.as_ref(),
         ids,
         operation_id,
     );
+    // 只有真正跑完才切 meta：中途取消时旧基必须继续服务未处理的图片。
+    let cancelled = task.should_cancel();
+    if outcome.is_ok()
+        && !cancelled
+        && let Some(active) = &basis
+    {
+        if let Err(error) = basis::commit(
+            &context.database,
+            &context.root,
+            active,
+            capability.basis_samples,
+        ) {
+            log::warn!("写入语义特征基身份失败：{error}");
+        }
+        // 旧包可能还被本次进程的写句柄占着；关掉句柄后再释放一次。
+        context.store.release_handles();
+        if let Err(error) = basis::release_pending(&context.database, &context.root) {
+            log::warn!("释放旧语义特征包失败：{error}");
+        }
+    }
     if let Some(operation) = operation {
         let error = outcome
             .as_ref()
@@ -194,12 +249,39 @@ pub fn execute(
     outcome
 }
 
+/// 确定本次任务要写入的基；库内没有可用基时，在本任务开头拟合。
+///
+/// 返回 `None` 表示拟合期间被取消，任务按取消结束。
+fn resolve_basis(context: &JobContext, task: &Arc<TaskHandle>) -> AppResult<Option<ActiveBasis>> {
+    basis::prepare_local(&context.database, &context.settings, &context.root)?;
+    if let Some(active) = basis::active_basis(&context.settings, &context.root)? {
+        return Ok(Some(active));
+    }
+    let fit = basis::FitContext {
+        database: context.database.clone(),
+        thumbs: context.thumbs.clone(),
+        root: context.root.clone(),
+        settings: context.settings.clone(),
+        resources: context.resources.clone(),
+        images: context.images.clone(),
+        memory: context.memory.clone(),
+    };
+    let fitted = basis::fit(&fit, task)?;
+    // 拟合阶段按样本张数计数；后面要按待处理图片重新计数，先把这段进度清掉，
+    // 否则统计完成前进度条会短暂显示拟合阶段的 100%。
+    task.set_completed(0);
+    task.set_total(0);
+    Ok(fitted)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     context: &JobContext,
     task: &TaskHandle,
     request: &AiJobRequest,
     client: &AiClient,
     capability: &Capability,
+    basis: Option<&ActiveBasis>,
     ids: Vec<i64>,
     operation_id: Option<i64>,
 ) -> AppResult<()> {
@@ -219,6 +301,7 @@ fn run_job(
             client,
             capability,
             request,
+            basis.map(|basis| basis.id.as_str()),
             image_id,
             operation_id,
             &holder,
@@ -265,6 +348,7 @@ fn process_one(
     client: &AiClient,
     capability: &Capability,
     request: &AiJobRequest,
+    basis_id: Option<&str>,
     image_id: i64,
     operation_id: Option<i64>,
     holder: &HolderInfo,
@@ -320,6 +404,7 @@ fn process_one(
                 &context.store,
                 image_id,
                 &result.embedding.model,
+                basis_id,
                 FeatureKind::Spp,
                 &spp,
             )?;
@@ -328,6 +413,7 @@ fn process_one(
                 &context.store,
                 image_id,
                 &result.embedding.model,
+                basis_id,
                 FeatureKind::MaxSim,
                 &maxsim,
             )?;
@@ -398,6 +484,46 @@ fn process_one(
             })
         }
     }
+}
+
+/// 加载图片塔并确认它用的是本次任务要写的基。
+///
+/// 已加载但基不同时必须重载，否则描述子会混进旧基的包。
+pub(crate) fn ensure_image_capability(
+    client: &AiClient,
+    health: &Health,
+    basis: &ActiveBasis,
+) -> Result<Capability, AiError> {
+    if let Some(capability) = health.capability("imageEmbedding")
+        && capability.ready
+        && capability.basis_id.as_deref() == Some(basis.id.as_str())
+    {
+        return Ok(capability.clone());
+    }
+    let request = basis.paths.request(&basis.id);
+    let capabilities =
+        client.ensure_models_with_basis(&["imageEmbedding".to_owned()], Some(&request))?;
+    let capability = capabilities.get("imageEmbedding").cloned().or_else(|| {
+        client
+            .health()
+            .ok()
+            .and_then(|health| health.capability("imageEmbedding").cloned())
+    });
+    let Some(capability) = capability else {
+        return Err(AiError::invalid("服务没有可用的 imageEmbedding 能力"));
+    };
+    if !capability.ready {
+        return Err(AiError::invalid("图片塔没有加载成功"));
+    }
+    if let Some(loaded) = capability.basis_id.as_deref()
+        && loaded != basis.id
+    {
+        return Err(AiError::invalid(format!(
+            "图片塔加载的基 {loaded} 与任务要求的 {} 不一致",
+            basis.id
+        )));
+    }
+    Ok(capability)
 }
 
 pub(crate) fn ensure_capability(

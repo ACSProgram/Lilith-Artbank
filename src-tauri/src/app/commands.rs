@@ -1009,9 +1009,9 @@ pub fn get_image_pose(
 
 #[tauri::command]
 pub async fn get_ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
+    let settings = state.settings.snapshot().ai;
+    let runtime = state.ai.clone();
     trace::read_async("get_ai_status", async move {
-        let settings = state.settings.snapshot().ai;
-        let runtime = state.ai.clone();
         tauri::async_runtime::spawn_blocking(move || runtime.status(&settings))
             .await
             .map_err(|error| error.to_string())
@@ -1114,20 +1114,30 @@ pub fn get_image_capabilities(
 }
 
 #[tauri::command]
-pub fn get_feature_summary(state: State<'_, AppState>) -> Result<FeatureSummary, String> {
-    trace::read("get_feature_summary", || {
-        AppError::command(state.feature_summary())
-    })
+pub async fn get_feature_summary(app: AppHandle) -> Result<FeatureSummary, String> {
+    trace::read_async(
+        "get_feature_summary",
+        run_blocking(app, |state| state.feature_summary()),
+    )
+    .await
 }
 
-/// 语义描述子的全库待处理张数；找相似面板用它决定新模式是否可用。
+/// 语义描述子在某个范围内的待补齐张数；找相似面板用它决定新模式是否可用。
+///
+/// 这条要扫全范围的行，必须走阻塞线程池：同步命令会把主线程占住，整个界面都卡。
 #[tauri::command]
-pub fn get_semantic_feature_pending(
-    state: State<'_, AppState>,
+pub async fn get_semantic_feature_pending(
+    app: AppHandle,
+    scope: Option<TaskScope>,
 ) -> Result<SemanticFeaturePending, String> {
-    trace::read("get_semantic_feature_pending", || {
-        AppError::command(state.ai.semantic_feature_pending())
-    })
+    trace::read_async(
+        "get_semantic_feature_pending",
+        run_blocking(app, move |state| {
+            let settings = state.settings.snapshot().ai;
+            state.ai.semantic_feature_pending(&settings, scope.as_ref())
+        }),
+    )
+    .await
 }
 
 #[tauri::command]

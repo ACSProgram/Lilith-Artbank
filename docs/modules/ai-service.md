@@ -78,7 +78,7 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
 | SPP（构图） | 24×24 patch → 8×8 均值池化 → 白化 128 维 → 每格 L2 归一化 | 64×128，摊平 8192 个 int8 |
 | MaxSim（主体） | 注意力 top-32 → 池化头 V 投影 → 白化 64 维 → 每位 L2 归一化 | 32×64，摊平 2048 个 int8 |
 
-白化基是离线拟合产物，不是模型自带：`spp_basis.npz` 与 `maxsim_basis.npz` 放在模型目录（与 `config.json` 同级），文件内带 `version`、训练样本数与固定 int8 `scale`。基缺失或版本不匹配时**图片能力整体不可用**，不做静默降级；换一次基，全库描述子整包作废重算。
+白化基属于图库派生数据，不是模型自带：`spp_basis.npz` 与 `maxsim_basis.npz` 放在库内 `.artbank/basis/<clip_model>/`，文件内带 `version`、训练样本数与固定 int8 `scale`。模型目录里的同名文件只是通用兜底：库内没有基且有效图片少于 1500 张时在打开图库时复制过去；有效图片达到 1500 张则在第一次生成语义特征时随批量任务分层抽样拟合。基身份 `basis_id = blake3(模型名 + 两份 npz 字节) 前 16 位`，同时写进库 `meta.feature_basis` 与 `spp` / `maxsim` 的包名；换基后旧描述子按“缺”处理，批量任务补齐后 meta 才切到新基，旧包延迟释放。全局 embedding 与 pose 不受基影响。
 
 ## 端点
 
@@ -93,6 +93,8 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
       "ready": true,
       "model": "siglip2-giant-opt-patch16-384",
       "dim": 1536,
+      "basisId": "0123456789abcdef",
+      "basisSamples": 3000,
       "features": [
         { "kind": "spp", "dim": 8192, "dtype": "i8" },
         { "kind": "maxsim", "dim": 2048, "dtype": "i8" }
@@ -114,16 +116,31 @@ image 与 text embedding 必须来自同一模型/维度。服务在响应里返
 按需加载模型，幂等；可能耗时数十秒到数分钟。
 
 ```json
-{ "capabilities": ["imageEmbedding", "pose"] }
+{ "capabilities": ["imageEmbedding"], "basis": { "dir": "<库>/.artbank/basis/<clip_model>", "id": "0123456789abcdef" } }
 ```
 
-响应 `{ "capabilities": { ... } }`，结构同 health。加载失败返回 422/503；失败的塔不会保留半加载状态。
+`basis` 可选：只对 `imageEmbedding` 生效。应用总是传入库内基目录与 `basis_id`；服务端发现已加载的图片塔基身份不同就重载（约 36 s，只在换库或换基时发生）。省略时按 `--model-dir` 里的通用兜底读取，连兜底也没有就只加载塔本身（全局 embedding 可用，语义描述子请求返回 422）。响应 `{ "capabilities": { ... } }`，结构同 health；加载失败返回 422/503；失败的塔不会保留半加载状态。
 
 `ensure` 在把权重映射进内存之后会**先跑一次前向**（warmup）再返回：权重是按需分页的 mmap，只 mmap 时 RSS 约 499 MB，首次 forward 才把 2.83 GB 真正读进物理内存（耗时见[性能基准](../guides/performance.md)）。所以“加载完成”等于“可以直接用”，这段时间算在 ensure 的耗时里而不是第一次搜索里。warmup 失败按加载失败处理。
 
 - 一次请求最多接受一个 CLIP 塔；同时请求 `imageEmbedding` 与 `textEmbedding` 返回 400。应用分别加载图片塔与文本塔。
 - 请求 `description` 返回 404；当前服务端没有描述模型。
 - 加载图片塔会让已驻留的文本塔让位，反之亦然。
+
+### POST /v1/basis/start · add · finish · cancel
+
+库内没有基且有效图片达到 1500 张时，应用在第一次生成语义特征的批量任务开头用这四个端点拟合库内基；有效图片不足 1500 张则直接复制通用兜底，不拟合。读图与进度留在 Rust，Python 只持有累积器状态。
+
+```http
+POST /v1/basis/start
+{ "model": "siglip2-giant-opt-patch16-384", "maxsimSample": 1400 }
+→ { "status": "success", "sampleId": "<id>", "model": "..." }
+```
+
+- `add?sampleId=<id>`：body 为图片原始字节，逐张调用；返回已累积张数。服务端只在内存里累加 SPP 的 64 格充分统计量与 MaxSim 的 top-32 局部（蓄水池抽样），不写临时文件。
+- `finish`：`{ "sampleId": "<id>" }` → `{ "status": "success", "spp": "<base64 npz>", "maxsim": "<base64 npz>", "samples": 3000 }`。应用算出 `basis_id` 并把两份 npz 落进库内；`meta.feature_basis` 等描述子批量任务成功后再切换。
+- `cancel`：`{ "sampleId": "<id>" }` → 丢弃累积器；已上传的样本不留任何文件。
+- 一次只保留一个拟合会话；`add` 不重试（同一张被重复计入会污染统计量），取消在每张之间生效。
 
 ### POST /v1/embed/image
 
@@ -152,7 +169,7 @@ Content-Type: application/octet-stream
 
 - 描述子按 int8 摊平后 base64 传输；不返回原始 patch（576×1536 走 JSON 是 10 MB+/张）。
 - 图片塔未加载时返回 503；批量 embedding 任务在开始前调用 `/v1/models/ensure` 加载图片塔。
-- 请求了 `spp` / `maxsim` 但服务端没有白化基时，模型加载已失败，`/v1/models/ensure` 返回 422，不会只返回一半。
+- 请求了 `spp` / `maxsim` 但图片塔没有白化基时返回 422 `basis_missing`；全局向量仍然返回，不会只返回一半描述子。
 - 旧客户端不带 `features` 时行为不变，只返回全局向量。
 
 ### POST /v1/embed/text
@@ -214,7 +231,8 @@ Content-Type: application/octet-stream
 
 ### 任务类型
 
-- `embedding`：为选中/当前视图/全库缺失的图片生成语义特征——同一次前向写全局 embedding、SPP 与 MaxSim 三条记录。待处理条件是三种描述子缺任一；对“有 embedding、缺 spp/maxsim”的旧图会重跑一次前向并把三条都写一遍，因此不需要单独的“补特征”入口。
+- `embedding`：为选中/当前视图/全库缺失的图片生成语义特征——同一次前向写全局 embedding、SPP 与 MaxSim 三条记录。待处理条件是三种描述子缺任一；`spp` / `maxsim` 按包含 `basis_id` 的包名判断，换基后旧包记录自动进入待处理。对“有 embedding、缺 spp/maxsim”的旧图会重跑一次前向并把三条都写一遍，因此不需要单独的“补特征”入口。
+- `basis`（自动）：库内没有基时，小库（有效图片 <1500 张）在打开图库时直接复制模型目录的通用兜底（`meta.feature_basis.source=universal`）；大库不在开库时拟合，等到第一次生成语义特征的批量任务开头再按 3000 张分层抽样拟合（`source=library`），拟合阶段与描述子阶段共用同一张任务卡片，可按张取消。失败或取消不写 meta、不写基文件，功能维持“无基”。已有基不会自动重拟合。
 - `pose`：为选中/当前视图/全库缺失的图片生成 pose。
 - `description`：为选中/当前视图/描述为空的图片生成描述；默认只填空，可选覆盖。服务端没有描述模型，界面置灰。
 - `textSearch`：只做一次 text embedding，然后本地扫描。
@@ -238,6 +256,9 @@ Content-Type: application/octet-stream
 ## 存储
 
 ```text
+<library>/.artbank/basis/<clip_model>/
+  spp_basis.npz
+  maxsim_basis.npz
 <library>/.artbank/features/
   embedding-<model-slug>-1536-f16-<hash8>.pack   raw little-endian f16 records
   pose-<model-slug>-132-f32-<hash8>.pack         raw little-endian f32 records
@@ -245,7 +266,9 @@ Content-Type: application/octet-stream
   maxsim-<model-slug>-2048-i8-<hash8>.pack       raw little-endian int8 records
 ```
 
-- 文件名由 kind、模型 slug（小写、非字母数字折叠为 `-`、最多 48 字符）、维度、dtype 与模型名 BLAKE3 前 8 位组成，同一模型名始终落到同一个包。
+- 文件名由 kind、模型 slug（小写、非字母数字折叠为 `-`、最多 48 字符）、维度、dtype 与身份哈希组成。`embedding` / `pose` 的身份哈希只含模型名（与旧版本一致）；`spp` / `maxsim` 额外拼入 `basis_id`，换基自然落到新包，新旧描述子不会混在一个文件里。
+- 库 `meta.feature_basis` 是一条 JSON：`{model, id, samples, source: library|universal, fitted_at}`。检索门限与描述子读取只用已提交的 meta；批量任务预览/启动用库内当前文件算出的 `basis_id`，所以手工替换库内基后预览会把已有描述子全部算进“将处理 M”。
+- 换基成功（批量任务跑完并写完全部描述子）后才切 meta，并把旧基的两个包名记进 `meta.feature.pendingRelease.v1`；释放前确认没有任何 `feature_blobs` 行引用，Windows 上文件被读句柄占住时留到下次打开图库再删。中途取消不动 meta，旧包继续服务未处理的图片。
 - 包头 32 字节：magic `ARTBFTR1`、version、kind、dtype、dim、record_len、创建时间（14-15 字节保留）；`record_len` 必须等于 `dim × 2`（f16）、`dim × 4`（f32）或 `dim`（int8）。spp/maxsim 的 `dim` 还必须是 8192 / 2048，写包与读包头时都校验，不合即报错。
 - SPP 的记录是 64 格 × 128 维、MaxSim 是 32 局部 × 64 维，摊平后按 `(n, dim)` 扁平行存放；形状由 kind 固定写在代码常量里，不放进包头，MAGIC 与 VERSION 不变。
 - int8 的固定 scale 只写在白化基文件里，不进每条记录；相似度计算中 scale 会自然抵消。
@@ -258,14 +281,13 @@ Content-Type: application/octet-stream
 
 ## 服务端实现（server/）
 
-- 入口 `server/main.py`：标准库 `ThreadingHTTPServer`，只绑 `127.0.0.1`；路由 `/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/shutdown`；`/v1/describe` 返回 404。
+- 入口 `server/main.py`：标准库 `ThreadingHTTPServer`，只绑 `127.0.0.1`；路由 `/v1/health`、`/v1/models/ensure`、`/v1/embed/image`、`/v1/embed/text`、`/v1/pose`、`/v1/basis/start|add|finish|cancel`、`/v1/shutdown`；`/v1/describe` 返回 404。
 - 推理并发上限 4（`MAX_INFERENCE_CONCURRENCY`）：名额满时立刻回 503 `server_busy`，不排队，避免并发请求一起放大显存与内存；`/v1/health` 与 `/v1/shutdown` 不占名额，并发推理时也能探活与关闭。
-- `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。加载完成后立即 warmup 一次前向。
-- `--prewarm-imports`：启动后在后台线程导入 torch/transformers（实测 7.7–8.0 s、RSS 420 MB），把这段成本从“第一次 AI 请求”挪到“用户还在看图”。没有模型目录时不预热。应用按设置 `ai.prewarmImports`（默认开）决定是否传这个参数。
+- `clip_cache.py`：从同一份 safetensors 索引只读取 `vision_model.*` 或 `text_model.*`，不实例化另一塔；CUDA 用 fp16，CPU 用 fp32；同一时间只驻留一个塔，加载另一塔时旧塔立即让位；空闲 300 秒自动卸载（`--idle-unload-seconds`，0 表示关闭）。health 不等待加载或推理。加载完成后立即 warmup 一次前向。图片塔记录当前 `basis_id`：`ensure` 带基目录且身份不同就重载；不带基时复用已有塔（拟合只需要塔本身）。
+- `image_features.py`：SPP / MaxSim 描述子计算、白化基读取与 int8 量化；另含拟合累积器（SPP 充分统计量、MaxSim 蓄水池抽样）与 `/v1/basis/*` 使用的内存会话。`clip_cache.py` 加载图片塔时一并载入基并注册注意力捕获；没有基时塔仍可加载，只禁用描述子。
+- `tools/fit_basis.py`：开发期离线拟合工具，可给预抽特征 npz 或图片清单，输出两份 npz。正式库不再需要人工运行：应用会自动抽样拟合；这个脚本用于准备模型目录里的通用兜底基或研究对比。
 - `pose_engine.py`：MediaPipe Pose（`model_complexity=2`、`static_image_mode=True`、`min_detection_confidence=0.3`）。模型随 `python_embeded` 携带，不读 `resources/models`；未检测到人体返回空数组。
 - `image_io.py`：PIL 解码、EXIF 方向、RGB 转换；单张上限 1 亿像素（`MAX_PIXELS`，与导入解码上限一致），超过直接拒绝；解码失败或超限返回 422。
-- `image_features.py`：SPP / MaxSim 描述子计算、白化基读取与 int8 量化；`clip_cache.py` 加载图片塔时一并载入两份基并注册注意力捕获，缺基即让图片能力不可用。
-- `tools/fit_basis.py`：离线拟合 `spp_basis.npz` / `maxsim_basis.npz`。输入可以是预抽好的特征 npz（`patch`/`attn`/可选 `patch_v`），也可以给图片目录或路径清单现场跑图片塔；正式基要用全库分层抽样（至少数千张，覆盖不同画风与画幅）。
 - 运行环境为 Python 3.11 + torch 2.5.1+cu121 + transformers 4.57.6 + mediapipe 0.10.14，依赖已在 `python_embeded` 内，不做运行时下载。
 - 日志写 `logs/ai-server.log`；只记录启动参数、模型加载/卸载、耗时与错误，不记录图片内容或向量。
 - 描述能力未实现；`/v1/describe` 返回 404，只有批量任务里的描述项置灰。
@@ -281,7 +303,7 @@ Content-Type: application/octet-stream
 - **语义搜索**：text → text embedding → `cosine((v - mean), (q - mean))` 与相同 model/dim 的 image embeddings 扫描。慢阶段通过 `semantic-stage` 事件上报（加载文本模型 / 生成查询向量 / 计算均值 / 扫描向量），界面显示在搜索框下方。比较时同时计算 `dot(v, q)` 与 `dot(v, mean)`，由 `||v||≈1` 还原中心化后的范数，保持精确余弦。客户端只加载文本塔；图片模型名与维度从 health 读取，不触发图片塔加载。
 - **相似 embedding**：参考图的 image embedding（单张，或多张平均后归一化）同样减均值后扫描。参考图没有 embedding 时直接报错要求先跑 AI 任务，不在查询路径里顺手生成。
 - **偏重主体 / 偏重构图**：`kind=embedding` 下另有 `featureMode`。`overall` 走上面的全局向量；`subject` 用 MaxSim、`composition` 用 SPP。两者都是两段式：先按全局 embedding 与同一个阈值扫描并排序，取前 `ceil(20% × 阈值后命中数)`（下限 200 张），再读取候选的对应描述子重排。SPP 是对位格子余弦的平均，MaxSim 是候选局部与参考局部双向最近邻的平均；int8 量化 scale 在余弦里自然抵消，Rust 侧不需要基文件。候选缺描述子时整次拒绝，不把两种排序混在一起。
-- **模式门限**：参考图本身必须有对应描述子；全库（不含临时区）不能还有待补齐的语义描述子，否则返回“语义特征还在生成（剩余 N 张）”。门限与批量任务共用 `PendingFilter::Features`，回填完成后无需单独操作。
+- **模式门限**：参考图本身必须有对应描述子；当前范围（`scope` 对应的文件夹子树 / 集合 / 当前视图 / 选择 / 临时区，缺省是全库、不含临时区）内不能还有待补齐的语义描述子，否则报「全库还有 N 张图片没有语义特征」或「当前范围还有 N 张…」。门限跟着范围走：只回填了一个文件夹时，把范围选到那个文件夹就能用两种新模式。门限与批量任务共用 `PendingFilter::Features`，但检索按已提交的 `meta.feature_basis` 计算包名，换基任务完成前旧包仍可服务；批量任务预览/启动则用库内当前文件的 `basis_id`。回填完成后无需单独操作。
 - **平均参考**：多张参考图只支持主色与 embedding。主色把每张图的 4/8 色按等权合并后，在 OKLab 做加权 k-means（初始质心按权重最高、随后每次取最远点，不用随机种子），保留同样数量的代表色；embedding 先求平均再归一化。所有参考图都会从结果中排除；缺任一特征、模型/维度不一致或超过 100 张时整次拒绝。
 - **范围**：找相似与语义搜索的后端都接受 `TaskScope`（当前选择/文件夹/集合/视图/临时文件夹/全库）；界面只在找相似面板里提供范围选择，语义搜索目前只有 MCP 侧会传 `scope`。全库不解析 id；其它范围由 `TaskScope::resolve` 先用现有查询取 id 集合，再与扫描取交集。embedding/pose 在读取向量前就丢掉范围外的行，主色/pHash 在常驻索引扫描时跳过范围外的行，不退回 O(n²)。**全库（`scope` 省略或 `library`）不包含临时文件夹里的图片**；`temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图。embedding 均值默认也排除临时区；库里只有临时特征时回退到包含临时区，保证 `scope=temp` 仍能搜索。
 - **阈值**：pHash 是 0–256 距离上限；主色是 0–1 的 OKLab 距离上限；embedding、pose、语义是 -1–1 的相似度下限。`total` 只统计范围与阈值过滤后的命中。三种语义特征口径共用同一个 embedding 阈值：它只决定粗筛入口，不按当前模式过滤；`subject` / `composition` 的排序分与阈值不是同一刻度，因此界面不显示绝对分，MCP 的 `preview.score` 返回 null。
@@ -334,7 +356,8 @@ Content-Type: application/octet-stream
 - `server/pose_engine.py`：MediaPipe Pose 33 点。
 - `server/image_io.py`：图片字节解码与 EXIF 方向。
 - `src-tauri/src/app/tasks/`：任务总线、资源准入（`concurrency/resources.rs`）、默认排队（FIFO + 路径写优先）、panic 兜底与统一事件；`handle.rs` 放任务句柄，`bus.rs` 放总线与进度泵。
-- `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片。
+- `src-tauri/src/ai/pack.rs`：追加式 feature pack、包头校验与按偏移切片；包名包含 `basis_id`（仅 `spp` / `maxsim`），写句柄可显式关闭以便切基后删旧包。
+- `src-tauri/src/ai/basis.rs`：库内基路径、`basis_id` 计算、`meta.feature_basis` 读写、通用兜底复制、分层抽样、拟合任务、旧包待释放清单与延迟删除。
 - `src-tauri/src/ai/embedding.rs`：fp16 落盘、均值、mmap 扫描、目标图相似、pHash 候选的 embedding 复核。
 - `src-tauri/src/ai/descriptors.rs`：SPP / MaxSim 的 int8 落盘、参考图与候选指针读取、对位余弦与双向 MaxSim 打分、两段式候选重排；维度由 kind 固定，指针写入与 embedding 共用 `pack::write_pointer`。
 - `src-tauri/src/ai/pose.rs`：33 点 f32 存取与 pose 相似度扫描。
@@ -360,8 +383,10 @@ Content-Type: application/octet-stream
 - 依赖预热让被托管的服务进程常驻约 420 MB；只有整场会话完全不用 AI 时才是净浪费，可在设置里关掉。
 - 语义搜索依赖 health 在 `ready=false` 时仍返回图片模型名与维度；外部服务实现必须遵守这一点。
 - 描述能力未实现；批量任务中的描述项按缺少能力置灰。
-- 找相似的「偏重主体 / 偏重构图」已可用，但真实库回填与散读带宽尚未实测；回填完成前这两个模式会显示剩余张数并置灰。
-- 模型目录没有白化基时图片能力整体不可用；旧模型目录需要先运行 `server/tools/fit_basis.py` 生成两份基，再启动批量任务回填。
+- 找相似的「偏重主体 / 偏重构图」已可用，但真实库全量回填与散读带宽尚未实测；当前范围还没补齐时这两个模式会显示剩余张数并置灰。
+- 库内没有白化基时全局 embedding 仍可用，但 `spp` / `maxsim` 请求返回 422；应用在打开图库时只给小库复制通用兜底，大库在第一次生成语义特征时随批量任务拟合，不再要求用户手工运行 `fit_basis.py`。已有基不会自动重拟合。
+- 换基后在批量任务跑完前，已处理图片的指针会指向新包；此时用旧 meta 读取会把这些图片算作缺描述子，门限会提示剩余张数。中途取消不会丢旧包，未处理的图片仍由旧包服务；重跑只补剩余项。
+- 手工替换库内基属于“显式换基”：批量任务预览/启动用库内文件算出的新 `basis_id`，检索与门限仍读已提交的 meta，直到任务成功后才切换。
 - 设置与日志固定写在程序目录，不从旧 AppData 设置迁移；程序目录不可写时启动失败。
 - 便携包只包含 exe、`server/` 与资源清单，不包含 `python_embeded/`、`resources/models/`；不生成 NSIS 安装器。
 - 真实服务、真实模型与 WebView2 界面待用户手工验收，清单见[待办](../planning/todo.md)。

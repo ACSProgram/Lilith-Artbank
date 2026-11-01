@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { TaskStartResult } from "../../app/taskTypes";
+import type { TaskScope } from "../../shared/scope";
 import {
   mockAddTags,
   mockApplyFolderOrder,
@@ -422,10 +423,14 @@ export const libraryApi = {
     return invoke<ImageCapabilities[]>("get_image_capabilities", { imageIds });
   },
 
-  /** 全库还缺多少张语义描述子；0 表示三种口径都可用。 */
-  async getSemanticFeaturePending(): Promise<{ remaining: number }> {
+  /** 某个范围内还缺多少张语义描述子；0 表示三种口径都可用。省略范围按全库算。 */
+  async getSemanticFeaturePending(
+    scope?: TaskScope | null,
+  ): Promise<{ remaining: number }> {
     if (!isTauri()) return { remaining: 0 };
-    return invoke<{ remaining: number }>("get_semantic_feature_pending");
+    return invoke<{ remaining: number }>("get_semantic_feature_pending", {
+      scope: scope ?? null,
+    });
   },
 
   async getFeatureSummary(): Promise<FeatureSummary> {

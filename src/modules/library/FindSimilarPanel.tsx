@@ -224,14 +224,16 @@ export function FindSimilarPanel({
     };
   }, [open, idsKey, context]);
 
-  // 新模式要等全库补齐；面板每次打开都重新读一次，回填完成后不用重开面板。
+  // 新模式的门限跟着「范围」走：范围内补齐就能用，换范围重新读一次。
+  // 面板打开期间回填完成时，重开面板或换范围都会刷新，不需要另加轮询。
   useEffect(() => {
-    if (!open) return;
+    if (!open || !context) return;
     let disposed = false;
     setPendingSemantic(null);
     setPendingError(null);
+    const built = buildScope(scope, context, { includeSubfolders });
     void libraryApi
-      .getSemanticFeaturePending()
+      .getSemanticFeaturePending(built ?? { type: "library" })
       .then((next) => {
         if (!disposed) setPendingSemantic(next.remaining);
       })
@@ -241,7 +243,7 @@ export function FindSimilarPanel({
     return () => {
       disposed = true;
     };
-  }, [open, context]);
+  }, [open, context, scope, includeSubfolders]);
 
   useEffect(() => {
     const current = contextRef.current;
@@ -394,7 +396,7 @@ export function FindSimilarPanel({
       if (pendingError) return unavailable("暂时无法读取语义特征生成进度");
       if (pendingSemantic == null) return unavailable("正在读取语义特征生成进度");
       if (pendingSemantic > 0)
-        return unavailable(`语义特征还在生成（剩余 ${pendingSemantic} 张）`);
+        return unavailable(`本范围内还有 ${pendingSemantic} 张没有语义特征`);
       return { enabled: true };
     };
     map.subject = gate("maxsim", "偏重主体");

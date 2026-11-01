@@ -901,9 +901,17 @@ pub fn schema_docs() -> Value {
             ]),
             "mcp_features": view_doc(&[
                 field("image_id", "INTEGER", "正常图片 id"),
-                field("kind", "TEXT", "embedding / pose"),
-                field("model", "TEXT", "生成模型名"),
-                field("dim", "INTEGER", "embedding 维度，或 pose 的关键点个数"),
+                field("kind", "TEXT", "embedding / pose / spp / maxsim"),
+                field(
+                    "model",
+                    "TEXT",
+                    "生成模型名；spp/maxsim 记录的是同一次前向的图片塔模型",
+                ),
+                field(
+                    "dim",
+                    "INTEGER",
+                    "embedding 维度、pose 关键点个数，或 spp/maxsim 摊平后的 int8 个数",
+                ),
                 field("updated_at_ms", "INTEGER", "生成时间（毫秒时间戳）"),
             ]),
         },

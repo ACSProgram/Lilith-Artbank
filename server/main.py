@@ -25,7 +25,12 @@ from clip_cache import (
     ModelNotReady,
     prewarm_imports,
 )
-from image_features import MAXSIM_RECORD_DIM, SPP_RECORD_DIM, encode
+from image_features import (
+    MAXSIM_RECORD_DIM,
+    SPP_RECORD_DIM,
+    BasisRegistry,
+    encode,
+)
 from image_io import ImageDecodeError, decode_image
 from pose_engine import PoseEngine
 
@@ -100,6 +105,7 @@ class ApiState:
     def __init__(self, cache: ClipCache, pose: PoseEngine):
         self.cache = cache
         self.pose = pose
+        self.basis = BasisRegistry()
 
 
 class ApiServer(ThreadingHTTPServer):
@@ -132,6 +138,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "/v1/embed/text",
                 "/v1/pose",
                 "/v1/describe",
+                "/v1/basis/start",
+                "/v1/basis/add",
+                "/v1/basis/finish",
+                "/v1/basis/cancel",
                 "/v1/shutdown",
             ):
                 raise ApiError(405, "method_not_allowed", "该端点只接受 POST")
@@ -222,6 +232,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._pose()
         if path == "/v1/describe":
             raise ApiError(404, "capability_missing", "未配置描述模型")
+        if path == "/v1/basis/start":
+            return self._basis_start()
+        if path == "/v1/basis/add":
+            return self._basis_add()
+        if path == "/v1/basis/finish":
+            return self._basis_finish()
+        if path == "/v1/basis/cancel":
+            return self._basis_cancel()
         raise ApiError(404, "not_found", f"未知端点：{path}")
 
     def _health_payload(self) -> dict:
@@ -235,11 +253,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "dim": info.dim,
                 }
                 if kind == "image":
-                    # 描述子与图片塔同源；塔能加载就说明两份基已经就位。
+                    # 描述子与图片塔同源；塔能加载就说明语义描述子接口可用。
                     capability["features"] = [
                         {"kind": feature_kind, "dim": dim, "dtype": "i8"}
                         for feature_kind, dim in IMAGE_FEATURES.items()
                     ]
+                    basis_id, samples = self.server.state.cache.basis_info()
+                    if basis_id is not None:
+                        capability["basisId"] = basis_id
+                    if samples is not None:
+                        capability["basisSamples"] = samples
                 capabilities[name] = capability
         capabilities["pose"] = {
             "ready": self.server.state.pose.ready(),
@@ -269,10 +292,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "clip_tower_conflict",
                 "一次只能加载一个 CLIP 塔，请分别加载图片塔与文本塔",
             )
+        basis = self._parse_basis(payload)
 
         try:
             if "imageEmbedding" in requested:
-                self.server.state.cache.ensure("image")
+                self.server.state.cache.ensure("image", basis)
             if "textEmbedding" in requested:
                 self.server.state.cache.ensure("text")
             if "pose" in requested:
@@ -285,6 +309,20 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(422, "model_load_failed", str(error)) from error
 
         return {"capabilities": self._health_payload()["capabilities"]}
+
+    def _parse_basis(self, payload: dict) -> tuple[Path, str] | None:
+        raw = payload.get("basis")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ApiError(400, "bad_request", "basis 必须是对象")
+        directory = raw.get("dir")
+        basis_id = raw.get("id")
+        if not isinstance(directory, str) or not directory.strip():
+            raise ApiError(400, "bad_request", "basis.dir 不能为空")
+        if not isinstance(basis_id, str) or not basis_id.strip():
+            raise ApiError(400, "bad_request", "basis.id 不能为空")
+        return Path(directory).expanduser(), basis_id.strip()
 
     def _embed_image(self) -> dict:
         info = self._check_model(self._query_value("model"))
@@ -316,8 +354,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         or tower.maxsim_basis is None
                     ):
                         raise ApiError(
-                            500,
-                            "descriptor_unavailable",
+                            422,
+                            "basis_missing",
                             "图片塔没有语义描述子所需的注意力捕获或白化基",
                         )
                     attention = tower.attention.get("weights")
@@ -430,6 +468,104 @@ class ApiHandler(BaseHTTPRequestHandler):
             "imageWidth": width,
             "imageHeight": height,
             "landmarks": landmarks,
+        }
+
+    def _basis_start(self) -> dict:
+        payload = self._read_json()
+        model = payload.get("model") or ""
+        if not isinstance(model, str):
+            raise ApiError(400, "bad_request", "model 必须是字符串")
+        info = self._check_model(model)
+        maxsim_sample = payload.get("maxsimSample", 1400)
+        if (
+            not isinstance(maxsim_sample, int)
+            or isinstance(maxsim_sample, bool)
+            or maxsim_sample <= 0
+        ):
+            raise ApiError(400, "bad_request", "maxsimSample 必须是正整数")
+        try:
+            sample_id = self.server.state.basis.start(info.model_name, maxsim_sample)
+        except ValueError as error:
+            raise ApiError(400, "bad_request", str(error)) from error
+        return {
+            "status": "success",
+            "sampleId": sample_id,
+            "model": info.model_name,
+        }
+
+    def _basis_add(self) -> dict:
+        sample_id = self._query_value("sampleId")
+        if not sample_id:
+            raise ApiError(400, "bad_request", "缺少 sampleId")
+        body = self._read_body()
+        torch, _ = _torch()
+        image = decode_image(body)
+        try:
+            if not self.server.state.cache.ready("image"):
+                self.server.state.cache.ensure("image")
+            with self.server.state.cache.use("image") as tower:
+                if (
+                    tower.attention is None
+                    or tower.v_weight is None
+                    or tower.v_bias is None
+                ):
+                    raise ApiError(
+                        422,
+                        "capability_missing",
+                        "图片塔不支持语义特征拟合",
+                    )
+                tower.attention.pop("weights", None)
+                inputs = tower.processor(images=image, return_tensors="pt")
+                pixel_values = inputs["pixel_values"].to(
+                    device=tower.device, dtype=tower.dtype
+                )
+                with torch.inference_mode():
+                    output = tower.model(pixel_values=pixel_values)
+                    attention = tower.attention.get("weights")
+                    if attention is None:
+                        raise ApiError(
+                            500, "attention_missing", "没有捕获到图片塔注意力"
+                        )
+                    hidden = output.last_hidden_state[0].float()
+                    projected = hidden @ tower.v_weight.T + tower.v_bias
+                try:
+                    count = self.server.state.basis.add(
+                        sample_id, hidden, attention, projected
+                    )
+                except KeyError as error:
+                    raise ApiError(
+                        404, "basis_session_missing", str(error.args[0])
+                    ) from error
+        finally:
+            image.close()
+        return {"status": "success", "sampleId": sample_id, "count": count}
+
+    def _basis_finish(self) -> dict:
+        payload = self._read_json()
+        sample_id = payload.get("sampleId")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ApiError(400, "bad_request", "缺少 sampleId")
+        try:
+            spp, maxsim, samples = self.server.state.basis.finish(sample_id)
+        except KeyError as error:
+            raise ApiError(404, "basis_session_missing", str(error.args[0])) from error
+        except ValueError as error:
+            raise ApiError(422, "basis_unfit", str(error)) from error
+        return {
+            "status": "success",
+            "spp": base64.b64encode(spp).decode("ascii"),
+            "maxsim": base64.b64encode(maxsim).decode("ascii"),
+            "samples": samples,
+        }
+
+    def _basis_cancel(self) -> dict:
+        payload = self._read_json()
+        sample_id = payload.get("sampleId")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ApiError(400, "bad_request", "缺少 sampleId")
+        return {
+            "status": "success",
+            "cancelled": self.server.state.basis.cancel(sample_id),
         }
 
     def _check_model(self, requested: str) -> ClipModelInfo:

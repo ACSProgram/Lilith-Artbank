@@ -63,7 +63,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 - `tags_list` 与 `folders_list` 都有 `total` 与 `nextCursor`：同级或标签超过 `limit` 时给出游标，原样传给 `cursor` 取下一页；单页上限仍是 500（`tags_list` 默认 100、`folders_list` 默认 200）。游标是 offset 语义的不透明字符串，解析失败报“游标无效”，不静默回到第一页。翻页不回快照：两次调用之间有写入时可能重复或漏掉条目，返回里的 `pagingNote` 已写明。
 - `search_images` 始终返回 `total`；`pageSize` 超出 1–50 直接报错，不静默截断。分面计数按需开启，2 字搜索与超大集合较慢。开 `includeFacets` 时额外返回 `facetsNote`：标签分面不应用 `tagIds` / `tagPresence` / `excludeTagIds`，选中一个标签后仍能看到其它标签的计数；其余分面各自排除自身维度。搜索与集合视图的分面按命中集统计，那里的标签分面只含命中集内的标签。分面只给 `tagId` 与计数，名称用 `tags_list` 取。
 - `find_similar` 的 `total` 是范围与阈值过滤后的全部命中数，`returned` 是可翻页/可全选的条数（受 `limit` 限制）。预览每行带 `score`：`scoreKind=distance`（phash/color）越小越近，`similarity`（embedding/pose/semantic）越大越近。结果复用应用唯一的相似结果槽：后一次相似或语义搜索会让前一个 token 失效。
-- `featureMode` 只在 `mode=image` 且 `kind=embedding` 时有效：`overall`（默认）沿用全局向量；`subject` 用 MaxSim、`composition` 用 SPP，先按整体相似度阈值粗筛前 20%，再按描述子重排。后两种只支持单张参考图，传多张直接报错；其它 `kind` 或 `mode=text` 传非 `overall` 也报错。特征未生成时返回明确错误（含剩余张数），不返回空结果。这两种模式下 `scoreKind=none`、预览 `score` 为 null，因为阈值与重排分不是同一刻度。
+- `featureMode` 只在 `mode=image` 且 `kind=embedding` 时有效：`overall`（默认）沿用全局向量；`subject` 用 MaxSim、`composition` 用 SPP，先按整体相似度阈值粗筛前 20%，再按描述子重排。后两种只支持单张参考图，传多张直接报错；其它 `kind` 或 `mode=text` 传非 `overall` 也报错。门限跟着 `scope`：只回填了一部分时，把 `scope` 收窄到已补齐的文件夹就能用。特征未生成时返回明确错误（含剩余张数），不返回空结果。这两种模式下 `scoreKind=none`、预览 `score` 为 null，因为阈值与重排分不是同一刻度。
 - `find_similar` 的 `threshold` 一律是上限：pHash 是 0–256 距离上限（省略时默认 6），`color4` / `color8` 是 0–1 距离上限，`embedding` / `pose` 是 -1–1 的相似度下限；省略都不做阈值过滤。方向容易记错：`color` 传 0 会筛掉全部、传 1 等于不筛，`embedding` 传 1 会全部命中。多张参考图只支持 `color4`/`color8`/`embedding` 的平均，最多 100 张；`phash` 与 `pose` 只接受单张。所有 `featureMode` 共用 embedding 阈值。
 - `find_similar` 的 `scope` 与界面一致：`library`（默认）、`folder`（`folderId`、`includeSubfolders`，默认包含）、`collection`（`collectionId`）、`selection`（`imageIds`）、`view`（结构化 `query`）、`temp`（临时文件夹）。全库不解析 id；其它范围在 Rust 侧解析成 id 集合后与扫描取交集。全库扫描（`scope` 省略或 `library`）不包含临时图片；`scope=temp`、显式 id 或 `view=temp` 等显式范围可以命中临时图片。
 - 语义搜索（`mode=text`）要求用英文短语：中文向量彼此挤在一起，实测无关句余弦 0.607 对英文 0.328，「用自己的描述找回自己」中文 1/3、英文 3/3。工具描述与界面占位文案都写明这一点；这一轮不做翻译层，也不换文本塔。
@@ -95,7 +95,7 @@ mcp { enabled: false, port: 18767, mode: "readOnly" | "ask" | "full" }
 | `mcp_folders` / `mcp_trash_folders` | 正常/回收站文件夹；回收站行显示 `original_path`（旧 v10 行回退到 `path`），仓库内部路径不出现在响应里；根目录用空字符串表示 |
 | `mcp_tags` / `mcp_image_tags` | 标签、正常图片的标签关系与图片数 |
 | `mcp_collections` / `mcp_collection_items` | 集合、成员数与成员位置 |
-| `mcp_features` | 正常图片是否有 embedding/pose、模型与维度；不含 pack 名、偏移与向量本体 |
+| `mcp_features` | 正常图片的 embedding / pose / spp / maxsim 记录、模型、维度与时间；不含 pack 名、偏移与向量本体 |
 
 - 字段口径：`rating` 代替 `score`；时间用 `_ms`；大小用 `_bytes`；pHash 与主色用 `hex()` 输出十六进制。不暴露绝对路径、仓库路径、内部表、pack 名或待释放细节。
 - 内联上限：200 行 / 256 KiB / 5 秒；超限返回 `truncated=true` 并明确说明不是全量，且在截断前多读一行确认还有数据。

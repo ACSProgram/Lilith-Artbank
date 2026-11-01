@@ -66,7 +66,8 @@ impl AiError {
         }
     }
 
-    fn invalid(message: impl Into<String>) -> Self {
+    /// 请求本身有问题（参数、服务端能力不符）：重试也不会有不同结果。
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             retryable: false,
@@ -110,6 +111,12 @@ pub struct Capability {
     #[serde(default)]
     pub model: String,
     pub dim: Option<u32>,
+    /// 图片塔当前加载的基身份；缺省表示服务端不确定或外部实现没有这个字段。
+    #[serde(default)]
+    pub basis_id: Option<String>,
+    /// 基的训练样本数；应用用它补齐 `meta.feature_basis`。
+    #[serde(default)]
+    pub basis_samples: Option<u32>,
 }
 
 /// `/v1/health` 与 `/v1/models/ensure` 的公共结构；没有该能力时字段可整体缺省。
@@ -212,6 +219,44 @@ struct CapabilitiesResponse {
     capabilities: HashMap<String, Capability>,
 }
 
+/// `/v1/models/ensure` 的可选基参数：目录 + 应用算出的身份。
+#[derive(Debug, Clone, Serialize)]
+pub struct BasisRequest {
+    pub dir: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BasisResult {
+    pub spp: Vec<u8>,
+    pub maxsim: Vec<u8>,
+    pub samples: u32,
+}
+
+#[derive(Deserialize)]
+struct BasisSessionResponse {
+    #[serde(default, rename = "sampleId")]
+    sample_id: String,
+}
+
+#[derive(Deserialize)]
+struct BasisAddResponse {
+    #[serde(default, rename = "count")]
+    count: u64,
+}
+
+#[derive(Deserialize)]
+struct BasisFinishResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    spp: String,
+    #[serde(default)]
+    maxsim: String,
+    #[serde(default)]
+    samples: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Method {
     Get,
@@ -282,7 +327,20 @@ impl AiClient {
         &self,
         capabilities: &[String],
     ) -> Result<HashMap<String, Capability>, AiError> {
-        let payload = serde_json::json!({ "capabilities": capabilities }).to_string();
+        self.ensure_models_with_basis(capabilities, None)
+    }
+
+    /// 加载模型；图片塔可以带一个明确的白化基，`None` 时服务端按模型目录兜底。
+    pub fn ensure_models_with_basis(
+        &self,
+        capabilities: &[String],
+        basis: Option<&BasisRequest>,
+    ) -> Result<HashMap<String, Capability>, AiError> {
+        let mut payload = serde_json::json!({ "capabilities": capabilities });
+        if let Some(basis) = basis {
+            payload["basis"] = serde_json::json!({ "dir": basis.dir, "id": basis.id });
+        }
+        let payload = payload.to_string();
         let url = self.url("/v1/models/ensure");
         self.with_budget(ENSURE_TIMEOUT, ENSURE_ATTEMPTS, ENSURE_BUDGET, |timeout| {
             let body = self.execute(
@@ -295,6 +353,95 @@ impl AiClient {
             let parsed: CapabilitiesResponse = parse_body(&body)?;
             Ok(parsed.capabilities)
         })
+    }
+
+    pub fn basis_start(&self, model: &str, maxsim_sample: u32) -> Result<String, AiError> {
+        let payload = serde_json::json!({
+            "model": model,
+            "maxsimSample": maxsim_sample,
+        })
+        .to_string();
+        let url = self.url("/v1/basis/start");
+        self.with_budget(self.attempt_timeout, MAX_ATTEMPTS, self.budget, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/json; charset=utf-8"),
+                Some(payload.as_bytes()),
+                timeout,
+            )?;
+            let parsed: BasisSessionResponse = parse_body(&body)?;
+            if parsed.sample_id.trim().is_empty() {
+                return Err(AiError::invalid("拟合服务没有返回 sampleId"));
+            }
+            Ok(parsed.sample_id)
+        })
+    }
+
+    /// 逐张累积拟合样本。每次 `add` 在服务端只执行一次：重试会让同一张图被重复计入。
+    pub fn basis_add(&self, sample_id: &str, bytes: &[u8]) -> Result<u64, AiError> {
+        let url = query_url(&self.url("/v1/basis/add"), &[("sampleId", sample_id)]);
+        self.with_budget(self.attempt_timeout, 1, self.attempt_timeout, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/octet-stream"),
+                Some(bytes),
+                timeout,
+            )?;
+            let parsed: BasisAddResponse = parse_body(&body)?;
+            Ok(parsed.count)
+        })
+    }
+
+    pub fn basis_finish(&self, sample_id: &str) -> Result<BasisResult, AiError> {
+        let payload = serde_json::json!({ "sampleId": sample_id }).to_string();
+        let url = self.url("/v1/basis/finish");
+        // 拟合要对 1536 维协方差做特征分解，单独给一份更宽的预算。
+        self.with_budget(ENSURE_TIMEOUT, 1, ENSURE_TIMEOUT, |timeout| {
+            let body = self.execute(
+                Method::Post,
+                &url,
+                Some("application/json; charset=utf-8"),
+                Some(payload.as_bytes()),
+                timeout,
+            )?;
+            let parsed: BasisFinishResponse = parse_body(&body)?;
+            if parsed
+                .status
+                .as_deref()
+                .is_some_and(|value| value != "success")
+            {
+                return Err(AiError::invalid("拟合基返回失败状态"));
+            }
+            let spp = BASE64
+                .decode(parsed.spp.as_bytes())
+                .map_err(|error| AiError::invalid(format!("spp 基编码无效：{error}")))?;
+            let maxsim = BASE64
+                .decode(parsed.maxsim.as_bytes())
+                .map_err(|error| AiError::invalid(format!("maxsim 基编码无效：{error}")))?;
+            if spp.is_empty() || maxsim.is_empty() {
+                return Err(AiError::invalid("拟合服务返回了空的基文件"));
+            }
+            Ok(BasisResult {
+                spp,
+                maxsim,
+                samples: parsed.samples,
+            })
+        })
+    }
+
+    pub fn basis_cancel(&self, sample_id: &str) -> Result<(), AiError> {
+        let payload = serde_json::json!({ "sampleId": sample_id }).to_string();
+        let url = self.url("/v1/basis/cancel");
+        self.execute(
+            Method::Post,
+            &url,
+            Some("application/json; charset=utf-8"),
+            Some(payload.as_bytes()),
+            Duration::from_secs(5),
+        )?;
+        Ok(())
     }
 
     #[cfg(test)]

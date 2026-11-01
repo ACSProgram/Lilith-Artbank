@@ -29,6 +29,7 @@ fn setup() -> (
     service::LibrarySession,
     std::path::PathBuf,
     Arc<FeatureStore>,
+    String,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("library");
@@ -53,7 +54,16 @@ fn setup() -> (
         .unwrap();
     let store = Arc::new(FeatureStore::new());
     store.set_root(root.join(".artbank/features"));
-    (temp, session, root, store)
+    // 批量任务现在要求库内基；测试不需要真的 npz，只用于算身份。
+    let model = crate::ai::basis::model_name(&AiSettings::default()).unwrap();
+    let basis_dir = root.join(".artbank/basis").join(&model);
+    std::fs::create_dir_all(&basis_dir).unwrap();
+    let spp = b"spp-test-basis";
+    let maxsim = b"maxsim-test-basis";
+    std::fs::write(basis_dir.join("spp_basis.npz"), spp).unwrap();
+    std::fs::write(basis_dir.join("maxsim_basis.npz"), maxsim).unwrap();
+    let basis_id = crate::ai::basis::compute_id(&model, spp, maxsim);
+    (temp, session, root, store, basis_id)
 }
 
 fn context(
@@ -78,7 +88,12 @@ fn context(
     }
 }
 
-fn mock_server() -> MockServer {
+/// 假服务；`cancel_on_embed` 有值时，收到第一张图片的向量请求就请取消，
+/// 用来验证「取消后不切基身份」。
+fn mock_server(
+    basis_id: String,
+    cancel_on_embed: Option<std::sync::Arc<TaskHandle>>,
+) -> MockServer {
     let spp = BASE64.encode(vec![1_u8; FeatureKind::SPP_RECORD_DIM as usize]);
     let maxsim = BASE64.encode(vec![2_u8; FeatureKind::MAXSIM_RECORD_DIM as usize]);
     MockServer::start(move |request, _| {
@@ -89,7 +104,12 @@ fn mock_server() -> MockServer {
                     "status": "ok",
                     "version": "1",
                     "capabilities": {
-                        "imageEmbedding": {"ready": true, "model": "siglip2-test", "dim": 4},
+                        "imageEmbedding": {
+                            "ready": true,
+                            "model": "siglip2-test",
+                            "dim": 4,
+                            "basisId": basis_id
+                        },
                         "textEmbedding": {"ready": true, "model": "siglip2-test", "dim": 4},
                         "pose": {"ready": true, "model": "mediapipe-pose"},
                         "description": {"ready": true, "model": "desc-test"}
@@ -98,6 +118,9 @@ fn mock_server() -> MockServer {
                 .to_string(),
             )
         } else if request.path.starts_with("/v1/embed/image") {
+            if let Some(task) = &cancel_on_embed {
+                task.request_cancel();
+            }
             MockResponse::json(
                 200,
                 serde_json::json!({
@@ -176,8 +199,8 @@ fn task(name: &str, kind: AiJobKind, scope: &str) -> std::sync::Arc<TaskHandle> 
 
 #[test]
 fn runs_embedding_pose_and_description_jobs() {
-    let (_temp, session, root, store) = setup();
-    let server = mock_server();
+    let (_temp, session, root, store, basis_id) = setup();
+    let server = mock_server(basis_id, None);
     let context = context(&session, &root, store, server.url());
 
     let job = task("embed", AiJobKind::Embedding, "选中 1 张");
@@ -263,7 +286,7 @@ fn runs_embedding_pose_and_description_jobs() {
 
 #[test]
 fn never_overwrites_handwritten_description() {
-    let (_temp, session, root, store) = setup();
+    let (_temp, session, root, store, basis_id) = setup();
     session
         .db
         .with_writer(|connection| {
@@ -275,7 +298,7 @@ fn never_overwrites_handwritten_description() {
             Ok(())
         })
         .unwrap();
-    let server = mock_server();
+    let server = mock_server(basis_id, None);
     let context = context(&session, &root, store, server.url());
     let job = task("desc", AiJobKind::Description, "选中 1 张");
     let mut value = request(AiJobKind::Description);
@@ -297,7 +320,7 @@ fn never_overwrites_handwritten_description() {
 
 #[test]
 fn deleted_selection_is_not_counted_as_pending() {
-    let (_temp, session, root, store) = setup();
+    let (_temp, session, root, store, basis_id) = setup();
     session
         .db
         .with_writer(|connection| {
@@ -305,7 +328,7 @@ fn deleted_selection_is_not_counted_as_pending() {
             Ok(())
         })
         .unwrap();
-    let server = mock_server();
+    let server = mock_server(basis_id, None);
     let context = context(&session, &root, store, server.url());
     let job = task("embed", AiJobKind::Embedding, "选中 1 张");
     execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
@@ -324,4 +347,70 @@ fn rejects_long_prompt_and_bad_tokens() {
         ..AiJobRequest::default()
     };
     assert!(request.normalized().is_err());
+}
+
+/// 把库内基换成另一份，模拟手工换基；返回新基身份。
+fn replace_basis(root: &std::path::Path) -> String {
+    let model = crate::ai::basis::model_name(&AiSettings::default()).unwrap();
+    let dir = root.join(".artbank/basis").join(&model);
+    let spp = b"other-spp-basis";
+    let maxsim = b"other-maxsim-basis";
+    std::fs::write(dir.join("spp_basis.npz"), spp).unwrap();
+    std::fs::write(dir.join("maxsim_basis.npz"), maxsim).unwrap();
+    crate::ai::basis::compute_id(&model, spp, maxsim)
+}
+
+fn saved_basis(session: &service::LibrarySession) -> crate::ai::basis::FeatureBasis {
+    crate::ai::basis::load_meta(&session.db)
+        .unwrap()
+        .expect("meta.feature_basis 应存在")
+}
+
+#[test]
+fn completed_run_switches_basis_meta() {
+    let (_temp, session, root, store, old_id) = setup();
+    crate::ai::basis::save_meta(
+        &session.db,
+        &crate::ai::basis::FeatureBasis {
+            model: crate::ai::basis::model_name(&AiSettings::default()).unwrap(),
+            id: old_id,
+            samples: 1,
+            source: crate::ai::basis::SOURCE_LIBRARY.into(),
+            fitted_at: 1,
+        },
+    )
+    .unwrap();
+    let new_id = replace_basis(&root);
+    let server = mock_server(new_id.clone(), None);
+    let context = context(&session, &root, store, server.url());
+    let job = task("embed", AiJobKind::Embedding, "选中 1 张");
+    execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
+    assert_eq!(saved_basis(&session).id, new_id, "跑完应把 meta 切到新基");
+}
+
+#[test]
+fn cancelled_run_keeps_previous_basis_meta() {
+    let (_temp, session, root, store, old_id) = setup();
+    crate::ai::basis::save_meta(
+        &session.db,
+        &crate::ai::basis::FeatureBasis {
+            model: crate::ai::basis::model_name(&AiSettings::default()).unwrap(),
+            id: old_id.clone(),
+            samples: 1,
+            source: crate::ai::basis::SOURCE_LIBRARY.into(),
+            fitted_at: 1,
+        },
+    )
+    .unwrap();
+    let new_id = replace_basis(&root);
+    let job = task("embed", AiJobKind::Embedding, "选中 1 张");
+    // 假服务在收到第一张图的向量请求时请取消：任务会跑完这一张，但不算跑完。
+    let server = mock_server(new_id, Some(job.clone()));
+    let context = context(&session, &root, store, server.url());
+    execute(&context, &job, &request(AiJobKind::Embedding)).unwrap();
+    assert_eq!(
+        saved_basis(&session).id,
+        old_id,
+        "取消的任务不能切 meta，旧基要继续服务未处理的图片"
+    );
 }

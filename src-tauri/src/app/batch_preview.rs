@@ -58,6 +58,7 @@ pub fn preview(
     database: &LibraryDb,
     root: &Path,
     request: &BatchTaskPreviewRequest,
+    basis_id: Option<&str>,
 ) -> AppResult<BatchTaskPreview> {
     if request.kind == BatchTaskKind::Edit {
         let (options, ids) = edit_request(request)?;
@@ -79,7 +80,7 @@ pub fn preview(
             available_bytes: estimate.available_bytes,
         });
     }
-    let filter = filter_for(request)?;
+    let filter = filter_for(request, basis_id)?;
     // 缺模型维度时只需要范围总数：用 `All` 扫一遍拿 `total`，`will_process` 不返回。
     let query_filter = filter.clone().unwrap_or(PendingFilter::All);
     let stats = match request.scope.to_library_query()? {
@@ -112,7 +113,10 @@ fn edit_request(request: &BatchTaskPreviewRequest) -> AppResult<(BatchEditOption
     Ok((options, query::normalize_scope_ids(image_ids)?))
 }
 
-fn filter_for(request: &BatchTaskPreviewRequest) -> AppResult<Option<PendingFilter>> {
+fn filter_for(
+    request: &BatchTaskPreviewRequest,
+    basis_id: Option<&str>,
+) -> AppResult<Option<PendingFilter>> {
     Ok(match request.kind {
         BatchTaskKind::Thumbnail => Some(if request.overwrite {
             PendingFilter::All
@@ -129,7 +133,11 @@ fn filter_for(request: &BatchTaskPreviewRequest) -> AppResult<Option<PendingFilt
                     {
                         Some(PendingFilter::Features {
                             model: capability.model.clone(),
-                            dims: semantic_feature_demands(capability.dim),
+                            dims: semantic_feature_demands(
+                                &capability.model,
+                                capability.dim,
+                                basis_id,
+                            ),
                         })
                     }
                     _ => None,
@@ -170,7 +178,7 @@ mod tests {
             capability: None,
             edit: None,
         };
-        let error = filter_for(&request).unwrap_err();
+        let error = filter_for(&request, None).unwrap_err();
         assert!(error.to_string().contains("不提供待处理数量"));
     }
 
@@ -183,7 +191,7 @@ mod tests {
             capability: None,
             edit: None,
         };
-        assert!(filter_for(&request).unwrap().is_none());
+        assert!(filter_for(&request, None).unwrap().is_none());
 
         let request = BatchTaskPreviewRequest {
             capability: Some(PreviewCapability {
@@ -192,6 +200,6 @@ mod tests {
             }),
             ..request
         };
-        assert!(filter_for(&request).unwrap().is_none());
+        assert!(filter_for(&request, None).unwrap().is_none());
     }
 }
